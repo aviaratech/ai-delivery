@@ -73,4 +73,10 @@ jobs:
           test "$(find package-artifact -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
           cd package-artifact
           shasum -a 256 -c SHA256SUMS
-          npm publish ./*.tgz --access public
+          mkdir unpacked repacked
+          tar -xzf ./*.tgz -C unpacked
+          cd unpacked/package
+          npm pack --ignore-scripts --pack-destination ../../repacked
+          test "$(find ../../repacked -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
+          cmp ../../*.tgz ../../repacked/*.tgz
+          npm publish . --ignore-scripts --access public
