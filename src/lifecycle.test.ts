@@ -17,16 +17,19 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
+import { syntheticDiscoveryClients, syntheticOverrides } from './fixtures/discovery.js';
+import { Octokit } from '@octokit/rest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
-import { loadDeliveryConfig } from './config/deliveryConfig.js';
+import { loadDeliveryConfig, parseDeliveryConfig } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/index.js';
 import { executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
 import { gitCommonDir } from './git.js';
+import * as githubClient from './github/client.js';
 import {
   createIssue,
   developIssue,
@@ -47,6 +50,25 @@ import {
   preparePrWorktree,
   prepareStandaloneWorktree,
 } from './worktree.js';
+
+vi.mock('./github/client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./github/client.js')>();
+  return {
+    ...actual,
+    createDeliveryGitHubClients: async (input: { role: 'author' | 'reviewer' }) => ({
+      ...syntheticDiscoveryClients(),
+      authSource: 'app',
+      role: input.role,
+      rest: new Octokit({
+        request: {
+          fetch: async () => {
+            throw new Error('Unexpected network request in synthetic lifecycle test.');
+          },
+        },
+      }),
+    }),
+  };
+});
 
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -71,13 +93,13 @@ function directoryHash(path: string): string {
   return digestValue(entries);
 }
 
-function fixture(options: { twoStages?: boolean } = {}): {
+async function fixture(options: { twoStages?: boolean } = {}): Promise<{
   root: string;
   counter: string;
   secondCounter: string;
   failSecond: string;
   runtimeEntryPath: string;
-} {
+}> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-lifecycle-')));
   const counter = join(root, '.git', 'stage-count.txt');
   const secondCounter = join(root, '.git', 'second-stage-count.txt');
@@ -129,9 +151,12 @@ function fixture(options: { twoStages?: boolean } = {}): {
           identity: 'synthetic-reviewer',
         },
       },
-      schemaVersion: 'ai-delivery.config@1',
+      schemaVersion: 'ai-delivery.config@2',
     };
-    writeFileSync(join(root, 'ai-delivery.config.json'), `${JSON.stringify(config)}\n`);
+    writeFileSync(
+      join(root, 'ai-delivery.config.json'),
+      `${JSON.stringify(syntheticOverrides(parseDeliveryConfig(config)))}\n`,
+    );
     writeFileSync(
       join(root, 'policy.mjs'),
       `
@@ -145,6 +170,7 @@ const stable = value => Array.isArray(value) ? '[' + value.map(stable).join(',')
 const digest = value => 'sha256:' + createHash('sha256').update(stable(value)).digest('hex');
 const bytes = value => 'sha256:' + createHash('sha256').update(value).digest('hex');
 const policyDigest = bytes(readFileSync(fileURLToPath(import.meta.url)));
+export const deliverySettings = ${JSON.stringify({ roles: config.roles, commandPolicy: config.commandPolicy })};
 export default {
   schemaVersion: 'RepositoryDeliveryPolicy@1',
   classifyExactRange(input) {
@@ -181,6 +207,8 @@ export default {
     git(root, 'commit', '-qm', 'synthetic base');
     git(root, 'push', '-q', 'origin', 'main');
     git(root, 'fetch', '-q', 'origin', 'main');
+    git(root, 'config', `url.${join(root, '.git', 'remote.git')}.insteadOf`, 'https://github.com/example/widget.git');
+    git(root, 'remote', 'set-url', 'origin', 'https://github.com/example/widget.git');
     const runtimeRoot = join(root, '.git', 'synthetic-runtime');
     const runtimeEntryPath = join(runtimeRoot, 'package', 'dist', 'cli.js');
     const packagePath = join(runtimeRoot, 'package', 'package.json');
@@ -194,13 +222,13 @@ export default {
     writeFileSync(mcpLauncherPath, 'synthetic MCP launcher bytes\n');
     writeFileSync(
       pluginManifestPath,
-      JSON.stringify({ name: 'ai-delivery', packageVersion: '0.1.0', deliveryCapabilityVersion: 1 }),
+      JSON.stringify({ name: 'ai-delivery', packageVersion: '0.1.0', deliveryCapabilityVersion: 2 }),
     );
     const content = {
-      capability: { cli: 1, mcp: 1 },
+      capability: { cli: 2, mcp: 2 },
       cliPath: runtimeEntryPath,
       cliSha256: sha256(runtimeEntryPath),
-      configDigest: loadDeliveryConfig(root).configDigest,
+      configDigest: (await loadDeliveryConfig(root)).configDigest,
       mcpLauncherPath,
       mcpLauncherSha256: sha256(mcpLauncherPath),
       packageVersion: '0.1.0',
@@ -209,7 +237,7 @@ export default {
       pluginManifestPath,
       pluginManifestSha256: sha256(pluginManifestPath),
       repository: 'example/widget',
-      schemaVersion: 'ai-delivery.runtime-admission@1',
+      schemaVersion: 'ai-delivery.runtime-admission@2',
       sourceArchiveSha256: digestValue('synthetic archive'),
       sourceCommit: git(root, 'rev-parse', 'HEAD'),
     };
@@ -224,15 +252,15 @@ export default {
 }
 
 test('installed CLI and MCP admission fails before a worktree mutation on source or capability drift', async () => {
-  const { root, runtimeEntryPath } = fixture();
+  const { root, runtimeEntryPath } = await fixture();
   try {
-    const input = { repoRoot: root, runtimeEntryPath };
+    const input = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
     const path = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
     const original = readFileSync(path, 'utf8');
-    assert.equal(assertDeliveryRuntimeAdmitted(input).capability.mcp, 1);
+    assert.equal((await assertDeliveryRuntimeAdmitted(input)).capability.mcp, 2);
     const changedModule = join(dirname(runtimeEntryPath), 'mutated.js');
     writeFileSync(changedModule, 'unadmitted module bytes\n');
-    assert.throws(() => assertDeliveryRuntimeAdmitted(input), /source, capability or repository admission/u);
+    await assert.rejects(assertDeliveryRuntimeAdmitted(input), /source, capability or repository admission/u);
     rmSync(changedModule);
     rmSync(path);
     await assert.rejects(
@@ -252,14 +280,83 @@ test('installed CLI and MCP admission fails before a worktree mutation on source
     const { admissionId: _old, ...content } = admission;
     const mismatched = { ...content, mcpLauncherSha256: sha256(launcherPath), capability: { cli: 1, mcp: 2 } };
     writeFileSync(path, JSON.stringify({ ...mismatched, admissionId: digestValue(mismatched) }));
-    assert.throws(() => assertDeliveryRuntimeAdmitted(input), /source, capability or repository admission/u);
+    await assert.rejects(assertDeliveryRuntimeAdmitted(input), /source, capability or repository admission/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
+test('a changed discovered Project identity invalidates the installed admission', async () => {
+  const { root, runtimeEntryPath } = await fixture();
+  const base = syntheticDiscoveryClients();
+  const graphql = async (query: string, variables: Record<string, unknown>): Promise<unknown> => {
+    const result: unknown = await base.graphql(query, variables);
+    if (query.includes('query ProjectDeliveryConfiguration')) {
+      (result as { organization: { projectV2: { id: string } } }).organization.projectV2.id = 'REPLACED-PROJECT';
+    }
+    return result;
+  };
+  const mocked = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockResolvedValueOnce({
+    authSource: 'app',
+    role: 'author',
+    rest: new Octokit(),
+    graphql: graphql as typeof base.graphql,
+  });
+  try {
+    await assert.rejects(
+      assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath }),
+      /source, capability or repository admission/u,
+    );
+    assert.equal(existsSync(join(root, '.worktrees')), false);
+  } finally {
+    mocked.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI dispatch and MCP reject ambiguous discovery with the same error before mutation', async () => {
+  const { root, runtimeEntryPath } = await fixture();
+  const path = join(root, 'ai-delivery.config.json');
+  const overrides = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  delete overrides.project;
+  writeFileSync(path, JSON.stringify(overrides));
+  const base = syntheticDiscoveryClients();
+  const graphql = async (query: string, variables: Record<string, unknown>): Promise<unknown> => {
+    if (query.includes('projectsV2(first:'))
+      return { repository: { projectsV2: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+    return base.graphql(query, variables);
+  };
+  const mocked = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockResolvedValue({
+    authSource: 'app',
+    role: 'author',
+    rest: new Octokit(),
+    graphql: graphql as typeof base.graphql,
+  });
+  const execution = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
+  const server = createAiDeliveryMcpServer(execution);
+  const client = new Client({ name: 'synthetic-discovery-client', version: '1.0.0' });
+  try {
+    await assert.rejects(
+      executeTool('issue_create', { title: 'Ambiguous destination' }, execution),
+      /Discovered 0 compatible linked Projects/u,
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({ name: 'issue_create', arguments: { title: 'Ambiguous destination' } });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /Discovered 0 compatible linked Projects/u);
+    assert.equal(existsSync(join(root, '.worktrees')), false);
+  } finally {
+    await client.close();
+    await server.close();
+    mocked.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('an old active issue remains pinned while a new row uses the same canonical registry', async () => {
-  const { root } = fixture();
+  const { root } = await fixture();
   try {
     const oldPath = join(root, '.worktrees', 'issue-17');
     git(root, 'worktree', 'add', '-b', 'issue/17', oldPath, 'main');
@@ -295,7 +392,7 @@ test('an old active issue remains pinned while a new row uses the same canonical
     const relationshipContext = {
       root,
       repo: { owner: 'example', repo: 'widget' },
-      config: loadDeliveryConfig(root).config,
+      config: (await loadDeliveryConfig(root)).config,
       clients: {
         rest: {
           issues: {
@@ -349,7 +446,7 @@ test('an old active issue remains pinned while a new row uses the same canonical
 });
 
 test('synthetic cutover restores exact pre-write state and resumes an incomplete verification stage', async () => {
-  const { root, counter, secondCounter, failSecond } = fixture({ twoStages: true });
+  const { root, counter, secondCounter, failSecond } = await fixture({ twoStages: true });
   const backup = mkdtempSync(join(tmpdir(), 'ai-delivery-cutover-backup-'));
   try {
     const row = await prepareIssueWorktree({
@@ -373,7 +470,10 @@ test('synthetic cutover restores exact pre-write state and resumes an incomplete
     const evidenceBefore = directoryHash(evidencePath);
     const pointerBefore = readlinkSync(current);
     const currentCli = join(current, 'package', 'dist', 'cli.js');
-    assert.equal(assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath: currentCli }).capability.cli, 1);
+    assert.equal(
+      (await assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath: currentCli })).capability.cli,
+      2,
+    );
 
     cpSync(oldRelease, newRelease, { recursive: true });
     writeFileSync(join(newRelease, 'package', 'dist', 'cli.js'), 'unadmitted CLI bytes\n');
@@ -383,7 +483,7 @@ test('synthetic cutover restores exact pre-write state and resumes an incomplete
       executeTool(
         'issue_worktree_create',
         { branch: 'scratch/cutover', name: 'scratch-cutover' },
-        { repoRoot: root, runtimeEntryPath: currentCli },
+        { repoRoot: root, runtimeEntryPath: currentCli, identity: 'synthetic-author' },
       ),
       /source, capability or repository admission/u,
     );
@@ -393,7 +493,7 @@ test('synthetic cutover restores exact pre-write state and resumes an incomplete
     unlinkSync(current);
     symlinkSync(pointerBefore, current);
     assert.equal(readlinkSync(current), pointerBefore);
-    assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath: currentCli });
+    await assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath: currentCli });
 
     const uninterrupted = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
     assert.equal(readFileSync(counter, 'utf8'), '1');
@@ -464,7 +564,7 @@ test('synthetic cutover restores exact pre-write state and resumes an incomplete
 });
 
 test('issue worktree verification resumes a completed stage and rejects changed inputs', async () => {
-  const { root, counter, runtimeEntryPath } = fixture();
+  const { root, counter, runtimeEntryPath } = await fixture();
   try {
     await assert.rejects(
       executeTool('issue_create', { title: 'Wrong repository', repo: 'other/widget' }, { repoRoot: root }),
@@ -566,7 +666,7 @@ test('issue worktree verification resumes a completed stage and rejects changed 
 });
 
 test('scratch start derives safe names and reports the requested worktree', async () => {
-  const { root, runtimeEntryPath } = fixture();
+  const { root, runtimeEntryPath } = await fixture();
   try {
     const first = (await executeTool(
       'issue_start',
@@ -657,9 +757,9 @@ test('MCP request rejects unsupported legacy options before lifecycle dispatch',
 });
 
 test('synthetic issue traverses native intake, readiness, receipt-bound App review, exact merge and finish', async () => {
-  const { root } = fixture();
+  const { root } = await fixture();
   const remote = join(root, '.git', 'remote.git');
-  const config = loadDeliveryConfig(root).config;
+  const config = (await loadDeliveryConfig(root)).config;
   const baseSha = git(root, 'rev-parse', 'main');
   const issueNumber = 17;
   const prNumber = 23;
@@ -752,6 +852,7 @@ test('synthetic issue traverses native intake, readiness, receipt-bound App revi
                   options: [],
                   issueField: {
                     __typename: 'IssueFieldSingleSelect',
+                    id: 'ISSUE-FIELD-101',
                     fullDatabaseId: '101',
                     name: 'Estimate',
                     options: ['1', '2', '4'].map((name) => ({ id: name, name })),
@@ -765,6 +866,7 @@ test('synthetic issue traverses native intake, readiness, receipt-bound App revi
                   options: [],
                   issueField: {
                     __typename: 'IssueFieldSingleSelect',
+                    id: 'ISSUE-FIELD-102',
                     fullDatabaseId: '102',
                     name: 'Urgency',
                     options: ['High', 'Low'].map((name) => ({ id: name, name })),

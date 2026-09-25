@@ -123,6 +123,7 @@ function runStageCommand(repoRoot: string, argv: readonly string[]): Buffer {
 }
 
 export async function verifyIssue(input: {
+  personalAuth?: boolean;
   admittedResourceClasses?: readonly string[];
   issueNumber: number;
   repoRoot: string;
@@ -130,7 +131,10 @@ export async function verifyIssue(input: {
   const root = gitRoot(input.repoRoot);
   assertRegisteredIssue(root, input.issueNumber);
   const common = gitCommonDir(root);
-  const loaded = loadDeliveryConfig(root);
+  const loaded = await loadDeliveryConfig(
+    root,
+    input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth },
+  );
   const selected = await loadSelectedRepositoryPolicy({
     repoRoot: root,
     policySourcePath: loaded.config.policy.module,
@@ -221,6 +225,7 @@ export async function verifyIssue(input: {
 }
 
 export async function createIssuePhaseEvidence(input: {
+  personalAuth?: boolean;
   approval?: RepositoryApprovalBinding;
   issueNumber: number;
   mergeReadback?: RepositoryMergeReadback;
@@ -229,7 +234,10 @@ export async function createIssuePhaseEvidence(input: {
 }): Promise<RepositoryDeliveryEvidence> {
   const root = gitRoot(input.repoRoot);
   assertRegisteredIssue(root, input.issueNumber);
-  const loaded = loadDeliveryConfig(root);
+  const loaded = await loadDeliveryConfig(
+    root,
+    input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth },
+  );
   const selected = await loadSelectedRepositoryPolicy({
     repoRoot: root,
     policySourcePath: loaded.config.policy.module,

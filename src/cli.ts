@@ -20,7 +20,7 @@ const program = new Command();
 program
   .name('ai-delivery')
   .description('Generic GitHub issue and pull request delivery')
-  .version('0.1.0')
+  .version('0.2.0')
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit personal-token author mode')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
@@ -250,8 +250,11 @@ program
   .command('pr:checkout')
   .requiredOption('--pr <number>')
   .action(async (o: { pr: string }) => {
-    assertDeliveryRuntimeAdmitted(execution());
     const context = await contextFor(execution(), 'pr:checkout');
+    await assertDeliveryRuntimeAdmitted({
+      ...execution(),
+      ...(context.configuration ? { configuration: context.configuration } : {}),
+    });
     print(await checkoutPr(context, Number(o.pr)));
   });
 program
@@ -312,8 +315,11 @@ program
   .option('--pr <number>')
   .option('--name <name>')
   .action(async (o: { pr?: string; name?: string }) => {
-    assertDeliveryRuntimeAdmitted(execution());
     const context = await contextFor(execution(), 'worktrees:cleanup');
+    await assertDeliveryRuntimeAdmitted({
+      ...execution(),
+      ...(context.configuration ? { configuration: context.configuration } : {}),
+    });
     await cleanupNonIssueWorktree({
       repoRoot: context.root,
       ...(o.pr === undefined ? {} : { prNumber: Number(o.pr) }),
@@ -333,11 +339,18 @@ program
   .description('Report bounded terminal delivery metrics')
   .command('velocity')
   .option('--json', 'Print the canonical JSON report')
-  .action(() => {
+  .action(async () => {
     const root = primaryGitRoot(execution().repoRoot);
-    const config = loadDeliveryConfig(root).config;
+    const config = (await loadDeliveryConfig(root)).config;
     const report = buildVelocityReport(getDeliveryRecords(root), new Date(), config.native.points.values.map(Number));
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  });
+program
+  .command('config:resolve')
+  .description('Read the effective GitHub destination and admission digest')
+  .action(async () => {
+    const context = await contextFor(execution(), 'config:resolve');
+    print({ configDigest: context.configuration?.configDigest, routing: context.configuration?.routing });
   });
 program.command('mcp:serve').action(async () => serveAiDeliveryMcp(execution()));
 

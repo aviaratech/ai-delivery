@@ -3,14 +3,14 @@ import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 
-import { loadDeliveryConfig } from '../config/deliveryConfig.js';
+import { loadDeliveryConfig, type LoadedDeliveryConfig } from '../config/deliveryConfig.js';
 import { assertPrivateFile } from '../delivery/common.js';
 import { digestValue } from '../delivery/index.js';
 import { DeliveryError } from '../errors.js';
 import { gitCommonDir, gitRoot } from '../git.js';
 
 const Sha256 = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
-const CAPABILITY = 1;
+const CAPABILITY = 2;
 const RuntimeAdmissionSchema = z
   .object({
     admissionId: Sha256,
@@ -26,7 +26,7 @@ const RuntimeAdmissionSchema = z
     pluginManifestPath: z.string().min(1),
     pluginManifestSha256: Sha256,
     repository: z.string().min(1),
-    schemaVersion: z.literal('ai-delivery.runtime-admission@1'),
+    schemaVersion: z.literal('ai-delivery.runtime-admission@2'),
     sourceArchiveSha256: Sha256,
     sourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
   })
@@ -75,12 +75,16 @@ function manifest(path: string): Record<string, unknown> {
  * bytes to one source archive and the consuming repository configuration.
  * Neither invocation surface can refresh its own admission during a mutation.
  */
-export function assertDeliveryRuntimeAdmitted(input: {
+export async function assertDeliveryRuntimeAdmitted(input: {
   repoRoot: string;
   runtimeEntryPath?: string;
-}): RuntimeAdmission {
+  personalAuth?: boolean;
+  configuration?: LoadedDeliveryConfig;
+}): Promise<RuntimeAdmission> {
   const root = gitRoot(input.repoRoot);
-  const loaded = loadDeliveryConfig(root);
+  const loaded =
+    input.configuration ??
+    (await loadDeliveryConfig(root, input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }));
   const path = join(gitCommonDir(root), 'ai-delivery', 'runtime-admission.json');
   let admission: RuntimeAdmission;
   try {

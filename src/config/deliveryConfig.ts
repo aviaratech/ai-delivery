@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 
 import { DeliveryError } from '../errors.js';
+import { digestValue } from '../delivery/common.js';
+import { createDeliveryGitHubClients } from '../github/client.js';
+import { resolveRepoFromRemote } from '../github/repo.js';
+import { discoverDeliveryRouting, type DiscoveryClients, type DeliveryRouting } from '../github/discovery.js';
 
 export const DELIVERY_CONFIG_FILE = 'ai-delivery.config.json';
 export const DELIVERY_POLICY_CONTRACT = 'RepositoryDeliveryPolicy@1';
@@ -106,7 +111,7 @@ const DeliveryConfigSchema = z
       .strict(),
     repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u),
     roles: z.object({ author: Role, reviewer: Role }).strict(),
-    schemaVersion: z.literal('ai-delivery.config@1'),
+    schemaVersion: z.literal('ai-delivery.config@2'),
   })
   .strict()
   .superRefine((value, context) => {
@@ -175,59 +180,172 @@ const DeliveryConfigSchema = z
 export type DeliveryConfig = z.infer<typeof DeliveryConfigSchema>;
 export type DeliveryRole = keyof DeliveryConfig['roles'];
 
+const ModulePath = z.string().regex(/^\.\/(?!.*(?:^|\/)\.\.(?:\/|$))[^\s]+\.(?:mjs|js)$/u);
+const OverridesSchema = z
+  .object({
+    schemaVersion: z.literal('ai-delivery.config@2').optional(),
+    repository: z
+      .string()
+      .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
+      .optional(),
+    remote: Name.optional(),
+    policy: z.object({ module: ModulePath }).strict().optional(),
+    project: PositiveInteger.optional(),
+    pointsField: Name.optional(),
+    priorityField: Name.optional(),
+    statusField: Name.optional(),
+    statuses: z.object({ blocked: Name, done: Name, inProgress: Name, todo: Name }).strict().optional(),
+    issueTypes: UniqueNames.optional(),
+  })
+  .strict();
+export type DeliveryOverrides = z.infer<typeof OverridesSchema>;
+const PolicySettingsSchema = z
+  .object({
+    roles: DeliveryConfigSchema.shape.roles,
+    commandPolicy: DeliveryConfigSchema.shape.commandPolicy,
+  })
+  .strict();
+export type DeliveryPolicySettings = z.infer<typeof PolicySettingsSchema>;
+
+export interface LoadedDeliverySettings extends DeliveryPolicySettings {
+  configPath: string | null;
+  overrides: DeliveryOverrides;
+  policy: DeliveryConfig['policy'];
+  policyModulePath: string;
+  repository: string;
+  sourceDigest: string;
+}
 export interface LoadedDeliveryConfig {
   config: DeliveryConfig;
   configDigest: string;
-  configPath: string;
+  configPath: string | null;
   policyModulePath: string;
+  remote: string | undefined;
+  routing: DeliveryRouting;
 }
 
-export function loadDeliveryConfig(repositoryRoot: string): LoadedDeliveryConfig {
+/** The optional file contains choices, never a required copy of GitHub metadata. */
+export function readDeliveryOverrides(repositoryRoot: string): {
+  overrides: DeliveryOverrides;
+  bytes: Buffer;
+  path: string | null;
+} {
   const root = realpathSync(repositoryRoot);
-  const configPath = join(root, DELIVERY_CONFIG_FILE);
-  let bytes: Buffer;
+  const path = join(root, DELIVERY_CONFIG_FILE);
   try {
-    if (!isWithin(root, realpathSync(configPath))) {
-      throw new DeliveryError(`${DELIVERY_CONFIG_FILE} must be a repository-root source file.`);
-    }
-    bytes = readFileSync(configPath);
+    lstatSync(path);
   } catch (error) {
-    if (error instanceof DeliveryError) throw error;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      return { overrides: {}, bytes: Buffer.alloc(0), path: null };
+    throw new DeliveryError(`Unable to read ${DELIVERY_CONFIG_FILE}.`);
+  }
+  if (!isWithin(root, realpathSync(path)))
+    throw new DeliveryError(`${DELIVERY_CONFIG_FILE} must stay within the repository root.`);
+  assertSourceControlled({ filePath: path, label: DELIVERY_CONFIG_FILE, root });
+  const bytes = readFileSync(path);
+  try {
+    const raw: unknown = JSON.parse(bytes.toString('utf8')) as unknown;
+    return { overrides: OverridesSchema.parse(raw), bytes, path };
+  } catch {
     throw new DeliveryError(
-      `Missing repository-root ${DELIVERY_CONFIG_FILE}. Configure repository, native fields, policy and distinct App roles.`,
+      `Invalid ${DELIVERY_CONFIG_FILE}; expected optional ai-delivery.config@2 routing overrides. Migrate authentication and command settings to the policy module's deliverySettings export.`,
     );
   }
-  assertSourceControlled({ filePath: configPath, label: DELIVERY_CONFIG_FILE, root });
-  let raw: unknown;
-  try {
-    raw = JSON.parse(bytes.toString('utf8')) as unknown;
-  } catch {
-    throw new DeliveryError(`Invalid ${DELIVERY_CONFIG_FILE}: expected JSON.`);
-  }
-  const config = parseDeliveryConfig(raw);
-  const selectedPath = resolve(root, config.policy.module);
-  if (isAbsolute(config.policy.module) || !isWithin(root, selectedPath)) {
-    throw new DeliveryError(`Invalid ${DELIVERY_CONFIG_FILE}: policy module must stay within the repository root.`);
-  }
+}
+
+/** Explicit credentials and checks stay with the already-required repository policy. */
+export async function loadDeliverySettings(repositoryRoot: string): Promise<LoadedDeliverySettings> {
+  const root = realpathSync(repositoryRoot);
+  const local = readDeliveryOverrides(root);
+  const module = local.overrides.policy?.module ?? './ai-delivery.policy.mjs';
+  const selectedPath = resolve(root, module);
   let policyModulePath: string;
   try {
     policyModulePath = realpathSync(selectedPath);
   } catch {
-    throw new DeliveryError(`Policy module selected by ${DELIVERY_CONFIG_FILE} is missing.`);
+    throw new DeliveryError(
+      `Missing repository delivery policy ${module}. Export explicit deliverySettings and RepositoryDeliveryPolicy@1.`,
+    );
   }
-  if (!isWithin(root, policyModulePath)) {
-    throw new DeliveryError(`Policy module selected by ${DELIVERY_CONFIG_FILE} escapes the repository root.`);
+  if (!isWithin(root, policyModulePath)) throw new DeliveryError('Policy module must stay within the repository root.');
+  assertSourceControlled({ filePath: policyModulePath, label: 'Policy module', root });
+  const policyBytes = readFileSync(policyModulePath);
+  const policyHash = createHash('sha256').update(policyBytes).digest('hex');
+  const imported: unknown = await import(`${pathToFileURL(policyModulePath).href}?policy=${policyHash}`);
+  const settings = PolicySettingsSchema.safeParse((imported as { deliverySettings?: unknown }).deliverySettings);
+  if (!settings.success)
+    throw new DeliveryError(
+      'Policy module must export valid explicit deliverySettings with commandPolicy and distinct App roles.',
+    );
+  const roles = settings.data.roles;
+  const names = [...Object.values(roles.author.credentialEnv), ...Object.values(roles.reviewer.credentialEnv)];
+  if (
+    roles.author.identity.toLowerCase() === roles.reviewer.identity.toLowerCase() ||
+    new Set(names).size !== 6 ||
+    [roles.author.identity, roles.reviewer.identity].some((value) => /^personal(?:$|[-_])/iu.test(value))
+  ) {
+    throw new DeliveryError('Policy settings require distinct App identities and credential environment names.');
   }
-  assertSourceControlled({
-    filePath: policyModulePath,
-    label: `Policy module selected by ${DELIVERY_CONFIG_FILE}`,
-    root,
+  const repo = resolveRepoFromRemote(root, local.overrides.remote);
+  const repository = `${repo.owner}/${repo.repo}`;
+  if (
+    local.overrides.repository !== undefined &&
+    local.overrides.repository.toLowerCase() !== repository.toLowerCase()
+  ) {
+    throw new DeliveryError('Repository assertion does not match the selected Git remote.');
+  }
+  return {
+    ...settings.data,
+    configPath: local.path,
+    overrides: local.overrides,
+    policy: { contract: DELIVERY_POLICY_CONTRACT, module },
+    policyModulePath,
+    repository,
+    sourceDigest: digestValue({
+      overrides: local.bytes.toString('utf8'),
+      policy: policyBytes.toString('utf8'),
+      repository,
+    }),
+  };
+}
+
+/** One resolver supplies the CLI, MCP, installer admission and verification evidence. */
+export async function loadDeliveryConfig(
+  repositoryRoot: string,
+  options: {
+    clients?: DiscoveryClients;
+    personalAuth?: boolean;
+  } = {},
+): Promise<LoadedDeliveryConfig> {
+  const settings = await loadDeliverySettings(repositoryRoot);
+  const clients =
+    options.clients ??
+    (await createDeliveryGitHubClients({
+      config: settings,
+      identity: options.personalAuth ? 'personal' : settings.roles.author.identity,
+      ...(options.personalAuth ? { personalAuth: { enabled: true as const } } : {}),
+      role: 'author',
+    }));
+  const routing = await discoverDeliveryRouting({
+    clients,
+    repository: settings.repository,
+    overrides: settings.overrides,
+  });
+  const config = parseDeliveryConfig({
+    schemaVersion: 'ai-delivery.config@2',
+    repository: routing.repository,
+    policy: settings.policy,
+    roles: settings.roles,
+    commandPolicy: settings.commandPolicy,
+    native: routing.native,
   });
   return {
     config,
-    configDigest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
-    configPath,
-    policyModulePath,
+    configDigest: digestValue({ sourceDigest: settings.sourceDigest, routing }),
+    configPath: settings.configPath,
+    policyModulePath: settings.policyModulePath,
+    remote: settings.overrides.remote,
+    routing,
   };
 }
 
@@ -243,7 +361,7 @@ export function parseDeliveryConfig(input: unknown): DeliveryConfig {
 }
 
 export function resolveDeliveryRoleCredentials(input: {
-  config: DeliveryConfig;
+  config: Pick<DeliveryConfig, 'roles'>;
   env?: NodeJS.ProcessEnv;
   role: DeliveryRole;
 }): { appId: string; installationId: number; privateKeyPath: string } {

@@ -446,6 +446,7 @@ export async function publishPr(
       })
     : undefined;
   const evidence = await createIssuePhaseEvidence({
+    personalAuth: context.clients.authSource === 'personal',
     ...(approval === undefined ? {} : { approval }),
     issueNumber: input.issueNumber,
     phase: 'publish',
@@ -898,6 +899,7 @@ export async function mergePr(
     }
   }
   const currentPublication = await createIssuePhaseEvidence({
+    personalAuth: context.clients.authSource === 'personal',
     ...(run.classification.risk === 'high'
       ? {
           approval: reviewArtifactApproval({
@@ -929,6 +931,7 @@ export async function mergePr(
     reviewReceiptId: review.receiptId,
   };
   const evidence = await createIssuePhaseEvidence({
+    personalAuth: context.clients.authSource === 'personal',
     approval,
     issueNumber: input.issueNumber,
     mergeReadback: {
@@ -941,7 +944,7 @@ export async function mergePr(
     phase: 'merge',
     repoRoot: row.path,
   });
-  const loaded = loadDeliveryConfig(row.path);
+  const loaded = await loadDeliveryConfig(row.path, { personalAuth: context.clients.authSource === 'personal' });
   const selected = await loadSelectedRepositoryPolicy({
     repoRoot: row.path,
     policySourcePath: loaded.config.policy.module,
@@ -1059,6 +1062,7 @@ export async function finishIssue(
     graphql: context.clients.graphql,
     issueNodeId: closed.node_id,
     org: context.config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: 'Done',
   });
@@ -1173,6 +1177,7 @@ async function readCompletedIssue(
     graphql: context.clients.graphql,
     issueNodeId: issue.node_id,
     org: context.config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
     settings: projectSettingsFromDeliveryConfig(context.config),
   });
   if (project?.status !== 'Done') throw new DeliveryError('Completed issue Project status is not Done.');
