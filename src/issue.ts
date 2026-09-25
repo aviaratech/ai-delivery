@@ -455,6 +455,7 @@ export async function developIssue(
       `Issue #${issueNumber} is not ready: ${readiness.failures.map((f) => f.message).join('; ')}`,
     );
   const row = await prepareIssueWorktree({
+    ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
     identity: context.config.roles.author.identity,
     issueNumber,
     repoRoot: context.root,

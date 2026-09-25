@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { DeliveryError } from '../errors.js';
 import { digestValue } from '../delivery/common.js';
 import { createDeliveryGitHubClients } from '../github/client.js';
-import { resolveRepoFromRemote } from '../github/repo.js';
+import { resolveGitRemoteName, resolveRepoFromRemote } from '../github/repo.js';
 import { discoverDeliveryRouting, type DiscoveryClients, type DeliveryRouting } from '../github/discovery.js';
 
 export const DELIVERY_CONFIG_FILE = 'ai-delivery.config.json';
@@ -341,10 +341,15 @@ export async function loadDeliveryConfig(
   });
   return {
     config,
-    configDigest: digestValue({ sourceDigest: settings.sourceDigest, routing }),
+    configDigest: digestValue({
+      sourceDigest: settings.sourceDigest,
+      routing,
+      roles: config.roles,
+      commandPolicy: config.commandPolicy,
+    }),
     configPath: settings.configPath,
     policyModulePath: settings.policyModulePath,
-    remote: settings.overrides.remote,
+    remote: resolveGitRemoteName(repositoryRoot, settings.overrides.remote),
     routing,
   };
 }

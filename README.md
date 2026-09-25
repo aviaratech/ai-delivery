@@ -100,6 +100,11 @@ option catalogs. Optional `issueTypes` restricts the discovered enabled types;
 unavailable types are refused. IDs, titles and available choices remain GitHub
 facts. Unknown keys and legacy full-config files are refused.
 
+Worktree bases, verification, PR fetches and cleanup all use the selected remote's
+tracking refs. Fetch that remote and set its remote HEAD before delivery when its
+default branch is not `main`; delivery never falls back to another remote or a
+local branch to establish its base.
+
 Set each role's environment variables to its App ID, installation ID and absolute
 private-key path. Secret values and keys stay outside Git. The author App needs
 Contents, Issues, organization Projects and Pull requests write permissions plus
@@ -124,7 +129,8 @@ The consumer installer must issue a private `ai-delivery.runtime-admission@2`
 record at `<git-common-dir>/ai-delivery/runtime-admission.json`. It binds the
 verified archive, package version, capability 2, actual CLI/MCP/plugin bytes and
 paths, repository and the resolver's `configDigest`. That digest includes the
-policy/settings source, optional overrides and effective discovered routing;
+policy/settings source, validated effective roles and checks, optional overrides
+and effective discovered routing;
 **do not substitute a JSON-file hash**. Drift in the Project, fields, options,
 policy, overrides or installed bytes invalidates admission and verification
 receipts. Resolution never refreshes its own admission during a mutation.

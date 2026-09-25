@@ -321,6 +321,7 @@ program
       ...(context.configuration ? { configuration: context.configuration } : {}),
     });
     await cleanupNonIssueWorktree({
+      ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
       repoRoot: context.root,
       ...(o.pr === undefined ? {} : { prNumber: Number(o.pr) }),
       ...(o.name === undefined ? {} : { name: o.name }),

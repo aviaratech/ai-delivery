@@ -139,7 +139,7 @@ export async function verifyIssue(input: {
     repoRoot: root,
     policySourcePath: loaded.config.policy.module,
   });
-  const base = coordinate(root, defaultBaseRef(root));
+  const base = coordinate(root, defaultBaseRef(root, loaded.remote));
   const head = coordinate(root);
   const classification = classifyRepositoryExactRange({
     base,

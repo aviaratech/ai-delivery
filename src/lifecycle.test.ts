@@ -28,7 +28,7 @@ import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { loadDeliveryConfig, parseDeliveryConfig } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/index.js';
 import { executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
-import { gitCommonDir } from './git.js';
+import { defaultBaseRef, gitCommonDir } from './git.js';
 import * as githubClient from './github/client.js';
 import {
   createIssue,
@@ -93,7 +93,7 @@ function directoryHash(path: string): string {
   return digestValue(entries);
 }
 
-async function fixture(options: { twoStages?: boolean } = {}): Promise<{
+async function fixture(options: { twoStages?: boolean; remote?: string; divergentOrigin?: boolean } = {}): Promise<{
   root: string;
   counter: string;
   secondCounter: string;
@@ -101,6 +101,7 @@ async function fixture(options: { twoStages?: boolean } = {}): Promise<{
   runtimeEntryPath: string;
 }> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-lifecycle-')));
+  const remoteName = options.remote ?? 'origin';
   const counter = join(root, '.git', 'stage-count.txt');
   const secondCounter = join(root, '.git', 'second-stage-count.txt');
   const failSecond = join(root, '.git', 'fail-second-stage');
@@ -109,7 +110,7 @@ async function fixture(options: { twoStages?: boolean } = {}): Promise<{
     git(root, 'config', 'user.name', 'Synthetic Delivery');
     git(root, 'config', 'user.email', 'delivery@example.test');
     git(root, 'init', '--bare', '-q', join(root, '.git', 'remote.git'));
-    git(root, 'remote', 'add', 'origin', join(root, '.git', 'remote.git'));
+    git(root, 'remote', 'add', remoteName, join(root, '.git', 'remote.git'));
     writeFileSync(join(root, '.gitignore'), '.issue-cli/\n.worktrees/\n');
     writeFileSync(join(root, 'artifact.txt'), 'synthetic proof\n');
     const config = {
@@ -155,7 +156,7 @@ async function fixture(options: { twoStages?: boolean } = {}): Promise<{
     };
     writeFileSync(
       join(root, 'ai-delivery.config.json'),
-      `${JSON.stringify(syntheticOverrides(parseDeliveryConfig(config)))}\n`,
+      `${JSON.stringify({ ...syntheticOverrides(parseDeliveryConfig(config)), ...(options.divergentOrigin ? { remote: remoteName } : {}) })}\n`,
     );
     writeFileSync(
       join(root, 'policy.mjs'),
@@ -205,10 +206,16 @@ export default {
     );
     git(root, 'add', '.');
     git(root, 'commit', '-qm', 'synthetic base');
-    git(root, 'push', '-q', 'origin', 'main');
-    git(root, 'fetch', '-q', 'origin', 'main');
+    git(root, 'push', '-q', remoteName, 'main');
+    git(root, 'fetch', '-q', remoteName, 'main');
     git(root, 'config', `url.${join(root, '.git', 'remote.git')}.insteadOf`, 'https://github.com/example/widget.git');
-    git(root, 'remote', 'set-url', 'origin', 'https://github.com/example/widget.git');
+    git(root, 'remote', 'set-url', remoteName, 'https://github.com/example/widget.git');
+    if (options.divergentOrigin) {
+      git(root, 'remote', 'add', 'origin', 'https://github.com/other/unrelated.git');
+      const unrelated = git(root, 'commit-tree', 'HEAD^{tree}', '-m', 'Unrelated origin root');
+      git(root, 'update-ref', 'refs/remotes/origin/main', unrelated);
+      git(root, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+    }
     const runtimeRoot = join(root, '.git', 'synthetic-runtime');
     const runtimeEntryPath = join(runtimeRoot, 'package', 'dist', 'cli.js');
     const packagePath = join(runtimeRoot, 'package', 'package.json');
@@ -282,6 +289,53 @@ test('installed CLI and MCP admission fails before a worktree mutation on source
     writeFileSync(path, JSON.stringify({ ...mismatched, admissionId: digestValue(mismatched) }));
     await assert.rejects(assertDeliveryRuntimeAdmitted(input), /source, capability or repository admission/u);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('effective policy settings drift invalidates admission even when the policy wrapper is unchanged', async () => {
+  const { root, runtimeEntryPath } = await fixture();
+  const policyPath = join(root, 'policy.mjs');
+  const authorEnv = 'AI_DELIVERY_TEST_DYNAMIC_AUTHOR';
+  const checkEnv = 'AI_DELIVERY_TEST_DYNAMIC_CHECK';
+  const previousAuthor = process.env[authorEnv];
+  const previousCheck = process.env[checkEnv];
+  try {
+    delete process.env[authorEnv];
+    delete process.env[checkEnv];
+    writeFileSync(
+      policyPath,
+      readFileSync(policyPath, 'utf8') +
+        `
+Object.defineProperty(deliverySettings.roles.author, 'identity', { get: () => process.env.${authorEnv} ?? 'synthetic-author' });
+Object.defineProperty(deliverySettings.commandPolicy.checks, 'test', { get: () => process.env.${checkEnv} ?? 'REQUIRED' });
+`,
+    );
+    const admissionPath = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
+    const { admissionId: _id, ...content } = JSON.parse(readFileSync(admissionPath, 'utf8')) as Record<string, unknown>;
+    const baseline = await loadDeliveryConfig(root);
+    const admitted = { ...content, configDigest: baseline.configDigest };
+    writeFileSync(admissionPath, JSON.stringify({ ...admitted, admissionId: digestValue(admitted) }));
+    await assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath });
+    const originalBytes = readFileSync(policyPath, 'utf8');
+    for (const [key, value] of [
+      [authorEnv, 'changed-author'],
+      [checkEnv, 'SKIP'],
+    ] as const) {
+      process.env[key] = value;
+      assert.notEqual((await loadDeliveryConfig(root)).configDigest, baseline.configDigest);
+      await assert.rejects(
+        assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath }),
+        /source, capability or repository admission/u,
+      );
+      delete process.env[key];
+    }
+    assert.equal(readFileSync(policyPath, 'utf8'), originalBytes);
+  } finally {
+    if (previousAuthor === undefined) delete process.env[authorEnv];
+    else process.env[authorEnv] = previousAuthor;
+    if (previousCheck === undefined) delete process.env[checkEnv];
+    else process.env[checkEnv] = previousCheck;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -756,10 +810,17 @@ test('MCP request rejects unsupported legacy options before lifecycle dispatch',
   }
 });
 
-test('synthetic issue traverses native intake, readiness, receipt-bound App review, exact merge and finish', async () => {
-  const { root } = await fixture();
+test.each([
+  { remote: 'origin', divergentOrigin: false },
+  { remote: 'upstream', divergentOrigin: false },
+  { remote: 'upstream', divergentOrigin: true },
+])('synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin', async (routing) => {
+  const { root } = await fixture(routing);
+  const remoteName = routing.remote;
+  assert.equal(defaultBaseRef(root, remoteName), `refs/remotes/${remoteName}/main`);
   const remote = join(root, '.git', 'remote.git');
-  const config = (await loadDeliveryConfig(root)).config;
+  const configuration = await loadDeliveryConfig(root);
+  const config = configuration.config;
   const baseSha = git(root, 'rev-parse', 'main');
   const issueNumber = 17;
   const prNumber = 23;
@@ -1077,7 +1138,7 @@ test('synthetic issue traverses native intake, readiness, receipt-bound App revi
           '-m',
           input.message,
         );
-        git(root, 'push', '-q', 'origin', `${mergeSha}:refs/heads/merge-object`);
+        git(root, 'push', '-q', remoteName, `${mergeSha}:refs/heads/merge-object`);
         return { data: { sha: mergeSha } };
       },
       getCommit: async () => ({
@@ -1105,6 +1166,7 @@ test('synthetic issue traverses native intake, readiness, receipt-bound App revi
     root,
     repo: { owner: 'example', repo: 'widget' },
     config,
+    configuration,
     clients: {
       authSource: 'app',
       role: 'author',
@@ -1203,7 +1265,7 @@ test('synthetic issue traverses native intake, readiness, receipt-bound App revi
     );
     // The public push requires a real author App installation token. Bind a synthetic
     // publication at that external boundary so the remaining public phases run offline.
-    git(row.path, 'push', '-q', 'origin', `${headSha}:refs/heads/issue/17`);
+    git(row.path, 'push', '-q', remoteName, `${headSha}:refs/heads/issue/17`);
     const publishEvidence = await createIssuePhaseEvidence({ issueNumber, phase: 'publish', repoRoot: row.path });
     const publicationContent = {
       baseSha,

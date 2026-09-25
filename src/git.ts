@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 
 import { DeliveryError } from './errors.js';
+import { resolveGitRemoteName } from './github/repo.js';
 
 export interface GitCoordinate {
   sha: string;
@@ -64,10 +65,14 @@ export function changedPaths(cwd: string, baseSha: string, headSha: string): str
   return output.split('\0').filter(Boolean).sort();
 }
 
-export function defaultBaseRef(cwd: string): string {
-  const remoteHead = gitExitCode(cwd, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD');
-  if (remoteHead === 0) return git(cwd, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD');
-  if (gitExitCode(cwd, 'show-ref', '--verify', '--quiet', 'refs/remotes/origin/main') === 0) return 'origin/main';
-  if (gitExitCode(cwd, 'show-ref', '--verify', '--quiet', 'refs/heads/main') === 0) return 'main';
-  return git(cwd, 'branch', '--show-current');
+export function defaultBaseRef(cwd: string, selectedRemote?: string): string {
+  const remote = resolveGitRemoteName(cwd, selectedRemote);
+  const prefix = `refs/remotes/${remote}/`;
+  if (gitExitCode(cwd, 'symbolic-ref', '--quiet', `${prefix}HEAD`) === 0) {
+    const ref = git(cwd, 'symbolic-ref', '--quiet', `${prefix}HEAD`);
+    if (!ref.startsWith(prefix)) throw new DeliveryError('Selected remote HEAD points outside its tracking refs.');
+    return ref;
+  }
+  if (gitExitCode(cwd, 'show-ref', '--verify', '--quiet', `${prefix}main`) === 0) return `${prefix}main`;
+  throw new DeliveryError(`Fetch the selected remote ${remote} and set its default branch before delivery.`);
 }

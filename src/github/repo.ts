@@ -30,7 +30,7 @@ export function resolveDeliveryRepo(
   return { owner, repo };
 }
 
-export function resolveRepoFromRemote(repoRoot: string, selectedRemote?: string): RepoCoordinates {
+export function resolveGitRemoteName(repoRoot: string, selectedRemote?: string): string {
   const remotes = spawnSync('git', ['remote'], { cwd: repoRoot, encoding: 'utf8' });
   if (remotes.status !== 0) throw new DeliveryError('Unable to list Git remotes.');
   const names = remotes.stdout.trim().split('\n').filter(Boolean);
@@ -41,6 +41,12 @@ export function resolveRepoFromRemote(repoRoot: string, selectedRemote?: string)
     throw new DeliveryError('Select a Git remote explicitly when the checkout has zero or multiple remotes.');
   }
   const remoteName = selectedRemote ?? names[0];
+  if (!remoteName) throw new DeliveryError('Git remote selection is missing.');
+  return remoteName;
+}
+
+export function resolveRepoFromRemote(repoRoot: string, selectedRemote?: string): RepoCoordinates {
+  const remoteName = resolveGitRemoteName(repoRoot, selectedRemote);
   const result = spawnSync('git', ['config', '--get', `remote.${remoteName}.url`], {
     cwd: repoRoot,
     encoding: 'utf8',

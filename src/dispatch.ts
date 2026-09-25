@@ -238,12 +238,15 @@ async function preflightStartDevelopment(
     );
   }
   listWorktreesStrict(context.root);
-  if (gitExitCode(context.root, 'rev-parse', '--verify', defaultBaseRef(context.root)) !== 0) {
+  if (
+    gitExitCode(context.root, 'rev-parse', '--verify', defaultBaseRef(context.root, context.configuration?.remote)) !==
+    0
+  ) {
     throw new DeliveryError('Default base ref is missing before tracked issue creation.');
   }
 }
 
-function scratchStart(input: Record<string, unknown>, execution: ExecutionContext, identity: string) {
+function scratchStart(input: Record<string, unknown>, execution: ExecutionContext, identity: string, remote?: string) {
   const title = (optionalString(input, 'title') ?? requireString(input, 'request'))
     .replace(/\s+/gu, ' ')
     .trim()
@@ -261,7 +264,13 @@ function scratchStart(input: Record<string, unknown>, execution: ExecutionContex
       .replace(/-+$/gu, '') || 'scratch';
   const branch = branchOverride ?? `scratch/${slug}`;
   const name = `scratch-${slug}`;
-  return prepareStandaloneWorktree({ branch, identity, name, repoRoot: execution.repoRoot }).then((row) => ({
+  return prepareStandaloneWorktree({
+    branch,
+    identity,
+    name,
+    repoRoot: execution.repoRoot,
+    ...(remote ? { remote } : {}),
+  }).then((row) => ({
     mode: 'scratch' as const,
     title,
     branch: row.branch,
@@ -321,7 +330,7 @@ export async function executeTool(
         if (input.issueNumber !== undefined || input.develop === true || input.resumeCreated === true) {
           throw new DeliveryError('Scratch worktree cannot claim a tracked issue.');
         }
-        return scratchStart(input, execution, identity);
+        return scratchStart(input, execution, identity, context.configuration?.remote);
       }
       return startTrackedIssue(context, input);
     }
@@ -448,6 +457,7 @@ export async function executeTool(
     case 'issue_worktree_create': {
       const identity = await identityFor(execution, 'worktree:create');
       return prepareStandaloneWorktree({
+        ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
         branch: requireString(input, 'branch'),
         identity,
         name: requireString(input, 'name'),
