@@ -1,0 +1,82 @@
+{
+  "name": "@aviaratech/ai-delivery",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Generic GitHub issue and pull request delivery CLI and MCP server",
+  "homepage": "https://github.com/aviaratech/ai-delivery#readme",
+  "bugs": {
+    "url": "https://github.com/aviaratech/ai-delivery/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aviaratech/ai-delivery.git"
+  },
+  "bin": {
+    "ai-delivery": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "plugins/ai-delivery",
+    "README.md",
+    "CONTRIBUTING.md"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./agent": {
+      "types": "./dist/agent.d.ts",
+      "default": "./dist/agent.js"
+    },
+    "./delivery": {
+      "types": "./dist/delivery/index.d.ts",
+      "default": "./dist/delivery/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "default": "./dist/mcp/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "format": "oxfmt src package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "format:check": "oxfmt --check src package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "lint": "oxlint",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
+    "test": "npm run build && vitest run",
+    "checks": "npm run format:check && npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@octokit/auth-app": "^8.2.0",
+    "@octokit/graphql": "^9.0.3",
+    "@octokit/rest": "^22.0.1",
+    "chalk": "^5.6.2",
+    "commander": "^14.0.3",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/proper-lockfile": "^4.1.4",
+    "oxfmt": "0.70.0",
+    "oxlint": "1.85.0",
+    "oxlint-tsgolint": "7.0.2003",
+    "typescript": "6.0.2",
+    "vitest": "5.0.1"
+  },
+  "engines": {
+    "node": ">=24.21.0 <25",
+    "npm": "11.19.0"
+  },
+  "packageManager": "npm@11.19.0"
+}

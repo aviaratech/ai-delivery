@@ -1,0 +1,158 @@
+import { z } from 'zod';
+
+const Positive = z.number().int().positive();
+const Labels = z.array(z.string().regex(/^(?:area|risk):[^\s:]+$/u));
+export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@1' as const;
+const Tracking = {
+  blockedBy: z.array(Positive).optional(),
+  body: z.string().optional(),
+  issueType: z.string().min(1).optional(),
+  labels: Labels.optional(),
+  milestone: Positive.optional(),
+  parentIssueNumber: Positive.optional(),
+  points: Positive.optional(),
+  priority: z.string().min(1).optional(),
+  repo: z
+    .string()
+    .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
+    .optional(),
+  title: z.string().trim().min(1).max(256),
+};
+
+export const AI_DELIVERY_MCP_TOOLS = [
+  {
+    name: 'issue_create',
+    commandName: 'create',
+    description: 'Create a native GitHub tracking issue with configured metadata and relationships',
+    inputSchema: z.strictObject(Tracking),
+  },
+  {
+    name: 'issue_start',
+    commandName: 'start',
+    description: 'Create or resume a tracked issue and optionally prepare its worktree',
+    inputSchema: z.strictObject({
+      ...Tracking,
+      body: Tracking.body.optional(),
+      issueType: Tracking.issueType.optional(),
+      points: Tracking.points.optional(),
+      priority: Tracking.priority.optional(),
+      title: Tracking.title.optional(),
+      issueNumber: Positive.optional(),
+      request: z.string().min(1).optional(),
+      develop: z.boolean().optional(),
+      resumeCreated: z.boolean().optional(),
+      scratch: z.boolean().optional(),
+      branch: z.string().min(1).optional(),
+    }),
+  },
+  {
+    name: 'issue_update',
+    commandName: 'update',
+    description: 'Update native issue fields and exact relationship sets with readback',
+    inputSchema: z.strictObject({
+      blockedBy: z.array(Positive).optional(),
+      body: z.string().optional(),
+      issueNumber: Positive,
+      issueType: z.string().min(1).optional(),
+      labels: Labels.optional(),
+      milestone: Positive.nullable().optional(),
+      parentIssueNumber: Positive.nullable().optional(),
+      points: Positive.optional(),
+      priority: z.string().min(1).optional(),
+      state: z.enum(['open', 'closed']).optional(),
+      title: z.string().trim().min(1).max(256).optional(),
+    }),
+  },
+  {
+    name: 'issue_info',
+    commandName: 'info',
+    description: 'Read live issue metadata, relationships, Project status and registered worktree',
+    inputSchema: z.strictObject({ issueNumber: Positive, cached: z.boolean().optional() }),
+  },
+  {
+    name: 'issue_ready_check',
+    commandName: 'ready:check',
+    description: 'Evaluate deterministic readiness from live native issue state',
+    inputSchema: z.strictObject({ issueNumber: Positive, repo: Tracking.repo }),
+  },
+  {
+    name: 'issue_develop',
+    commandName: 'develop',
+    description: 'Prepare the one registered issue worktree after readiness passes',
+    inputSchema: z.strictObject({ issueNumber: Positive, assignee: z.string().min(1).optional() }),
+  },
+  {
+    name: 'issue_verify',
+    commandName: 'verify',
+    description: 'Resume exact-head policy stages and produce versioned delivery evidence',
+    inputSchema: z.strictObject({
+      issueNumber: Positive,
+      admit: z.array(z.string().min(1)).optional(),
+      prepublicationReview: z.string().min(1).optional(),
+    }),
+  },
+  {
+    name: 'issue_pr_create',
+    commandName: 'pr:create',
+    description: 'Publish a verified draft or promote the unchanged reviewed PR',
+    inputSchema: z.strictObject({
+      issueNumber: Positive,
+      body: z.string().min(1).optional(),
+      draft: z.boolean().optional(),
+      dryRun: z.boolean().optional(),
+      title: z.string().min(1).optional(),
+    }),
+  },
+  {
+    name: 'issue_pr_info',
+    commandName: 'pr:info',
+    description: 'Inspect a PR by PR number or by its registered issue branch',
+    inputSchema: z.strictObject({ issueNumber: Positive.optional(), prNumber: Positive.optional() }),
+  },
+  {
+    name: 'issue_pr_review',
+    commandName: 'pr:review',
+    description: 'Submit one existing exact-head independent review with the reviewer App role',
+    inputSchema: z.strictObject({
+      issueNumber: Positive,
+      prNumber: Positive,
+      artifact: z.string().min(1),
+      identity: z.string().min(1).optional(),
+      dryRun: z.boolean().optional(),
+    }),
+  },
+  {
+    name: 'issue_pr_merge',
+    commandName: 'pr:merge',
+    description: 'Guarded exact-head merge with live blocker, check and review readback',
+    inputSchema: z.strictObject({
+      issueNumber: Positive,
+      prNumber: Positive,
+      strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
+      dryRun: z.boolean().optional(),
+    }),
+  },
+  {
+    name: 'issue_finish',
+    commandName: 'finish',
+    description: 'Resume merge, issue completion and non-force worktree cleanup',
+    inputSchema: z.strictObject({
+      issueNumber: Positive,
+      prNumber: Positive,
+      strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
+      dryRun: z.boolean().optional(),
+    }),
+  },
+  {
+    name: 'issue_worktree_create',
+    commandName: 'worktree:create',
+    description: 'Prepare one explicit standalone worktree without an issue',
+    inputSchema: z.strictObject({ name: z.string().min(1), branch: z.string().min(1) }),
+  },
+] as const;
+
+export type AiDeliveryMcpToolName = (typeof AI_DELIVERY_MCP_TOOLS)[number]['name'];
+
+export function getAiDeliveryMcpTool(name: string): (typeof AI_DELIVERY_MCP_TOOLS)[number] | null {
+  return AI_DELIVERY_MCP_TOOLS.find((tool) => tool.name === name) ?? null;
+}
