@@ -27,7 +27,7 @@ const REVIEWER_COMMANDS = new Set(['pr:review']);
 
 export function evaluateCommandIdentityPolicy(input: {
   commandName: string;
-  deliveryConfig: DeliveryConfig;
+  deliveryConfig: Pick<DeliveryConfig, 'roles'>;
   identity: null | string;
   personalAuth?: boolean;
 }): CommandIdentityPolicyEvaluation {

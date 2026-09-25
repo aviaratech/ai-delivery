@@ -14,6 +14,7 @@ import {
 } from './delivery/index.js';
 import { DeliveryError } from './errors.js';
 import { coordinate, defaultBaseRef, git, gitCommonDir, gitExitCode, gitRoot } from './git.js';
+import { resolveGitRemoteName } from './github/repo.js';
 import { withAuthorGitToken } from './github/client.js';
 import {
   getConfiguredNativeIssueMetadata,
@@ -187,9 +188,10 @@ function validateDeliveryImpact(body: string): void {
   }
 }
 
-function baseBranch(root: string): string {
-  const ref = defaultBaseRef(root);
-  const value = ref.startsWith('origin/') ? ref.slice('origin/'.length) : ref;
+function baseBranch(root: string, selectedRemote?: string): string {
+  const remote = resolveGitRemoteName(root, selectedRemote);
+  const ref = defaultBaseRef(root, remote);
+  const value = ref.slice(`refs/remotes/${remote}/`.length);
   if (!/^[A-Za-z0-9._/-]+$/u.test(value)) throw new DeliveryError('Invalid configured default branch.');
   return value;
 }
@@ -262,10 +264,11 @@ async function pushReviewedHead(context: DeliveryContext, path: string, branch: 
 }
 
 async function fetchMergedBase(context: DeliveryContext, branch: string): Promise<void> {
-  const refspec = `${branch}:refs/remotes/origin/${branch}`;
-  const origin = git(context.root, 'remote', 'get-url', 'origin');
-  if (isAbsolute(origin) || origin.startsWith('file://')) {
-    git(context.root, 'fetch', 'origin', refspec);
+  const remote = resolveGitRemoteName(context.root, context.configuration?.remote);
+  const refspec = `${branch}:refs/remotes/${remote}/${branch}`;
+  const url = git(context.root, 'remote', 'get-url', remote);
+  if (isAbsolute(url) || url.startsWith('file://')) {
+    git(context.root, 'fetch', remote, refspec);
     return;
   }
   await runAuthorGit(
@@ -375,7 +378,8 @@ export async function checkoutPr(context: DeliveryContext, prNumber: number) {
   const remoteHead = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.head.ref}` })).data
     .object.sha;
   if (remoteHead !== pr.head.sha) throw new DeliveryError('PR branch ref drifted from the observed head.');
-  const fetchedRef = `refs/remotes/origin/ai-delivery-pr-${prNumber}`;
+  const remote = resolveGitRemoteName(context.root, context.configuration?.remote);
+  const fetchedRef = `refs/remotes/${remote}/ai-delivery-pr-${prNumber}`;
   await runAuthorGit(
     context,
     context.root,
@@ -446,6 +450,7 @@ export async function publishPr(
       })
     : undefined;
   const evidence = await createIssuePhaseEvidence({
+    personalAuth: context.clients.authSource === 'personal',
     ...(approval === undefined ? {} : { approval }),
     issueNumber: input.issueNumber,
     phase: 'publish',
@@ -456,8 +461,12 @@ export async function publishPr(
   const body =
     input.body ?? `Closes #${input.issueNumber}\n\n## Delivery Impact\n\nRoadmap impact: none\nDocs impact: none\n`;
   validateDeliveryImpact(body);
-  const remoteHead = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${baseBranch(root)}` })).data
-    .object.sha;
+  const remoteHead = (
+    await context.clients.rest.git.getRef({
+      ...context.repo,
+      ref: `heads/${baseBranch(root, context.configuration?.remote)}`,
+    })
+  ).data.object.sha;
   if (remoteHead !== run.classification.base.sha)
     throw new DeliveryError('Remote base changed after exact-head verification.');
   await pushReviewedHead(context, row.path, row.branch, head.sha);
@@ -476,7 +485,7 @@ export async function publishPr(
     : (
         await context.clients.rest.pulls.create({
           ...context.repo,
-          base: baseBranch(root),
+          base: baseBranch(root, context.configuration?.remote),
           body,
           draft: true,
           head: row.branch,
@@ -898,6 +907,7 @@ export async function mergePr(
     }
   }
   const currentPublication = await createIssuePhaseEvidence({
+    personalAuth: context.clients.authSource === 'personal',
     ...(run.classification.risk === 'high'
       ? {
           approval: reviewArtifactApproval({
@@ -929,6 +939,7 @@ export async function mergePr(
     reviewReceiptId: review.receiptId,
   };
   const evidence = await createIssuePhaseEvidence({
+    personalAuth: context.clients.authSource === 'personal',
     approval,
     issueNumber: input.issueNumber,
     mergeReadback: {
@@ -941,7 +952,7 @@ export async function mergePr(
     phase: 'merge',
     repoRoot: row.path,
   });
-  const loaded = loadDeliveryConfig(row.path);
+  const loaded = await loadDeliveryConfig(row.path, { personalAuth: context.clients.authSource === 'personal' });
   const selected = await loadSelectedRepositoryPolicy({
     repoRoot: row.path,
     policySourcePath: loaded.config.policy.module,
@@ -1059,10 +1070,11 @@ export async function finishIssue(
     graphql: context.clients.graphql,
     issueNodeId: closed.node_id,
     org: context.config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: 'Done',
   });
-  const branch = baseBranch(context.root);
+  const branch = baseBranch(context.root, context.configuration?.remote);
   await fetchMergedBase(context, branch);
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: input.prNumber })).data;
   const [remoteBase, remoteHead] = await Promise.all([
@@ -1097,6 +1109,7 @@ export async function finishIssue(
     throw new DeliveryError('Terminal delivery timeline is invalid.');
   }
   await cleanupMergedIssueWorktree({
+    ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
     issueNumber: input.issueNumber,
     repoRoot: context.root,
     merge: attestation,
@@ -1173,6 +1186,7 @@ async function readCompletedIssue(
     graphql: context.clients.graphql,
     issueNodeId: issue.node_id,
     org: context.config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
     settings: projectSettingsFromDeliveryConfig(context.config),
   });
   if (project?.status !== 'Done') throw new DeliveryError('Completed issue Project status is not Done.');

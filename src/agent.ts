@@ -1,4 +1,10 @@
-export { loadDeliveryConfig, parseDeliveryConfig, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
+export {
+  loadDeliveryConfig,
+  loadDeliverySettings,
+  readDeliveryOverrides,
+  parseDeliveryConfig,
+  resolveDeliveryRoleCredentials,
+} from './config/deliveryConfig.js';
 export type { DeliveryConfig, DeliveryRole, LoadedDeliveryConfig } from './config/deliveryConfig.js';
 export { createDeliveryGitHubClients } from './github/client.js';
 export { resolveDeliveryRepo } from './github/repo.js';
@@ -21,3 +27,7 @@ export type { DeliveryRecord, VelocityReport, PointBucketStatistics } from './se
 export { getIssueWorktreeStrict, listWorktreesStrict } from './services/worktreeRegistry.js';
 export { prepareIssueWorktree, prepareStandaloneWorktree } from './worktree.js';
 export { verifyIssue, createIssuePhaseEvidence } from './verification.js';
+
+export { discoverDeliveryRouting } from './github/discovery.js';
+export type { DeliveryRouting, DiscoveryClients } from './github/discovery.js';
+export type { DeliveryOverrides, DeliveryPolicySettings, LoadedDeliverySettings } from './config/deliveryConfig.js';

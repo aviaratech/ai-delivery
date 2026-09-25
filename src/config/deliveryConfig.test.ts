@@ -1,3 +1,4 @@
+import { syntheticDiscoveryClients, syntheticOverrides } from '../fixtures/discovery.js';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -77,7 +78,7 @@ function syntheticConfig(input: { owner: string; projectNumber: number; repo: st
         identity: 'synthetic-reviewer',
       },
     },
-    schemaVersion: 'ai-delivery.config@1',
+    schemaVersion: 'ai-delivery.config@2',
   } as const;
 }
 
@@ -132,13 +133,17 @@ describe('portable delivery configuration', () => {
         mkdirSync(root);
         git(['init', '--quiet', root]);
         git(['remote', 'add', 'origin', `https://github.com/${owner}/${repo}.git`], { cwd: root });
-        writeFileSync(join(root, 'policy.mjs'), 'export const contract = "RepositoryDeliveryPolicy@1";\n');
+        const configured = parseDeliveryConfig(syntheticConfig({ owner, projectNumber, repo }));
+        writeFileSync(
+          join(root, 'policy.mjs'),
+          `export const deliverySettings = ${JSON.stringify({ roles: configured.roles, commandPolicy: configured.commandPolicy })};\n`,
+        );
         writeFileSync(
           join(root, 'ai-delivery.config.json'),
-          JSON.stringify(syntheticConfig({ owner, projectNumber, repo })),
+          JSON.stringify(syntheticOverrides(parseDeliveryConfig(syntheticConfig({ owner, projectNumber, repo })))),
         );
         git(['add', 'policy.mjs', 'ai-delivery.config.json'], { cwd: root });
-        const loaded = loadDeliveryConfig(root);
+        const loaded = await loadDeliveryConfig(root, { clients: syntheticDiscoveryClients(configured) });
         assert.match(loaded.configDigest, /^sha256:[a-f0-9]{64}$/u);
         assert.deepEqual(resolveDeliveryRepo(loaded.config, root), { owner, repo });
         assert.throws(
@@ -257,7 +262,7 @@ describe('portable delivery configuration', () => {
     const base = syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' });
     const temp = mkdtempSync(join(tmpdir(), 'delivery-invalid-'));
     try {
-      assert.throws(() => loadDeliveryConfig(temp), /Missing repository-root ai-delivery.config.json/u);
+      await assert.rejects(loadDeliveryConfig(temp), /Missing repository delivery policy/u);
       assert.throws(
         () => parseDeliveryConfig({ ...base, policy: { ...base.policy, contract: 'wrong' } }),
         /policy.contract/u,
@@ -310,9 +315,12 @@ describe('portable delivery configuration', () => {
       );
       git(['init', '--quiet', temp]);
       writeFileSync(join(temp, 'policy.mjs'), 'export const contract = "RepositoryDeliveryPolicy@1";\n');
-      writeFileSync(join(temp, 'ai-delivery.config.json'), JSON.stringify(base));
+      writeFileSync(
+        join(temp, 'ai-delivery.config.json'),
+        JSON.stringify(syntheticOverrides(parseDeliveryConfig(base))),
+      );
       git(['add', 'ai-delivery.config.json'], { cwd: temp });
-      assert.throws(() => loadDeliveryConfig(temp), /must be source-controlled/u);
+      await assert.rejects(loadDeliveryConfig(temp), /must be source-controlled/u);
       assert.throws(
         () => resolveDeliveryRoleCredentials({ config, env: {}, role: 'author' }),
         /Missing GitHub App credentials for author/u,

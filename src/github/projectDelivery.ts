@@ -120,10 +120,24 @@ export async function getProjectDeliveryConfiguration(input: {
   settings: ProjectDeliverySettings;
 }): Promise<ProjectDeliveryConfiguration> {
   const settings = requireProjectSettings(input.settings);
+  const project = await readProjectDeliveryDefinition({
+    graphql: input.graphql,
+    org: input.org,
+    number: settings.number,
+  });
+  return resolveProjectDeliveryConfiguration(project, { requireWritable: input.requireWritable === true, settings });
+}
+
+export async function readProjectDeliveryDefinition(input: {
+  graphql: typeof GraphQLType;
+  org: string;
+  number: number;
+}): Promise<Record<string, unknown>> {
   const nodes: unknown[] = [];
   let cursor: null | string = null;
   let hasNextPage = true;
   const seenCursors = new Set<string>();
+  const fieldIds = new Set<string>();
   let project: null | Record<string, unknown> = null;
 
   while (hasNextPage) {
@@ -135,6 +149,7 @@ export async function getProjectDeliveryConfiguration(input: {
               id
               number
               title
+              closed
               viewerCanUpdate
               fields(first: 100, after: $cursor) {
                 nodes {
@@ -174,24 +189,58 @@ export async function getProjectDeliveryConfiguration(input: {
           }
         }
       `,
-      { cursor, number: settings.number, org: input.org },
+      { cursor, number: input.number, org: input.org },
     );
     const responseRecord = requireRecord(response, 'GitHub returned invalid delivery Project configuration.');
+    if ('errors' in responseRecord) throw new DeliveryError('GitHub returned partial delivery Project evidence.');
     const organization = requireRecord(
       responseRecord.organization,
       `Organization ${input.org} is unavailable to the selected GitHub identity.`,
     );
     const pageProject = requireRecord(
       organization.projectV2,
-      `Expected organization Project #${String(settings.number)} (${settings.title}).`,
+      `Expected organization Project #${String(input.number)}.`,
     );
     const fields = requireRecord(pageProject.fields, 'GitHub omitted delivery Project fields.');
+    const previousProject = project;
+    if (
+      previousProject !== null &&
+      ['id', 'number', 'title', 'closed', 'viewerCanUpdate'].some((key) => previousProject[key] !== pageProject[key])
+    ) {
+      throw new DeliveryError('Delivery Project identity changed while reading its field pages.');
+    }
     if (!Array.isArray(fields.nodes)) {
       throw new DeliveryError('GitHub returned invalid delivery Project field nodes.');
     }
-    for (const node of fields.nodes) nodes.push(node as unknown);
+    for (const node of fields.nodes) {
+      const field = requireRecord(node, 'GitHub returned an incomplete delivery Project field.');
+      const fieldId = requireString(field.id, 'GitHub omitted a delivery Project field ID.');
+      if (fieldIds.has(fieldId)) throw new DeliveryError('GitHub repeated a delivery Project field.');
+      fieldIds.add(fieldId);
+      requireString(field.name, 'GitHub omitted a delivery Project field name.');
+      requireString(field.__typename, 'GitHub omitted a delivery Project field type.');
+      if (field.__typename === 'ProjectV2SingleSelectField') {
+        if (typeof field.isIssueField !== 'boolean')
+          throw new DeliveryError('GitHub omitted the Project field binding kind.');
+        readOptions(field.options, 'Project field');
+        if (field.isIssueField) {
+          const issueField = requireRecord(field.issueField, 'GitHub omitted the bound organization field.');
+          requireString(issueField.__typename, 'GitHub omitted the bound organization field type.');
+          if (issueField.__typename === 'IssueFieldSingleSelect') {
+            requireString(issueField.id, 'GitHub omitted the bound organization field ID.');
+            requireString(issueField.name, 'GitHub omitted the bound organization field name.');
+            if (!/^[1-9]\d*$/u.test(String(issueField.fullDatabaseId)))
+              throw new DeliveryError('GitHub omitted the bound organization field database ID.');
+            readOptions(issueField.options, 'organization field');
+          }
+        }
+      }
+      nodes.push(node as unknown);
+    }
     project = { ...pageProject, fields: { nodes } };
     const pageInfo = requireRecord(fields.pageInfo, 'GitHub omitted delivery Project field pagination.');
+    if (typeof pageInfo.hasNextPage !== 'boolean')
+      throw new DeliveryError('GitHub omitted delivery Project pagination state.');
     hasNextPage = pageInfo.hasNextPage === true;
     const nextCursor = typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null;
     assertAdvancingCursor({ cursor, hasNextPage, nextCursor, seenCursors, surface: 'field' });
@@ -200,12 +249,9 @@ export async function getProjectDeliveryConfiguration(input: {
   }
 
   if (project === null) {
-    throw new DeliveryError(`Expected organization Project #${String(settings.number)} (${settings.title}).`);
+    throw new DeliveryError(`Expected organization Project #${String(input.number)}.`);
   }
-  return resolveProjectDeliveryConfiguration(project, {
-    requireWritable: input.requireWritable === true,
-    settings,
-  });
+  return project;
 }
 
 export function projectSettingsFromDeliveryConfig(config: DeliveryConfig): ProjectDeliverySettings {

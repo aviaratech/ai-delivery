@@ -55,7 +55,7 @@ export function assertDeliveryRolePermissions(input: {
 
 /** The author role may use a personal token only after an explicit operator opt-in. */
 export async function createDeliveryGitHubClients(input: {
-  config: DeliveryConfig;
+  config: Pick<DeliveryConfig, 'roles'>;
   env?: NodeJS.ProcessEnv;
   identity: string;
   personalAuth?: { enabled: true; token?: string };

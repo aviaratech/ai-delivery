@@ -28,7 +28,7 @@ the `npm-publish` environment. Before enabling it, the repository owner must:
 3. For a new npm package name, have the package owner establish it with a
    separately authorized and reviewed initial version before configuring
    trusted publishing. npm cannot bind a trusted publisher before the package
-   exists. Keep the `0.1.0` release for the protected OIDC workflow; do not add
+   exists. Use the protected OIDC workflow for subsequent releases; do not add
    npm credentials to Actions or substitute a token-based workflow.
 4. Register `@aviaratech/ai-delivery` with npm trusted publishing for GitHub
    organization `aviaratech`, repository `ai-delivery`, workflow filename

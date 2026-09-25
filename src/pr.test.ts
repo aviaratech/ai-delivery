@@ -25,6 +25,8 @@ async function fixture(): Promise<{ root: string; path: string; baseSha: string;
   git(root, 'add', '.');
   git(root, 'commit', '-qm', 'base');
   const baseSha = git(root, 'rev-parse', 'HEAD');
+  git(root, 'remote', 'add', 'origin', 'https://github.com/example/widget.git');
+  git(root, 'update-ref', 'refs/remotes/origin/main', baseSha);
   const row = await prepareIssueWorktree({ baseRef: 'main', identity: 'author', issueNumber: 17, repoRoot: root });
   writeFileSync(join(row.path, 'feature.txt'), 'feature\n');
   git(row.path, 'add', '.');
@@ -161,6 +163,7 @@ test('remote squash recovery persists receipt, repairs registry, and cleans with
     assert.equal(getIssueWorktreeStrict(17, state.root).status, 'merged');
     assert.equal(receipt.schemaVersion, 'ai-delivery.merge@3');
     if (receipt.schemaVersion !== 'ai-delivery.merge@3') throw new Error('Expected current merge receipt.');
+    git(state.root, 'update-ref', 'refs/remotes/origin/main', mergeSha);
     const attestation = {
       baseBranch: receipt.baseBranch,
       baseSha: receipt.baseSha,

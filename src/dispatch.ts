@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 
-import { loadDeliveryConfig } from './config/deliveryConfig.js';
+import { loadDeliveryConfig, loadDeliverySettings, readDeliveryOverrides } from './config/deliveryConfig.js';
+import { resolveRepoFromRemote } from './github/repo.js';
 import { DeliveryError } from './errors.js';
 import { defaultBaseRef, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
 import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js';
@@ -77,8 +78,8 @@ export function resumedIssueUpdate(input: Record<string, unknown>): UpdateIssueI
     ...(input.blockedBy === undefined ? {} : { blockedBy: input.blockedBy as number[] }),
   };
 }
-function identityFor(input: ExecutionContext, commandName: string): string {
-  const config = loadDeliveryConfig(gitRoot(input.repoRoot)).config;
+async function identityFor(input: ExecutionContext, commandName: string): Promise<string> {
+  const config = await loadDeliverySettings(gitRoot(input.repoRoot));
   const identity = input.identity ?? '';
   const policy = evaluateCommandIdentityPolicy({
     commandName,
@@ -93,7 +94,9 @@ function identityFor(input: ExecutionContext, commandName: string): string {
 function assertRepositorySelector(input: Record<string, unknown>, execution: ExecutionContext): void {
   const selector = input.repo ?? execution.repo;
   if (selector === undefined) return;
-  const configured = loadDeliveryConfig(gitRoot(execution.repoRoot)).config.repository;
+  const root = gitRoot(execution.repoRoot);
+  const selected = resolveRepoFromRemote(root, readDeliveryOverrides(root).overrides.remote);
+  const configured = `${selected.owner}/${selected.repo}`;
   if (typeof selector !== 'string' || selector.toLowerCase() !== configured.toLowerCase()) {
     throw new DeliveryError('Repository selector must match the configured repository for this Git checkout.');
   }
@@ -101,7 +104,7 @@ function assertRepositorySelector(input: Record<string, unknown>, execution: Exe
 
 export async function contextFor(input: ExecutionContext, commandName: string, role: 'author' | 'reviewer' = 'author') {
   assertRepositorySelector({}, input);
-  const identity = identityFor(input, commandName);
+  const identity = await identityFor(input, commandName);
   return loadDeliveryContext({
     identity,
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
@@ -235,12 +238,15 @@ async function preflightStartDevelopment(
     );
   }
   listWorktreesStrict(context.root);
-  if (gitExitCode(context.root, 'rev-parse', '--verify', defaultBaseRef(context.root)) !== 0) {
+  if (
+    gitExitCode(context.root, 'rev-parse', '--verify', defaultBaseRef(context.root, context.configuration?.remote)) !==
+    0
+  ) {
     throw new DeliveryError('Default base ref is missing before tracked issue creation.');
   }
 }
 
-function scratchStart(input: Record<string, unknown>, execution: ExecutionContext, identity: string) {
+function scratchStart(input: Record<string, unknown>, execution: ExecutionContext, identity: string, remote?: string) {
   const title = (optionalString(input, 'title') ?? requireString(input, 'request'))
     .replace(/\s+/gu, ' ')
     .trim()
@@ -258,7 +264,13 @@ function scratchStart(input: Record<string, unknown>, execution: ExecutionContex
       .replace(/-+$/gu, '') || 'scratch';
   const branch = branchOverride ?? `scratch/${slug}`;
   const name = `scratch-${slug}`;
-  return prepareStandaloneWorktree({ branch, identity, name, repoRoot: execution.repoRoot }).then((row) => ({
+  return prepareStandaloneWorktree({
+    branch,
+    identity,
+    name,
+    repoRoot: execution.repoRoot,
+    ...(remote ? { remote } : {}),
+  }).then((row) => ({
     mode: 'scratch' as const,
     title,
     branch: row.branch,
@@ -275,16 +287,42 @@ export async function executeTool(
   if (!definition) throw new DeliveryError(`Unknown ai-delivery tool ${name}.`);
   const input = definition.inputSchema.parse(raw) as Record<string, unknown>;
   assertRepositorySelector(input, execution);
+  if (name === 'issue_info' && input.cached === true)
+    return cachedIssueInfo(execution.repoRoot, requiredNumber(input, 'issueNumber'));
+  const commands: Record<AiDeliveryMcpToolName, string> = {
+    issue_create: 'create',
+    issue_start: 'start',
+    issue_update: 'update',
+    issue_info: 'info',
+    issue_ready_check: 'ready:check',
+    issue_develop: 'develop',
+    issue_verify: 'verify',
+    issue_pr_create: 'pr:create',
+    issue_pr_info: 'pr:info',
+    issue_pr_review: 'pr:review',
+    issue_pr_merge: 'pr:merge',
+    issue_finish: 'finish',
+    issue_worktree_create: 'worktree:create',
+  };
+  const requestedIdentity = name === 'issue_pr_review' ? optionalString(input, 'identity') : undefined;
+  const selectedExecution = requestedIdentity === undefined ? execution : { ...execution, identity: requestedIdentity };
+  const context = await contextFor(
+    selectedExecution,
+    commands[name],
+    name === 'issue_pr_review' ? 'reviewer' : 'author',
+  );
   if (MUTATING_TOOLS.has(name) && input.dryRun !== true) {
-    assertDeliveryRuntimeAdmitted(execution);
+    await assertDeliveryRuntimeAdmitted({
+      ...execution,
+      ...(context.configuration === undefined ? {} : { configuration: context.configuration }),
+    });
   }
   switch (name) {
     case 'issue_create': {
-      const context = await contextFor(execution, 'create');
       return createIssue(context, input as unknown as CreateIssueInput);
     }
     case 'issue_start': {
-      const identity = identityFor(execution, 'start');
+      const identity = await identityFor(execution, 'start');
       if (input.resumeCreated === true && (input.issueNumber === undefined || input.develop !== true)) {
         throw new DeliveryError('Resume of a known created issue requires issueNumber and develop=true.');
       }
@@ -292,26 +330,21 @@ export async function executeTool(
         if (input.issueNumber !== undefined || input.develop === true || input.resumeCreated === true) {
           throw new DeliveryError('Scratch worktree cannot claim a tracked issue.');
         }
-        return scratchStart(input, execution, identity);
+        return scratchStart(input, execution, identity, context.configuration?.remote);
       }
-      const context = await contextFor(execution, 'start');
       return startTrackedIssue(context, input);
     }
     case 'issue_update': {
-      const context = await contextFor(execution, 'update');
       return updateIssue(context, input as unknown as UpdateIssueInput);
     }
     case 'issue_info': {
       if (input.cached === true) return cachedIssueInfo(execution.repoRoot, requiredNumber(input, 'issueNumber'));
-      const context = await contextFor(execution, 'info');
       return issueInfo(context, requiredNumber(input, 'issueNumber'));
     }
     case 'issue_ready_check': {
-      const context = await contextFor(execution, 'ready:check');
       return readyCheck(context, requiredNumber(input, 'issueNumber'));
     }
     case 'issue_develop': {
-      const context = await contextFor(execution, 'develop');
       const issueNumber = requiredNumber(input, 'issueNumber');
       const result = await developIssue(context, issueNumber);
       if (input.assignee !== undefined)
@@ -327,6 +360,7 @@ export async function executeTool(
       const root = primaryGitRoot(execution.repoRoot);
       const row = getIssueWorktreeStrict(issueNumber, root);
       const run = await verifyIssue({
+        personalAuth: context.clients.authSource === 'personal',
         issueNumber,
         repoRoot: row.path,
         ...(input.admit === undefined
@@ -336,7 +370,12 @@ export async function executeTool(
       let approval;
       if (input.prepublicationReview !== undefined) {
         const artifact = parseReviewArtifact(readFileSync(requireString(input, 'prepublicationReview'), 'utf8'));
-        const config = loadDeliveryConfig(row.path).config;
+        const config = (
+          await loadDeliveryConfig(
+            row.path,
+            execution.personalAuth === undefined ? {} : { personalAuth: execution.personalAuth },
+          )
+        ).config;
         savePrepublicationArtifact({
           artifact,
           classification: run.classification,
@@ -347,6 +386,7 @@ export async function executeTool(
         approval = reviewArtifactApproval({ artifact, classification: run.classification, config, issueNumber });
       }
       const evidence = await createIssuePhaseEvidence({
+        personalAuth: context.clients.authSource === 'personal',
         ...(approval === undefined ? {} : { approval }),
         issueNumber,
         phase: 'verify',
@@ -360,7 +400,6 @@ export async function executeTool(
       };
     }
     case 'issue_pr_create': {
-      const context = await contextFor(execution, 'pr:create');
       const issueNumber = requiredNumber(input, 'issueNumber');
       if (input.dryRun === true) {
         const row = getIssueWorktreeStrict(issueNumber, context.root);
@@ -375,19 +414,12 @@ export async function executeTool(
       });
     }
     case 'issue_pr_info': {
-      const context = await contextFor(execution, 'pr:info');
       return prInfo(context, {
         ...(input.issueNumber === undefined ? {} : { issueNumber: Number(input.issueNumber) }),
         ...(input.prNumber === undefined ? {} : { prNumber: Number(input.prNumber) }),
       });
     }
     case 'issue_pr_review': {
-      const identity = optionalString(input, 'identity') ?? execution.identity;
-      const context = await contextFor(
-        { ...execution, ...(identity === undefined ? {} : { identity }) },
-        'pr:review',
-        'reviewer',
-      );
       if (input.dryRun === true) {
         const issueNumber = requiredNumber(input, 'issueNumber');
         const row = getIssueWorktreeStrict(issueNumber, context.root);
@@ -410,7 +442,6 @@ export async function executeTool(
     }
     case 'issue_pr_merge':
     case 'issue_finish': {
-      const context = await contextFor(execution, name === 'issue_finish' ? 'finish' : 'pr:merge');
       const issueNumber = requiredNumber(input, 'issueNumber');
       const prNumber = requiredNumber(input, 'prNumber');
       if (input.dryRun === true) {
@@ -424,8 +455,9 @@ export async function executeTool(
         : mergePr(context, { issueNumber, prNumber, ...(strategy === undefined ? {} : { strategy }) });
     }
     case 'issue_worktree_create': {
-      const identity = identityFor(execution, 'worktree:create');
+      const identity = await identityFor(execution, 'worktree:create');
       return prepareStandaloneWorktree({
+        ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
         branch: requireString(input, 'branch'),
         identity,
         name: requireString(input, 'name'),

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { DeliveryConfig } from './config/deliveryConfig.js';
+import type { DeliveryConfig, LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/index.js';
 import { DeliveryError } from './errors.js';
@@ -14,6 +14,7 @@ import {
 } from './github/nativeIssueMetadata.js';
 import {
   getIssueProjectStatus,
+  type ProjectDeliveryConfiguration,
   projectSettingsFromDeliveryConfig,
   syncIssueProjectStatus,
 } from './github/projectDelivery.js';
@@ -33,6 +34,8 @@ import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 export interface DeliveryContext {
   clients: GitHubClients;
+  configuration?: LoadedDeliveryConfig;
+  projectConfiguration?: ProjectDeliveryConfiguration;
   config: DeliveryConfig;
   repo: RepoCoordinates;
   root: string;
@@ -45,15 +48,31 @@ export async function loadDeliveryContext(input: {
   role: 'author' | 'reviewer';
 }): Promise<DeliveryContext> {
   const root = gitRoot(input.repoRoot);
-  const config = loadDeliveryConfig(root).config;
-  const repo = resolveDeliveryRepo(config, root);
+  const loaded = await loadDeliveryConfig(
+    root,
+    input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth },
+  );
+  const config = loaded.config;
+  const repo = resolveDeliveryRepo(config, root, loaded.remote);
   const clients = await createDeliveryGitHubClients({
     config,
     identity: input.identity,
     ...(input.personalAuth ? { personalAuth: { enabled: true as const } } : {}),
     role: input.role,
   });
-  return { clients, config, repo, root: primaryGitRoot(root) };
+  const routing = loaded.routing;
+  const projectConfiguration: ProjectDeliveryConfiguration = {
+    projectId: routing.projectId,
+    projectNumber: config.native.project.number,
+    title: config.native.project.title,
+    pointsFieldId: routing.pointsFieldId,
+    priorityFieldId: routing.priorityFieldId,
+    statusFieldId: routing.statusFieldId,
+    statusOptionIds: routing.statusOptionIds,
+    settings: projectSettingsFromDeliveryConfig(config),
+    writable: true,
+  };
+  return { clients, config, configuration: loaded, projectConfiguration, repo, root: primaryGitRoot(root) };
 }
 
 function labels(input: readonly string[] | undefined): string[] {
@@ -93,6 +112,7 @@ export async function createIssue(
 ): Promise<{
   body: string;
   created: { number: number; title: string; url: string };
+  routing?: LoadedDeliveryConfig['routing'];
 }> {
   if (!input.title.trim()) throw new DeliveryError('Issue title is required.');
   if (input.issueType !== undefined && !context.config.native.issueTypes.includes(input.issueType)) {
@@ -169,6 +189,7 @@ export async function createIssue(
       graphql: clients.graphql,
       issueNodeId: created.data.node_id,
       org: config.native.organization,
+      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
       settings: projectSettingsFromDeliveryConfig(config),
       status: targets.unresolvedBlockers.length > 0 ? 'Blocked' : 'Todo',
     });
@@ -179,6 +200,7 @@ export async function createIssue(
     );
   }
   return {
+    ...(context.configuration ? { routing: context.configuration.routing } : {}),
     body: created.data.body ?? input.body ?? '',
     created: { number: issueNumber, title: created.data.title, url: created.data.html_url },
   };
@@ -295,6 +317,7 @@ export async function resumeCreatedIssue(context: DeliveryContext, input: Update
     graphql: context.clients.graphql,
     issueNodeId: issue.node_id,
     org: context.config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: info.blockedBy.length > 0 ? 'Blocked' : 'Todo',
   });
@@ -302,6 +325,7 @@ export async function resumeCreatedIssue(context: DeliveryContext, input: Update
 }
 
 export interface IssueInfo {
+  routing?: LoadedDeliveryConfig['routing'];
   blockedBy: number[];
   body: string;
   issueNumber: number;
@@ -363,10 +387,12 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
       graphql: clients.graphql,
       issueNodeId: issue.node_id,
       org: config.native.organization,
+      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
       settings: projectSettingsFromDeliveryConfig(config),
     }),
   ]);
   const info: IssueInfo = {
+    ...(context.configuration ? { routing: context.configuration.routing } : {}),
     blockedBy: relationships.blockers.filter((blocker) => blocker.state === 'OPEN').map((blocker) => blocker.number),
     body: issue.body ?? '',
     issueNumber,
@@ -429,6 +455,7 @@ export async function developIssue(
       `Issue #${issueNumber} is not ready: ${readiness.failures.map((f) => f.message).join('; ')}`,
     );
   const row = await prepareIssueWorktree({
+    ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
     identity: context.config.roles.author.identity,
     issueNumber,
     repoRoot: context.root,
@@ -438,6 +465,7 @@ export async function developIssue(
     graphql: context.clients.graphql,
     issueNodeId: issue.node_id,
     org: context.config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: 'In Progress',
   });

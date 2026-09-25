@@ -1,6 +1,8 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 
+import { resolveGitRemoteName } from './github/repo.js';
+
 import { DeliveryError } from './errors.js';
 import { assertClean, defaultBaseRef, git, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
 import {
@@ -28,6 +30,7 @@ export async function prepareIssueWorktree(input: {
   identity: string;
   issueNumber: number;
   repoRoot: string;
+  remote?: string;
 }): Promise<WorktreeEntry> {
   assertIssueNumber(input.issueNumber);
   const root = primaryGitRoot(input.repoRoot);
@@ -56,7 +59,7 @@ export async function prepareIssueWorktree(input: {
     return row;
   }
   if (existsSync(target)) throw new DeliveryError('An unregistered issue worktree path already exists.');
-  const base = input.baseRef ?? defaultBaseRef(root);
+  const base = input.baseRef ?? defaultBaseRef(root, input.remote);
   if (!base || gitExitCode(root, 'rev-parse', '--verify', '--quiet', base) !== 0) {
     throw new DeliveryError('Default base ref is missing.');
   }
@@ -94,6 +97,7 @@ export async function prepareStandaloneWorktree(input: {
   identity: string;
   name: string;
   repoRoot: string;
+  remote?: string;
 }): Promise<WorktreeEntry> {
   if (!/^[a-z][a-z0-9-]{0,63}$/u.test(input.name) || !/^[A-Za-z0-9._/-]+$/u.test(input.branch)) {
     throw new DeliveryError('Invalid standalone worktree name or branch.');
@@ -107,7 +111,7 @@ export async function prepareStandaloneWorktree(input: {
   ) {
     throw new DeliveryError('Standalone worktree name or branch already exists.');
   }
-  const base = input.baseRef ?? defaultBaseRef(root);
+  const base = input.baseRef ?? defaultBaseRef(root, input.remote);
   git(root, 'worktree', 'add', '-b', input.branch, target, base);
   const now = new Date().toISOString();
   const row: WorktreeEntry = {
@@ -198,6 +202,7 @@ export async function cleanupNonIssueWorktree(input: {
   name?: string;
   prNumber?: number;
   repoRoot: string;
+  remote?: string;
 }): Promise<void> {
   if ((input.name === undefined) === (input.prNumber === undefined)) {
     throw new DeliveryError('Select exactly one registered PR number or standalone name.');
@@ -232,11 +237,13 @@ export async function cleanupNonIssueWorktree(input: {
   }
   assertClean(target);
   const head = git(target, 'rev-parse', 'HEAD');
+  const remote = resolveGitRemoteName(root, input.remote);
   const remoteRef =
     input.prNumber === undefined
-      ? `refs/remotes/origin/${row.branch}`
-      : `refs/remotes/origin/ai-delivery-pr-${input.prNumber}`;
-  const retainedByBase = gitExitCode(root, 'merge-base', '--is-ancestor', head, defaultBaseRef(root)) === 0;
+      ? `refs/remotes/${remote}/${row.branch}`
+      : `refs/remotes/${remote}/ai-delivery-pr-${input.prNumber}`;
+  const retainedByBase =
+    gitExitCode(root, 'merge-base', '--is-ancestor', head, defaultBaseRef(root, input.remote)) === 0;
   const retainedByRemote =
     gitExitCode(root, 'show-ref', '--verify', '--quiet', remoteRef) === 0 &&
     gitExitCode(root, 'merge-base', '--is-ancestor', head, remoteRef) === 0;
@@ -262,6 +269,7 @@ export interface MergeCleanupAttestation {
 export async function cleanupMergedIssueWorktree(input: {
   issueNumber: number;
   repoRoot: string;
+  remote?: string;
   merge?: MergeCleanupAttestation;
   afterRemoval?: () => Promise<void>;
 }): Promise<void> {
@@ -280,7 +288,7 @@ export async function cleanupMergedIssueWorktree(input: {
     throw new DeliveryError('Registered worktree is missing.');
   }
   if (present) assertClean(row.path);
-  const base = defaultBaseRef(root);
+  const base = defaultBaseRef(root, input.remote);
   const branchIncluded = gitExitCode(root, 'merge-base', '--is-ancestor', row.branch, base) === 0;
   const attestation = input.merge;
   if (attestation) {
@@ -288,7 +296,7 @@ export async function cleanupMergedIssueWorktree(input: {
       attestation.headBranch !== row.branch ||
       attestation.headSha !== git(present ? row.path : root, 'rev-parse', present ? 'HEAD' : row.branch) ||
       (attestation.remoteHeadSha !== null && attestation.remoteHeadSha !== attestation.headSha) ||
-      attestation.baseBranch !== base.replace(/^origin\//u, '') ||
+      attestation.baseBranch !== base.slice(`refs/remotes/${resolveGitRemoteName(root, input.remote)}/`.length) ||
       attestation.remoteBaseSha !== git(root, 'rev-parse', base) ||
       gitExitCode(root, 'merge-base', '--is-ancestor', attestation.baseSha, attestation.mergeSha) !== 0 ||
       gitExitCode(root, 'merge-base', '--is-ancestor', attestation.mergeSha, base) !== 0 ||
