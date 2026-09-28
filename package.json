@@ -1,6 +1,6 @@
 {
   "name": "@aviaratech/ai-delivery",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": false,
   "description": "Generic GitHub issue and pull request delivery CLI and MCP server",
   "homepage": "https://github.com/aviaratech/ai-delivery#readme",
