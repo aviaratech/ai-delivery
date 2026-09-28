@@ -38,8 +38,9 @@ const NativeField = z
   })
   .strict();
 
-const Role = z
+const AppRole = z
   .object({
+    authSource: z.literal('app').optional(),
     credentialEnv: z
       .object({
         appId: EnvName,
@@ -50,6 +51,16 @@ const Role = z
     identity: Name,
   })
   .strict();
+const AuthorRole = z.union([
+  AppRole,
+  z
+    .object({
+      authSource: z.literal('personal'),
+      credentialEnv: z.object({ token: EnvName }).strict(),
+      identity: Name,
+    })
+    .strict(),
+]);
 
 const DeliveryConfigSchema = z
   .object({
@@ -110,7 +121,7 @@ const DeliveryConfigSchema = z
       })
       .strict(),
     repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u),
-    roles: z.object({ author: Role, reviewer: Role }).strict(),
+    roles: z.object({ author: AuthorRole, reviewer: AppRole }).strict(),
     schemaVersion: z.literal('ai-delivery.config@2'),
   })
   .strict()
@@ -130,8 +141,8 @@ const DeliveryConfigSchema = z
       });
     }
     if (
-      [value.roles.author.identity, value.roles.reviewer.identity].some((identity) =>
-        /^personal(?:$|[-_])/iu.test(identity),
+      [value.roles.author, value.roles.reviewer].some(
+        (role) => role.authSource !== 'personal' && /^personal(?:$|[-_])/iu.test(role.identity),
       )
     ) {
       context.addIssue({
@@ -142,7 +153,7 @@ const DeliveryConfigSchema = z
     }
     const authorEnv = Object.values(value.roles.author.credentialEnv);
     const reviewerEnv = Object.values(value.roles.reviewer.credentialEnv);
-    if (new Set([...authorEnv, ...reviewerEnv]).size !== 6) {
+    if (new Set([...authorEnv, ...reviewerEnv]).size !== authorEnv.length + reviewerEnv.length) {
       context.addIssue({
         code: 'custom',
         message: 'Author and reviewer credential environment names must be distinct.',
@@ -275,16 +286,18 @@ export async function loadDeliverySettings(repositoryRoot: string): Promise<Load
   const settings = PolicySettingsSchema.safeParse((imported as { deliverySettings?: unknown }).deliverySettings);
   if (!settings.success)
     throw new DeliveryError(
-      'Policy module must export valid explicit deliverySettings with commandPolicy and distinct App roles.',
+      'Policy module must export valid explicit deliverySettings with commandPolicy and distinct author/reviewer roles.',
     );
   const roles = settings.data.roles;
   const names = [...Object.values(roles.author.credentialEnv), ...Object.values(roles.reviewer.credentialEnv)];
   if (
     roles.author.identity.toLowerCase() === roles.reviewer.identity.toLowerCase() ||
-    new Set(names).size !== 6 ||
-    [roles.author.identity, roles.reviewer.identity].some((value) => /^personal(?:$|[-_])/iu.test(value))
+    new Set(names).size !== names.length ||
+    [roles.author, roles.reviewer].some(
+      (role) => role.authSource !== 'personal' && /^personal(?:$|[-_])/iu.test(role.identity),
+    )
   ) {
-    throw new DeliveryError('Policy settings require distinct App identities and credential environment names.');
+    throw new DeliveryError('Policy settings require distinct identities and credential environment names.');
   }
   const repo = resolveRepoFromRemote(root, local.overrides.remote);
   const repository = `${repo.owner}/${repo.repo}`;
@@ -318,19 +331,32 @@ export async function loadDeliveryConfig(
   } = {},
 ): Promise<LoadedDeliveryConfig> {
   const settings = await loadDeliverySettings(repositoryRoot);
+  const legacyPersonalAuth = options.personalAuth === true && settings.roles.author.authSource !== 'personal';
   const clients =
     options.clients ??
     (await createDeliveryGitHubClients({
       config: settings,
-      identity: options.personalAuth ? 'personal' : settings.roles.author.identity,
-      ...(options.personalAuth ? { personalAuth: { enabled: true as const } } : {}),
+      identity: legacyPersonalAuth ? 'personal' : settings.roles.author.identity,
+      ...(legacyPersonalAuth ? { personalAuth: { enabled: true as const } } : {}),
       role: 'author',
     }));
-  const routing = await discoverDeliveryRouting({
-    clients,
-    repository: settings.repository,
-    overrides: settings.overrides,
-  });
+  let routing: DeliveryRouting;
+  try {
+    routing = await discoverDeliveryRouting({
+      clients,
+      repository: settings.repository,
+      overrides: settings.overrides,
+    });
+  } catch (error) {
+    if (
+      options.clients === undefined &&
+      settings.roles.author.authSource === 'personal' &&
+      (error as { status?: number }).status === 401
+    ) {
+      throw new DeliveryError('Configured personal author token is invalid or expired; refresh the selected token.');
+    }
+    throw error;
+  }
   const config = parseDeliveryConfig({
     schemaVersion: 'ai-delivery.config@2',
     repository: routing.repository,
@@ -371,8 +397,11 @@ export function resolveDeliveryRoleCredentials(input: {
   role: DeliveryRole;
 }): { appId: string; installationId: number; privateKeyPath: string } {
   const { config, role } = input;
+  if (config.roles[role].authSource === 'personal') {
+    throw new DeliveryError('Personal author credentials use the configured token environment variable.');
+  }
   const env = input.env ?? process.env;
-  const names = config.roles[role].credentialEnv;
+  const names = config.roles[role].credentialEnv as { appId: string; installationId: string; privateKeyPath: string };
   const values = {
     appId: env[names.appId]?.trim(),
     installationId: env[names.installationId]?.trim(),

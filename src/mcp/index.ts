@@ -9,7 +9,7 @@ import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
 
 export function createAiDeliveryMcpServer(context: ExecutionContext): McpServer {
-  const server = new McpServer({ name: 'ai-delivery', version: '0.2.1' });
+  const server = new McpServer({ name: 'ai-delivery', version: '0.3.0' });
   const tools: readonly { name: string; description: string; inputSchema: z.ZodObject<z.ZodRawShape> }[] =
     AI_DELIVERY_MCP_TOOLS;
   for (const tool of tools) {

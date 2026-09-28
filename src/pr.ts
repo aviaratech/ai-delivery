@@ -15,7 +15,7 @@ import {
 import { DeliveryError } from './errors.js';
 import { coordinate, defaultBaseRef, git, gitCommonDir, gitExitCode, gitRoot } from './git.js';
 import { resolveGitRemoteName } from './github/repo.js';
-import { withAuthorGitToken } from './github/client.js';
+import { createDeliveryGitHubClients, withAuthorGitToken, type GitHubClients } from './github/client.js';
 import {
   getConfiguredNativeIssueMetadata,
   nativeIssueSettingsFromDeliveryConfig,
@@ -33,6 +33,7 @@ import {
   reviewArtifactApproval,
   assertSubmittedReviewCurrent,
   parseReviewArtifact,
+  readRequiredReviewState,
   submitReview,
 } from './review.js';
 import {
@@ -196,7 +197,7 @@ function baseBranch(root: string, selectedRemote?: string): string {
   return value;
 }
 
-/** @internal Selected-App Git transport, exported for process-boundary tests. */
+/** @internal Selected-author Git transport, exported for process-boundary tests. */
 export async function runAuthorGit(
   context: DeliveryContext,
   path: string,
@@ -225,7 +226,7 @@ export async function runAuthorGit(
       );
     }
     if (unsafeConfig.status === 0) {
-      throw new DeliveryError('Local Git transport configuration conflicts with selected App authentication.');
+      throw new DeliveryError('Local Git transport configuration conflicts with selected author authentication.');
     }
     const temporary = mkdtempSync(join(tmpdir(), 'ai-delivery-git-auth-'));
     const askpass = join(temporary, 'askpass.sh');
@@ -288,6 +289,7 @@ export async function prInfo(
   headSha: string | null;
   baseSha: string | null;
   draft: boolean | null;
+  authorLogin: string | null;
   url: string | null;
 }> {
   if (input.prNumber !== undefined) {
@@ -298,6 +300,7 @@ export async function prInfo(
       headSha: pr.head.sha,
       baseSha: pr.base.sha,
       draft: pr.draft ?? null,
+      authorLogin: pr.user?.login ?? null,
       url: pr.html_url,
     };
   }
@@ -320,9 +323,10 @@ export async function prInfo(
         headSha: pr.head.sha,
         baseSha: pr.base.sha,
         draft: pr.draft ?? null,
+        authorLogin: pr.user?.login ?? null,
         url: pr.html_url,
       }
-    : { number: null, state: null, headSha: null, baseSha: null, draft: null, url: null };
+    : { number: null, state: null, headSha: null, baseSha: null, draft: null, authorLogin: null, url: null };
 }
 
 export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' | 'open' = 'open') {
@@ -346,15 +350,17 @@ export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' 
 
 export async function prChecks(context: DeliveryContext, prNumber: number) {
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
-  const [checks, status] = await Promise.all([
+  const [checks, status, reviewState] = await Promise.all([
     context.clients.rest.checks.listForRef({ ...context.repo, ref: pr.head.sha, per_page: 100 }),
     context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: pr.head.sha }),
+    readRequiredReviewState(context, prNumber, pr.head.sha),
   ]);
   return {
     schemaVersion: 'ai-delivery.pr-checks@1' as const,
     prNumber: pr.number,
     headSha: pr.head.sha,
     combinedStatus: status.data.state,
+    reviewState,
     checkRuns: checks.data.check_runs.map((check) => ({
       name: check.name,
       status: check.status,
@@ -405,6 +411,115 @@ export async function checkoutPr(context: DeliveryContext, prNumber: number) {
   });
 }
 
+export interface ReviewRoutePreflight {
+  author: { actorLogin: string; authSource: GitHubClients['authSource']; credentialSource: string; identity: string };
+  reviewer: { actorLogin: string; credentialSource: string; identity: string; repositoryAccess: 'readable' };
+  rules: { observedRequiredApprovals: number | null; visibility: 'complete' | 'partial' | 'unknown' };
+  approvalEligibility: 'unknown';
+  nextAction: string;
+}
+
+function requiredApprovalCount(value: unknown): number | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const count = (value as Record<string, unknown>).required_approving_review_count;
+  return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+/** Check the selected actors and available rule evidence before the first remote mutation. */
+export async function preflightReviewRoute(
+  context: DeliveryContext,
+  base = baseBranch(context.root, context.configuration?.remote),
+  selectedReviewer?: GitHubClients,
+): Promise<ReviewRoutePreflight> {
+  const configuredAuthorSource = context.config.roles.author.authSource ?? 'app';
+  if (context.clients.authSource !== configuredAuthorSource) {
+    throw new DeliveryError(
+      'PR publication requires the configured author credential; configure the personal author role for personal publication.',
+    );
+  }
+  if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor) {
+    throw new DeliveryError('PR publication requires authenticated author identity readback.');
+  }
+  const author = await context.clients.authenticatedAuthor();
+  if (!author.actorLogin || !author.credentialIdentity) {
+    throw new DeliveryError('Author GitHub identity readback is incomplete.');
+  }
+  const reviewer =
+    selectedReviewer ??
+    (await createDeliveryGitHubClients({
+      config: context.config,
+      identity: context.config.roles.reviewer.identity,
+      role: 'reviewer',
+    }));
+  if (reviewer.role !== 'reviewer' || reviewer.authSource !== 'app' || !reviewer.appActorLogin) {
+    throw new DeliveryError('Configured reviewer GitHub App identity is unavailable.');
+  }
+  const reviewerActor = await reviewer.appActorLogin();
+  if (!reviewerActor) throw new DeliveryError('Reviewer GitHub App actor lookup is incomplete.');
+  if (author.actorLogin.toLowerCase() === reviewerActor.toLowerCase()) {
+    throw new DeliveryError(
+      'Author and reviewer resolve to the same GitHub actor; select distinct configured credentials.',
+    );
+  }
+  try {
+    const repository = (await reviewer.rest.repos.get({ ...context.repo })).data;
+    if (repository.full_name.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()) {
+      throw new DeliveryError('Reviewer GitHub App repository readback disagrees with the selected checkout.');
+    }
+  } catch (error) {
+    if (error instanceof DeliveryError) throw error;
+    throw new DeliveryError(
+      'Reviewer GitHub App cannot read the selected repository; verify its installation and repository access.',
+    );
+  }
+  const [rulesetResult, protectionResult] = await Promise.allSettled([
+    context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+      ...context.repo,
+      branch: base,
+    }),
+    context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
+      ...context.repo,
+      branch: base,
+    }),
+  ]);
+  const counts: number[] = [];
+  if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
+    for (const rule of rulesetResult.value.data) {
+      if (rule.type === 'pull_request') {
+        const count = requiredApprovalCount(rule.parameters);
+        if (count !== null) counts.push(count);
+      }
+    }
+  }
+  if (protectionResult.status === 'fulfilled') {
+    const protection = protectionResult.value.data as { required_pull_request_reviews?: unknown };
+    const count = requiredApprovalCount(protection.required_pull_request_reviews);
+    if (count !== null) counts.push(count);
+  }
+  const visible = Number(rulesetResult.status === 'fulfilled') + Number(protectionResult.status === 'fulfilled');
+  const visibility = visible === 2 ? 'complete' : visible === 1 ? 'partial' : 'unknown';
+  return {
+    author: {
+      actorLogin: author.actorLogin,
+      authSource: context.clients.authSource,
+      credentialSource: context.clients.credentialSource ?? 'unreported',
+      identity: context.config.roles.author.identity,
+    },
+    reviewer: {
+      actorLogin: reviewerActor,
+      credentialSource: reviewer.credentialSource ?? 'unreported',
+      identity: context.config.roles.reviewer.identity,
+      repositoryAccess: 'readable',
+    },
+    rules: { observedRequiredApprovals: counts.length > 0 ? Math.max(...counts) : null, visibility },
+    approvalEligibility: 'unknown',
+    nextAction:
+      visibility === 'complete'
+        ? 'Confirm whether the reviewer approval counts after exact-head submission; installation scopes do not prove required-review eligibility.'
+        : 'Inspect the active branch review rule with an authorized repository view and confirm whether the reviewer approval counts after exact-head submission.',
+  };
+}
+
 export async function publishPr(
   context: DeliveryContext,
   input: {
@@ -413,7 +528,13 @@ export async function publishPr(
     issueNumber: number;
     title?: string;
   },
-): Promise<{ prNumber: number; url: string; publicationEvidenceId: string }> {
+): Promise<{
+  prNumber: number;
+  url: string;
+  publicationEvidenceId: string;
+  reviewRoute?: ReviewRoutePreflight;
+  reviewState?: Awaited<ReturnType<typeof readRequiredReviewState>>;
+}> {
   const root = gitRoot(context.root);
   const row = getIssueWorktreeStrict(input.issueNumber, root);
   if (row.type !== 'issue' || row.status === 'merged')
@@ -438,7 +559,12 @@ export async function publishPr(
     const readback = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: publication.prNumber }))
       .data;
     if (readback.draft || readback.head.sha !== head.sha) throw new DeliveryError('PR ready readback failed.');
-    return { prNumber: publication.prNumber, url: readback.html_url, publicationEvidenceId: publication.evidenceId };
+    return {
+      prNumber: publication.prNumber,
+      url: readback.html_url,
+      publicationEvidenceId: publication.evidenceId,
+      reviewState: await readRequiredReviewState(context, publication.prNumber, head.sha),
+    };
   }
   const prepublication = loadPrepublicationArtifact(row.path, input.issueNumber, head.sha);
   const approval = prepublication
@@ -450,7 +576,7 @@ export async function publishPr(
       })
     : undefined;
   const evidence = await createIssuePhaseEvidence({
-    personalAuth: context.clients.authSource === 'personal',
+    personalAuth: context.clients.authSource === 'personal' && context.config.roles.author.authSource !== 'personal',
     ...(approval === undefined ? {} : { approval }),
     issueNumber: input.issueNumber,
     phase: 'publish',
@@ -469,7 +595,7 @@ export async function publishPr(
   ).data.object.sha;
   if (remoteHead !== run.classification.base.sha)
     throw new DeliveryError('Remote base changed after exact-head verification.');
-  await pushReviewedHead(context, row.path, row.branch, head.sha);
+  const reviewRoute = await preflightReviewRoute(context, baseBranch(root, context.configuration?.remote));
   const matches = (
     await context.clients.rest.pulls.list({
       ...context.repo,
@@ -480,6 +606,12 @@ export async function publishPr(
   ).data;
   if (matches.length > 1) throw new DeliveryError('Multiple open PRs match the registered branch.');
   const existing = matches[0];
+  if (existing?.user?.login && existing.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase()) {
+    throw new DeliveryError(
+      'Existing PR author differs from the configured author actor; inspect the PR and resolve the actor mismatch explicitly.',
+    );
+  }
+  await pushReviewedHead(context, row.path, row.branch, head.sha);
   const pr = existing
     ? (await context.clients.rest.pulls.get({ ...context.repo, pull_number: existing.number })).data
     : (
@@ -494,6 +626,11 @@ export async function publishPr(
       ).data;
   if (pr.head.sha !== head.sha || pr.base.sha !== remoteHead || pr.state !== 'open' || !pr.draft) {
     throw new DeliveryError('Draft PR readback does not match the verified head and base.');
+  }
+  if (!pr.user?.login || pr.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase()) {
+    throw new DeliveryError(
+      'Published PR author differs from the selected author credential; inspect the PR before continuing.',
+    );
   }
   const content = {
     baseSha: remoteHead,
@@ -513,7 +650,7 @@ export async function publishPr(
     projectRoot: root,
     status: 'pr-published',
   });
-  return { prNumber: pr.number, url: pr.html_url, publicationEvidenceId: evidence.evidenceId };
+  return { prNumber: pr.number, url: pr.html_url, publicationEvidenceId: evidence.evidenceId, reviewRoute };
 }
 
 export async function submitFormalReview(
@@ -523,7 +660,11 @@ export async function submitFormalReview(
     issueNumber: number;
     prNumber: number;
   },
-): Promise<{ receiptId: string; githubReviewId: number }> {
+): Promise<{
+  receiptId: string;
+  githubReviewId: number;
+  reviewState: Awaited<ReturnType<typeof readRequiredReviewState>>;
+}> {
   const row = getIssueWorktreeStrict(input.issueNumber, context.root);
   const run = loadVerifiedRun(row.path, input.issueNumber);
   const publication = loadPublication(row.path, input.issueNumber, run.classification.head.sha);
@@ -536,7 +677,11 @@ export async function submitFormalReview(
     prNumber: input.prNumber,
     publicationEvidenceId: publication.evidenceId,
   });
-  return { receiptId: receipt.receiptId, githubReviewId: receipt.githubReviewId };
+  return {
+    receiptId: receipt.receiptId,
+    githubReviewId: receipt.githubReviewId,
+    reviewState: await readRequiredReviewState(context, input.prNumber, run.classification.head.sha),
+  };
 }
 
 async function checkPrMergeability(
@@ -552,13 +697,18 @@ async function checkPrMergeability(
   checksPassed: boolean;
 }> {
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
-  if (
-    pr.state !== 'open' ||
-    pr.draft ||
-    pr.head.sha !== expectedHead ||
-    pr.mergeable !== true ||
-    pr.mergeable_state !== 'clean'
-  )
+  if (pr.state !== 'open' || pr.draft || pr.head.sha !== expectedHead)
+    throw new DeliveryError('PR is not clean, ready and mergeable at the exact reviewed head.');
+  const reviewState = await readRequiredReviewState(context, prNumber, expectedHead);
+  if (reviewState.status === 'still-required') {
+    throw new DeliveryError(
+      `The submitted APPROVED review is stored, but GitHub still requires a qualifying approval. ${reviewState.nextAction}`,
+    );
+  }
+  if (reviewState.status === 'changes-requested') {
+    throw new DeliveryError(`GitHub reports changes requested. ${reviewState.nextAction}`);
+  }
+  if (pr.mergeable !== true || pr.mergeable_state !== 'clean')
     throw new DeliveryError('PR is not clean, ready and mergeable at the exact reviewed head.');
   const issueNumber = Number(/^issue\/(\d+)$/u.exec(pr.head.ref)?.[1]);
   if (!Number.isSafeInteger(issueNumber)) throw new DeliveryError('PR branch is not a registered issue branch.');
@@ -907,7 +1057,7 @@ export async function mergePr(
     }
   }
   const currentPublication = await createIssuePhaseEvidence({
-    personalAuth: context.clients.authSource === 'personal',
+    personalAuth: context.clients.authSource === 'personal' && context.config.roles.author.authSource !== 'personal',
     ...(run.classification.risk === 'high'
       ? {
           approval: reviewArtifactApproval({
@@ -939,7 +1089,7 @@ export async function mergePr(
     reviewReceiptId: review.receiptId,
   };
   const evidence = await createIssuePhaseEvidence({
-    personalAuth: context.clients.authSource === 'personal',
+    personalAuth: context.clients.authSource === 'personal' && context.config.roles.author.authSource !== 'personal',
     approval,
     issueNumber: input.issueNumber,
     mergeReadback: {
@@ -952,7 +1102,9 @@ export async function mergePr(
     phase: 'merge',
     repoRoot: row.path,
   });
-  const loaded = await loadDeliveryConfig(row.path, { personalAuth: context.clients.authSource === 'personal' });
+  const loaded = await loadDeliveryConfig(row.path, {
+    personalAuth: context.clients.authSource === 'personal' && context.config.roles.author.authSource !== 'personal',
+  });
   const selected = await loadSelectedRepositoryPolicy({
     repoRoot: row.path,
     policySourcePath: loaded.config.policy.module,

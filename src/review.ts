@@ -77,6 +77,71 @@ export const SubmittedReviewReceiptSchema = z
   });
 export type SubmittedReviewReceipt = z.infer<typeof SubmittedReviewReceiptSchema>;
 
+export interface RequiredReviewState {
+  reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null;
+  status: 'satisfied' | 'changes-requested' | 'still-required' | 'unknown';
+  nextAction: string;
+}
+
+/** GitHub's PR decision is the live requirement state, not the state of one submitted review. */
+export async function readRequiredReviewState(
+  context: DeliveryContext,
+  prNumber: number,
+  expectedHead: string,
+): Promise<RequiredReviewState> {
+  let response: {
+    repository: {
+      pullRequest: { headRefOid: string; reviewDecision: RequiredReviewState['reviewDecision'] } | null;
+    } | null;
+  };
+  try {
+    response = await context.clients.graphql<typeof response>(
+      'query DeliveryReviewDecision($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { headRefOid reviewDecision } } }',
+      { owner: context.repo.owner, name: context.repo.repo, number: prNumber },
+    );
+  } catch {
+    return {
+      reviewDecision: null,
+      status: 'unknown',
+      nextAction: 'Inspect the PR review requirement in GitHub before merge; review decision readback is unavailable.',
+    };
+  }
+  const pr = response.repository?.pullRequest;
+  if (!pr) {
+    return {
+      reviewDecision: null,
+      status: 'unknown',
+      nextAction: 'Inspect the PR review requirement in GitHub before merge; PR decision readback is unavailable.',
+    };
+  }
+  if (pr.headRefOid !== expectedHead) {
+    throw new DeliveryError('GitHub review decision does not match the exact PR head.');
+  }
+  if (pr.reviewDecision === 'APPROVED') {
+    return { reviewDecision: 'APPROVED', status: 'satisfied', nextAction: 'Continue only after required checks pass.' };
+  }
+  if (pr.reviewDecision === 'REVIEW_REQUIRED') {
+    return {
+      reviewDecision: 'REVIEW_REQUIRED',
+      status: 'still-required',
+      nextAction:
+        'GitHub still requires a qualifying approval. Inspect the active rule and obtain approval from an eligible independent reviewer; do not change actors or protections automatically.',
+    };
+  }
+  if (pr.reviewDecision === 'CHANGES_REQUESTED') {
+    return {
+      reviewDecision: 'CHANGES_REQUESTED',
+      status: 'changes-requested',
+      nextAction: 'Resolve the blocking review and obtain a fresh exact-head independent approval.',
+    };
+  }
+  return {
+    reviewDecision: null,
+    status: 'unknown',
+    nextAction: 'Inspect the PR review requirement in GitHub before merge; no required-review decision was exposed.',
+  };
+}
+
 export function parseReviewArtifact(raw: unknown): ReviewArtifact {
   const value = typeof raw === 'string' ? (JSON.parse(raw) as unknown) : raw;
   return ReviewArtifactSchema.parse(value);

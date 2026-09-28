@@ -11,6 +11,7 @@ import { DeliveryError } from '../errors.js';
 
 export interface GitHubClients {
   authSource: 'app' | 'personal';
+  credentialSource?: string;
   role: DeliveryRole;
   appActorLogin?: () => Promise<string>;
   authenticatedAuthor?: () => Promise<{ actorLogin: string; credentialIdentity: string }>;
@@ -20,13 +21,13 @@ export interface GitHubClients {
 
 const authorGitTokens = new WeakMap<GitHubClients, string>();
 
-/** Pass the selected author App token only to the operation that needs Git HTTP auth. */
+/** Pass the selected author token only to the operation that needs Git HTTP auth. */
 export async function withAuthorGitToken<T>(
   clients: GitHubClients,
   callback: (token: string) => Promise<T> | T,
 ): Promise<T> {
-  const token = clients.role === 'author' && clients.authSource === 'app' ? authorGitTokens.get(clients) : undefined;
-  if (!token) throw new DeliveryError('Git push requires the selected author GitHub App installation token.');
+  const token = clients.role === 'author' ? authorGitTokens.get(clients) : undefined;
+  if (!token) throw new DeliveryError('Git push requires the selected author credential token.');
   return callback(token);
 }
 
@@ -63,6 +64,17 @@ export async function createDeliveryGitHubClients(input: {
   role: DeliveryRole;
 }): Promise<GitHubClients> {
   const env = input.env ?? process.env;
+  const selected = input.config.roles[input.role];
+  if (selected.authSource === 'personal') {
+    if (input.role !== 'author' || input.identity.trim().toLowerCase() !== selected.identity.toLowerCase()) {
+      throw new DeliveryError('Personal author operation requires the configured author identity.');
+    }
+    const token = env[selected.credentialEnv.token]?.trim();
+    if (!token) {
+      throw new DeliveryError(`Missing personal author token in ${selected.credentialEnv.token}.`);
+    }
+    return personalClients(token, `env:${selected.credentialEnv.token}`);
+  }
   if (input.personalAuth !== undefined) {
     if (
       input.personalAuth.enabled !== true ||
@@ -73,33 +85,28 @@ export async function createDeliveryGitHubClients(input: {
     }
     const token = input.personalAuth.token?.trim() || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim();
     if (!token) throw new DeliveryError('Explicit personal-token auth requested but no token was supplied.');
-    return buildClients(token, 'personal', 'author', undefined, async () => {
-      try {
-        const user = (await new Octokit({ auth: token }).rest.users.getAuthenticated()).data;
-        if (!Number.isSafeInteger(user.id) || user.id <= 0 || !user.login) {
-          throw new DeliveryError('Personal author identity readback is incomplete.');
-        }
-        return { actorLogin: user.login, credentialIdentity: `user:${String(user.id)}` };
-      } catch (error) {
-        if (error instanceof DeliveryError) throw error;
-        throw new DeliveryError('Personal author identity readback failed.');
-      }
-    });
+    const source = input.personalAuth.token?.trim()
+      ? 'explicit-personal-token'
+      : env.GH_TOKEN?.trim()
+        ? 'env:GH_TOKEN'
+        : 'env:GITHUB_TOKEN';
+    return personalClients(token, source);
   }
 
-  const selected = input.config.roles[input.role];
   if (input.identity.trim().toLowerCase() !== selected.identity.toLowerCase()) {
     throw new DeliveryError(`GitHub ${input.role} operation requires the configured ${input.role} identity.`);
   }
   const credentials = resolveDeliveryRoleCredentials({ config: input.config, env, role: input.role });
   const otherRole: DeliveryRole = input.role === 'author' ? 'reviewer' : 'author';
-  const other = resolveDeliveryRoleCredentials({ config: input.config, env, role: otherRole });
-  if (
-    credentials.appId === other.appId ||
-    credentials.installationId === other.installationId ||
-    credentials.privateKeyPath === other.privateKeyPath
-  ) {
-    throw new DeliveryError('Author and reviewer must use distinct GitHub App credentials.');
+  if (input.config.roles[otherRole].authSource !== 'personal') {
+    const other = resolveDeliveryRoleCredentials({ config: input.config, env, role: otherRole });
+    if (
+      credentials.appId === other.appId ||
+      credentials.installationId === other.installationId ||
+      credentials.privateKeyPath === other.privateKeyPath
+    ) {
+      throw new DeliveryError('Author and reviewer must use distinct GitHub App credentials.');
+    }
   }
   let privateKey: string;
   try {
@@ -151,28 +158,55 @@ export async function createDeliveryGitHubClients(input: {
             }
           }
         : undefined;
-    return buildClients(result.token, 'app', input.role, appActorLogin, authenticatedAuthor);
+    return buildClients(
+      result.token,
+      'app',
+      input.role,
+      `app:${credentials.appId}:installation:${credentials.installationId}`,
+      appActorLogin,
+      authenticatedAuthor,
+    );
   } catch (error) {
     if (error instanceof DeliveryError) throw error;
     throw new DeliveryError(`GitHub App authentication failed for ${input.role} role.`);
   }
 }
 
+function personalClients(token: string, credentialSource: string): GitHubClients {
+  return buildClients(token, 'personal', 'author', credentialSource, undefined, async () => {
+    try {
+      const user = (await new Octokit({ auth: token }).rest.users.getAuthenticated()).data;
+      if (!Number.isSafeInteger(user.id) || user.id <= 0 || !user.login) {
+        throw new DeliveryError('Personal author identity readback is incomplete.');
+      }
+      return { actorLogin: user.login, credentialIdentity: `user:${String(user.id)}` };
+    } catch (error) {
+      if (error instanceof DeliveryError) throw error;
+      if ((error as { status?: number }).status === 401) {
+        throw new DeliveryError('Configured personal author token is invalid or expired; refresh the selected token.');
+      }
+      throw new DeliveryError('Personal author identity readback failed.');
+    }
+  });
+}
+
 function buildClients(
   token: string,
   authSource: GitHubClients['authSource'],
   role: DeliveryRole,
+  credentialSource: string,
   appActorLogin?: () => Promise<string>,
   authenticatedAuthor?: GitHubClients['authenticatedAuthor'],
 ): GitHubClients {
   const clients: GitHubClients = {
     authSource,
+    credentialSource,
     role,
     ...(appActorLogin ? { appActorLogin } : {}),
     ...(authenticatedAuthor ? { authenticatedAuthor } : {}),
     graphql: graphql.defaults({ headers: { authorization: `token ${token}` } }),
     rest: new Octokit({ auth: token }),
   };
-  if (authSource === 'app' && role === 'author') authorGitTokens.set(clients, token);
+  if (role === 'author') authorGitTokens.set(clients, token);
   return clients;
 }

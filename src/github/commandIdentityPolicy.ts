@@ -44,13 +44,17 @@ export function evaluateCommandIdentityPolicy(input: {
   let error: string | null = null;
   if (!identity) {
     error = `Command "${normalizedCommandName}" requires an explicit ${requiredRole} identity.`;
+  } else if (identity === input.deliveryConfig.roles[requiredRole].identity.toLowerCase()) {
+    if (input.personalAuth === true && input.deliveryConfig.roles[requiredRole].authSource !== 'personal') {
+      error = 'Personal-token override requires the explicit personal identity.';
+    }
   } else if (identity === 'personal') {
     if (requiredRole !== 'author' || input.personalAuth !== true) {
-      error = `Command "${normalizedCommandName}" requires a configured GitHub App role; personal-token fallback requires explicit author opt-in.`;
+      error = `Command "${normalizedCommandName}" requires its configured identity; personal-token override requires explicit author opt-in.`;
     }
   } else if (input.personalAuth === true) {
     error = 'Personal-token opt-in requires the explicit personal identity.';
-  } else if (identity !== input.deliveryConfig.roles[requiredRole].identity.toLowerCase()) {
+  } else {
     error = `Command "${normalizedCommandName}" requires configured ${requiredRole} identity "${input.deliveryConfig.roles[requiredRole].identity}".`;
   }
   return { error, normalizedCommandName, requiredRole, requiresExplicitIdentity: true };

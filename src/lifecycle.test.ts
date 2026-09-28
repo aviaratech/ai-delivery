@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   cpSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -39,7 +40,7 @@ import {
   updateIssue,
   type DeliveryContext,
 } from './issue.js';
-import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, publishPr, submitFormalReview } from './pr.js';
+import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, prInfo, publishPr, submitFormalReview } from './pr.js';
 import { updateIssueWorktreeDelivery } from './services/worktreeRegistry.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
@@ -51,22 +52,127 @@ import {
   prepareStandaloneWorktree,
 } from './worktree.js';
 
+const personalRoute = vi.hoisted(() => ({
+  active: false,
+  baseSha: '',
+  headSha: '',
+  reviews: [] as Array<{
+    id: number;
+    body: string;
+    state: 'APPROVED';
+    commit_id: string;
+    user: { login: string };
+    html_url: string;
+  }>,
+  submitted: 0,
+}));
+
 vi.mock('./github/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./github/client.js')>();
   return {
     ...actual,
-    createDeliveryGitHubClients: async (input: { role: 'author' | 'reviewer' }) => ({
-      ...syntheticDiscoveryClients(),
-      authSource: 'app',
-      role: input.role,
-      rest: new Octokit({
+    createDeliveryGitHubClients: async (input: Parameters<typeof actual.createDeliveryGitHubClients>[0]) => {
+      if (personalRoute.active && input.config.roles.author.authSource === 'personal') {
+        const pr = () => ({
+          number: 23,
+          node_id: 'PR-23',
+          html_url: 'https://github.com/example/widget/pull/23',
+          head: { sha: personalRoute.headSha, ref: 'issue/17' },
+          base: { sha: personalRoute.baseSha, ref: 'main' },
+          state: 'open',
+          draft: true,
+          user: { login: 'host-user' },
+        });
+        if (input.role === 'reviewer') {
+          assert.equal(input.identity, 'synthetic-reviewer');
+          return {
+            ...syntheticDiscoveryClients(),
+            authSource: 'app',
+            credentialSource: 'app:reviewer',
+            role: 'reviewer',
+            appActorLogin: async () => 'synthetic-reviewer[bot]',
+            rest: {
+              repos: { get: async () => ({ data: { full_name: 'example/widget' } }) },
+              pulls: {
+                get: async () => ({ data: pr() }),
+                listReviews: async () => ({ data: personalRoute.reviews }),
+                createReview: async (request: { body: string; commit_id: string; event: string }) => {
+                  assert.equal(request.event, 'APPROVE');
+                  assert.equal(request.commit_id, personalRoute.headSha);
+                  personalRoute.submitted += 1;
+                  const review = {
+                    id: 31,
+                    body: request.body,
+                    state: 'APPROVED' as const,
+                    commit_id: personalRoute.headSha,
+                    user: { login: 'synthetic-reviewer[bot]' },
+                    html_url: 'https://github.com/example/widget/pull/23#pullrequestreview-31',
+                  };
+                  personalRoute.reviews.push(review);
+                  return { data: review };
+                },
+              },
+            },
+            graphql: async (query: string, variables: Record<string, unknown>) =>
+              query.includes('DeliveryReviewDecision')
+                ? {
+                    repository: {
+                      pullRequest: { headRefOid: personalRoute.headSha, reviewDecision: 'REVIEW_REQUIRED' },
+                    },
+                  }
+                : syntheticDiscoveryClients().graphql(query, variables),
+          };
+        }
+        assert.equal(input.identity, 'host-author');
+        const clients = await actual.createDeliveryGitHubClients({
+          ...input,
+          env: { AUTHOR_TOKEN: 'selected-personal-token', GH_TOKEN: 'ambient-token' },
+        });
+        Object.assign(clients, {
+          authenticatedAuthor: async () => ({ actorLogin: 'host-user', credentialIdentity: 'user:37' }),
+          graphql: syntheticDiscoveryClients().graphql,
+          rest: {
+            issues: { get: async () => ({ data: { title: 'Synthetic issue' } }) },
+            git: { getRef: async () => ({ data: { object: { sha: personalRoute.baseSha } } }) },
+            pulls: {
+              list: async () => ({ data: [] }),
+              create: async () => ({ data: pr() }),
+              get: async () => ({ data: pr() }),
+            },
+            request: async () => Promise.reject(Object.assign(new Error('Rules unreadable'), { status: 403 })),
+          },
+        });
+        return clients;
+      }
+      const rest = new Octokit({
         request: {
           fetch: async () => {
             throw new Error('Unexpected network request in synthetic lifecycle test.');
           },
         },
-      }),
-    }),
+      });
+      if (input.role === 'reviewer') {
+        Object.assign(rest.repos, { get: async () => ({ data: { full_name: 'example/widget' } }) });
+      }
+      return {
+        ...syntheticDiscoveryClients(),
+        authSource: input.role === 'author' && input.config.roles.author.authSource === 'personal' ? 'personal' : 'app',
+        role: input.role,
+        ...(input.role === 'author'
+          ? {
+              authenticatedAuthor: async () => ({
+                actorLogin: input.config.roles.author.authSource === 'personal' ? 'host-user' : 'synthetic-author[bot]',
+                credentialIdentity: input.config.roles.author.authSource === 'personal' ? 'user:37' : 'app:201',
+              }),
+              credentialSource: input.config.roles.author.authSource === 'personal' ? 'env:AUTHOR_TOKEN' : 'app:author',
+            }
+          : {}),
+        ...(input.role === 'reviewer'
+          ? { appActorLogin: async () => 'synthetic-reviewer', credentialSource: 'app:reviewer' }
+          : {}),
+        rest,
+      };
+    },
   };
 });
 
@@ -99,6 +205,7 @@ async function fixture(
     remote?: string;
     divergentOrigin?: boolean;
     firstStageScript?: string;
+    personalAuthor?: boolean;
   } = {},
 ): Promise<{
   root: string;
@@ -142,14 +249,16 @@ async function fixture(
       policy: { contract: 'RepositoryDeliveryPolicy@1', module: './policy.mjs' },
       repository: 'example/widget',
       roles: {
-        author: {
-          credentialEnv: {
-            appId: 'AUTHOR_APP_ID',
-            installationId: 'AUTHOR_INSTALLATION_ID',
-            privateKeyPath: 'AUTHOR_KEY_PATH',
-          },
-          identity: 'synthetic-author',
-        },
+        author: options.personalAuthor
+          ? { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' }
+          : {
+              credentialEnv: {
+                appId: 'AUTHOR_APP_ID',
+                installationId: 'AUTHOR_INSTALLATION_ID',
+                privateKeyPath: 'AUTHOR_KEY_PATH',
+              },
+              identity: 'synthetic-author',
+            },
         reviewer: {
           credentialEnv: {
             appId: 'REVIEWER_APP_ID',
@@ -958,6 +1067,141 @@ test('the stage output bound covers both streams and publishes no checkpoint on 
     rmSync(root, { recursive: true, force: true });
   }
 });
+test('public PR dry run retains a configured host author and App reviewer', async () => {
+  const { root } = await fixture({ personalAuthor: true });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'host-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'host author change\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic host author change');
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    const result = (await executeTool(
+      'issue_pr_create',
+      { issueNumber: 17, dryRun: true },
+      { repoRoot: row.path, identity: 'host-author' },
+    )) as {
+      dryRun: boolean;
+      reviewRoute: {
+        author: { actorLogin: string; authSource: string; credentialSource: string };
+        reviewer: { actorLogin: string };
+        approvalEligibility: string;
+      };
+    };
+    assert.equal(result.dryRun, true);
+    assert.deepEqual(result.reviewRoute.author, {
+      actorLogin: 'host-user',
+      authSource: 'personal',
+      credentialSource: 'env:AUTHOR_TOKEN',
+      identity: 'host-author',
+    });
+    assert.equal(result.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer');
+    assert.equal(result.reviewRoute.approvalEligibility, 'unknown');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test('public dispatch publishes with selected host token and submits the configured App review once', async () => {
+  const { root, runtimeEntryPath } = await fixture({ personalAuthor: true });
+  const originalPath = process.env.PATH;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'host-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'host author publication\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic host publication');
+    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    personalRoute.baseSha = run.classification.base.sha;
+    personalRoute.headSha = run.classification.head.sha;
+    personalRoute.reviews.length = 0;
+    personalRoute.submitted = 0;
+    personalRoute.active = true;
+
+    const realGit = (originalPath ?? '')
+      .split(':')
+      .map((directory) => join(directory, 'git'))
+      .find(existsSync);
+    if (!realGit) throw new Error('Git executable unavailable for public transport test.');
+    git(root, 'config', '--local', '--unset', `url.${join(root, '.git', 'remote.git')}.insteadOf`);
+    const shimDir = join(root, '.git', 'git-shim');
+    const pushMarker = join(root, '.git', 'selected-host-push');
+    mkdirSync(shimDir);
+    const shim = join(shimDir, 'git');
+    writeFileSync(
+      shim,
+      `#!/bin/sh
+if [ "$1" = -c ] && [ "$2" = credential.helper= ] && [ "$3" = push ]; then
+  [ "$AI_DELIVERY_GIT_TOKEN" = selected-personal-token ] || exit 91
+  [ "$("$GIT_ASKPASS" Password)" = selected-personal-token ] || exit 92
+  : > "${pushMarker}"
+  exit 0
+fi
+exec "${realGit}" "$@"
+`,
+    );
+    chmodSync(shim, 0o700);
+    process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
+
+    const execution = { repoRoot: row.path, runtimeEntryPath, identity: 'host-author' };
+    const published = (await executeTool('issue_pr_create', { issueNumber: 17 }, execution)) as {
+      prNumber: number;
+      reviewRoute: { author: { actorLogin: string; credentialSource: string }; reviewer: { actorLogin: string } };
+    };
+    assert.equal(published.prNumber, 23);
+    assert.equal(existsSync(pushMarker), true);
+    assert.equal(published.reviewRoute.author.actorLogin, 'host-user');
+    assert.equal(published.reviewRoute.author.credentialSource, 'env:AUTHOR_TOKEN');
+    assert.equal(published.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer[bot]');
+    const info = (await executeTool('issue_pr_info', { prNumber: 23 }, execution)) as { authorLogin: string };
+    assert.equal(info.authorLogin, 'host-user');
+
+    const artifactContent = {
+      authorIdentity: 'host-author',
+      checks: ['verified exact diff'],
+      diffScopeHash: digestValue(run.classification.changedPaths),
+      elapsedMs: 1,
+      findings: [],
+      head: run.classification.head,
+      issueNumber: 17,
+      prNumber: 23,
+      readOnly: true,
+      requestedEffort: 'xhigh',
+      requestedModel: 'gpt-6-astra',
+      effectiveEffort: 'xhigh',
+      effectiveModel: 'gpt-6-astra',
+      reviewerIdentity: 'synthetic-reviewer',
+      schemaVersion: 'ai-delivery.review-artifact@1',
+      summary: 'Independent exact-head review',
+      verdict: 'approve',
+    };
+    const artifact = JSON.stringify({ ...artifactContent, artifactId: digestValue(artifactContent) });
+    const reviewInput = { issueNumber: 17, prNumber: 23, identity: 'synthetic-reviewer', artifact };
+    const first = (await executeTool('issue_pr_review', reviewInput, execution)) as {
+      receiptId: string;
+      reviewState: { status: string };
+    };
+    assert.equal(first.reviewState.status, 'still-required');
+    assert.equal(personalRoute.submitted, 1);
+    const second = (await executeTool('issue_pr_review', reviewInput, execution)) as { receiptId: string };
+    assert.equal(second.receiptId, first.receiptId);
+    assert.equal(personalRoute.submitted, 1);
+  } finally {
+    personalRoute.active = false;
+    personalRoute.reviews.length = 0;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15_000);
 
 test('scratch start derives safe names and reports the requested worktree', async () => {
   const { root, runtimeEntryPath } = await fixture();
@@ -1050,11 +1294,7 @@ test('MCP request rejects unsupported legacy options before lifecycle dispatch',
   }
 });
 
-test.each([
-  { remote: 'origin', divergentOrigin: false },
-  { remote: 'upstream', divergentOrigin: false },
-  { remote: 'upstream', divergentOrigin: true },
-])('synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin', async (routing) => {
+async function syntheticLifecycle(routing: { remote: string; divergentOrigin: boolean }): Promise<void> {
   const { root } = await fixture(routing);
   const remoteName = routing.remote;
   assert.equal(defaultBaseRef(root, remoteName), `refs/remotes/${remoteName}/main`);
@@ -1092,6 +1332,7 @@ test.each([
   let mergeSha = '';
   let stalePrReadbacks = 0;
   let review: Record<string, unknown> | null = null;
+  let reviewDecision: 'APPROVED' | 'REVIEW_REQUIRED' = 'REVIEW_REQUIRED';
   const calls: string[] = [];
   const createPayloads: Record<string, unknown>[] = [];
   const statuses = { Queued: 'todo', Active: 'active', Waiting: 'blocked', Shipped: 'done' };
@@ -1123,11 +1364,13 @@ test.each([
     merge_commit_sha: mergeSha || null,
     mergeable: true,
     mergeable_state: 'clean',
-    user: { login: 'synthetic-author' },
+    user: { login: 'synthetic-author[bot]' },
     head: { sha: headSha, ref: 'issue/17' },
     base: { sha: baseSha, ref: 'main' },
   });
   const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
+    if (query.includes('DeliveryReviewDecision'))
+      return { repository: { pullRequest: { headRefOid: headSha, reviewDecision } } };
     if (query.includes('ProjectDeliveryConfiguration'))
       return {
         organization: {
@@ -1262,6 +1505,10 @@ test.each([
   };
   const rest = {
     request: async (route: string, parameters: Record<string, unknown>) => {
+      if (route === 'GET /repos/{owner}/{repo}/rules/branches/{branch}')
+        return { data: [{ type: 'pull_request', parameters: { required_approving_review_count: 1 } }] };
+      if (route === 'GET /repos/{owner}/{repo}/branches/{branch}/protection')
+        throw Object.assign(new Error('Synthetic protected branch visibility unavailable'), { status: 403 });
       if (route === 'GET /orgs/{org}/issue-fields')
         return {
           data: [
@@ -1499,10 +1746,7 @@ test.each([
     headSha = git(row.path, 'rev-parse', 'HEAD');
     const run = await verifyIssue({ issueNumber, repoRoot: row.path });
     await assert.rejects(publishPr(context, { issueNumber, body: 'Closes #17' }), /Delivery Impact/);
-    await assert.rejects(
-      publishPr(context, { issueNumber }),
-      /Git push requires the selected author GitHub App installation token/,
-    );
+    await assert.rejects(publishPr(context, { issueNumber }), /Git push requires the selected author credential token/);
     // The public push requires a real author App installation token. Bind a synthetic
     // publication at that external boundary so the remaining public phases run offline.
     git(row.path, 'push', '-q', remoteName, `${headSha}:refs/heads/issue/17`);
@@ -1537,7 +1781,9 @@ test.each([
       status: 'pr-published',
     });
     assert.equal((await listPrs(context)).pullRequests[0]?.number, prNumber);
+    assert.equal((await prInfo(context, { prNumber })).authorLogin, 'synthetic-author[bot]');
     assert.equal((await prChecks(context, prNumber)).combinedStatus, 'success');
+    assert.equal((await prChecks(context, prNumber)).reviewState.status, 'still-required');
     await assert.rejects(checkoutPr(context, prNumber), /open in-repository branch/u);
     assert.equal(git(remote, 'rev-parse', 'refs/heads/issue/17'), headSha);
     await assert.rejects(mergePr(context, { issueNumber, prNumber }), /submitted independent review/);
@@ -1575,8 +1821,11 @@ test.each([
     );
     const reviewResult = await submitFormalReview(reviewer, { artifact, issueNumber, prNumber });
     assert.equal(reviewResult.githubReviewId, 31);
+    assert.equal(reviewResult.reviewState.status, 'still-required');
     await publishPr(context, { issueNumber, draft: false });
     assert.equal(prDraft, false);
+    await assert.rejects(mergePr(context, { issueNumber, prNumber }), /submitted APPROVED review.*still requires/u);
+    reviewDecision = 'APPROVED';
     checksPassed = false;
     await assert.rejects(mergePr(context, { issueNumber, prNumber }), /failed or pending checks/);
     checksPassed = true;
@@ -1614,7 +1863,9 @@ test.each([
     const result = JSON.parse(originalResult) as Record<string, unknown>;
     const { resultId: _resultId, ...resultContent } = result;
     const wrongResult = { ...resultContent, mergeSha: 'a'.repeat(40) };
-    writeFileSync(resultPath, JSON.stringify({ ...wrongResult, resultId: digestValue(wrongResult) }), { mode: 0o600 });
+    writeFileSync(resultPath, JSON.stringify({ ...wrongResult, resultId: digestValue(wrongResult) }), {
+      mode: 0o600,
+    });
     await assert.rejects(
       finishIssue(context, { issueNumber, prNumber, strategy: 'merge' }),
       /exact prepared merge intent/u,
@@ -1685,4 +1936,14 @@ test.each([
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}
+
+test.each([
+  { remote: 'origin', divergentOrigin: false },
+  { remote: 'upstream', divergentOrigin: false },
+  { remote: 'upstream', divergentOrigin: true },
+])(
+  'synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin',
+  syntheticLifecycle,
+  15_000,
+);

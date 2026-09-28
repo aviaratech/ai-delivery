@@ -7,7 +7,7 @@ import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import { contextFor, executeTool, type ExecutionContext } from './dispatch.js';
 import { git, gitExitCode, primaryGitRoot } from './git.js';
 import { listIssueSubissues } from './issue.js';
-import { checkoutPr, listPrs, prChecks } from './pr.js';
+import { checkoutPr, listPrs, preflightReviewRoute, prChecks } from './pr.js';
 import { serveAiDeliveryMcp } from './mcp/index.js';
 import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
@@ -20,9 +20,9 @@ const program = new Command();
 program
   .name('ai-delivery')
   .description('Generic GitHub issue and pull request delivery')
-  .version('0.2.1')
+  .version('0.3.0')
   .option('--identity <name>', 'Configured author or reviewer identity')
-  .option('--personal-auth', 'Explicit personal-token author mode')
+  .option('--personal-auth', 'Explicit legacy personal-token author override')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
   .option('--repo-root <path>', 'Target Git repository root', process.cwd());
 
@@ -351,7 +351,11 @@ program
   .description('Read the effective GitHub destination and admission digest')
   .action(async () => {
     const context = await contextFor(execution(), 'config:resolve');
-    print({ configDigest: context.configuration?.configDigest, routing: context.configuration?.routing });
+    print({
+      configDigest: context.configuration?.configDigest,
+      routing: context.configuration?.routing,
+      reviewRoute: await preflightReviewRoute(context),
+    });
   });
 program.command('mcp:serve').action(async () => serveAiDeliveryMcp(execution()));
 
