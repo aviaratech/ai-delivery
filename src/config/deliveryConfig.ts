@@ -340,11 +340,23 @@ export async function loadDeliveryConfig(
       ...(legacyPersonalAuth ? { personalAuth: { enabled: true as const } } : {}),
       role: 'author',
     }));
-  const routing = await discoverDeliveryRouting({
-    clients,
-    repository: settings.repository,
-    overrides: settings.overrides,
-  });
+  let routing: DeliveryRouting;
+  try {
+    routing = await discoverDeliveryRouting({
+      clients,
+      repository: settings.repository,
+      overrides: settings.overrides,
+    });
+  } catch (error) {
+    if (
+      options.clients === undefined &&
+      settings.roles.author.authSource === 'personal' &&
+      (error as { status?: number }).status === 401
+    ) {
+      throw new DeliveryError('Configured personal author token is invalid or expired; refresh the selected token.');
+    }
+    throw error;
+  }
   const config = parseDeliveryConfig({
     schemaVersion: 'ai-delivery.config@2',
     repository: routing.repository,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'vitest';
@@ -17,11 +17,13 @@ const head = { sha: 'a'.repeat(40), tree: 'b'.repeat(40) };
 const publicationEvidenceId = `sha256:${'c'.repeat(64)}`;
 const marker = (id: string) => `<!-- ai-delivery-review-artifact: ${id} -->`;
 
-function fixture(input: { authorLogin?: string | null; existingReview?: boolean; reviewLogin?: string } = {}) {
+function fixture(
+  input: { authorLogin?: string | null; existingReview?: boolean; personalAuthor?: boolean; reviewLogin?: string } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-review-'));
   execFileSync('git', ['init', '-q', root]);
   const artifactContent = {
-    authorIdentity: 'synthetic-author',
+    authorIdentity: input.personalAuthor ? 'host-author' : 'synthetic-author',
     checks: ['build'],
     diffScopeHash: digestValue(['change.ts']),
     elapsedMs: 1,
@@ -56,7 +58,12 @@ function fixture(input: { authorLogin?: string | null; existingReview?: boolean;
     root,
     repo: { owner: 'example', repo: 'repo' },
     config: {
-      roles: { author: { identity: 'synthetic-author' }, reviewer: { identity: 'synthetic-reviewer' } },
+      roles: {
+        author: input.personalAuthor
+          ? { authSource: 'personal', identity: 'host-author' }
+          : { identity: 'synthetic-author' },
+        reviewer: { identity: 'synthetic-reviewer' },
+      },
     } as DeliveryConfig,
     clients: {
       authSource: 'app',
@@ -126,6 +133,19 @@ test('reviewer App bot submits and reuses an exact-head approval without GET /us
   }
 });
 
+test('configured App reviewer approves a host-authored PR once at the exact head', async () => {
+  const state = fixture({ authorLogin: 'host-user', personalAuthor: true });
+  try {
+    const first = await state.submit();
+    assert.equal(first.login, 'synthetic-reviewer[bot]');
+    assert.equal(state.created, 1);
+    assert.equal((await state.submit()).receiptId, first.receiptId);
+    assert.equal(state.created, 1);
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
 test('reviewer App bot recovers a matching remote marker without another review', async () => {
   const state = fixture({ existingReview: true });
   try {
@@ -171,6 +191,7 @@ test('live GitHub review decision distinguishes a submitted review from a satisf
     assert.equal(pending.status, 'still-required');
     assert.equal(pending.reviewDecision, 'REVIEW_REQUIRED');
     assert.match(pending.nextAction, /eligible independent reviewer/u);
+    assert.doesNotMatch(pending.nextAction, /submitted APPROVED review/u);
     context.clients.graphql = (async () => ({
       repository: { pullRequest: { headRefOid: head.sha, reviewDecision: 'APPROVED' } },
     })) as never;
@@ -418,6 +439,30 @@ exit 97
     const authorContext = { root, repo: { owner: 'example', repo: 'repo' }, clients: author } as DeliveryContext;
     await runAuthorGit(
       authorContext,
+      root,
+      ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
+      'push',
+    );
+    assert.equal(existsSync(marker), true);
+    const personalConfig = {
+      ...config,
+      roles: {
+        author: { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' },
+        reviewer: config.roles.reviewer,
+      },
+    } as DeliveryConfig;
+    const personal = await createDeliveryGitHubClients({
+      config: personalConfig,
+      env: { ...env, AUTHOR_TOKEN: 'selected-personal-token', GH_TOKEN: 'ambient-token' },
+      identity: 'host-author',
+      role: 'author',
+    });
+    assert.equal(await withAuthorGitToken(personal, (token) => token), 'selected-personal-token');
+    writeFileSync(shim, readFileSync(shim, 'utf8').replaceAll('ghs_synthetic_author', 'selected-personal-token'));
+    chmodSync(shim, 0o700);
+    rmSync(marker);
+    await runAuthorGit(
+      { ...authorContext, clients: personal },
       root,
       ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
       'push',

@@ -125,7 +125,7 @@ export async function readRequiredReviewState(
       reviewDecision: 'REVIEW_REQUIRED',
       status: 'still-required',
       nextAction:
-        'A submitted APPROVED review has not satisfied GitHub requirements. Inspect the active rule and obtain a qualifying approval from an eligible independent reviewer; do not resubmit the same artifact or change actors automatically.',
+        'GitHub still requires a qualifying approval. Inspect the active rule and obtain approval from an eligible independent reviewer; do not change actors or protections automatically.',
     };
   }
   if (pr.reviewDecision === 'CHANGES_REQUESTED') {

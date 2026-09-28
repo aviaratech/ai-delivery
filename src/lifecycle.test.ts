@@ -55,7 +55,10 @@ vi.mock('./github/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./github/client.js')>();
   return {
     ...actual,
-    createDeliveryGitHubClients: async (input: { role: 'author' | 'reviewer' }) => {
+    createDeliveryGitHubClients: async (input: {
+      config: { roles: { author: { authSource?: string } } };
+      role: 'author' | 'reviewer';
+    }) => {
       const rest = new Octokit({
         request: {
           fetch: async () => {
@@ -68,8 +71,17 @@ vi.mock('./github/client.js', async (importOriginal) => {
       }
       return {
         ...syntheticDiscoveryClients(),
-        authSource: 'app',
+        authSource: input.role === 'author' && input.config.roles.author.authSource === 'personal' ? 'personal' : 'app',
         role: input.role,
+        ...(input.role === 'author'
+          ? {
+              authenticatedAuthor: async () => ({
+                actorLogin: input.config.roles.author.authSource === 'personal' ? 'host-user' : 'synthetic-author[bot]',
+                credentialIdentity: input.config.roles.author.authSource === 'personal' ? 'user:37' : 'app:201',
+              }),
+              credentialSource: input.config.roles.author.authSource === 'personal' ? 'env:AUTHOR_TOKEN' : 'app:author',
+            }
+          : {}),
         ...(input.role === 'reviewer'
           ? { appActorLogin: async () => 'synthetic-reviewer', credentialSource: 'app:reviewer' }
           : {}),
@@ -108,6 +120,7 @@ async function fixture(
     remote?: string;
     divergentOrigin?: boolean;
     firstStageScript?: string;
+    personalAuthor?: boolean;
   } = {},
 ): Promise<{
   root: string;
@@ -151,14 +164,16 @@ async function fixture(
       policy: { contract: 'RepositoryDeliveryPolicy@1', module: './policy.mjs' },
       repository: 'example/widget',
       roles: {
-        author: {
-          credentialEnv: {
-            appId: 'AUTHOR_APP_ID',
-            installationId: 'AUTHOR_INSTALLATION_ID',
-            privateKeyPath: 'AUTHOR_KEY_PATH',
-          },
-          identity: 'synthetic-author',
-        },
+        author: options.personalAuthor
+          ? { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' }
+          : {
+              credentialEnv: {
+                appId: 'AUTHOR_APP_ID',
+                installationId: 'AUTHOR_INSTALLATION_ID',
+                privateKeyPath: 'AUTHOR_KEY_PATH',
+              },
+              identity: 'synthetic-author',
+            },
         reviewer: {
           credentialEnv: {
             appId: 'REVIEWER_APP_ID',
@@ -967,6 +982,44 @@ test('the stage output bound covers both streams and publishes no checkpoint on 
     rmSync(root, { recursive: true, force: true });
   }
 });
+test('public PR dry run retains a configured host author and App reviewer', async () => {
+  const { root } = await fixture({ personalAuthor: true });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'host-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'host author change\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic host author change');
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    const result = (await executeTool(
+      'issue_pr_create',
+      { issueNumber: 17, dryRun: true },
+      { repoRoot: row.path, identity: 'host-author' },
+    )) as {
+      dryRun: boolean;
+      reviewRoute: {
+        author: { actorLogin: string; authSource: string; credentialSource: string };
+        reviewer: { actorLogin: string };
+        approvalEligibility: string;
+      };
+    };
+    assert.equal(result.dryRun, true);
+    assert.deepEqual(result.reviewRoute.author, {
+      actorLogin: 'host-user',
+      authSource: 'personal',
+      credentialSource: 'env:AUTHOR_TOKEN',
+      identity: 'host-author',
+    });
+    assert.equal(result.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer');
+    assert.equal(result.reviewRoute.approvalEligibility, 'unknown');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15_000);
 
 test('scratch start derives safe names and reports the requested worktree', async () => {
   const { root, runtimeEntryPath } = await fixture();
