@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   cpSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -51,14 +52,98 @@ import {
   prepareStandaloneWorktree,
 } from './worktree.js';
 
+const personalRoute = vi.hoisted(() => ({
+  active: false,
+  baseSha: '',
+  headSha: '',
+  reviews: [] as Array<{
+    id: number;
+    body: string;
+    state: 'APPROVED';
+    commit_id: string;
+    user: { login: string };
+    html_url: string;
+  }>,
+  submitted: 0,
+}));
+
 vi.mock('./github/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./github/client.js')>();
   return {
     ...actual,
-    createDeliveryGitHubClients: async (input: {
-      config: { roles: { author: { authSource?: string } } };
-      role: 'author' | 'reviewer';
-    }) => {
+    createDeliveryGitHubClients: async (input: Parameters<typeof actual.createDeliveryGitHubClients>[0]) => {
+      if (personalRoute.active && input.config.roles.author.authSource === 'personal') {
+        const pr = () => ({
+          number: 23,
+          node_id: 'PR-23',
+          html_url: 'https://github.com/example/widget/pull/23',
+          head: { sha: personalRoute.headSha, ref: 'issue/17' },
+          base: { sha: personalRoute.baseSha, ref: 'main' },
+          state: 'open',
+          draft: true,
+          user: { login: 'host-user' },
+        });
+        if (input.role === 'reviewer') {
+          assert.equal(input.identity, 'synthetic-reviewer');
+          return {
+            ...syntheticDiscoveryClients(),
+            authSource: 'app',
+            credentialSource: 'app:reviewer',
+            role: 'reviewer',
+            appActorLogin: async () => 'synthetic-reviewer[bot]',
+            rest: {
+              repos: { get: async () => ({ data: { full_name: 'example/widget' } }) },
+              pulls: {
+                get: async () => ({ data: pr() }),
+                listReviews: async () => ({ data: personalRoute.reviews }),
+                createReview: async (request: { body: string; commit_id: string; event: string }) => {
+                  assert.equal(request.event, 'APPROVE');
+                  assert.equal(request.commit_id, personalRoute.headSha);
+                  personalRoute.submitted += 1;
+                  const review = {
+                    id: 31,
+                    body: request.body,
+                    state: 'APPROVED' as const,
+                    commit_id: personalRoute.headSha,
+                    user: { login: 'synthetic-reviewer[bot]' },
+                    html_url: 'https://github.com/example/widget/pull/23#pullrequestreview-31',
+                  };
+                  personalRoute.reviews.push(review);
+                  return { data: review };
+                },
+              },
+            },
+            graphql: async (query: string, variables: Record<string, unknown>) =>
+              query.includes('DeliveryReviewDecision')
+                ? {
+                    repository: {
+                      pullRequest: { headRefOid: personalRoute.headSha, reviewDecision: 'REVIEW_REQUIRED' },
+                    },
+                  }
+                : syntheticDiscoveryClients().graphql(query, variables),
+          };
+        }
+        assert.equal(input.identity, 'host-author');
+        const clients = await actual.createDeliveryGitHubClients({
+          ...input,
+          env: { AUTHOR_TOKEN: 'selected-personal-token', GH_TOKEN: 'ambient-token' },
+        });
+        Object.assign(clients, {
+          authenticatedAuthor: async () => ({ actorLogin: 'host-user', credentialIdentity: 'user:37' }),
+          graphql: syntheticDiscoveryClients().graphql,
+          rest: {
+            issues: { get: async () => ({ data: { title: 'Synthetic issue' } }) },
+            git: { getRef: async () => ({ data: { object: { sha: personalRoute.baseSha } } }) },
+            pulls: {
+              list: async () => ({ data: [] }),
+              create: async () => ({ data: pr() }),
+              get: async () => ({ data: pr() }),
+            },
+            request: async () => Promise.reject(Object.assign(new Error('Rules unreadable'), { status: 403 })),
+          },
+        });
+        return clients;
+      }
       const rest = new Octokit({
         request: {
           fetch: async () => {
@@ -779,6 +864,103 @@ test('public PR dry run retains a configured host author and App reviewer', asyn
     assert.equal(result.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer');
     assert.equal(result.reviewRoute.approvalEligibility, 'unknown');
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test('public dispatch publishes with selected host token and submits the configured App review once', async () => {
+  const { root, runtimeEntryPath } = await fixture({ personalAuthor: true });
+  const originalPath = process.env.PATH;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'host-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'host author publication\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic host publication');
+    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    personalRoute.baseSha = run.classification.base.sha;
+    personalRoute.headSha = run.classification.head.sha;
+    personalRoute.reviews.length = 0;
+    personalRoute.submitted = 0;
+    personalRoute.active = true;
+
+    const realGit = (originalPath ?? '')
+      .split(':')
+      .map((directory) => join(directory, 'git'))
+      .find(existsSync);
+    if (!realGit) throw new Error('Git executable unavailable for public transport test.');
+    git(root, 'config', '--local', '--unset', `url.${join(root, '.git', 'remote.git')}.insteadOf`);
+    const shimDir = join(root, '.git', 'git-shim');
+    const pushMarker = join(root, '.git', 'selected-host-push');
+    mkdirSync(shimDir);
+    const shim = join(shimDir, 'git');
+    writeFileSync(
+      shim,
+      `#!/bin/sh
+if [ "$1" = -c ] && [ "$2" = credential.helper= ] && [ "$3" = push ]; then
+  [ "$AI_DELIVERY_GIT_TOKEN" = selected-personal-token ] || exit 91
+  [ "$("$GIT_ASKPASS" Password)" = selected-personal-token ] || exit 92
+  : > "${pushMarker}"
+  exit 0
+fi
+exec "${realGit}" "$@"
+`,
+    );
+    chmodSync(shim, 0o700);
+    process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
+
+    const execution = { repoRoot: row.path, runtimeEntryPath, identity: 'host-author' };
+    const published = (await executeTool('issue_pr_create', { issueNumber: 17 }, execution)) as {
+      prNumber: number;
+      reviewRoute: { author: { actorLogin: string; credentialSource: string }; reviewer: { actorLogin: string } };
+    };
+    assert.equal(published.prNumber, 23);
+    assert.equal(existsSync(pushMarker), true);
+    assert.equal(published.reviewRoute.author.actorLogin, 'host-user');
+    assert.equal(published.reviewRoute.author.credentialSource, 'env:AUTHOR_TOKEN');
+    assert.equal(published.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer[bot]');
+    const info = (await executeTool('issue_pr_info', { prNumber: 23 }, execution)) as { authorLogin: string };
+    assert.equal(info.authorLogin, 'host-user');
+
+    const artifactContent = {
+      authorIdentity: 'host-author',
+      checks: ['verified exact diff'],
+      diffScopeHash: digestValue(run.classification.changedPaths),
+      elapsedMs: 1,
+      findings: [],
+      head: run.classification.head,
+      issueNumber: 17,
+      prNumber: 23,
+      readOnly: true,
+      requestedEffort: 'xhigh',
+      requestedModel: 'gpt-6-astra',
+      effectiveEffort: 'xhigh',
+      effectiveModel: 'gpt-6-astra',
+      reviewerIdentity: 'synthetic-reviewer',
+      schemaVersion: 'ai-delivery.review-artifact@1',
+      summary: 'Independent exact-head review',
+      verdict: 'approve',
+    };
+    const artifact = JSON.stringify({ ...artifactContent, artifactId: digestValue(artifactContent) });
+    const reviewInput = { issueNumber: 17, prNumber: 23, identity: 'synthetic-reviewer', artifact };
+    const first = (await executeTool('issue_pr_review', reviewInput, execution)) as {
+      receiptId: string;
+      reviewState: { status: string };
+    };
+    assert.equal(first.reviewState.status, 'still-required');
+    assert.equal(personalRoute.submitted, 1);
+    const second = (await executeTool('issue_pr_review', reviewInput, execution)) as { receiptId: string };
+    assert.equal(second.receiptId, first.receiptId);
+    assert.equal(personalRoute.submitted, 1);
+  } finally {
+    personalRoute.active = false;
+    personalRoute.reviews.length = 0;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
     rmSync(root, { recursive: true, force: true });
   }
 }, 15_000);
