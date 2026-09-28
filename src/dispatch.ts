@@ -19,7 +19,7 @@ import {
   type CreateIssueInput,
   type UpdateIssueInput,
 } from './issue.js';
-import { finishIssue, mergePr, prInfo, publishPr, submitFormalReview } from './pr.js';
+import { finishIssue, mergePr, preflightReviewRoute, prInfo, publishPr, submitFormalReview } from './pr.js';
 import { parseReviewArtifact, reviewArtifactApproval, savePrepublicationArtifact } from './review.js';
 import { evaluateAgentReadiness } from './services/agentReadinessService.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
@@ -360,7 +360,8 @@ export async function executeTool(
       const root = primaryGitRoot(execution.repoRoot);
       const row = getIssueWorktreeStrict(issueNumber, root);
       const run = await verifyIssue({
-        personalAuth: context.clients.authSource === 'personal',
+        personalAuth:
+          context.clients.authSource === 'personal' && context.config.roles.author.authSource !== 'personal',
         issueNumber,
         repoRoot: row.path,
         ...(input.admit === undefined
@@ -386,7 +387,8 @@ export async function executeTool(
         approval = reviewArtifactApproval({ artifact, classification: run.classification, config, issueNumber });
       }
       const evidence = await createIssuePhaseEvidence({
-        personalAuth: context.clients.authSource === 'personal',
+        personalAuth:
+          context.clients.authSource === 'personal' && context.config.roles.author.authSource !== 'personal',
         ...(approval === undefined ? {} : { approval }),
         issueNumber,
         phase: 'verify',
@@ -404,7 +406,12 @@ export async function executeTool(
       if (input.dryRun === true) {
         const row = getIssueWorktreeStrict(issueNumber, context.root);
         const run = loadVerifiedRun(row.path, issueNumber);
-        return { dryRun: true, headSha: run.classification.head.sha, risk: run.classification.risk };
+        return {
+          dryRun: true,
+          headSha: run.classification.head.sha,
+          risk: run.classification.risk,
+          reviewRoute: await preflightReviewRoute(context),
+        };
       }
       return publishPr(context, {
         issueNumber,

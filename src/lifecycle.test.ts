@@ -39,7 +39,7 @@ import {
   updateIssue,
   type DeliveryContext,
 } from './issue.js';
-import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, publishPr, submitFormalReview } from './pr.js';
+import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, prInfo, publishPr, submitFormalReview } from './pr.js';
 import { updateIssueWorktreeDelivery } from './services/worktreeRegistry.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
@@ -55,18 +55,27 @@ vi.mock('./github/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./github/client.js')>();
   return {
     ...actual,
-    createDeliveryGitHubClients: async (input: { role: 'author' | 'reviewer' }) => ({
-      ...syntheticDiscoveryClients(),
-      authSource: 'app',
-      role: input.role,
-      rest: new Octokit({
+    createDeliveryGitHubClients: async (input: { role: 'author' | 'reviewer' }) => {
+      const rest = new Octokit({
         request: {
           fetch: async () => {
             throw new Error('Unexpected network request in synthetic lifecycle test.');
           },
         },
-      }),
-    }),
+      });
+      if (input.role === 'reviewer') {
+        Object.assign(rest.repos, { get: async () => ({ data: { full_name: 'example/widget' } }) });
+      }
+      return {
+        ...syntheticDiscoveryClients(),
+        authSource: 'app',
+        role: input.role,
+        ...(input.role === 'reviewer'
+          ? { appActorLogin: async () => 'synthetic-reviewer', credentialSource: 'app:reviewer' }
+          : {}),
+        rest,
+      };
+    },
   };
 });
 
@@ -810,11 +819,7 @@ test('MCP request rejects unsupported legacy options before lifecycle dispatch',
   }
 });
 
-test.each([
-  { remote: 'origin', divergentOrigin: false },
-  { remote: 'upstream', divergentOrigin: false },
-  { remote: 'upstream', divergentOrigin: true },
-])('synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin', async (routing) => {
+async function syntheticLifecycle(routing: { remote: string; divergentOrigin: boolean }): Promise<void> {
   const { root } = await fixture(routing);
   const remoteName = routing.remote;
   assert.equal(defaultBaseRef(root, remoteName), `refs/remotes/${remoteName}/main`);
@@ -852,6 +857,7 @@ test.each([
   let mergeSha = '';
   let stalePrReadbacks = 0;
   let review: Record<string, unknown> | null = null;
+  let reviewDecision: 'APPROVED' | 'REVIEW_REQUIRED' = 'REVIEW_REQUIRED';
   const calls: string[] = [];
   const createPayloads: Record<string, unknown>[] = [];
   const statuses = { Queued: 'todo', Active: 'active', Waiting: 'blocked', Shipped: 'done' };
@@ -883,11 +889,13 @@ test.each([
     merge_commit_sha: mergeSha || null,
     mergeable: true,
     mergeable_state: 'clean',
-    user: { login: 'synthetic-author' },
+    user: { login: 'synthetic-author[bot]' },
     head: { sha: headSha, ref: 'issue/17' },
     base: { sha: baseSha, ref: 'main' },
   });
   const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
+    if (query.includes('DeliveryReviewDecision'))
+      return { repository: { pullRequest: { headRefOid: headSha, reviewDecision } } };
     if (query.includes('ProjectDeliveryConfiguration'))
       return {
         organization: {
@@ -1022,6 +1030,10 @@ test.each([
   };
   const rest = {
     request: async (route: string, parameters: Record<string, unknown>) => {
+      if (route === 'GET /repos/{owner}/{repo}/rules/branches/{branch}')
+        return { data: [{ type: 'pull_request', parameters: { required_approving_review_count: 1 } }] };
+      if (route === 'GET /repos/{owner}/{repo}/branches/{branch}/protection')
+        throw Object.assign(new Error('Synthetic protected branch visibility unavailable'), { status: 403 });
       if (route === 'GET /orgs/{org}/issue-fields')
         return {
           data: [
@@ -1259,10 +1271,7 @@ test.each([
     headSha = git(row.path, 'rev-parse', 'HEAD');
     const run = await verifyIssue({ issueNumber, repoRoot: row.path });
     await assert.rejects(publishPr(context, { issueNumber, body: 'Closes #17' }), /Delivery Impact/);
-    await assert.rejects(
-      publishPr(context, { issueNumber }),
-      /Git push requires the selected author GitHub App installation token/,
-    );
+    await assert.rejects(publishPr(context, { issueNumber }), /Git push requires the selected author credential token/);
     // The public push requires a real author App installation token. Bind a synthetic
     // publication at that external boundary so the remaining public phases run offline.
     git(row.path, 'push', '-q', remoteName, `${headSha}:refs/heads/issue/17`);
@@ -1297,7 +1306,9 @@ test.each([
       status: 'pr-published',
     });
     assert.equal((await listPrs(context)).pullRequests[0]?.number, prNumber);
+    assert.equal((await prInfo(context, { prNumber })).authorLogin, 'synthetic-author[bot]');
     assert.equal((await prChecks(context, prNumber)).combinedStatus, 'success');
+    assert.equal((await prChecks(context, prNumber)).reviewState.status, 'still-required');
     await assert.rejects(checkoutPr(context, prNumber), /open in-repository branch/u);
     assert.equal(git(remote, 'rev-parse', 'refs/heads/issue/17'), headSha);
     await assert.rejects(mergePr(context, { issueNumber, prNumber }), /submitted independent review/);
@@ -1335,8 +1346,11 @@ test.each([
     );
     const reviewResult = await submitFormalReview(reviewer, { artifact, issueNumber, prNumber });
     assert.equal(reviewResult.githubReviewId, 31);
+    assert.equal(reviewResult.reviewState.status, 'still-required');
     await publishPr(context, { issueNumber, draft: false });
     assert.equal(prDraft, false);
+    await assert.rejects(mergePr(context, { issueNumber, prNumber }), /submitted APPROVED review.*still requires/u);
+    reviewDecision = 'APPROVED';
     checksPassed = false;
     await assert.rejects(mergePr(context, { issueNumber, prNumber }), /failed or pending checks/);
     checksPassed = true;
@@ -1374,7 +1388,9 @@ test.each([
     const result = JSON.parse(originalResult) as Record<string, unknown>;
     const { resultId: _resultId, ...resultContent } = result;
     const wrongResult = { ...resultContent, mergeSha: 'a'.repeat(40) };
-    writeFileSync(resultPath, JSON.stringify({ ...wrongResult, resultId: digestValue(wrongResult) }), { mode: 0o600 });
+    writeFileSync(resultPath, JSON.stringify({ ...wrongResult, resultId: digestValue(wrongResult) }), {
+      mode: 0o600,
+    });
     await assert.rejects(
       finishIssue(context, { issueNumber, prNumber, strategy: 'merge' }),
       /exact prepared merge intent/u,
@@ -1445,4 +1461,14 @@ test.each([
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}
+
+test.each([
+  { remote: 'origin', divergentOrigin: false },
+  { remote: 'upstream', divergentOrigin: false },
+  { remote: 'upstream', divergentOrigin: true },
+])(
+  'synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin',
+  syntheticLifecycle,
+  15_000,
+);

@@ -10,8 +10,8 @@ import type { DeliveryConfig } from './config/deliveryConfig.js';
 import { digestValue, type RepositoryClassificationReceipt } from './delivery/index.js';
 import { createDeliveryGitHubClients, withAuthorGitToken } from './github/client.js';
 import type { DeliveryContext } from './issue.js';
-import { runAuthorGit } from './pr.js';
-import { ReviewArtifactSchema, submitReview } from './review.js';
+import { preflightReviewRoute, runAuthorGit } from './pr.js';
+import { readRequiredReviewState, ReviewArtifactSchema, submitReview } from './review.js';
 
 const head = { sha: 'a'.repeat(40), tree: 'b'.repeat(40) };
 const publicationEvidenceId = `sha256:${'c'.repeat(64)}`;
@@ -155,6 +155,128 @@ test('reviewer App rejects self review and a foreign marker actor', async () => 
   }
 });
 
+test('live GitHub review decision distinguishes a submitted review from a satisfied requirement', async () => {
+  const state = fixture();
+  try {
+    const context = {
+      root: state.root,
+      repo: { owner: 'example', repo: 'repo' },
+      clients: {
+        graphql: async () => ({
+          repository: { pullRequest: { headRefOid: head.sha, reviewDecision: 'REVIEW_REQUIRED' } },
+        }),
+      },
+    } as unknown as DeliveryContext;
+    const pending = await readRequiredReviewState(context, 19, head.sha);
+    assert.equal(pending.status, 'still-required');
+    assert.equal(pending.reviewDecision, 'REVIEW_REQUIRED');
+    assert.match(pending.nextAction, /eligible independent reviewer/u);
+    context.clients.graphql = (async () => ({
+      repository: { pullRequest: { headRefOid: head.sha, reviewDecision: 'APPROVED' } },
+    })) as never;
+    const satisfied = await readRequiredReviewState(context, 19, head.sha);
+    assert.equal(satisfied.status, 'satisfied');
+    context.clients.graphql = (async () => {
+      throw new Error('Repository rules unreadable');
+    }) as never;
+    const unknown = await readRequiredReviewState(context, 19, head.sha);
+    assert.equal(unknown.status, 'unknown');
+    assert.match(unknown.nextAction, /inspect the PR review requirement/iu);
+    context.clients.graphql = (async () => ({ repository: null })) as never;
+    assert.equal((await readRequiredReviewState(context, 19, head.sha)).status, 'unknown');
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
+test('prepublication review route reports selected actors and unknown approval eligibility', async () => {
+  const author = {
+    authSource: 'personal',
+    credentialSource: 'env:AUTHOR_TOKEN',
+    role: 'author',
+    authenticatedAuthor: async () => ({ actorLogin: 'host-user', credentialIdentity: 'user:37' }),
+    rest: {
+      request: async (route: string) => {
+        if (route === 'GET /repos/{owner}/{repo}/rules/branches/{branch}')
+          return { data: [{ type: 'pull_request', parameters: { required_approving_review_count: 1 } }] };
+        if (route === 'GET /repos/{owner}/{repo}/branches/{branch}/protection')
+          throw Object.assign(new Error('not visible'), { status: 403 });
+        throw new Error(`Unexpected route ${route}`);
+      },
+    },
+  };
+  const reviewer = {
+    authSource: 'app',
+    credentialSource: 'app:102:installation:202',
+    role: 'reviewer',
+    appActorLogin: async () => 'reviewer-app[bot]',
+    rest: { repos: { get: async () => ({ data: { full_name: 'example/repo' } }) } },
+  };
+  const context = {
+    repo: { owner: 'example', repo: 'repo' },
+    config: {
+      roles: { author: { authSource: 'personal', identity: 'host-author' }, reviewer: { identity: 'reviewer-app' } },
+    },
+    clients: author,
+  } as unknown as DeliveryContext;
+  const route = await preflightReviewRoute(context, 'main', reviewer as never);
+  assert.equal(route.author.actorLogin, 'host-user');
+  assert.equal(route.author.credentialSource, 'env:AUTHOR_TOKEN');
+  assert.equal(route.reviewer.actorLogin, 'reviewer-app[bot]');
+  assert.equal(route.reviewer.repositoryAccess, 'readable');
+  assert.equal(route.rules.visibility, 'partial');
+  assert.equal(route.rules.observedRequiredApprovals, 1);
+  assert.equal(route.approvalEligibility, 'unknown');
+  assert.match(route.nextAction, /confirm whether the reviewer approval counts/u);
+  const unreadable = await preflightReviewRoute(
+    {
+      ...context,
+      clients: {
+        ...author,
+        rest: { request: async () => Promise.reject(new Error('Rules unavailable')) },
+      },
+    } as unknown as DeliveryContext,
+    'main',
+    reviewer as never,
+  );
+  assert.equal(unreadable.rules.visibility, 'unknown');
+  assert.equal(unreadable.rules.observedRequiredApprovals, null);
+  const appRoute = await preflightReviewRoute(
+    {
+      ...context,
+      config: { roles: { author: { identity: 'author-app' }, reviewer: { identity: 'reviewer-app' } } },
+      clients: {
+        ...author,
+        authSource: 'app',
+        credentialSource: 'app:101:installation:201',
+        authenticatedAuthor: async () => ({
+          actorLogin: 'author-app[bot]',
+          credentialIdentity: 'app:101:installation:201',
+        }),
+      },
+    } as unknown as DeliveryContext,
+    'main',
+    reviewer as never,
+  );
+  assert.equal(appRoute.author.actorLogin, 'author-app[bot]');
+  assert.equal(appRoute.author.authSource, 'app');
+  await assert.rejects(
+    preflightReviewRoute(context, 'main', { ...reviewer, appActorLogin: async () => 'host-user' } as never),
+    /same GitHub actor/u,
+  );
+  await assert.rejects(
+    preflightReviewRoute(
+      {
+        ...context,
+        config: { roles: { author: { identity: 'app-author' }, reviewer: { identity: 'reviewer-app' } } },
+      } as unknown as DeliveryContext,
+      'main',
+      reviewer as never,
+    ),
+    /configure the personal author role/u,
+  );
+});
+
 test('App client resolves its bot from JWT GET /app and keeps author token scoped', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-app-auth-'));
   const originalFetch = globalThis.fetch;
@@ -250,7 +372,7 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
     assert.deepEqual(requests, ['POST /app/installations/202/access_tokens', 'GET /app']);
     await assert.rejects(
       withAuthorGitToken(clients, () => undefined),
-      /selected author GitHub App/u,
+      /selected author credential token/u,
     );
     const author = await createDeliveryGitHubClients({ config, env, identity: 'synthetic-author', role: 'author' });
     assert.equal(await withAuthorGitToken(author, (token) => token), 'ghs_synthetic_author');
