@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
@@ -104,22 +104,103 @@ function stageEnvironmentDigest(): string {
   });
 }
 
-function runStageCommand(repoRoot: string, argv: readonly string[]): Buffer {
+function reportVerificationProgress(input: {
+  state: 'running' | 'reused' | 'completed' | 'failed';
+  stageId: string;
+  commandLabel?: string;
+  completedStages: number;
+  remainingStages: number;
+  reusedStages: number;
+  elapsedMs: number;
+  capturedOutputBytes?: number;
+  reason?: string;
+}): void {
+  process.stderr.write(`ai-delivery.verify ${JSON.stringify(input)}\n`);
+}
+
+function runStageCommand(
+  repoRoot: string,
+  argv: readonly string[],
+  abortSignal?: AbortSignal,
+  onRunning?: (capturedOutputBytes: number) => void,
+): Promise<Buffer> {
   const [executable, ...args] = argv;
   if (!executable) throw new DeliveryError('Policy selected an empty stage command.');
-  const result = spawnSync(executable, args, {
-    cwd: repoRoot,
-    encoding: 'buffer',
-    maxBuffer: 8 * 1024 * 1024,
-    timeout: 600_000,
-    stdio: ['ignore', 'pipe', 'pipe'],
+  if (abortSignal?.aborted) throw new DeliveryError('Selected policy stage command cancelled.');
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      cwd: repoRoot,
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let outputBytes = 0;
+    let failure: string | undefined;
+    let cleanupFailure: string | undefined;
+    const killOwned = (): void => {
+      if (child.pid === undefined) return;
+      try {
+        if (process.platform === 'win32') {
+          if (!child.kill('SIGKILL') && child.exitCode === null && child.signalCode === null)
+            cleanupFailure = 'could not signal the owned child';
+          else cleanupFailure = undefined;
+        } else {
+          process.kill(-child.pid, 'SIGKILL');
+          cleanupFailure = undefined;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') cleanupFailure = undefined;
+        else cleanupFailure = error instanceof Error ? error.message : String(error);
+      }
+    };
+    const stop = (reason: string): void => {
+      if (failure !== undefined) return;
+      failure = reason;
+      killOwned();
+    };
+    const capture = (chunks: Buffer[], chunk: Buffer): void => {
+      outputBytes += chunk.length;
+      if (outputBytes > 8 * 1024 * 1024) {
+        stop('captured output exceeded 8 MiB');
+        return;
+      }
+      chunks.push(chunk);
+    };
+    child.stdout.on('data', (chunk: Buffer) => capture(stdout, chunk));
+    child.stderr.on('data', (chunk: Buffer) => capture(stderr, chunk));
+    child.stdout.once('error', (error) => stop(error.message));
+    child.stderr.once('error', (error) => stop(error.message));
+    child.once('error', (error) => stop(error.message));
+    child.once('exit', (code, signal) => {
+      if (code !== 0 || signal !== null) stop(`exit ${String(code)}${signal === null ? '' : ` signal ${signal}`}`);
+    });
+    const progressTimer = setInterval(() => onRunning?.(outputBytes), 5_000);
+    progressTimer.unref();
+    const onAbort = (): void => stop('cancelled');
+    const onSigint = (): void => stop('cancelled by SIGINT');
+    const onSigterm = (): void => stop('cancelled by SIGTERM');
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
+    process.once('SIGINT', onSigint);
+    process.once('SIGTERM', onSigterm);
+    if (abortSignal?.aborted) onAbort();
+    child.once('close', (code, signal) => {
+      clearInterval(progressTimer);
+      abortSignal?.removeEventListener('abort', onAbort);
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+      if (failure !== undefined || code !== 0 || signal !== null) {
+        const reason = failure ?? `exit ${String(code)}${signal === null ? '' : ` signal ${signal}`}`;
+        reject(
+          new DeliveryError(
+            `Selected policy stage command failed (${reason}).${cleanupFailure === undefined ? '' : ` Owned process cleanup failed (${cleanupFailure}).`}`,
+          ),
+        );
+        return;
+      }
+      resolve(Buffer.concat([...stdout, ...stderr], outputBytes));
+    });
   });
-  const output = Buffer.concat([Buffer.from(result.stdout ?? ''), Buffer.from(result.stderr ?? '')]);
-  if (result.error || result.status !== 0 || output.length > 8 * 1024 * 1024) {
-    const reason = result.error?.message ?? `exit ${String(result.status)}`;
-    throw new DeliveryError(`Selected policy stage command failed (${reason}).`);
-  }
-  return output;
 }
 
 export async function verifyIssue(input: {
@@ -127,7 +208,12 @@ export async function verifyIssue(input: {
   admittedResourceClasses?: readonly string[];
   issueNumber: number;
   repoRoot: string;
+  signal?: AbortSignal;
 }): Promise<VerificationRun> {
+  const assertNotCancelled = (): void => {
+    if (input.signal?.aborted) throw new DeliveryError('Verification cancelled.');
+  };
+  assertNotCancelled();
   const root = gitRoot(input.repoRoot);
   assertRegisteredIssue(root, input.issueNumber);
   const common = gitCommonDir(root);
@@ -154,7 +240,10 @@ export async function verifyIssue(input: {
   const receipts: RepositoryStageReceipt[] = [];
   const admitted = new Set(input.admittedResourceClasses ?? ['source_only']);
   const environmentDigest = stageEnvironmentDigest();
+  const startedAtMs = Date.now();
+  let reusedStages = 0;
   for (const stage of classification.requiredStages) {
+    assertNotCancelled();
     if (!admitted.has(stage.resourceClass)) {
       throw new DeliveryError(`Stage '${stage.id}' requires explicit ${stage.resourceClass} admission.`);
     }
@@ -182,14 +271,56 @@ export async function verifyIssue(input: {
     });
     if (cached) {
       receipts.push(cached);
+      reusedStages += 1;
+      reportVerificationProgress({
+        state: 'reused',
+        stageId: stage.id,
+        completedStages: receipts.length,
+        remainingStages: classification.requiredStages.length - receipts.length,
+        reusedStages,
+        elapsedMs: Date.now() - startedAtMs,
+      });
       continue;
     }
+    assertNotCancelled();
     const startedAt = new Date().toISOString();
-    const commands = stage.commands.map((command) => ({
-      exitCode: 0,
-      label: command.label,
-      outputDigest: writeRepositoryCommandOutput({ bytes: runStageCommand(root, command.argv), gitCommonDir: common }),
-    }));
+    const commands: { exitCode: number; label: string; outputDigest: string }[] = [];
+    for (const command of stage.commands) {
+      const progress = (capturedOutputBytes: number): void =>
+        reportVerificationProgress({
+          state: 'running',
+          stageId: stage.id,
+          commandLabel: command.label,
+          completedStages: receipts.length,
+          remainingStages: classification.requiredStages.length - receipts.length,
+          reusedStages,
+          elapsedMs: Date.now() - startedAtMs,
+          capturedOutputBytes,
+        });
+      progress(0);
+      let bytes: Buffer;
+      try {
+        bytes = await runStageCommand(root, command.argv, input.signal, progress);
+      } catch (error) {
+        reportVerificationProgress({
+          state: 'failed',
+          stageId: stage.id,
+          commandLabel: command.label,
+          completedStages: receipts.length,
+          remainingStages: classification.requiredStages.length - receipts.length,
+          reusedStages,
+          elapsedMs: Date.now() - startedAtMs,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      assertNotCancelled();
+      commands.push({
+        exitCode: 0,
+        label: command.label,
+        outputDigest: writeRepositoryCommandOutput({ bytes, gitCommonDir: common }),
+      });
+    }
     const artifacts =
       stage.attestationKey === undefined
         ? []
@@ -207,9 +338,19 @@ export async function verifyIssue(input: {
       stageInput,
       startedAt,
     });
+    assertNotCancelled();
     writeRepositoryStageCheckpoint({ gitCommonDir: common, receipt, repoRoot: root });
     receipts.push(receipt);
+    reportVerificationProgress({
+      state: 'completed',
+      stageId: stage.id,
+      completedStages: receipts.length,
+      remainingStages: classification.requiredStages.length - receipts.length,
+      reusedStages,
+      elapsedMs: Date.now() - startedAtMs,
+    });
   }
+  assertNotCancelled();
   const aggregate = createRepositoryStageAggregate({ classification, receipts });
   writeRepositoryStageAggregate({ gitCommonDir: common, aggregate });
   const content = {

@@ -34,6 +34,7 @@ export interface ExecutionContext {
   repo?: string;
   repoRoot: string;
   runtimeEntryPath?: string;
+  signal?: AbortSignal;
 }
 
 const MUTATING_TOOLS = new Set<AiDeliveryMcpToolName>([
@@ -363,6 +364,7 @@ export async function executeTool(
         personalAuth: context.clients.authSource === 'personal',
         issueNumber,
         repoRoot: row.path,
+        ...(execution.signal === undefined ? {} : { signal: execution.signal }),
         ...(input.admit === undefined
           ? {}
           : { admittedResourceClasses: ['source_only', ...(input.admit as string[])] }),
