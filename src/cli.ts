@@ -20,7 +20,7 @@ const program = new Command();
 program
   .name('ai-delivery')
   .description('Generic GitHub issue and pull request delivery')
-  .version('0.3.0')
+  .version('0.3.1')
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit legacy personal-token author override')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
@@ -200,13 +200,44 @@ program
   .command('verify')
   .requiredOption('--issue <number>')
   .option('--admit <classes>')
+  .option('--max-aggregate-rss-bytes <bytes>')
+  .option('--max-new-output-bytes <bytes>')
+  .option('--min-free-disk-bytes <bytes>')
+  .option(
+    '--output-root <path>',
+    'Filesystem output root; repeat for each root',
+    (value: string, roots: string[]) => [...roots, value],
+    [],
+  )
   .option('--prepublication-review <path>')
-  .action(async (o: { issue: string; admit?: string; prepublicationReview?: string }) =>
-    run('issue_verify', {
-      issueNumber: int(o.issue),
-      admit: list(o.admit),
-      prepublicationReview: o.prepublicationReview,
-    }),
+  .action(
+    async (o: {
+      issue: string;
+      admit?: string;
+      maxAggregateRssBytes?: string;
+      maxNewOutputBytes?: string;
+      minFreeDiskBytes?: string;
+      outputRoot?: string[];
+      prepublicationReview?: string;
+    }) =>
+      run('issue_verify', {
+        issueNumber: int(o.issue),
+        admit: list(o.admit),
+        ...(o.maxAggregateRssBytes === undefined &&
+        o.maxNewOutputBytes === undefined &&
+        o.minFreeDiskBytes === undefined &&
+        (o.outputRoot?.length ?? 0) === 0
+          ? {}
+          : {
+              resourceBounds: {
+                maxAggregateRssBytes: int(o.maxAggregateRssBytes),
+                ...(o.maxNewOutputBytes === undefined ? {} : { maxNewOutputBytes: int(o.maxNewOutputBytes) }),
+                minFreeDiskBytes: int(o.minFreeDiskBytes),
+                ...((o.outputRoot?.length ?? 0) === 0 ? {} : { outputRoots: o.outputRoot }),
+              },
+            }),
+        prepublicationReview: o.prepublicationReview,
+      }),
   );
 program
   .command('pr:create')

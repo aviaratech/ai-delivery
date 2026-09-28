@@ -8,8 +8,8 @@ import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
 
-export function createAiDeliveryMcpServer(context: ExecutionContext): McpServer {
-  const server = new McpServer({ name: 'ai-delivery', version: '0.3.0' });
+export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls?: Set<Promise<unknown>>): McpServer {
+  const server = new McpServer({ name: 'ai-delivery', version: '0.3.1' });
   const tools: readonly { name: string; description: string; inputSchema: z.ZodObject<z.ZodRawShape> }[] =
     AI_DELIVERY_MCP_TOOLS;
   for (const tool of tools) {
@@ -22,10 +22,18 @@ export function createAiDeliveryMcpServer(context: ExecutionContext): McpServer 
           return { content: [{ type: 'text' as const, text: `Invalid arguments for ${tool.name}.` }], isError: true };
         }
         try {
-          const value = await executeTool(tool.name as AiDeliveryMcpToolName, parsed.data, {
+          const signal = context.signal === undefined ? extra.signal : AbortSignal.any([context.signal, extra.signal]);
+          const pending = executeTool(tool.name as AiDeliveryMcpToolName, parsed.data, {
             ...context,
-            signal: extra.signal,
+            signal,
           });
+          activeCalls?.add(pending);
+          let value: unknown;
+          try {
+            value = await pending;
+          } finally {
+            activeCalls?.delete(pending);
+          }
           return { content: [{ type: 'text' as const, text: JSON.stringify(value) }] };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -39,10 +47,18 @@ export function createAiDeliveryMcpServer(context: ExecutionContext): McpServer 
 
 export async function serveAiDeliveryMcp(context: ExecutionContext): Promise<void> {
   setLogsSuppressed(true);
-  const server = createAiDeliveryMcpServer(context);
-  const close = async () => {
-    await server.close();
-    process.exit(0);
+  const shutdown = new AbortController();
+  const activeCalls = new Set<Promise<unknown>>();
+  const server = createAiDeliveryMcpServer({ ...context, signal: shutdown.signal }, activeCalls);
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    closing ??= (async () => {
+      shutdown.abort();
+      await Promise.allSettled(activeCalls);
+      await server.close();
+      process.exit(0);
+    })();
+    return closing;
   };
   process.once('SIGINT', () => {
     void close();

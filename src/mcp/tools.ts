@@ -89,6 +89,14 @@ export const AI_DELIVERY_MCP_TOOLS = [
       issueNumber: Positive,
       admit: z.array(z.string().min(1)).optional(),
       prepublicationReview: z.string().min(1).optional(),
+      resourceBounds: z
+        .strictObject({
+          maxAggregateRssBytes: z.number().int().positive().safe(),
+          maxNewOutputBytes: z.number().int().positive().safe().optional(),
+          minFreeDiskBytes: z.number().int().positive().safe(),
+          outputRoots: z.array(z.string().min(1)).min(1).optional(),
+        })
+        .optional(),
     }),
   },
   {
