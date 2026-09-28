@@ -261,7 +261,7 @@ program
   .command('pr:review')
   .requiredOption('--issue <number>')
   .requiredOption('--pr <number>')
-  .requiredOption('--artifact <path>')
+  .requiredOption('--artifact <path>', 'Path to a UTF-8 JSON review artifact file (not inline JSON)')
   .option('--dry-run')
   .action(async (o: { issue: string; pr: string; artifact: string; dryRun?: boolean }) =>
     run('issue_pr_review', {
