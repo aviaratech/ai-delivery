@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   cpSync,
@@ -93,7 +93,14 @@ function directoryHash(path: string): string {
   return digestValue(entries);
 }
 
-async function fixture(options: { twoStages?: boolean; remote?: string; divergentOrigin?: boolean } = {}): Promise<{
+async function fixture(
+  options: {
+    twoStages?: boolean;
+    remote?: string;
+    divergentOrigin?: boolean;
+    firstStageScript?: string;
+  } = {},
+): Promise<{
   root: string;
   counter: string;
   secondCounter: string;
@@ -184,7 +191,7 @@ export default {
     return { policyDigest, policyEvidence: { ...content, evidenceId: digest(content) },
       requiredStages: [{ id: 'check', dependsOn: [], semanticInputKeys: ['source'],
         resourceClass: 'source_only', commands: [{ label: 'count', argv: [process.execPath, '-e',
-          ${JSON.stringify(`const fs=require('fs');const p=${JSON.stringify(counter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));`)}] }] }${
+          ${JSON.stringify(options.firstStageScript ?? `const fs=require('fs');const p=${JSON.stringify(counter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));`)}] }] }${
             options.twoStages
               ? `, { id: 'second', dependsOn: ['check'], semanticInputKeys: ['source'],
         resourceClass: 'source_only', commands: [{ label: 'retry', argv: [process.execPath, '-e',
@@ -714,6 +721,239 @@ test('issue worktree verification resumes a completed stage and rejects changed 
     assert.equal(evidence.classificationReceiptId, first.classification.receiptId);
     writeFileSync(join(row.path, 'artifact.txt'), 'corrupt');
     await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a progressing stage remains observable beyond a former short deadline', async () => {
+  const marker = join(tmpdir(), `ai-delivery-stage-start-${process.pid}-${Date.now()}`);
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');fs.writeFileSync(${JSON.stringify(marker)},'started');process.stdout.write('begin');setTimeout(()=>{process.stdout.write('end');},180);`,
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'feature\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic progressing stage');
+    const progressSpy = vi.spyOn(process.stderr, 'write');
+    let completed = false;
+    const run = verifyIssue({ issueNumber: 17, repoRoot: row.path }).then((value) => {
+      completed = true;
+      return value;
+    });
+    const markerDeadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < markerDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(marker), true);
+    assert.equal(completed, false, 'stage must remain observable while its process runs');
+    assert.ok(
+      progressSpy.mock.calls.some(
+        ([chunk]) => String(chunk).includes('"state":"running"') && String(chunk).includes('"stageId":"check"'),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(completed, false, 'useful work continues beyond the injected former deadline');
+    const result = await run;
+    assert.equal(result.stageReceipts.length, 1);
+  } finally {
+    vi.restoreAllMocks();
+    rmSync(marker, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cancelling verification stops its owned descendant and preserves an unrelated process', async () => {
+  const marker = join(tmpdir(), `ai-delivery-stage-child-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const unrelatedHeartbeat = `${marker}-unrelated`;
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setTimeout(()=>{},400);`,
+  });
+  let descendantPid: number | undefined;
+  const unrelated = spawn(
+    process.execPath,
+    ['-e', `const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(unrelatedHeartbeat)},'x'),20);`],
+    {
+      detached: true,
+      stdio: 'ignore',
+    },
+  );
+  unrelated.unref();
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'feature\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic cancellable stage');
+    const controller = new AbortController();
+    const run = verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      signal: controller.signal,
+    });
+    const markerDeadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < markerDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    controller.abort();
+    await assert.rejects(run, /cancelled/u);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const stoppedSize = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    const unrelatedSize = existsSync(unrelatedHeartbeat) ? readFileSync(unrelatedHeartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stoppedSize);
+    assert.ok(readFileSync(unrelatedHeartbeat).length > unrelatedSize);
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    if (unrelated.pid !== undefined) {
+      try {
+        process.kill(unrelated.pid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(unrelatedHeartbeat, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  { name: 'nonzero exit', terminate: 'process.exit(7)', expected: /exit 7/u },
+  { name: 'signal', terminate: "process.kill(process.pid,'SIGTERM')", expected: /signal SIGTERM/u },
+])('a stage $name stops descendants holding its output pipes open', async ({ terminate, expected }) => {
+  const marker = join(tmpdir(), `ai-delivery-failed-stage-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{stdio:['ignore','inherit','inherit']});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));${terminate};`,
+  });
+  let descendantPid: number | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'feature\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic failing stage');
+    const controller = new AbortController();
+    const run = verifyIssue({ issueNumber: 17, repoRoot: row.path, signal: controller.signal });
+    const rejection = assert.rejects(run, expected);
+    const markerDeadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < markerDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    timeout = setTimeout(() => controller.abort(), 500);
+    await rejection;
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const stoppedSize = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stoppedSize);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP request cancellation stops verification and leaves no stage receipt', async () => {
+  const marker = join(tmpdir(), `ai-delivery-mcp-cancel-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const { root, runtimeEntryPath } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setTimeout(()=>{},1000);`,
+  });
+  const server = createAiDeliveryMcpServer({ repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' });
+  const client = new Client({ name: 'synthetic-cancelling-client', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  let descendantPid: number | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'feature\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic MCP cancellable stage');
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const controller = new AbortController();
+    const call = client.callTool({ name: 'issue_verify', arguments: { issueNumber: 17 } }, undefined, {
+      signal: controller.signal,
+    });
+    const markerDeadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < markerDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    controller.abort();
+    await assert.rejects(call, /abort/iu);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stoppedSize = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stoppedSize);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    await client.close();
+    await server.close();
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the stage output bound covers both streams and publishes no checkpoint on overflow', async () => {
+  const { root } = await fixture({
+    firstStageScript: `process.stdout.write(Buffer.alloc(4*1024*1024));process.stderr.write(Buffer.alloc(4*1024*1024+1));`,
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'feature\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic output bound');
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path }), /captured output exceeded 8 MiB/u);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

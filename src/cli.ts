@@ -20,7 +20,7 @@ const program = new Command();
 program
   .name('ai-delivery')
   .description('Generic GitHub issue and pull request delivery')
-  .version('0.2.0')
+  .version('0.2.1')
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit personal-token author mode')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
