@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'vitest';
 
-import { assertDeliveryRolePermissions, createDeliveryGitHubClients } from '../github/client.js';
+import { assertDeliveryRolePermissions, createDeliveryGitHubClients, withAuthorGitToken } from '../github/client.js';
 import { evaluateCommandIdentityPolicy } from '../github/commandIdentityPolicy.js';
 import {
   clearConfiguredNativeIssuePoints,
@@ -122,6 +122,113 @@ function syntheticProject(config: ReturnType<typeof parseDeliveryConfig>) {
 }
 
 describe('portable delivery configuration', () => {
+  it('selects a configured personal author token without ambient fallback and keeps the reviewer App role', async () => {
+    const base = syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' });
+    const config = parseDeliveryConfig({
+      ...base,
+      roles: {
+        author: { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' },
+        reviewer: base.roles.reviewer,
+      },
+    });
+    assert.equal(
+      evaluateCommandIdentityPolicy({ commandName: 'pr:create', deliveryConfig: config, identity: 'host-author' })
+        .error,
+      null,
+    );
+    assert.equal(
+      evaluateCommandIdentityPolicy({
+        commandName: 'pr:review',
+        deliveryConfig: config,
+        identity: 'synthetic-reviewer',
+      }).error,
+      null,
+    );
+    await assert.rejects(
+      createDeliveryGitHubClients({
+        config,
+        env: { GH_TOKEN: 'ambient-token' },
+        identity: 'host-author',
+        role: 'author',
+      }),
+      /AUTHOR_TOKEN/u,
+    );
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (_url, init) => {
+        assert.equal(new Headers(init?.headers).get('authorization'), 'token selected-token');
+        return new Response(JSON.stringify({ id: 37, login: 'selected-user' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+      const clients = await createDeliveryGitHubClients({
+        config,
+        env: { AUTHOR_TOKEN: 'selected-token', GH_TOKEN: 'ambient-token' },
+        identity: 'host-author',
+        role: 'author',
+      });
+      assert.equal(clients.authSource, 'personal');
+      assert.equal(await withAuthorGitToken(clients, (token) => token), 'selected-token');
+      assert.deepEqual(await clients.authenticatedAuthor?.(), {
+        actorLogin: 'selected-user',
+        credentialIdentity: 'user:37',
+      });
+      globalThis.fetch = async () => new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
+      const expired = await createDeliveryGitHubClients({
+        config,
+        env: { AUTHOR_TOKEN: 'expired-token' },
+        identity: 'host-author',
+        role: 'author',
+      });
+      if (!expired.authenticatedAuthor) throw new Error('Personal author readback is unavailable.');
+      await assert.rejects(expired.authenticatedAuthor(), /personal author token is invalid or expired/u);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('retains the configured personal author during configuration discovery with a legacy flag present', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'delivery-personal-config-'));
+    const originalFetch = globalThis.fetch;
+    const originalToken = process.env.AUTHOR_TOKEN;
+    try {
+      git(['init', '--quiet', temp]);
+      git(['remote', 'add', 'origin', 'https://github.com/sample/widget.git'], { cwd: temp });
+      const base = syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' });
+      const config = parseDeliveryConfig({
+        ...base,
+        roles: {
+          author: { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' },
+          reviewer: base.roles.reviewer,
+        },
+      });
+      writeFileSync(
+        join(temp, 'policy.mjs'),
+        `export const deliverySettings = ${JSON.stringify({ roles: config.roles, commandPolicy: config.commandPolicy })};\n`,
+      );
+      writeFileSync(join(temp, 'ai-delivery.config.json'), JSON.stringify(syntheticOverrides(config)));
+      git(['add', 'policy.mjs', 'ai-delivery.config.json'], { cwd: temp });
+      process.env.AUTHOR_TOKEN = 'selected-token';
+      let selectedRequests = 0;
+      globalThis.fetch = async (_url, init) => {
+        assert.match(new Headers(init?.headers).get('authorization') ?? '', /selected-token/u);
+        selectedRequests += 1;
+        return new Response(JSON.stringify({ data: { repository: null } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+      await assert.rejects(loadDeliveryConfig(temp, { personalAuth: true }), /Incomplete GitHub repository/u);
+      assert.equal(selectedRequests, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalToken === undefined) delete process.env.AUTHOR_TOKEN;
+      else process.env.AUTHOR_TOKEN = originalToken;
+      rmSync(temp, { force: true, recursive: true });
+    }
+  });
+
   it('loads two independent repository roots and binds native metadata to each configuration', async () => {
     const temp = mkdtempSync(join(tmpdir(), 'delivery-config-'));
     try {
@@ -419,7 +526,7 @@ describe('portable delivery configuration', () => {
       assert.match(
         evaluateCommandIdentityPolicy({ commandName: 'pr:create', deliveryConfig: config, identity: 'personal' })
           .error ?? '',
-        /personal-token fallback/u,
+        /personal-token override/u,
       );
       assert.throws(() => {
         validateConfiguredNativeTracking({ config, issueType: 'Task', points: 3, priority: 'High' });

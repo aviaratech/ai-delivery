@@ -10,21 +10,24 @@ Use the verified commit and its evidence throughout publication, review, and mer
 ## MCP tools first
 
 1. Run `issue_verify` on the committed change.
-2. Publish it as a draft with `issue_pr_create`, then inspect it with `issue_pr_info` as needed.
-3. Obtain an independent review of the exact pull request head and submit its evidence with `issue_pr_review`.
-4. Once the approval and required checks are present, promote the pull request and use `issue_finish` to complete guarded delivery and cleanup.
+2. Call `issue_pr_create` with `dryRun: true` and inspect its `reviewRoute`: selected author and reviewer actors, credential sources, repository access and rule visibility. Resolve missing credentials or same-actor errors before publication. Unknown rule visibility remains unknown.
+3. Publish as a draft with `issue_pr_create`, then inspect the actual PR author with `issue_pr_info` or GitHub readback. The selected author credential must make the push and PR; do not switch to an ambient connector.
+4. Obtain independent review of the exact pull request head. Submit its artifact with `issue_pr_review` and the configured reviewer `identity`, so the selected reviewer GitHub App makes the review. Inspect the returned `reviewState`.
+5. Promote the unchanged PR with `issue_pr_create` (`draft: false`), inspect live required-review state and checks, then use `issue_finish` only when GitHub requirements are satisfied.
 
-Missing or stale evidence, a changed head, failed checks, conflicts, or unresolved blockers require resolution before continuing.
+An `APPROVED` review receipt proves submission, not that GitHub counted it. If `reviewState` is `still-required`, inspect the active rule and obtain a qualifying independent approval. Do not repeat the same submission, replace the PR, change actors, or weaken protection automatically. Missing or stale evidence, a changed head, failed checks, conflicts, or unresolved blockers require resolution before continuing.
 
 ## CLI fallback
 
 ```bash
-ai-delivery verify
-ai-delivery pr:create --issue <number>
+ai-delivery --identity <configured-author> verify
+ai-delivery --identity <configured-author> pr:create --issue <number> --dry-run
+ai-delivery --identity <configured-author> pr:create --issue <number>
 # obtain independent review of the exact pull request head
-ai-delivery pr:review --issue 17 --pr 19 --artifact ./review-artifact.json
-ai-delivery pr:create --issue <number> --ready
-ai-delivery finish --issue <number> --pr <number>
+ai-delivery --identity <configured-reviewer> pr:review --issue <number> --pr <number> --artifact ./review-artifact.json
+ai-delivery --identity <configured-author> pr:create --issue <number> --ready
+ai-delivery --identity <configured-author> pr:checks --pr <number>
+ai-delivery --identity <configured-author> finish --issue <number> --pr <number>
 ```
 
 For the CLI, `--artifact` is the path to a UTF-8 JSON review artifact file, not inline JSON. The MCP `issue_pr_review` tool instead takes the JSON content as its `artifact` argument. The content is validated against the review artifact schema before submission.
