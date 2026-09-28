@@ -24,7 +24,12 @@ import { parseReviewArtifact, reviewArtifactApproval, savePrepublicationArtifact
 import { evaluateAgentReadiness } from './services/agentReadinessService.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { getIssueWorktreeStrict, listWorktreesStrict } from './services/worktreeRegistry.js';
-import { createIssuePhaseEvidence, loadVerifiedRun, verifyIssue } from './verification.js';
+import {
+  createIssuePhaseEvidence,
+  loadVerifiedRun,
+  verifyIssue,
+  type VerificationResourceBounds,
+} from './verification.js';
 import { prepareStandaloneWorktree } from './worktree.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 
@@ -366,6 +371,9 @@ export async function executeTool(
         issueNumber,
         repoRoot: row.path,
         ...(execution.signal === undefined ? {} : { signal: execution.signal }),
+        ...(input.resourceBounds === undefined
+          ? {}
+          : { resourceBounds: input.resourceBounds as VerificationResourceBounds }),
         ...(input.admit === undefined
           ? {}
           : { admittedResourceClasses: ['source_only', ...(input.admit as string[])] }),
@@ -401,6 +409,7 @@ export async function executeTool(
         aggregateId: run.aggregate.aggregateId,
         evidenceId: evidence.evidenceId,
         manifestId: run.manifestId,
+        ...(run.resources === undefined ? {} : { resources: run.resources }),
       };
     }
     case 'issue_pr_create': {

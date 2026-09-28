@@ -205,6 +205,7 @@ async function fixture(
     remote?: string;
     divergentOrigin?: boolean;
     firstStageScript?: string;
+    secondStageScript?: string;
     personalAuthor?: boolean;
   } = {},
 ): Promise<{
@@ -304,7 +305,7 @@ export default {
             options.twoStages
               ? `, { id: 'second', dependsOn: ['check'], semanticInputKeys: ['source'],
         resourceClass: 'source_only', commands: [{ label: 'retry', argv: [process.execPath, '-e',
-          ${JSON.stringify(`const fs=require('fs');const p=${JSON.stringify(secondCounter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));if(fs.existsSync(${JSON.stringify(failSecond)}))process.exit(7);`)}] }] }`
+          ${JSON.stringify(options.secondStageScript ?? `const fs=require('fs');const p=${JSON.stringify(secondCounter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));if(fs.existsSync(${JSON.stringify(failSecond)}))process.exit(7);`)}] }] }`
               : ''
           }],
       risk: 'standard' };
@@ -1047,6 +1048,63 @@ test('MCP request cancellation stops verification and leaves no stage receipt', 
   }
 });
 
+test('MCP server shutdown cancellation waits for owned verification cleanup', async () => {
+  const marker = join(tmpdir(), `ai-delivery-mcp-shutdown-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const { root, runtimeEntryPath } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setTimeout(()=>{},1000);`,
+  });
+  const shutdown = new AbortController();
+  const server = createAiDeliveryMcpServer({
+    repoRoot: root,
+    runtimeEntryPath,
+    identity: 'synthetic-author',
+    signal: shutdown.signal,
+  });
+  const client = new Client({ name: 'synthetic-shutdown-client', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  let descendantPid: number | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'shutdown\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic MCP shutdown');
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const call = client.callTool({ name: 'issue_verify', arguments: { issueNumber: 17 } });
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    shutdown.abort();
+    const result = await call;
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /cancelled/u);
+    const size = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, size);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    await client.close();
+    await server.close();
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('the stage output bound covers both streams and publishes no checkpoint on overflow', async () => {
   const { root } = await fixture({
     firstStageScript: `process.stdout.write(Buffer.alloc(4*1024*1024));process.stderr.write(Buffer.alloc(4*1024*1024+1));`,
@@ -1064,6 +1122,750 @@ test('the stage output bound covers both streams and publishes no checkpoint on 
     await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path }), /captured output exceeded 8 MiB/u);
     assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a consumer RSS ceiling stops a running stage before it can publish a checkpoint', async () => {
+  const { root } = await fixture({
+    firstStageScript:
+      'const held=Buffer.alloc(32*1024*1024,1);setTimeout(()=>process.stdout.write(String(held.length)),500);',
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'bounded stage\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic resource bound');
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: { maxAggregateRssBytes: 1, minFreeDiskBytes: 1 },
+      } as Parameters<typeof verifyIssue>[0]),
+      /aggregate RSS.*limit/u,
+    );
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a consumer filesystem-output ceiling measures new files apart from captured stdout', async () => {
+  const { root } = await fixture({
+    firstStageScript:
+      "const fs=require('fs');fs.writeFileSync('generated.bin',Buffer.alloc(4096));setTimeout(()=>{},500);",
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'filesystem output\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic filesystem output');
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 1_024,
+          outputRoots: ['.'],
+        },
+      } as Parameters<typeof verifyIssue>[0]),
+      /new filesystem output.*limit/u,
+    );
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('insufficient free disk refuses admission before starting a selected command', async () => {
+  const { root } = await fixture({ firstStageScript: 'setTimeout(()=>{},500);' });
+  const progress = vi.spyOn(process.stderr, 'write');
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'disk admission\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic disk admission');
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: Number.MAX_SAFE_INTEGER },
+      }),
+      /Free disk fell below limit/u,
+    );
+    assert.equal(
+      progress.mock.calls.some(([message]) => String(message).includes('"state":"running"')),
+      false,
+    );
+  } finally {
+    progress.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the issue_verify request forwards consumer resource limits to the maintained runner', async () => {
+  const { root, runtimeEntryPath } = await fixture();
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'request resource limits\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic request resource limits');
+    await assert.rejects(
+      executeTool(
+        'issue_verify',
+        {
+          issueNumber: 17,
+          resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: Number.MAX_SAFE_INTEGER },
+        },
+        { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' },
+      ),
+      /Free disk fell below limit/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a bounded passing run records measured resources in versioned evidence', async () => {
+  const { root, runtimeEntryPath } = await fixture({
+    firstStageScript: "setTimeout(()=>process.stdout.write('done'),500);",
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'resource evidence\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic resource evidence');
+    const run = await verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    });
+    assert.equal(run.schemaVersion, 'ai-delivery.run@2');
+    const resources = run.resources;
+    assert.ok(resources);
+    assert.ok(resources.sampleCount > 0);
+    assert.ok((resources.maxSampledAggregateRssBytes ?? 0) > 0);
+    assert.ok((resources.minSampledFreeDiskBytes ?? 0) > 0);
+    assert.equal(resources.observation, 'sampled');
+    assert.equal(resources.processCoverage, 'observed-processes-only');
+    const evidence = await createIssuePhaseEvidence({ issueNumber: 17, phase: 'verify', repoRoot: row.path });
+    assert.equal(evidence.aggregateId, run.aggregate.aggregateId);
+    const dispatched = (await executeTool(
+      'issue_verify',
+      {
+        issueNumber: 17,
+        resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+      },
+      { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' },
+    )) as { resources?: { processCoverage?: string } };
+    assert.equal(dispatched.resources?.processCoverage, 'observed-processes-only');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('bounded verification reruns unmeasured work and reuses only matching measured stages', async () => {
+  const { root, counter, secondCounter, failSecond } = await fixture({ twoStages: true });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'resource resume\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic resource resume');
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '1');
+    const bounds = { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 };
+    writeFileSync(failSecond, 'fail once\n');
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }), /exit 7/u);
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '2');
+    rmSync(failSecond);
+    const resumed = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '3');
+    assert.ok((resumed.resources?.sampleCount ?? 0) > 0);
+    const repeated = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '3');
+    assert.ok((repeated.resources?.sampleCount ?? 0) > 0);
+    const stageInputId = repeated.stageReceipts[0]!.input.inputId.slice(7);
+    const stagePath = join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check', `${stageInputId}.json`);
+    rmSync(stagePath);
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+    assert.equal(existsSync(stagePath), true);
+    await verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: { ...bounds, maxAggregateRssBytes: 900_000_000 },
+    });
+    assert.equal(readFileSync(counter, 'utf8'), '3');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '4');
+    const sidecar = join(root, '.git', 'ai-delivery', 'resource-stages@1', `${stageInputId}.json`);
+    writeFileSync(sidecar, 'corrupt\n');
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }),
+      /Resource stage checkpoint is corrupt/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('filesystem output already measured in a resumed stage counts toward the run limit', async () => {
+  const { root } = await fixture({
+    twoStages: true,
+    firstStageScript:
+      "const fs=require('fs');fs.mkdirSync('.issue-cli',{recursive:true});fs.writeFileSync('.issue-cli/a.bin',Buffer.alloc(700));const p='.issue-cli/count';fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));setTimeout(()=>{},100);",
+    secondStageScript:
+      "const fs=require('fs');if(fs.existsSync('.issue-cli/fail'))process.exit(7);fs.writeFileSync('.issue-cli/b.bin',Buffer.alloc(700));setTimeout(()=>{},100);",
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'cumulative output\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic cumulative output');
+    mkdirSync(join(row.path, '.issue-cli'));
+    writeFileSync(join(row.path, '.issue-cli', 'fail'), 'x');
+    const resourceBounds = {
+      maxAggregateRssBytes: 1_000_000_000,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 1_000,
+      outputRoots: ['.issue-cli'],
+    };
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds }), /exit 7/u);
+    assert.equal(readFileSync(join(row.path, '.issue-cli', 'count'), 'utf8'), '1');
+    rmSync(join(row.path, '.issue-cli', 'fail'));
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds }),
+      /new filesystem output.*limit/u,
+    );
+    assert.equal(readFileSync(join(row.path, '.issue-cli', 'count'), 'utf8'), '1');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('failed-stage filesystem output remains charged on retry', async () => {
+  const { root } = await fixture({
+    firstStageScript:
+      "const fs=require('fs');fs.mkdirSync('.issue-cli',{recursive:true});fs.appendFileSync('.issue-cli/output.bin',Buffer.alloc(700));if(fs.existsSync('.issue-cli/fail'))process.exit(7);setTimeout(()=>{},100);",
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'failed output\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic failed output');
+    mkdirSync(join(row.path, '.issue-cli'));
+    const fail = join(row.path, '.issue-cli', 'fail');
+    writeFileSync(fail, 'x');
+    const resourceBounds = {
+      maxAggregateRssBytes: 1_000_000_000,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 1_000,
+      outputRoots: ['.issue-cli'],
+    };
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds }), /exit 7/u);
+    assert.equal(readFileSync(join(row.path, '.issue-cli', 'output.bin')).length, 700);
+    rmSync(fail);
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds }),
+      /new filesystem output.*limit/u,
+    );
+    assert.equal(readFileSync(join(row.path, '.issue-cli', 'output.bin')).length, 1_400);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+    rmSync(join(row.path, '.issue-cli', 'output.bin'));
+    const completed = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds });
+    assert.equal(readFileSync(join(row.path, '.issue-cli', 'output.bin')).length, 700);
+    assert.ok((completed.resources?.maxSampledNewOutputBytes ?? 0) < 1_000);
+    const baselineDirectory = join(root, '.git', 'ai-delivery', 'output-baselines@1');
+    const snapshot = readdirSync(baselineDirectory).find(
+      (name) => name.endsWith('.json') && !name.endsWith('.state.json'),
+    );
+    assert.ok(snapshot);
+    rmSync(join(baselineDirectory, snapshot));
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds }),
+      /Filesystem output baseline checkpoint is missing or corrupt/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('mixed-case output filenames round-trip through the durable baseline', async () => {
+  const { root } = await fixture();
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'mixed-case output\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic mixed-case output');
+    const output = join(row.path, '.issue-cli');
+    mkdirSync(output);
+    writeFileSync(join(output, 'a.bin'), 'a');
+    writeFileSync(join(output, 'B.bin'), 'B');
+    const run = await verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 1_000,
+        outputRoots: ['.issue-cli'],
+      },
+    });
+    assert.equal(run.resources?.maxSampledNewOutputBytes, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('aggregate RSS crossing stops three individually under-limit children', async () => {
+  const marker = join(tmpdir(), `ai-delivery-rss-children-${process.pid}-${Date.now()}`);
+  const limit = 200_000_000;
+  const worker = `const fs=require('fs');const held=Buffer.alloc(32*1024*1024,1);fs.writeFileSync(${JSON.stringify(marker)}+'-'+process.pid,String(process.memoryUsage().rss));setInterval(()=>{void held[0]},1000);`;
+  const { root } = await fixture({
+    firstStageScript: `const {spawn}=require('child_process');for(let i=0;i<3;i++)spawn(process.execPath,['-e',${JSON.stringify(worker)}],{stdio:'ignore'});setTimeout(()=>{},3000);`,
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'aggregate RSS\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic aggregate RSS');
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: { maxAggregateRssBytes: limit, minFreeDiskBytes: 1 },
+      }),
+      /aggregate RSS.*limit/u,
+    );
+    const rows = readdirSync(tmpdir()).filter((name) => name.startsWith(`${marker.split('/').at(-1)}-`));
+    assert.equal(rows.length, 3);
+    for (const name of rows) assert.ok(Number(readFileSync(join(tmpdir(), name), 'utf8')) < limit);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    for (const name of readdirSync(tmpdir()).filter((value) => value.startsWith(`${marker.split('/').at(-1)}-`))) {
+      const pid = Number(name.slice(name.lastIndexOf('-') + 1));
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+      rmSync(join(tmpdir(), name), { force: true });
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('filesystem output from a sampled detached child crosses its declared root limit', async () => {
+  const marker = join(tmpdir(), `ai-delivery-detached-output-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const worker = `const fs=require('fs');fs.writeFileSync('generated.bin',Buffer.alloc(4096));setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`;
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(worker)}],{detached:true,stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setTimeout(()=>{},2500);`,
+  });
+  let descendantPid: number | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'detached output\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic detached output');
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 1_024,
+          outputRoots: ['.'],
+        },
+      }),
+      /new filesystem output.*limit/u,
+    );
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stoppedSize = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stoppedSize);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a symbolic link in declared output roots fails before publishing sampled output evidence', async () => {
+  const { root } = await fixture();
+  const outside = mkdtempSync(join(tmpdir(), 'ai-delivery-output-link-'));
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'linked output\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic linked output');
+    mkdirSync(join(outside, 'target'));
+    symlinkSync(join(outside, 'target'), join(outside, 'declared'));
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 1_024,
+          outputRoots: [join(outside, 'declared')],
+        },
+      }),
+      /symbolic link/u,
+    );
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an unobserved detached pipe holder cannot keep a cancelled stage pending indefinitely', async () => {
+  const marker = join(tmpdir(), `ai-delivery-escaped-pipe-${process.pid}-${Date.now()}`);
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:['ignore','inherit','inherit']});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));process.exit(0);`,
+  });
+  let descendantPid: number | undefined;
+  let run: Promise<unknown> | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'escaped pipe\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic escaped pipe');
+    const controller = new AbortController();
+    run = verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      signal: controller.signal,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    });
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    controller.abort();
+    await assert.rejects(
+      Promise.race([
+        run,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('cleanup remained pending')), 3_000)),
+      ]),
+      /owned command pipes did not close/u,
+    );
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    await run?.catch(() => undefined);
+    rmSync(marker, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a direct child exit with inherited pipes still open fails within a bounded cleanup interval', async () => {
+  const marker = join(tmpdir(), `ai-delivery-exited-pipe-${process.pid}-${Date.now()}`);
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:['ignore','inherit','inherit']});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));process.exit(0);`,
+  });
+  let descendantPid: number | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'exited pipe\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic exited pipe');
+    const run = verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    });
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    await assert.rejects(
+      Promise.race([
+        run,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('stage remained pending')), 3_500)),
+      ]),
+      /owned command pipes did not close/u,
+    );
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('bounded cancellation cleans a sampled detached descendant and preserves an unrelated process', async () => {
+  const marker = join(tmpdir(), `ai-delivery-detached-child-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const unrelatedHeartbeat = `${marker}-unrelated`;
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{detached:true,stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setTimeout(()=>{},2500);`,
+  });
+  const unrelated = spawn(
+    process.execPath,
+    ['-e', `const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(unrelatedHeartbeat)},'x'),20);`],
+    { detached: true, stdio: 'ignore' },
+  );
+  unrelated.unref();
+  let descendantPid: number | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'detached child\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic detached child');
+    const controller = new AbortController();
+    const run = verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      signal: controller.signal,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    });
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    controller.abort();
+    await assert.rejects(run, /cancelled/u);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stoppedSize = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    const unrelatedSize = existsSync(unrelatedHeartbeat) ? readFileSync(unrelatedHeartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stoppedSize);
+    assert.ok(readFileSync(unrelatedHeartbeat).length > unrelatedSize);
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    if (unrelated.pid !== undefined) {
+      try {
+        process.kill(unrelated.pid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(unrelatedHeartbeat, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('sampled evidence identifies the escape boundary for a detached pipe-free child', async () => {
+  const marker = join(tmpdir(), `ai-delivery-late-detach-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const trigger = `${marker}-trigger`;
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const wait=setInterval(()=>{if(!fs.existsSync(${JSON.stringify(trigger)}))return;clearInterval(wait);setTimeout(()=>{const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{detached:true,stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));},250);setTimeout(()=>process.exit(0),500);},5);`,
+  });
+  let descendantPid: number | undefined;
+  const controller = new AbortController();
+  const progress = vi.spyOn(process.stderr, 'write');
+  let run: Promise<unknown> | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'late detach\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic late detach');
+    run = verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      signal: controller.signal,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    });
+    const deadline = Date.now() + 2_000;
+    while (
+      !progress.mock.calls.some(([message]) => String(message).includes('"sampledAggregateRssBytes"')) &&
+      Date.now() < deadline
+    )
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(progress.mock.calls.some(([message]) => String(message).includes('"sampledAggregateRssBytes"')));
+    writeFileSync(trigger, 'go');
+    const result = await run;
+    assert.equal(
+      (result as Awaited<ReturnType<typeof verifyIssue>>).resources?.processCoverage,
+      'observed-processes-only',
+    );
+    assert.equal((result as Awaited<ReturnType<typeof verifyIssue>>).aggregate.result, 'passed');
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    const size = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok((existsSync(heartbeat) ? readFileSync(heartbeat).length : 0) > size);
+  } finally {
+    controller.abort();
+    await run?.catch(() => undefined);
+    progress.mockRestore();
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const stopped = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stopped);
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
+    rmSync(trigger, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a successful command cannot publish while its sampled detached descendant survives', async () => {
+  const marker = join(tmpdir(), `ai-delivery-left-behind-${process.pid}-${Date.now()}`);
+  const heartbeat = `${marker}-heartbeat`;
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('fs');setInterval(()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'x'),20);`)}],{detached:true,stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setTimeout(()=>{},1400);`,
+  });
+  let descendantPid: number | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    writeFileSync(join(row.path, 'change.txt'), 'left behind\n');
+    git(row.path, 'add', 'change.txt');
+    git(row.path, 'commit', '-qm', 'synthetic left behind descendant');
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+      }),
+      /owned descendant survived/u,
+    );
+    descendantPid = Number(readFileSync(marker, 'utf8'));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stoppedSize = existsSync(heartbeat) ? readFileSync(heartbeat).length : 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(existsSync(heartbeat) ? readFileSync(heartbeat).length : 0, stoppedSize);
+    assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        /* already stopped */
+      }
+    }
+    rmSync(marker, { force: true });
+    rmSync(heartbeat, { force: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
