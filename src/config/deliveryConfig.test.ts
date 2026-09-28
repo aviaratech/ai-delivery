@@ -8,6 +8,7 @@ import { describe, it } from 'vitest';
 
 import { assertDeliveryRolePermissions, createDeliveryGitHubClients, withAuthorGitToken } from '../github/client.js';
 import { evaluateCommandIdentityPolicy } from '../github/commandIdentityPolicy.js';
+import { contextFor } from '../dispatch.js';
 import {
   clearConfiguredNativeIssuePoints,
   nativeIssueSettingsFromDeliveryConfig,
@@ -221,6 +222,11 @@ describe('portable delivery configuration', () => {
       };
       await assert.rejects(loadDeliveryConfig(temp, { personalAuth: true }), /Incomplete GitHub repository/u);
       assert.equal(selectedRequests, 1);
+      globalThis.fetch = async () => new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
+      await assert.rejects(
+        contextFor({ repoRoot: temp, identity: 'host-author' }, 'pr:create'),
+        /Configured personal author token is invalid or expired/u,
+      );
     } finally {
       globalThis.fetch = originalFetch;
       if (originalToken === undefined) delete process.env.AUTHOR_TOKEN;
