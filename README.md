@@ -13,7 +13,7 @@ procedure before any lifecycle write.
 ```sh
 node --version # 24.21.0
 npm --version  # 11.19.0
-npm install --save-dev @aviaratech/ai-delivery@0.2.0
+npm install --save-dev @aviaratech/ai-delivery@0.2.1
 npx ai-delivery --help
 npx ai-delivery --repo-root /absolute/path/to/consumer --identity configured-author info --issue 17
 npx ai-delivery --repo-root /absolute/path/to/consumer --identity configured-author mcp:serve
@@ -144,7 +144,7 @@ rows in `.issue-cli/worktrees.json` remain with their original runtime unless
 they already have an exact `ai-delivery.worktree-owner@1` witness. Installing this
 package never adopts or switches an active legacy writer.
 
-`verify` classifies a clean Git base/head range, runs only the stages selected by the repository policy, and persists content-addressed private checkpoints under the Git common directory. It reuses compatible complete stages and rejects corrupt or stale inputs. The `--admit` flag explicitly admits additional resource classes. Publication creates a draft PR only after exact-head verification; a high-risk policy also requires a prepublication review artifact. Ready promotion and merge require a submitted formal review. Merge checks live blockers, checks, base/head coordinates, and the policy boundary. Repositories may require an exact base/head lease for merge.
+`verify` classifies a clean Git base/head range, runs only the stages selected by the repository policy, and persists content-addressed private checkpoints under the Git common directory. It reuses compatible complete stages and rejects corrupt or stale inputs. Selected stage commands run asynchronously without a total-duration deadline. Bounded JSON status lines on stderr show the current stage and command, completed/reused/remaining stage counts, elapsed time, and captured output bytes when a command starts and every five seconds while it runs. These observations are not completion evidence; only complete receipts and the exact-source aggregate establish that. Captured stdout and stderr together remain limited to 8 MiB. Cancellation stops the current owned process group on POSIX and preserves completed checkpoints for a later retry. The `--admit` flag explicitly admits additional resource classes. Publication creates a draft PR only after exact-head verification; a high-risk policy also requires a prepublication review artifact. Ready promotion and merge require a submitted formal review. Merge checks live blockers, checks, base/head coordinates, and the policy boundary. Repositories may require an exact base/head lease for merge.
 
 For recovery, inspect the original issue/PR, worktree registry and exact source
 head before retrying. A `created-not-started` response includes `safeResume`
