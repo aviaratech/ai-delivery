@@ -10,6 +10,7 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -108,9 +109,25 @@ export function assertPrivateFile(path: string): Buffer {
   return readFileSync(path);
 }
 
-export function writeCreateOnly(path: string, bytes: Buffer): string {
+function syncEvidenceDirectory(path: string): void {
+  const directory = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
+}
+
+export function writeCreateOnly(path: string, bytes: Buffer, bytesDigest?: string): string {
+  // Only byte-addressed output can have identical competing values and use atomic replacement.
+  if (
+    bytesDigest !== undefined &&
+    (bytesDigest !== digestBytes(bytes) || basename(path) !== `${bytesDigest.slice(7)}.bin`)
+  )
+    throw new Error('Immutable output path does not bind its bytes.');
   try {
     if (!assertPrivateFile(path).equals(bytes)) throw new Error('Content addressed evidence path collision.');
+    syncEvidenceDirectory(path);
     return path;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -118,19 +135,27 @@ export function writeCreateOnly(path: string, bytes: Buffer): string {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   const fd = openSync(temporary, 'wx', 0o600);
+  let renamed = false;
   try {
-    writeFileSync(fd, bytes);
-    fsyncSync(fd);
+    try {
+      writeFileSync(fd, bytes);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      if (bytesDigest === undefined) linkSync(temporary, path);
+      else {
+        renameSync(temporary, path);
+        renamed = true;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !assertPrivateFile(path).equals(bytes)) throw error;
+    }
   } finally {
-    closeSync(fd);
+    if (!renamed) unlinkSync(temporary);
   }
-  try {
-    linkSync(temporary, path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !assertPrivateFile(path).equals(bytes)) throw error;
-  } finally {
-    unlinkSync(temporary);
-  }
+  syncEvidenceDirectory(path);
   if (!assertPrivateFile(path).equals(bytes)) throw new Error('Content addressed evidence write failed.');
   return path;
 }

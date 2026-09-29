@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /** Create a private directory hierarchy and durably publish every new directory entry. */
@@ -27,7 +37,14 @@ function ensureDirectoryDurably(directory: string, mode: number): void {
     candidate = parent;
   }
   for (const path of missing.reverse()) {
-    mkdirSync(path, { mode });
+    try {
+      mkdirSync(path, { mode });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const metadata = lstatSync(path);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink() || (mode === 0o700 && (metadata.mode & 0o077) !== 0))
+        throw new Error('Concurrent directory creation did not publish a safe directory.');
+    }
     fsyncDirectory(dirname(path));
   }
 }

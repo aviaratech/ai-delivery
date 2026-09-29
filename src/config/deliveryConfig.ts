@@ -116,7 +116,7 @@ const DeliveryConfigSchema = z
       .strict(),
     policy: z
       .object({
-        contract: z.literal(DELIVERY_POLICY_CONTRACT),
+        contract: z.enum([DELIVERY_POLICY_CONTRACT, 'RepositoryDeliveryPolicy@2']),
         module: z.string().regex(/^\.\/(?!.*(?:^|\/)\.\.(?:\/|$))[^\s]+\.(?:mjs|js)$/u),
       })
       .strict(),
@@ -283,6 +283,9 @@ export async function loadDeliverySettings(repositoryRoot: string): Promise<Load
   const policyBytes = readFileSync(policyModulePath);
   const policyHash = createHash('sha256').update(policyBytes).digest('hex');
   const imported: unknown = await import(`${pathToFileURL(policyModulePath).href}?policy=${policyHash}`);
+  const contract = z
+    .enum([DELIVERY_POLICY_CONTRACT, 'RepositoryDeliveryPolicy@2'])
+    .parse((imported as { default?: { schemaVersion?: unknown } }).default?.schemaVersion ?? DELIVERY_POLICY_CONTRACT);
   const settings = PolicySettingsSchema.safeParse((imported as { deliverySettings?: unknown }).deliverySettings);
   if (!settings.success)
     throw new DeliveryError(
@@ -311,7 +314,7 @@ export async function loadDeliverySettings(repositoryRoot: string): Promise<Load
     ...settings.data,
     configPath: local.path,
     overrides: local.overrides,
-    policy: { contract: DELIVERY_POLICY_CONTRACT, module },
+    policy: { contract, module },
     policyModulePath,
     repository,
     sourceDigest: digestValue({
