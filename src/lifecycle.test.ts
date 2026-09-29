@@ -113,14 +113,33 @@ vi.mock('./github/client.js', async (importOriginal) => {
                 },
               },
             },
-            graphql: async (query: string, variables: Record<string, unknown>) =>
-              query.includes('DeliveryReviewDecision')
-                ? {
-                    repository: {
-                      pullRequest: { headRefOid: personalRoute.headSha, reviewDecision: 'REVIEW_REQUIRED' },
+            graphql: async (query: string, variables: Record<string, unknown>) => {
+              if (query.includes('DeliveryReviewDecision')) {
+                return {
+                  repository: {
+                    pullRequest: { headRefOid: personalRoute.headSha, reviewDecision: 'REVIEW_REQUIRED' },
+                  },
+                };
+              }
+              if (query.includes('DeliveryReviewAccess')) {
+                return {
+                  repository: {
+                    pullRequest: {
+                      reviews: {
+                        nodes: personalRoute.reviews.map((review) => ({
+                          fullDatabaseId: String(review.id),
+                          author: { login: review.user.login.replace(/\[bot\]$/u, '') },
+                          authorCanPushToRepository: false,
+                          commit: { oid: review.commit_id },
+                          state: review.state,
+                        })),
+                      },
                     },
-                  }
-                : syntheticDiscoveryClients().graphql(query, variables),
+                  },
+                };
+              }
+              return syntheticDiscoveryClients().graphql(query, variables);
+            },
           };
         }
         assert.equal(input.identity, 'host-author');
@@ -1999,9 +2018,10 @@ exec "${realGit}" "$@"
     const reviewInput = { issueNumber: 17, prNumber: 23, identity: 'synthetic-reviewer', artifact };
     const first = (await executeTool('issue_pr_review', reviewInput, execution)) as {
       receiptId: string;
-      reviewState: { status: string };
+      reviewState: { status: string; submittedReviewAuthorCanPushToRepository: boolean | null };
     };
     assert.equal(first.reviewState.status, 'still-required');
+    assert.equal(first.reviewState.submittedReviewAuthorCanPushToRepository, false);
     assert.equal(personalRoute.submitted, 1);
     const second = (await executeTool('issue_pr_review', reviewInput, execution)) as { receiptId: string };
     assert.equal(second.receiptId, first.receiptId);

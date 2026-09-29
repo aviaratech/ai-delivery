@@ -413,9 +413,15 @@ export async function checkoutPr(context: DeliveryContext, prNumber: number) {
 
 export interface ReviewRoutePreflight {
   author: { actorLogin: string; authSource: GitHubClients['authSource']; credentialSource: string; identity: string };
-  reviewer: { actorLogin: string; credentialSource: string; identity: string; repositoryAccess: 'readable' };
+  reviewer: {
+    actorLogin: string;
+    credentialSource: string;
+    effectiveContentsPermission: NonNullable<GitHubClients['effectiveContentsPermission']> | 'unknown';
+    identity: string;
+    repositoryAccess: 'readable';
+  };
   rules: { observedRequiredApprovals: number | null; visibility: 'complete' | 'partial' | 'unknown' };
-  approvalEligibility: 'unknown';
+  approvalEligibility: 'unknown' | 'insufficient-permission';
   nextAction: string;
 }
 
@@ -498,6 +504,11 @@ export async function preflightReviewRoute(
   }
   const visible = Number(rulesetResult.status === 'fulfilled') + Number(protectionResult.status === 'fulfilled');
   const visibility = visible === 2 ? 'complete' : visible === 1 ? 'partial' : 'unknown';
+  const observedRequiredApprovals = counts.length > 0 ? Math.max(...counts) : null;
+  const insufficientPermission =
+    observedRequiredApprovals !== null &&
+    observedRequiredApprovals > 0 &&
+    reviewer.effectiveContentsPermission === 'read';
   return {
     author: {
       actorLogin: author.actorLogin,
@@ -508,15 +519,19 @@ export async function preflightReviewRoute(
     reviewer: {
       actorLogin: reviewerActor,
       credentialSource: reviewer.credentialSource ?? 'unreported',
+      effectiveContentsPermission: reviewer.effectiveContentsPermission ?? 'unknown',
       identity: context.config.roles.reviewer.identity,
       repositoryAccess: 'readable',
     },
-    rules: { observedRequiredApprovals: counts.length > 0 ? Math.max(...counts) : null, visibility },
-    approvalEligibility: 'unknown',
-    nextAction:
-      visibility === 'complete'
-        ? 'Confirm whether the reviewer approval counts after exact-head submission; installation scopes do not prove required-review eligibility.'
-        : 'Inspect the active branch review rule with an authorized repository view and confirm whether the reviewer approval counts after exact-head submission.',
+    rules: { observedRequiredApprovals, visibility },
+    approvalEligibility: insufficientPermission ? 'insufficient-permission' : 'unknown',
+    nextAction: insufficientPermission
+      ? 'The reviewer App token has Contents: read, but the visible rule requires approval from a reviewer with repository write access. To use the App for required approval, grant Contents: write, accept the installation permission change, and obtain a fresh token before publication.'
+      : visibility === 'complete' && observedRequiredApprovals === null
+        ? 'No required approving review was observed in the visible rules. Confirm the live PR review decision after exact-head submission.'
+        : visibility === 'complete'
+          ? 'Confirm whether the reviewer approval counts after exact-head submission; installation scopes do not prove required-review eligibility.'
+          : 'Inspect the active branch review rule with an authorized repository view and confirm whether the reviewer approval counts after exact-head submission.',
   };
 }
 
@@ -680,7 +695,10 @@ export async function submitFormalReview(
   return {
     receiptId: receipt.receiptId,
     githubReviewId: receipt.githubReviewId,
-    reviewState: await readRequiredReviewState(context, input.prNumber, run.classification.head.sha),
+    reviewState: await readRequiredReviewState(context, input.prNumber, run.classification.head.sha, {
+      id: receipt.githubReviewId,
+      login: receipt.login,
+    }),
   };
 }
 
