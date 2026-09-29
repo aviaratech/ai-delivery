@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   cpSync,
@@ -14,6 +14,7 @@ import {
   rmSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,6 +32,7 @@ import { digestValue } from './delivery/index.js';
 import { executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
 import { defaultBaseRef, gitCommonDir } from './git.js';
 import * as githubClient from './github/client.js';
+import * as atomicJson from './utils/atomicJson.js';
 import {
   createIssue,
   developIssue,
@@ -44,7 +46,7 @@ import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, prInfo, publishPr,
 import { updateIssueWorktreeDelivery } from './services/worktreeRegistry.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
-import { createIssuePhaseEvidence, verifyIssue } from './verification.js';
+import { createIssuePhaseEvidence, loadVerifiedRun, verifyIssue } from './verification.js';
 import {
   cleanupNonIssueWorktree,
   prepareIssueWorktree,
@@ -226,6 +228,7 @@ async function fixture(
     firstStageScript?: string;
     secondStageScript?: string;
     personalAuthor?: boolean;
+    componentPolicy?: boolean;
   } = {},
 ): Promise<{
   root: string;
@@ -247,6 +250,7 @@ async function fixture(
     git(root, 'remote', 'add', remoteName, join(root, '.git', 'remote.git'));
     writeFileSync(join(root, '.gitignore'), '.issue-cli/\n.worktrees/\n');
     writeFileSync(join(root, 'artifact.txt'), 'synthetic proof\n');
+    if (options.componentPolicy) writeFileSync(join(root, 'component.txt'), 'second component\n');
     const config = {
       commandPolicy: {
         checks: { format: 'REQUIRED', gitClean: 'REQUIRED', lint: 'REQUIRED', test: 'REQUIRED', typecheck: 'REQUIRED' },
@@ -309,7 +313,7 @@ const bytes = value => 'sha256:' + createHash('sha256').update(value).digest('he
 const policyDigest = bytes(readFileSync(fileURLToPath(import.meta.url)));
 export const deliverySettings = ${JSON.stringify({ roles: config.roles, commandPolicy: config.commandPolicy })};
 export default {
-  schemaVersion: 'RepositoryDeliveryPolicy@1',
+  schemaVersion: '${options.componentPolicy ? 'RepositoryDeliveryPolicy@2' : 'RepositoryDeliveryPolicy@1'}',
   classifyExactRange(input) {
     const content = { artifacts: [{ digest: bytes(readFileSync(new URL('./artifact.txt', import.meta.url))),
       path: 'artifact.txt', producer: 'synthetic' }],
@@ -319,10 +323,12 @@ export default {
       schemaVersion: 'ai-delivery.policy-evidence@1' };
     return { policyDigest, policyEvidence: { ...content, evidenceId: digest(content) },
       requiredStages: [{ id: 'check', dependsOn: [], semanticInputKeys: ['source'],
+        ${options.componentPolicy ? "semanticInputs: [{ key: 'source', digest: bytes(readFileSync(new URL('./artifact.txt', import.meta.url))) }]," : ''}
         resourceClass: 'source_only', commands: [{ label: 'count', argv: [process.execPath, '-e',
           ${JSON.stringify(options.firstStageScript ?? `const fs=require('fs');const p=${JSON.stringify(counter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));`)}] }] }${
             options.twoStages
               ? `, { id: 'second', dependsOn: ['check'], semanticInputKeys: ['source'],
+        ${options.componentPolicy ? "semanticInputs: [{ key: 'source', digest: bytes(readFileSync(new URL('./component.txt', import.meta.url))) }]," : ''}
         resourceClass: 'source_only', commands: [{ label: 'retry', argv: [process.execPath, '-e',
           ${JSON.stringify(options.secondStageScript ?? `const fs=require('fs');const p=${JSON.stringify(secondCounter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));if(fs.existsSync(${JSON.stringify(failSecond)}))process.exit(7);`)}] }] }`
               : ''
@@ -762,6 +768,486 @@ test('synthetic cutover restores exact pre-write state and resumes an incomplete
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('immediate successful commands establish ownership and remain reusable', async () => {
+  const { root } = await fixture();
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const policyPath = join(row.path, 'policy.mjs');
+    writeFileSync(
+      policyPath,
+      readFileSync(policyPath, 'utf8').replace("argv: [process.execPath, '-e',", "argv: ['/usr/bin/true',"),
+    );
+    git(row.path, 'add', 'policy.mjs');
+    git(row.path, 'commit', '-qm', 'immediate stage');
+    const first = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    const reused = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    assert.equal(first.stageReceipts[0]!.receiptId, reused.stageReceipts[0]!.receiptId);
+    const bounded = await verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    });
+    assert.equal(bounded.aggregate.result, 'passed');
+    assert.ok(bounded.resources!.sampleCount > 0);
+    assert.deepEqual(readdirSync(join(root, '.git/ai-delivery/writers@1')), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('component verification recomposes current-source aggregates with only affected stage execution', async () => {
+  const { root, counter, secondCounter } = await fixture({ twoStages: true, componentPolicy: true });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const resourceBounds = { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 };
+    const original = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds });
+    writeFileSync(join(row.path, 'unrelated.txt'), 'documentation');
+    git(row.path, 'add', '.');
+    git(row.path, 'commit', '-qm', 'unrelated source');
+    const current = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds });
+    assert.notEqual(current.classification.receiptId, original.classification.receiptId);
+    assert.deepEqual(
+      current.stageReceipts.map((r) => r.receiptId),
+      original.stageReceipts.map((r) => r.receiptId),
+    );
+    assert.equal(current.aggregate.classificationReceiptId, current.classification.receiptId);
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '1');
+    writeFileSync(join(row.path, 'component.txt'), 'changed second component');
+    git(row.path, 'add', '.');
+    git(row.path, 'commit', '-qm', 'second component');
+    const secondChanged = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds });
+    assert.equal(secondChanged.stageReceipts[0]!.receiptId, original.stageReceipts[0]!.receiptId);
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '2');
+    writeFileSync(join(row.path, 'artifact.txt'), 'changed upstream component');
+    git(row.path, 'add', '.');
+    git(row.path, 'commit', '-qm', 'upstream component');
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds });
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '3');
+    await createIssuePhaseEvidence({ issueNumber: 17, repoRoot: row.path, phase: 'verify' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quiet verification reports completion-based progress and remains cancellable', { timeout: 12_000 }, async () => {
+  const { root } = await fixture({ firstStageScript: 'setInterval(()=>{},1000);' });
+  const controller = new AbortController();
+  const progress = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  let running: ReturnType<typeof verifyIssue> | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    running = verifyIssue({ issueNumber: 17, repoRoot: row.path, signal: controller.signal });
+    void running.catch(() => undefined);
+    let status: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < 350; attempt++) {
+      const latest = progress.mock.calls
+        .map(([chunk]) => String(chunk))
+        .filter((line) => line.startsWith('ai-delivery.verify '))
+        .at(-1);
+      if (latest) status = JSON.parse(latest.slice('ai-delivery.verify '.length)) as Record<string, unknown>;
+      if (Number(status?.elapsedMs) >= 5_000) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(status?.completedCommands, 0);
+    assert.equal(status?.remainingCommands, 1);
+    assert.equal(status?.completedStages, 0);
+    assert.equal(status?.capturedOutputBytes, 0);
+    assert.ok(Number(status?.lastCompletedWorkAgeMs) >= 5_000);
+    controller.abort();
+    await assert.rejects(running, /cancelled/u);
+  } finally {
+    controller.abort();
+    await running?.catch(() => undefined);
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('writer persistence failure retains recovery identity while cancellation cleans its owned command', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-writer-failure-'));
+  const marker = join(directory, 'started');
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');fs.writeFileSync(${JSON.stringify(marker)},String(process.pid));setInterval(()=>{},1000);`,
+  });
+  const controller = new AbortController();
+  const original = atomicJson.writePrivateJsonFileAtomically;
+  let failWrites = false;
+  const persistence = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+    if (failWrites && path.includes('/writers@1/')) throw new Error('ENOSPC: synthetic writer persistence failure');
+    original(path, value);
+  });
+  let running: Promise<unknown> | undefined;
+  let owner: { pid: number; identity: string } | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const writerPath = join(root, '.git/ai-delivery/writers@1', `${digestValue(row.path).slice(7)}.json`);
+    running = verifyIssue({ issueNumber: 17, repoRoot: row.path, signal: controller.signal }).catch(
+      (error: unknown) => error,
+    );
+    for (let attempt = 0; attempt < 100 && !existsSync(marker); attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(marker));
+    const recorded = JSON.parse(readFileSync(writerPath, 'utf8')) as {
+      command: { root: { pid: number; identity: string } };
+    };
+    owner = recorded.command.root;
+    assert.equal(Number(readFileSync(marker, 'utf8')), owner.pid);
+    failWrites = true;
+    controller.abort();
+    const failure = String(await running);
+    assert.match(failure, /cancelled.*Writer state persistence failed.*ENOSPC/u);
+    assert.doesNotMatch(failure, /Owned process cleanup failed/u);
+    const remaining = spawnSync('ps', ['-p', String(owner.pid), '-o', 'stat='], { encoding: 'utf8' });
+    assert.ok(remaining.status === 1 || remaining.stdout.trim().startsWith('Z'));
+    assert.deepEqual((JSON.parse(readFileSync(writerPath, 'utf8')) as typeof recorded).command.root, owner);
+    assert.equal(existsSync(`${writerPath}.lock`), false);
+    failWrites = false;
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path }), /live verification writer/u);
+    assert.equal(existsSync(writerPath), true);
+  } finally {
+    controller.abort();
+    await running;
+    persistence.mockRestore();
+    if (owner !== undefined) {
+      const current = spawnSync('ps', ['-p', String(owner.pid), '-o', 'lstart='], { encoding: 'utf8' });
+      if (current.status === 0 && current.stdout.trim() === owner.identity) process.kill(owner.pid, 'SIGKILL');
+    }
+    rmSync(root, { recursive: true, force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('verification excludes a second writer in the same worktree before command execution', async () => {
+  const marker = join(tmpdir(), `ai-delivery-writer-${String(process.pid)}`);
+  const { root } = await fixture({
+    firstStageScript: `const fs=require('fs');fs.appendFileSync(${JSON.stringify(marker)},'started\\n');setInterval(()=>{},1000);`,
+  });
+  const controller = new AbortController();
+  let running: Promise<unknown> | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    running = verifyIssue({ issueNumber: 17, repoRoot: row.path, signal: controller.signal }).catch(
+      (error: unknown) => error,
+    );
+    for (let attempt = 0; attempt < 100 && !existsSync(marker); attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(marker));
+    const contender = new AbortController();
+    const stopContender = setTimeout(() => contender.abort(), 500);
+    try {
+      await assert.rejects(
+        verifyIssue({ issueNumber: 17, repoRoot: row.path, signal: contender.signal }),
+        /writer|Lock acquisition/u,
+      );
+    } finally {
+      clearTimeout(stopContender);
+    }
+    assert.equal(readFileSync(marker, 'utf8'), 'started\n');
+    controller.abort();
+    assert.match(String(await running), /cancelled/u);
+  } finally {
+    controller.abort();
+    await running;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(marker, { force: true });
+  }
+});
+
+test('live or unknown writer state fails closed even after a file lease becomes stale', async () => {
+  const { root, counter } = await fixture();
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const writerDirectory = join(root, '.git/ai-delivery/writers@1');
+    mkdirSync(writerDirectory, { recursive: true });
+    const writerPath = join(writerDirectory, `${digestValue(row.path).slice(7)}.json`);
+    const state = {
+      schemaVersion: 'ai-delivery.verification-writer@1',
+      writerId: '00000000-0000-4000-8000-000000000001',
+      worktreeDigest: digestValue(row.path),
+      owner: {
+        pid: process.pid,
+        identity: execFileSync('/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding: 'utf8' }).trim(),
+      },
+      command: { phase: 'idle' },
+    };
+    writeFileSync(writerPath, JSON.stringify({ ...state, stateId: digestValue(state) }), { mode: 0o600 });
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path }), /live verification writer/u);
+    const unknown = {
+      ...state,
+      owner: { ...state.owner, identity: 'replaced historical process' },
+      command: { phase: 'starting' },
+    };
+    writeFileSync(writerPath, JSON.stringify({ ...unknown, stateId: digestValue(unknown) }));
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path }), /unknown command ownership/u);
+    assert.equal(existsSync(counter), false);
+    assert.equal(existsSync(writerPath), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  'same-head worktrees overlap with isolated checkpoints and cancellation preserves the peer',
+  { timeout: 15_000 },
+  async () => {
+    const { root } = await fixture({
+      firstStageScript: `const fs=require('fs');const cp=require('child_process');const path=require('path');const dir=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim();const marker=path.join(dir,'peer-command');fs.writeFileSync(marker,'running');const wait=setInterval(()=>{if(fs.existsSync(marker+'.release')){clearInterval(wait);fs.writeFileSync(marker,'passed');}},20);`,
+    });
+    const cancel = new AbortController();
+    const parallelCancel = new AbortController();
+    let first: Promise<unknown> | undefined;
+    let second: ReturnType<typeof verifyIssue> | undefined;
+    let parallelRuns: ReturnType<typeof verifyIssue>[] = [];
+    try {
+      const a = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const b = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 18,
+        repoRoot: root,
+      });
+      assert.equal(git(a.path, 'rev-parse', 'HEAD'), git(b.path, 'rev-parse', 'HEAD'));
+      first = verifyIssue({ issueNumber: 17, repoRoot: a.path, signal: cancel.signal }).catch(
+        (error: unknown) => error,
+      );
+      second = verifyIssue({ issueNumber: 18, repoRoot: b.path });
+      void second.catch(() => undefined);
+      const markerA = join(git(a.path, 'rev-parse', '--absolute-git-dir'), 'peer-command');
+      const markerB = join(git(b.path, 'rev-parse', '--absolute-git-dir'), 'peer-command');
+      for (let attempt = 0; attempt < 100 && !(existsSync(markerA) && existsSync(markerB)); attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(readFileSync(markerA, 'utf8'), 'running');
+      assert.equal(readFileSync(markerB, 'utf8'), 'running');
+      cancel.abort();
+      assert.match(String(await first), /cancelled/u);
+      writeFileSync(`${markerB}.release`, 'ready');
+      const peer = await second;
+      writeFileSync(`${markerA}.release`, 'ready');
+      const retried = await verifyIssue({ issueNumber: 17, repoRoot: a.path });
+      assert.notEqual(peer.stageReceipts[0]!.input.inputId, retried.stageReceipts[0]!.input.inputId);
+      assert.equal(loadVerifiedRun(b.path, 18).manifestId, peer.manifestId);
+      assert.equal(loadVerifiedRun(a.path, 17).manifestId, retried.manifestId);
+      assert.equal(readFileSync(markerA, 'utf8'), 'passed');
+      assert.equal(readFileSync(markerB, 'utf8'), 'passed');
+      assert.deepEqual(peer.stageReceipts[0]!.commands, retried.stageReceipts[0]!.commands);
+      const resourceBounds = { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 };
+      const parallelStartedAt = Date.now();
+      for (const marker of [markerA, markerB]) {
+        rmSync(marker);
+        rmSync(`${marker}.release`);
+      }
+      parallelRuns = [
+        verifyIssue({ issueNumber: 17, repoRoot: a.path, resourceBounds, signal: parallelCancel.signal }),
+        verifyIssue({ issueNumber: 18, repoRoot: b.path, resourceBounds, signal: parallelCancel.signal }),
+      ];
+      const parallelRun = Promise.all(parallelRuns);
+      void parallelRun.catch(() => undefined);
+      for (let attempt = 0; attempt < 200 && !(existsSync(markerA) && existsSync(markerB)); attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(readFileSync(markerA, 'utf8'), 'running');
+      assert.equal(readFileSync(markerB, 'utf8'), 'running');
+      for (const marker of [markerA, markerB]) writeFileSync(`${marker}.release`, 'ready');
+      const parallel = await parallelRun;
+      const parallelElapsedMs = Date.now() - parallelStartedAt;
+      assert.deepEqual(
+        parallel.map((run) => run.stageReceipts[0]!.commands),
+        [peer.stageReceipts[0]!.commands, retried.stageReceipts[0]!.commands],
+      );
+      assert.ok(parallel.every((run) => run.resources!.sampleCount > 0));
+      const reused = await verifyIssue({ issueNumber: 18, repoRoot: b.path, resourceBounds });
+      assert.equal(reused.stageReceipts[0]!.receiptId, parallel[1]!.stageReceipts[0]!.receiptId);
+      const manifestA = join(
+        root,
+        '.git/ai-delivery/runs@2',
+        digestValue(a.path).slice(7),
+        `${peer.classification.head.sha}.json`,
+      );
+      const { manifestId: _foreignId, ...foreign } = parallel[1]!;
+      const foreignContent = { ...foreign, writer: { ...foreign.writer!, worktreeDigest: digestValue(a.path) } };
+      writeFileSync(manifestA, JSON.stringify({ ...foreignContent, manifestId: digestValue(foreignContent) }));
+      assert.throws(() => loadVerifiedRun(a.path, 17), /environment|foreign/u);
+      writeFileSync(manifestA, JSON.stringify(parallel[0]));
+      console.log(
+        'WRITER_ISOLATION_RECEIPT',
+        JSON.stringify({
+          sameHead: peer.classification.head.sha,
+          peerManifest: peer.manifestId,
+          retryManifest: retried.manifestId,
+          peerReused: true,
+          parallelElapsedMs,
+          maxObservedRssBytes: Math.max(...parallel.map((run) => run.resources!.maxSampledAggregateRssBytes!)),
+        }),
+      );
+    } finally {
+      cancel.abort();
+      parallelCancel.abort();
+      await first;
+      await second?.catch(() => undefined);
+      await Promise.allSettled(parallelRuns);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('interruption child verification', { skip: !process.env.AI_DELIVERY_INTERRUPTION_WORKTREE }, async () => {
+  await verifyIssue({ issueNumber: 17, repoRoot: process.env.AI_DELIVERY_INTERRUPTION_WORKTREE! });
+});
+
+test(
+  'interrupted writer recovers only its recorded command and resumes completed checkpoints',
+  { timeout: 30_000 },
+  async () => {
+    const { root, counter, secondCounter } = await fixture({
+      twoStages: true,
+      secondStageScript: `const fs=require('fs');const cp=require('child_process');const path=require('path');const dir=cp.execFileSync('git',['rev-parse','--git-common-dir'],{encoding:'utf8'}).trim();const count=path.join(dir,'second-stage-count.txt');fs.writeFileSync(count,String(Number(fs.existsSync(count)?fs.readFileSync(count,'utf8'):0)+1));if(!fs.existsSync(path.join(dir,'resume-interrupted')))setInterval(()=>{},1000);`,
+    });
+    let child: ReturnType<typeof spawn> | undefined;
+    let workerPid: number | undefined;
+    let ownedPid: number | undefined;
+    let workerIdentity: string | undefined;
+    let ownedIdentity: string | undefined;
+    let peer: ReturnType<typeof spawn> | undefined;
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      child = spawn(
+        process.execPath,
+        [
+          join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+          'run',
+          'dist/lifecycle.test.js',
+          '-t',
+          '^interruption child verification$',
+        ],
+        {
+          cwd: process.cwd(),
+          stdio: 'ignore',
+          env: { ...process.env, AI_DELIVERY_INTERRUPTION_WORKTREE: row.path },
+        },
+      );
+      const childClosed = new Promise((resolve) => child!.once('close', resolve));
+      const writerPath = join(root, '.git/ai-delivery/writers@1', `${digestValue(row.path).slice(7)}.json`);
+      let recorded:
+        | {
+            owner: { pid: number; identity: string };
+            command: { phase: string; root?: { pid: number; identity: string } };
+          }
+        | undefined;
+      for (let attempt = 0; attempt < 200; attempt++) {
+        if (existsSync(writerPath)) recorded = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof recorded;
+        if (recorded?.command.phase === 'running' && existsSync(secondCounter)) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(readFileSync(counter, 'utf8'), '1');
+      assert.equal(readFileSync(secondCounter, 'utf8'), '1');
+      assert.equal(recorded?.command.phase, 'running');
+      workerPid = recorded!.owner.pid;
+      ownedPid = recorded!.command.root!.pid;
+      workerIdentity = recorded!.owner.identity;
+      ownedIdentity = recorded!.command.root!.identity;
+      const completedDir = join(root, '.git/ai-delivery/verification@1/stages/check');
+      const completedCheckpoint = join(completedDir, readdirSync(completedDir)[0]!);
+      const completedDigest = sha256(completedCheckpoint);
+      peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+      assert.equal(
+        spawnSync('ps', ['-p', String(workerPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim(),
+        workerIdentity,
+      );
+      process.kill(workerPid, 'SIGKILL');
+      workerPid = undefined;
+      await childClosed;
+      process.kill(ownedPid, 0);
+      // A stale file lease is not permission to forget the durable command owner.
+      const stale = new Date(Date.now() - 20_000);
+      utimesSync(`${writerPath}.lock`, stale, stale);
+      writeFileSync(join(root, '.git/resume-interrupted'), 'ready');
+      const recovered = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+      assert.equal(readFileSync(counter, 'utf8'), '1');
+      assert.equal(readFileSync(secondCounter, 'utf8'), '2');
+      assert.equal(sha256(completedCheckpoint), completedDigest);
+      assert.equal(recovered.aggregate.result, 'passed');
+      process.kill(peer.pid!, 0);
+      assert.equal(existsSync(writerPath), false);
+      assert.equal(existsSync(`${writerPath}.lock`), false);
+      const survivor = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
+      assert.ok(
+        (survivor.status === 1 && !survivor.stdout.trim()) ||
+          (survivor.status === 0 && survivor.stdout.trim().startsWith('Z')),
+      );
+      console.log(
+        'INTERRUPTION_RESUME_RECEIPT',
+        JSON.stringify({
+          completedCheckpoint: completedDigest,
+          firstStageExecutions: 1,
+          interruptedStageExecutions: 2,
+          peerPreserved: true,
+          aggregateId: recovered.aggregate.aggregateId,
+        }),
+      );
+      ownedPid = undefined;
+    } finally {
+      for (const [pid, identity] of [
+        [workerPid, workerIdentity],
+        [ownedPid, ownedIdentity],
+      ] as const)
+        if (pid !== undefined && identity !== undefined) {
+          const current = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8' });
+          if (current.status !== 0 || current.stdout.trim() !== identity) continue;
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH');
+          }
+        }
+      for (const processHandle of [peer, child])
+        if (processHandle?.exitCode === null && processHandle.signalCode === null) processHandle.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('issue worktree verification resumes a completed stage and rejects changed inputs', async () => {
   const { root, counter, runtimeEntryPath } = await fixture();
@@ -1296,7 +1782,7 @@ test('a bounded passing run records measured resources in versioned evidence', a
       repoRoot: row.path,
       resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
     });
-    assert.equal(run.schemaVersion, 'ai-delivery.run@2');
+    assert.equal(run.schemaVersion, 'ai-delivery.run@3');
     const resources = run.resources;
     assert.ok(resources);
     assert.ok(resources.sampleCount > 0);
@@ -1950,13 +2436,6 @@ test('public dispatch publishes with selected host token and submits the configu
     writeFileSync(join(row.path, 'change.txt'), 'host author publication\n');
     git(row.path, 'add', 'change.txt');
     git(row.path, 'commit', '-qm', 'synthetic host publication');
-    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
-    personalRoute.baseSha = run.classification.base.sha;
-    personalRoute.headSha = run.classification.head.sha;
-    personalRoute.reviews.length = 0;
-    personalRoute.submitted = 0;
-    personalRoute.active = true;
-
     const realGit = (originalPath ?? '')
       .split(':')
       .map((directory) => join(directory, 'git'))
@@ -1981,6 +2460,12 @@ exec "${realGit}" "$@"
     );
     chmodSync(shim, 0o700);
     process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
+    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    personalRoute.baseSha = run.classification.base.sha;
+    personalRoute.headSha = run.classification.head.sha;
+    personalRoute.reviews.length = 0;
+    personalRoute.submitted = 0;
+    personalRoute.active = true;
 
     const execution = { repoRoot: row.path, runtimeEntryPath, identity: 'host-author' };
     const published = (await executeTool('issue_pr_create', { issueNumber: 17 }, execution)) as {

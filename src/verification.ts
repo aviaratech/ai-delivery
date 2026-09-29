@@ -1,12 +1,16 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, readdirSync, statfsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { existsSync, unlinkSync, lstatSync, readFileSync, readdirSync, statfsSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
+import { assertPrivateFile } from './delivery/common.js';
 import {
   classifyRepositoryExactRange,
+  assertRepositoryClassificationCurrent,
   createRepositoryDeliveryEvidence,
   createRepositoryStageAggregate,
   createRepositoryStageInput,
@@ -34,7 +38,8 @@ import {
 import { DeliveryError } from './errors.js';
 import { assertClean, changedPaths, coordinate, defaultBaseRef, git, gitCommonDir, gitRoot } from './git.js';
 import { getIssueWorktreeStrict } from './services/worktreeRegistry.js';
-import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
+import { withLock } from './utils/lockfile.js';
+import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 export interface VerificationRun {
   aggregate: RepositoryStageAggregate;
@@ -42,7 +47,8 @@ export interface VerificationRun {
   completedAt: string;
   manifestId: string;
   resources?: VerificationResourceSummary;
-  schemaVersion: 'ai-delivery.run@1' | 'ai-delivery.run@2';
+  schemaVersion: 'ai-delivery.run@1' | 'ai-delivery.run@2' | 'ai-delivery.run@3';
+  writer?: { worktreeDigest: string; producerDigest: string };
   stageReceipts: RepositoryStageReceipt[];
 }
 
@@ -523,6 +529,148 @@ async function confirmOwnedCleanup(state: OwnedProcessState): Promise<void> {
   }
 }
 
+/** Signal only birth identities established by this command, including observed detached children. */
+function terminateOwnedProcesses(state: OwnedProcessState): void {
+  if (!state.sampled || state.rootIdentity === undefined) throw new DeliveryError('Owned process identity is unknown.');
+  const snapshot = processSnapshot();
+  const root = snapshot.get(state.rootPid);
+  if (root !== undefined && root.identity !== state.rootIdentity)
+    throw new DeliveryError('Owned process group identity changed before cleanup.');
+  const alive = [...state.tracked.values()].flatMap((previous) => {
+    const current = snapshot.get(previous.pid);
+    if (current === undefined || current.status.startsWith('Z')) return [];
+    if (current.identity !== previous.identity)
+      throw new DeliveryError('Tracked process identity changed before cleanup.');
+    return [current];
+  });
+  const group = [...snapshot.values()].filter(
+    (member) => member.pgid === state.rootPid && !member.status.startsWith('Z'),
+  );
+  if (group.length > 0 && !alive.some((member) => member.pgid === state.rootPid))
+    throw new DeliveryError('Owned process group has no surviving recorded identity; cleanup is ambiguous.');
+  const signal = (pid: number): void => {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    }
+  };
+  if (group.length > 0) signal(-state.rootPid);
+  for (const member of alive.reverse()) signal(member.pid);
+}
+
+const ProcessIdentitySchema = z.strictObject({ pid: z.number().int().positive(), identity: z.string().min(1) });
+const WriterStateSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.verification-writer@1'),
+    writerId: z.uuid(),
+    worktreeDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    owner: ProcessIdentitySchema,
+    command: z.union([
+      z.strictObject({ phase: z.literal('idle') }),
+      z.strictObject({ phase: z.literal('starting') }),
+      z.strictObject({
+        phase: z.literal('running'),
+        root: ProcessIdentitySchema,
+        tracked: z.array(z.strictObject({ ...ProcessIdentitySchema.shape, pgid: z.number().int().positive() })),
+      }),
+    ]),
+    stateId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  })
+  .superRefine((state, ctx) => {
+    const { stateId, ...content } = state;
+    if (stateId !== digestValue(content)) ctx.addIssue({ code: 'custom', message: 'Writer state is corrupt.' });
+  });
+interface VerificationWriter {
+  starting(): void;
+  observed(state: OwnedProcessState): void;
+  idle(): void;
+}
+
+async function withVerificationWriter<T>(
+  root: string,
+  operation: (writer: VerificationWriter) => Promise<T>,
+): Promise<T> {
+  const digest = worktreeDigest(root);
+  const path = join(gitCommonDir(root), 'ai-delivery', 'writers@1', `${digest.slice(7)}.json`);
+  ensurePrivateDirectoryDurably(dirname(path));
+  return withLock(path, {
+    projectRoot: root,
+    timeout: 200,
+    operation: async () => {
+      const snapshot = processSnapshot();
+      const owner = snapshot.get(process.pid);
+      if (owner === undefined || owner.status.startsWith('Z'))
+        throw new DeliveryError('Verification writer identity is unknown.');
+      if (existsSync(path)) {
+        const previous = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
+        if (previous.worktreeDigest !== digest)
+          throw new DeliveryError('Verification writer belongs to another worktree.');
+        const priorOwner = snapshot.get(previous.owner.pid);
+        if (priorOwner?.identity === previous.owner.identity && !priorOwner.status.startsWith('Z'))
+          throw new DeliveryError('A live verification writer still owns this worktree.');
+        if (previous.command.phase === 'starting')
+          throw new DeliveryError('Interrupted writer has unknown command ownership; reconcile before retrying.');
+        if (previous.command.phase === 'running') {
+          const state: OwnedProcessState = {
+            rootPid: previous.command.root.pid,
+            rootIdentity: previous.command.root.identity,
+            sampled: true,
+            tracked: new Map(
+              previous.command.tracked.map((member) => [member.pid, { ...member, ppid: 0, rssBytes: 0, status: '' }]),
+            ),
+          };
+          terminateOwnedProcesses(state);
+          await confirmOwnedCleanup(state);
+          reportVerificationProgress({
+            state: 'recovered',
+            stageId: 'writer',
+            completedStages: 0,
+            reusedStages: 0,
+            remainingStages: 0,
+            elapsedMs: 0,
+            reason: 'Recorded interrupted command cleanup confirmed; compatible completed stages remain available.',
+          });
+        }
+      }
+      let state: Omit<z.infer<typeof WriterStateSchema>, 'stateId'> = {
+        schemaVersion: 'ai-delivery.verification-writer@1',
+        writerId: randomUUID(),
+        worktreeDigest: digest,
+        owner: { pid: owner.pid, identity: owner.identity },
+        command: { phase: 'idle' },
+      };
+      const persist = (command: typeof state.command): void => {
+        state = { ...state, command };
+        writePrivateJsonFileAtomically(path, { ...state, stateId: digestValue(state) });
+      };
+      persist({ phase: 'idle' });
+      const writer: VerificationWriter = {
+        starting: () => persist({ phase: 'starting' }),
+        observed: (owned) => {
+          if (owned.rootIdentity === undefined) throw new DeliveryError('Cannot persist an unknown command owner.');
+          persist({
+            phase: 'running',
+            root: { pid: owned.rootPid, identity: owned.rootIdentity },
+            tracked: [...owned.tracked.values()].map(({ pid, identity, pgid }) => ({ pid, identity, pgid })),
+          });
+        },
+        idle: () => persist({ phase: 'idle' }),
+      };
+      const releaseWriter = (): void => {
+        const current = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
+        if (current.writerId !== state.writerId) throw new DeliveryError('Verification writer ownership changed.');
+        if (current.command.phase === 'idle') unlinkSync(path);
+      };
+      try {
+        return await operation(writer);
+      } finally {
+        releaseWriter();
+      }
+    },
+  });
+}
+
 function primaryRoot(worktreeRoot: string): string {
   const common = gitCommonDir(worktreeRoot);
   if (basename(common) !== '.git') throw new DeliveryError('Expected a conventional non-bare Git repository.');
@@ -541,8 +689,60 @@ function assertRegisteredIssue(worktreeRoot: string, issueNumber: number, allowM
   assertClean(worktreeRoot);
 }
 
-function manifestPath(common: string, headSha: string): string {
-  return join(common, 'ai-delivery', 'runs', `${headSha}.json`);
+function worktreeDigest(root: string): string {
+  return digestValue(resolve(root));
+}
+function producerDigest(): string {
+  const root = dirname(fileURLToPath(import.meta.url));
+  const code: { path: string; digest: string }[] = [];
+  const collect = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) collect(path);
+      else if (entry.isFile() && entry.name.endsWith('.js') && !entry.name.endsWith('.test.js'))
+        code.push({ path: path.slice(root.length + 1), digest: digestBytes(readFileSync(path)) });
+    }
+  };
+  collect(root);
+  const dependencies = new Map<string, string>();
+  const collectDependencies = (manifestPath: string): void => {
+    if (dependencies.has(manifestPath)) return;
+    const bytes = readFileSync(manifestPath);
+    const manifest = z
+      .object({ dependencies: z.record(z.string(), z.string()).optional() })
+      .parse(JSON.parse(bytes.toString('utf8')));
+    dependencies.set(manifestPath, digestBytes(bytes));
+    const require = createRequire(manifestPath);
+    for (const name of Object.keys(manifest.dependencies ?? {}).sort()) {
+      let resolved: string;
+      try {
+        resolved = require.resolve(`${name}/package.json`);
+      } catch {
+        resolved = require.resolve(name);
+      }
+      let directory = dirname(resolved);
+      for (;;) {
+        const path = join(directory, 'package.json');
+        if (existsSync(path)) {
+          const candidate = z.object({ name: z.string().optional() }).parse(JSON.parse(readFileSync(path, 'utf8')));
+          if (candidate.name === name) {
+            collectDependencies(path);
+            break;
+          }
+        }
+        const parent = dirname(directory);
+        if (parent === directory) throw new DeliveryError(`Producer dependency identity is unavailable for ${name}.`);
+        directory = parent;
+      }
+    }
+  };
+  collectDependencies(join(dirname(root), 'package.json'));
+  return digestValue({ code, dependencies: [...dependencies].sort(([a], [b]) => a.localeCompare(b)) });
+}
+function manifestPath(common: string, headSha: string, root?: string): string {
+  return root === undefined
+    ? join(common, 'ai-delivery', 'runs', `${headSha}.json`)
+    : join(common, 'ai-delivery', 'runs@2', worktreeDigest(root).slice(7), `${headSha}.json`);
 }
 
 function parseRun(value: unknown): VerificationRun {
@@ -552,48 +752,98 @@ function parseRun(value: unknown): VerificationRun {
   const classification = RepositoryClassificationReceiptSchema.parse(input.classification);
   const aggregate = RepositoryStageAggregateSchema.parse(input.aggregate);
   const stageReceipts = RepositoryStageReceiptSchema.array().parse(input.stageReceipts);
-  if (input.schemaVersion !== 'ai-delivery.run@1' && input.schemaVersion !== 'ai-delivery.run@2') {
+  if (!['ai-delivery.run@1', 'ai-delivery.run@2', 'ai-delivery.run@3'].includes(String(input.schemaVersion)))
     throw new DeliveryError('Run manifest schema version is unsupported.');
-  }
-  if (input.schemaVersion === 'ai-delivery.run@1' && input.resources !== undefined) {
+  if (input.schemaVersion === 'ai-delivery.run@1' && input.resources !== undefined)
     throw new DeliveryError('Historical run manifest has unexpected resource evidence.');
-  }
-  const resources =
-    input.schemaVersion === 'ai-delivery.run@2' ? ResourceSummarySchema.parse(input.resources) : undefined;
+  const resources = input.resources === undefined ? undefined : ResourceSummarySchema.parse(input.resources);
+  if (input.schemaVersion === 'ai-delivery.run@2' && resources === undefined)
+    throw new DeliveryError('Historical bounded run lacks resource evidence.');
+  const writer =
+    input.schemaVersion === 'ai-delivery.run@3'
+      ? z
+          .strictObject({
+            worktreeDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+            producerDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+          })
+          .parse(input.writer)
+      : undefined;
   const content = {
     aggregate,
     classification,
     completedAt: input.completedAt,
     ...(resources === undefined ? {} : { resources }),
+    ...(writer === undefined ? {} : { writer }),
     schemaVersion: input.schemaVersion,
     stageReceipts,
   };
-  if (typeof input.completedAt !== 'string' || input.manifestId !== digestValue(content))
-    throw new DeliveryError('Run manifest identity is invalid.');
+  if (
+    typeof input.completedAt !== 'string' ||
+    input.manifestId !== digestValue(content) ||
+    createRepositoryStageAggregate({ classification, receipts: stageReceipts }).aggregateId !== aggregate.aggregateId
+  )
+    throw new DeliveryError('Run manifest identity or aggregate is invalid.');
   return { ...content, completedAt: input.completedAt, manifestId: input.manifestId } as VerificationRun;
 }
 
-function loadRun(common: string, headSha: string): VerificationRun {
+function loadRun(common: string, headSha: string, root: string, historical = false): VerificationRun {
   let raw: unknown;
   try {
+    raw = JSON.parse(readFileSync(manifestPath(common, headSha, root), 'utf8')) as unknown;
+  } catch (error) {
+    if (!historical || (error as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw new DeliveryError(
+        'Exact-head worktree verification run is missing or corrupt; verify with the current producer.',
+      );
     raw = JSON.parse(readFileSync(manifestPath(common, headSha), 'utf8')) as unknown;
-  } catch {
-    throw new DeliveryError('Exact-head verification run is missing or corrupt.');
   }
-  return parseRun(raw);
+  const run = parseRun(raw);
+  if (
+    run.classification.head.sha !== headSha ||
+    (run.writer !== undefined &&
+      (run.writer.worktreeDigest !== worktreeDigest(root) ||
+        (!historical && run.writer.producerDigest !== producerDigest()))) ||
+    (!historical && run.writer === undefined)
+  )
+    throw new DeliveryError('Verification run belongs to another writer or producer.');
+  const expectedEnvironment = historical ? undefined : verificationEnvironmentDigest(root, run.resources);
+  if (
+    expectedEnvironment !== undefined &&
+    run.stageReceipts.some((receipt) => receipt.input.environmentDigest !== expectedEnvironment)
+  )
+    throw new DeliveryError('Verification stage environment belongs to a foreign worktree or producer.');
+  return run;
 }
 
-function stageEnvironmentDigest(): string {
+function stageEnvironmentDigest(root: string, producer = producerDigest()): string {
   return digestValue({
     arch: process.arch,
     node: process.version,
     path: process.env.PATH ?? '',
     platform: process.platform,
+    worktreeDigest: worktreeDigest(root),
+    producerDigest: producer,
   });
 }
 
+function verificationEnvironmentDigest(
+  root: string,
+  resources?: Pick<VerificationResourceSummary, 'bounds' | 'outputBaselineId'>,
+  producer = producerDigest(),
+): string {
+  const environment = stageEnvironmentDigest(root, producer);
+  return resources === undefined
+    ? environment
+    : digestValue({
+        environment,
+        ...(resources.outputBaselineId === undefined ? {} : { outputBaselineId: resources.outputBaselineId }),
+        resourceBounds: resources.bounds,
+        resourceRunner: digestBytes(readFileSync(fileURLToPath(import.meta.url))),
+      });
+}
+
 function reportVerificationProgress(input: {
-  state: 'running' | 'reused' | 'completed' | 'failed';
+  state: 'running' | 'reused' | 'completed' | 'failed' | 'recovered';
   stageId: string;
   commandLabel?: string;
   completedStages: number;
@@ -606,6 +856,12 @@ function reportVerificationProgress(input: {
   sampledNewOutputBytes?: number;
   ownedProcessCount?: number;
   reason?: string;
+  completedCommands?: number;
+  remainingCommands?: number;
+  reusedCommands?: number;
+  executedCommandsPerSecond?: number;
+  lastCompletedWorkAgeMs?: number;
+  commandElapsedMs?: number;
 }): void {
   process.stderr.write(`ai-delivery.verify ${JSON.stringify(input)}\n`);
 }
@@ -618,27 +874,42 @@ function runStageCommand(
   resourceBounds?: VerificationResourceBounds,
   baseline?: OutputBaseline,
   onResourceSample?: (sample: ResourceSample) => void,
+  writer?: VerificationWriter,
 ): Promise<Buffer> {
   const [executable, ...args] = argv;
   if (!executable) throw new DeliveryError('Policy selected an empty stage command.');
   if (abortSignal?.aborted) throw new DeliveryError('Selected policy stage command cancelled.');
+  writer?.starting();
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, {
-      cwd: repoRoot,
-      detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    // The shell waits for our ownership receipt, then exec preserves its PID, birth identity and process group.
+    const child = spawn(
+      '/bin/sh',
+      [
+        '-c',
+        'IFS= read -r ready || exit 125; [ "$ready" = run ] || exit 125; exec "$@" </dev/null',
+        'ai-delivery-command',
+        executable,
+        ...args,
+      ],
+      {
+        cwd: repoRoot,
+        detached: process.platform !== 'win32',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+    );
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     const owned: OwnedProcessState | undefined =
-      resourceBounds === undefined || child.pid === undefined
+      process.platform === 'win32' || child.pid === undefined
         ? undefined
         : { rootPid: child.pid, sampled: false, tracked: new Map() };
     let outputBytes = 0;
     let failure: string | undefined;
     let cleanupFailure: string | undefined;
+    let writerFailure: string | undefined;
     let closed = false;
     let settled = false;
+    let commandReleased = false;
     let closeTimer: NodeJS.Timeout | undefined;
     let exitPipeTimer: NodeJS.Timeout | undefined;
     let resourceTimer: NodeJS.Timeout | undefined;
@@ -653,53 +924,30 @@ function runStageCommand(
     };
     const killOwned = (): void => {
       if (child.pid === undefined) return;
-      if (process.platform === 'win32') {
-        if (!child.kill('SIGKILL') && child.exitCode === null && child.signalCode === null)
-          cleanupFailure ??= 'could not signal the owned child';
-        return;
-      }
-      let groupIsOwned = resourceBounds === undefined;
       if (owned?.sampled) {
         try {
-          const snapshot = processSnapshot();
-          const root = snapshot.get(owned.rootPid);
-          if (root !== undefined && root.identity !== owned.rootIdentity) {
-            cleanupFailure ??= 'owned process group identity changed before cleanup';
-          } else {
-            groupIsOwned = [...snapshot.values()].some(
-              (member) => member.pgid === owned.rootPid && !member.status.startsWith('Z'),
-            );
-          }
-          for (const previous of [...owned.tracked.values()].reverse()) {
-            const current = snapshot.get(previous.pid);
-            if (current === undefined || current.status.startsWith('Z')) continue;
-            if (current.identity !== previous.identity) {
-              cleanupFailure ??= 'tracked process identity changed before cleanup';
-              continue;
-            }
-            try {
-              process.kill(previous.pid, 'SIGKILL');
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
-                cleanupFailure ??= error instanceof Error ? error.message : String(error);
-              }
-            }
-          }
+          observeOwnedProcesses(owned, processSnapshot());
         } catch (error) {
           cleanupFailure ??= error instanceof Error ? error.message : String(error);
-          groupIsOwned = child.exitCode === null && child.signalCode === null;
         }
-      } else if (resourceBounds !== undefined) {
-        groupIsOwned = child.exitCode === null && child.signalCode === null;
-        cleanupFailure ??= 'owned process identity was not observed before cleanup';
-      }
-      if (groupIsOwned) {
         try {
-          process.kill(-child.pid, 'SIGKILL');
+          writer?.observed(owned);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
-            cleanupFailure ??= error instanceof Error ? error.message : String(error);
-          }
+          writerFailure ??= error instanceof Error ? error.message : String(error);
+        }
+        // Durable state failure cannot prevent identity-checked termination of known-owned processes.
+        try {
+          terminateOwnedProcesses(owned);
+        } catch (error) {
+          cleanupFailure ??= error instanceof Error ? error.message : String(error);
+        }
+      } else {
+        try {
+          // The still-owned direct child is the only safe signal target before identity observation.
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+          if (commandReleased) cleanupFailure ??= 'owned process identity was not observed before cleanup';
+        } catch (error) {
+          cleanupFailure ??= error instanceof Error ? error.message : String(error);
         }
       }
     };
@@ -717,7 +965,7 @@ function runStageCommand(
           child.unref();
           reject(
             new DeliveryError(
-              `Selected policy stage command failed (${failure}). Owned process cleanup failed (owned command pipes did not close; descendant cleanup could not be verified).`,
+              `Selected policy stage command failed (${failure}).${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`} Owned process cleanup failed (owned command pipes did not close; descendant cleanup could not be verified).`,
             ),
           );
         }, 2_000);
@@ -735,7 +983,11 @@ function runStageCommand(
     child.stderr.on('data', (chunk: Buffer) => capture(stderr, chunk));
     child.stdout.once('error', (error) => stop(error.message));
     child.stderr.once('error', (error) => stop(error.message));
-    child.once('error', (error) => stop(error.message));
+    child.stdin.once('error', (error) => stop(error.message));
+    child.once('error', (error) => {
+      if (child.pid === undefined) writer?.idle();
+      stop(error.message);
+    });
     child.once('exit', (code, signal) => {
       if (code !== 0 || signal !== null) stop(`exit ${String(code)}${signal === null ? '' : ` signal ${signal}`}`);
       else if (!closed) {
@@ -744,24 +996,30 @@ function runStageCommand(
         }, 1_000);
       }
     });
-    if (resourceBounds !== undefined) {
-      child.once('spawn', () => {
-        const sample = (): void => {
-          if (failure !== undefined || child.pid === undefined) return;
-          try {
-            if (owned === undefined) throw new DeliveryError('Owned process identity is unavailable.');
+    child.once('spawn', () => {
+      const sample = (): void => {
+        if (failure !== undefined || child.pid === undefined) return;
+        try {
+          if (owned === undefined) throw new DeliveryError('Owned process identity is unavailable on this platform.');
+          observeOwnedProcesses(owned, processSnapshot());
+          writer?.observed(owned);
+          if (resourceBounds !== undefined) {
             const result = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline);
             onResourceSample?.(result);
             onRunning?.(outputBytes, result);
-          } catch (error) {
-            stop(error instanceof Error ? error.message : String(error));
           }
-        };
-        sample();
-        resourceTimer = setInterval(sample, 1_000);
-        resourceTimer.unref();
-      });
-    }
+          if (!commandReleased) {
+            commandReleased = true;
+            child.stdin.end('run\n');
+          }
+        } catch (error) {
+          stop(error instanceof Error ? error.message : String(error));
+        }
+      };
+      sample();
+      resourceTimer = setInterval(sample, 1_000);
+      resourceTimer.unref();
+    });
     const progressTimer = setInterval(() => onRunning?.(outputBytes), 5_000);
     progressTimer.unref();
     const onAbort = (): void => stop('cancelled');
@@ -777,11 +1035,12 @@ function runStageCommand(
       clearWatchers();
       if (failure === undefined && owned !== undefined) {
         try {
-          if (!owned.sampled) throw new DeliveryError('Owned process resource observation was unavailable.');
           if (resourceBounds !== undefined) {
-            const result = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline);
-            onResourceSample?.(result);
+            const sample = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline);
+            onResourceSample?.(sample);
+            onRunning?.(outputBytes, sample);
           }
+          if (!owned.sampled) throw new DeliveryError('Owned process resource observation was unavailable.');
           const remaining = observeOwnedProcesses(owned, processSnapshot());
           if (remaining.length > 0) throw new DeliveryError('A sampled owned descendant survived command exit.');
         } catch (error) {
@@ -790,21 +1049,31 @@ function runStageCommand(
       }
       if (failure !== undefined || code !== 0 || signal !== null) {
         const reason = failure ?? `exit ${String(code)}${signal === null ? '' : ` signal ${signal}`}`;
-        if (owned !== undefined) {
+        let cleanupConfirmed = child.pid === undefined || !commandReleased;
+        if (owned !== undefined && owned.sampled) {
           try {
             await confirmOwnedCleanup(owned);
+            cleanupConfirmed = true;
           } catch (error) {
             cleanupFailure ??= error instanceof Error ? error.message : String(error);
+          }
+        }
+        if (cleanupConfirmed) {
+          try {
+            writer?.idle();
+          } catch (error) {
+            writerFailure ??= error instanceof Error ? error.message : String(error);
           }
         }
         settled = true;
         reject(
           new DeliveryError(
-            `Selected policy stage command failed (${reason}).${cleanupFailure === undefined ? '' : ` Owned process cleanup failed (${cleanupFailure}).`}`,
+            `Selected policy stage command failed (${reason}).${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`}${cleanupFailure === undefined ? '' : ` Owned process cleanup failed (${cleanupFailure}).`}`,
           ),
         );
         return;
       }
+      writer?.idle();
       settled = true;
       resolve(Buffer.concat([...stdout, ...stderr], outputBytes));
     };
@@ -825,6 +1094,14 @@ export async function verifyIssue(input: {
   resourceBounds?: VerificationResourceBounds;
   signal?: AbortSignal;
 }): Promise<VerificationRun> {
+  const root = gitRoot(input.repoRoot);
+  return withVerificationWriter(root, (writer) => verifyIssueOwned(input, writer));
+}
+
+async function verifyIssueOwned(
+  input: Parameters<typeof verifyIssue>[0],
+  writer: VerificationWriter,
+): Promise<VerificationRun> {
   const assertNotCancelled = (): void => {
     if (input.signal?.aborted) throw new DeliveryError('Verification cancelled.');
   };
@@ -862,6 +1139,21 @@ export async function verifyIssue(input: {
   const admitted = new Set(input.admittedResourceClasses ?? ['source_only']);
   const startedAtMs = Date.now();
   let reusedStages = 0;
+  let completedCommands = 0;
+  let reusedCommands = 0;
+  let lastCompletedAtMs = startedAtMs;
+  const totalCommands = classification.requiredStages.reduce((total, stage) => total + stage.commands.length, 0);
+  const report = (progress: Parameters<typeof reportVerificationProgress>[0]): void => {
+    const elapsedMs = Date.now() - startedAtMs;
+    reportVerificationProgress({
+      ...progress,
+      completedCommands,
+      remainingCommands: totalCommands - completedCommands,
+      reusedCommands,
+      executedCommandsPerSecond: elapsedMs === 0 ? 0 : ((completedCommands - reusedCommands) * 1000) / elapsedMs,
+      lastCompletedWorkAgeMs: Date.now() - lastCompletedAtMs,
+    });
+  };
   const normalizedBounds: VerificationResourceSummary['bounds'] | undefined =
     input.resourceBounds === undefined
       ? undefined
@@ -884,15 +1176,8 @@ export async function verifyIssue(input: {
     sampleCount: 0,
   });
   const resources = normalizedBounds === undefined ? undefined : emptyResources();
-  const environmentDigest =
-    normalizedBounds === undefined
-      ? stageEnvironmentDigest()
-      : digestValue({
-          environment: stageEnvironmentDigest(),
-          ...(baseline === undefined ? {} : { outputBaselineId: baseline.baselineId }),
-          resourceBounds: normalizedBounds,
-          resourceRunner: digestBytes(readFileSync(fileURLToPath(import.meta.url))),
-        });
+  const producer = producerDigest();
+  const environmentDigest = verificationEnvironmentDigest(root, resources, producer);
   let stageResources: VerificationResourceSummary | undefined;
   const recordResourceSample = (sample: ResourceSample): void => {
     if (resources === undefined) return;
@@ -914,10 +1199,12 @@ export async function verifyIssue(input: {
     const stageInput = createRepositoryStageInput({
       classification,
       environmentDigest,
-      semanticInputs: stage.semanticInputKeys.map((key) => ({
-        digest: digestValue({ key, evidenceId: classification.policyEvidence.evidenceId }),
-        key,
-      })),
+      semanticInputs:
+        stage.semanticInputs ??
+        stage.semanticInputKeys.map((key) => ({
+          digest: digestValue({ key, evidenceId: classification.policyEvidence.evidenceId }),
+          key,
+        })),
       stageId: stage.id,
       upstream: stage.dependsOn.map((stageId) => {
         const receipt = receipts.find((value) => value.input.stageId === stageId);
@@ -958,7 +1245,10 @@ export async function verifyIssue(input: {
     if (cached) {
       receipts.push(cached);
       reusedStages += 1;
-      reportVerificationProgress({
+      completedCommands += cached.commands.length;
+      reusedCommands += cached.commands.length;
+      lastCompletedAtMs = Date.now();
+      report({
         state: 'reused',
         stageId: stage.id,
         completedStages: receipts.length,
@@ -973,9 +1263,10 @@ export async function verifyIssue(input: {
     const startedAt = new Date().toISOString();
     const commands: { exitCode: number; label: string; outputDigest: string }[] = [];
     for (const command of stage.commands) {
+      const commandStartedAtMs = Date.now();
       if (input.resourceBounds !== undefined) assertDiskHeadroom(root, input.resourceBounds, baseline);
       const progress = (capturedOutputBytes: number, sample?: ResourceSample): void =>
-        reportVerificationProgress({
+        report({
           state: 'running',
           stageId: stage.id,
           commandLabel: command.label,
@@ -984,6 +1275,7 @@ export async function verifyIssue(input: {
           reusedStages,
           elapsedMs: Date.now() - startedAtMs,
           capturedOutputBytes,
+          commandElapsedMs: Date.now() - commandStartedAtMs,
           ...(sample === undefined
             ? {}
             : {
@@ -1004,9 +1296,10 @@ export async function verifyIssue(input: {
           input.resourceBounds,
           baseline,
           recordResourceSample,
+          writer,
         );
       } catch (error) {
-        reportVerificationProgress({
+        report({
           state: 'failed',
           stageId: stage.id,
           commandLabel: command.label,
@@ -1019,6 +1312,8 @@ export async function verifyIssue(input: {
         throw error;
       }
       assertNotCancelled();
+      completedCommands += 1;
+      lastCompletedAtMs = Date.now();
       commands.push({
         exitCode: 0,
         label: command.label,
@@ -1047,7 +1342,8 @@ export async function verifyIssue(input: {
     writeRepositoryStageCheckpoint({ gitCommonDir: common, receipt, repoRoot: root });
     stageResources = undefined;
     receipts.push(receipt);
-    reportVerificationProgress({
+    lastCompletedAtMs = Date.now();
+    report({
       state: 'completed',
       stageId: stage.id,
       completedStages: receipts.length,
@@ -1057,6 +1353,15 @@ export async function verifyIssue(input: {
     });
   }
   assertNotCancelled();
+  assertRepositoryClassificationCurrent({
+    classification,
+    configDigest: loaded.configDigest,
+    policySourcePath: loaded.config.policy.module,
+    repoRoot: root,
+  });
+  if (coordinate(root).sha !== head.sha || coordinate(root, defaultBaseRef(root, loaded.remote)).sha !== base.sha)
+    throw new DeliveryError('Verification source changed during execution; classify and resume the current source.');
+  if (producerDigest() !== producer) throw new DeliveryError('Verification producer changed during execution.');
   const aggregate = createRepositoryStageAggregate({ classification, receipts });
   writeRepositoryStageAggregate({ gitCommonDir: common, aggregate });
   const content = {
@@ -1064,11 +1369,12 @@ export async function verifyIssue(input: {
     classification,
     completedAt: new Date().toISOString(),
     ...(resources === undefined ? {} : { resources: ResourceSummarySchema.parse(resources) }),
-    schemaVersion: resources === undefined ? ('ai-delivery.run@1' as const) : ('ai-delivery.run@2' as const),
+    schemaVersion: 'ai-delivery.run@3' as const,
+    writer: { worktreeDigest: worktreeDigest(root), producerDigest: producer },
     stageReceipts: receipts,
   };
   const run: VerificationRun = { ...content, manifestId: digestValue(content) };
-  writePrivateJsonFileAtomically(manifestPath(common, head.sha), run);
+  writePrivateJsonFileAtomically(manifestPath(common, head.sha, root), run);
   return run;
 }
 
@@ -1090,7 +1396,7 @@ export async function createIssuePhaseEvidence(input: {
     repoRoot: root,
     policySourcePath: loaded.config.policy.module,
   });
-  const run = loadRun(gitCommonDir(root), coordinate(root).sha);
+  const run = loadRun(gitCommonDir(root), coordinate(root).sha, root);
   const evidence = createRepositoryDeliveryEvidence({
     aggregate: run.aggregate,
     ...(input.approval === undefined ? {} : { approval: input.approval }),
@@ -1117,7 +1423,8 @@ export async function createIssuePhaseEvidence(input: {
 export function loadVerifiedRun(repoRoot: string, issueNumber: number): VerificationRun {
   const root = gitRoot(repoRoot);
   assertRegisteredIssue(root, issueNumber, true);
-  return loadRun(gitCommonDir(root), coordinate(root).sha);
+  const historical = getIssueWorktreeStrict(issueNumber, primaryRoot(root)).status === 'merged';
+  return loadRun(gitCommonDir(root), coordinate(root).sha, root, historical);
 }
 
 /** Recover an exact merged run after worktree removal interrupted terminal recording. */
@@ -1128,7 +1435,7 @@ export function loadRemovedMergedRun(primaryRepoRoot: string, issueNumber: numbe
     throw new DeliveryError('Removed-run recovery requires the exact registered merged issue.');
   }
   const headSha = git(root, 'rev-parse', `refs/heads/${row.branch}`);
-  const run = loadRun(gitCommonDir(root), headSha);
+  const run = loadRun(gitCommonDir(root), headSha, row.path, true);
   if (run.classification.head.sha !== headSha) {
     throw new DeliveryError('Recovered merged run disagrees with the registered branch.');
   }

@@ -28,6 +28,10 @@ export const RepositoryStageDefinitionSchema = z
     id: StageIdSchema,
     resourceClass: z.enum(['source_only', 'focused_node', 'canonical_verify', 'model', 'postgres_docker']),
     semanticInputKeys: z.array(z.string().min(1)).min(1),
+    semanticInputs: z
+      .array(z.object({ digest: DigestSchema, key: z.string().min(1) }).strict())
+      .min(1)
+      .optional(),
   })
   .strict();
 export type RepositoryStageDefinition = z.infer<typeof RepositoryStageDefinitionSchema>;
@@ -69,6 +73,9 @@ export const RepositoryPolicyClassificationSchema = z
         stage.dependsOn.some((d) => !seen.has(d)) ||
         new Set(stage.dependsOn).size !== stage.dependsOn.length ||
         !isUniqueSorted(stage.semanticInputKeys) ||
+        (stage.semanticInputs !== undefined &&
+          (!isUniqueSorted(stage.semanticInputs.map((entry) => entry.key)) ||
+            stableJson(stage.semanticInputs.map((entry) => entry.key)) !== stableJson(stage.semanticInputKeys))) ||
         (stage.commands.length === 0) !== (stage.attestationKey !== undefined)
       )
         ctx.addIssue({ code: 'custom', message: 'Policy stages must be unique, ordered and proof complete.' });
@@ -101,7 +108,7 @@ export const RepositoryPolicyBoundarySchema = z
 export type RepositoryPolicyBoundary = z.infer<typeof RepositoryPolicyBoundarySchema>;
 
 export interface RepositoryDeliveryPolicy {
-  readonly schemaVersion: 'RepositoryDeliveryPolicy@1';
+  readonly schemaVersion: 'RepositoryDeliveryPolicy@1' | 'RepositoryDeliveryPolicy@2';
   classifyExactRange(input: {
     repository: string;
     baseSha: string;
@@ -134,7 +141,7 @@ export const RepositoryClassificationReceiptSchema = z
     repository: RepositorySchema,
     requiredStages: z.array(RepositoryStageDefinitionSchema).min(1),
     risk: z.enum(['standard', 'high']),
-    schemaVersion: z.literal('ai-delivery.classification@1'),
+    schemaVersion: z.enum(['ai-delivery.classification@1', 'ai-delivery.classification@2']),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -148,6 +155,9 @@ export const RepositoryClassificationReceiptSchema = z
       stableJson(value.policyEvidence.head) !== stableJson(value.head) ||
       value.policyEvidence.configDigest !== value.configDigest ||
       value.policyEvidence.policyDigest !== value.policyDigest ||
+      value.requiredStages.some(
+        (stage) => (stage.semanticInputs !== undefined) !== (value.schemaVersion === 'ai-delivery.classification@2'),
+      ) ||
       !RepositoryPolicyClassificationSchema.safeParse({
         policyDigest: value.policyDigest,
         policyEvidence: value.policyEvidence,
@@ -171,7 +181,9 @@ export async function loadSelectedRepositoryPolicy(input: {
   if (
     policy === null ||
     typeof policy !== 'object' ||
-    (policy as RepositoryDeliveryPolicy).schemaVersion !== 'RepositoryDeliveryPolicy@1' ||
+    !['RepositoryDeliveryPolicy@1', 'RepositoryDeliveryPolicy@2'].includes(
+      (policy as RepositoryDeliveryPolicy).schemaVersion,
+    ) ||
     typeof (policy as RepositoryDeliveryPolicy).classifyExactRange !== 'function' ||
     typeof (policy as RepositoryDeliveryPolicy).validateBoundary !== 'function'
   )
@@ -195,7 +207,7 @@ export function classifyRepositoryExactRange(input: {
   policySourcePath: string;
   policy: RepositoryDeliveryPolicy;
 }): RepositoryClassificationReceipt {
-  if (input.policy.schemaVersion !== 'RepositoryDeliveryPolicy@1')
+  if (!['RepositoryDeliveryPolicy@1', 'RepositoryDeliveryPolicy@2'].includes(input.policy.schemaVersion))
     throw new Error('Unknown repository policy version.');
   const base = CoordinateSchema.parse(input.base);
   const head = CoordinateSchema.parse(input.head);
@@ -235,7 +247,10 @@ export function classifyRepositoryExactRange(input: {
     repository,
     requiredStages: selected.requiredStages,
     risk: selected.risk,
-    schemaVersion: 'ai-delivery.classification@1' as const,
+    schemaVersion:
+      input.policy.schemaVersion === 'RepositoryDeliveryPolicy@2'
+        ? ('ai-delivery.classification@2' as const)
+        : ('ai-delivery.classification@1' as const),
   };
   return RepositoryClassificationReceiptSchema.parse({ ...content, receiptId: digestValue(content) });
 }
@@ -276,7 +291,10 @@ export function validateRepositoryPolicyBoundary(input: {
   const base = CoordinateSchema.parse(input.currentBase);
   const head = CoordinateSchema.parse(input.currentHead);
   if (
-    input.policy.schemaVersion !== 'RepositoryDeliveryPolicy@1' ||
+    !['RepositoryDeliveryPolicy@1', 'RepositoryDeliveryPolicy@2'].includes(input.policy.schemaVersion) ||
+    (input.policy.schemaVersion === 'RepositoryDeliveryPolicy@2'
+      ? 'ai-delivery.classification@2'
+      : 'ai-delivery.classification@1') !== classification.schemaVersion ||
     input.configDigest !== classification.configDigest ||
     selectedPolicyDigest(input.repoRoot, input.policySourcePath) !== classification.policyDigest ||
     stableJson(base) !== stableJson(classification.base) ||
