@@ -12,6 +12,7 @@ import { DeliveryError } from '../errors.js';
 export interface GitHubClients {
   authSource: 'app' | 'personal';
   credentialSource?: string;
+  effectiveContentsPermission?: DeliveryPermission | 'admin';
   role: DeliveryRole;
   appActorLogin?: () => Promise<string>;
   authenticatedAuthor?: () => Promise<{ actorLogin: string; credentialIdentity: string }>;
@@ -165,6 +166,7 @@ export async function createDeliveryGitHubClients(input: {
       `app:${credentials.appId}:installation:${credentials.installationId}`,
       appActorLogin,
       authenticatedAuthor,
+      (result.permissions as Record<string, DeliveryPermission | 'admin'>).contents,
     );
   } catch (error) {
     if (error instanceof DeliveryError) throw error;
@@ -197,10 +199,12 @@ function buildClients(
   credentialSource: string,
   appActorLogin?: () => Promise<string>,
   authenticatedAuthor?: GitHubClients['authenticatedAuthor'],
+  effectiveContentsPermission?: GitHubClients['effectiveContentsPermission'],
 ): GitHubClients {
   const clients: GitHubClients = {
     authSource,
     credentialSource,
+    ...(effectiveContentsPermission ? { effectiveContentsPermission } : {}),
     role,
     ...(appActorLogin ? { appActorLogin } : {}),
     ...(authenticatedAuthor ? { authenticatedAuthor } : {}),

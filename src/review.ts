@@ -79,6 +79,7 @@ export type SubmittedReviewReceipt = z.infer<typeof SubmittedReviewReceiptSchema
 
 export interface RequiredReviewState {
   reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null;
+  submittedReviewAuthorCanPushToRepository: boolean | null;
   status: 'satisfied' | 'changes-requested' | 'still-required' | 'unknown';
   nextAction: string;
 }
@@ -88,6 +89,7 @@ export async function readRequiredReviewState(
   context: DeliveryContext,
   prNumber: number,
   expectedHead: string,
+  submittedReview?: { id: number; login: string },
 ): Promise<RequiredReviewState> {
   let response: {
     repository: {
@@ -102,6 +104,7 @@ export async function readRequiredReviewState(
   } catch {
     return {
       reviewDecision: null,
+      submittedReviewAuthorCanPushToRepository: null,
       status: 'unknown',
       nextAction: 'Inspect the PR review requirement in GitHub before merge; review decision readback is unavailable.',
     };
@@ -110,6 +113,7 @@ export async function readRequiredReviewState(
   if (!pr) {
     return {
       reviewDecision: null,
+      submittedReviewAuthorCanPushToRepository: null,
       status: 'unknown',
       nextAction: 'Inspect the PR review requirement in GitHub before merge; PR decision readback is unavailable.',
     };
@@ -117,26 +121,74 @@ export async function readRequiredReviewState(
   if (pr.headRefOid !== expectedHead) {
     throw new DeliveryError('GitHub review decision does not match the exact PR head.');
   }
+  let submittedReviewAuthorCanPushToRepository: boolean | null = null;
+  if (submittedReview) {
+    try {
+      const access = await context.clients.graphql<{
+        repository: {
+          pullRequest: {
+            reviews: {
+              nodes: Array<{
+                author: { login: string } | null;
+                authorCanPushToRepository: boolean;
+                commit: { oid: string } | null;
+                fullDatabaseId: string | number | null;
+                state: string;
+              } | null>;
+            };
+          } | null;
+        } | null;
+      }>(
+        'query DeliveryReviewAccess($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(last: 100) { nodes { fullDatabaseId author { login } authorCanPushToRepository commit { oid } state } } } } }',
+        { owner: context.repo.owner, name: context.repo.repo, number: prNumber },
+      );
+      // REST review receipts include [bot], while GraphQL may omit it for the same App actor.
+      const submittedActor = submittedReview.login.toLowerCase().replace(/\[bot\]$/u, '');
+      const exact = access.repository?.pullRequest?.reviews.nodes.find(
+        (review) =>
+          review !== null &&
+          String(review.fullDatabaseId) === String(submittedReview.id) &&
+          review.author?.login.toLowerCase().replace(/\[bot\]$/u, '') === submittedActor &&
+          review.commit?.oid === expectedHead &&
+          review.state === 'APPROVED',
+      );
+      if (typeof exact?.authorCanPushToRepository === 'boolean') {
+        submittedReviewAuthorCanPushToRepository = exact.authorCanPushToRepository;
+      }
+    } catch {
+      // A review access read failure does not erase the live PR decision.
+    }
+  }
   if (pr.reviewDecision === 'APPROVED') {
-    return { reviewDecision: 'APPROVED', status: 'satisfied', nextAction: 'Continue only after required checks pass.' };
+    return {
+      reviewDecision: 'APPROVED',
+      submittedReviewAuthorCanPushToRepository,
+      status: 'satisfied',
+      nextAction: 'Continue only after required checks pass.',
+    };
   }
   if (pr.reviewDecision === 'REVIEW_REQUIRED') {
     return {
       reviewDecision: 'REVIEW_REQUIRED',
+      submittedReviewAuthorCanPushToRepository,
       status: 'still-required',
       nextAction:
-        'GitHub still requires a qualifying approval. Inspect the active rule and obtain approval from an eligible independent reviewer; do not change actors or protections automatically.',
+        submittedReviewAuthorCanPushToRepository === false
+          ? 'GitHub still requires a qualifying approval; the submitted reviewer App review has no repository write access. Inspect the active rule and the App installation Contents grant, then obtain approval from an eligible independent reviewer.'
+          : 'GitHub still requires a qualifying approval. Inspect the active rule and obtain approval from an eligible independent reviewer; do not change actors or protections automatically.',
     };
   }
   if (pr.reviewDecision === 'CHANGES_REQUESTED') {
     return {
       reviewDecision: 'CHANGES_REQUESTED',
+      submittedReviewAuthorCanPushToRepository,
       status: 'changes-requested',
       nextAction: 'Resolve the blocking review and obtain a fresh exact-head independent approval.',
     };
   }
   return {
     reviewDecision: null,
+    submittedReviewAuthorCanPushToRepository,
     status: 'unknown',
     nextAction: 'Inspect the PR review requirement in GitHub before merge; no required-review decision was exposed.',
   };

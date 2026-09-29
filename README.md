@@ -109,8 +109,13 @@ For App roles, set environment variables for the App ID, installation ID and abs
 private-key path. Secret values and keys stay outside Git. The author App needs
 Contents, Issues, organization Projects and Pull requests write permissions plus
 read access to repository issue types and fields. Discovery uses that author
-identity; review operations still use the distinct reviewer App (Contents read,
-Pull requests write). Existing App author configurations remain valid.
+identity; review operations still use the distinct reviewer App (Contents read
+and Pull requests write suffice to submit a review). For that App's approval to
+satisfy a required-review rule, configure Contents write as well. Contents write
+also grants the App real code-write capability; grant it only when that review
+route is intended. Accept the App's new permissions on its installation and
+obtain fresh installation credentials before relying on the changed grant.
+Existing App author configurations remain valid.
 
 To use the host user's GitHub identity for publication, replace only the author
 role in `deliverySettings`:
@@ -133,11 +138,11 @@ artifacts and policy evidence.
 
 | Route | Package behavior | Native required approval |
 | --- | --- | --- |
-| Configured personal author + reviewer App | One App submits the exact-head independent review. | Confirm that GitHub counts it; an eligible independent human may still need to approve. |
-| Author App + reviewer App | Existing separate App roles keep their credential and review bindings. | Confirm that GitHub counts the reviewer App approval. |
+| Configured personal author + reviewer App | One App submits the exact-head independent review. | With Contents write accepted on the App installation, confirm that GitHub counts it; an eligible independent human may still need to approve if another rule blocks it. |
+| Author App + reviewer App | Existing separate App roles keep their credential and review bindings. | With Contents write accepted on the reviewer App installation, confirm that GitHub counts its approval. |
 | Author App + eligible human reviewer | A valid GitHub route for a repository that requires human approval; the current package still needs its configured reviewer App for the formal artifact receipt. | The human reviews and approves in GitHub. |
 
-GitHub requires qualifying approvals under [branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches) and [rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets). An App's installation scopes, repository read access, and submitted `APPROVED` review do not prove that its approval satisfies those rules. The live PR `reviewDecision` is the required-review readback; it does not attribute a counted approval to one actor.
+GitHub requires qualifying approvals under [branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches) and [rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets). Pull requests write permits submitting a review; it does not grant repository write access for a required approval. When a required-approval rule is visible and the reviewer App's effective Contents grant is read-only, `pr:create --dry-run` reports `approvalEligibility: insufficient-permission` before publication. Unknown grants or rules remain `unknown`. The post-review readback reports `submittedReviewAuthorCanPushToRepository` when GitHub exposes it for the exact submitted review. Neither an App's scopes nor a submitted `APPROVED` review proves that it counted. The live PR `reviewDecision` is the required-review readback; it does not attribute a counted approval to one actor. Recheck it on the current head before merge.
 
 The local Git commit author is metadata. The selected author token authenticates
 the push and PR creation; `issue_pr_info.authorLogin` confirms the actual PR

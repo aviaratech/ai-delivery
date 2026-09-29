@@ -210,6 +210,73 @@ test('live GitHub review decision distinguishes a submitted review from a satisf
   }
 });
 
+test('post-review readback reports exact App review push access without overriding GitHub decision', async () => {
+  let reviewDecision: 'APPROVED' | 'REVIEW_REQUIRED' = 'REVIEW_REQUIRED';
+  let reviewId = '41';
+  let reviewAuthor = 'reviewer-app';
+  let reviewCommit = head.sha;
+  let authorCanPushToRepository = false;
+  const context = {
+    repo: { owner: 'example', repo: 'repo' },
+    clients: {
+      graphql: async (query: string) =>
+        query.includes('DeliveryReviewAccess')
+          ? {
+              repository: {
+                pullRequest: {
+                  reviews: {
+                    nodes: [
+                      {
+                        fullDatabaseId: reviewId,
+                        author: { login: reviewAuthor },
+                        commit: { oid: reviewCommit },
+                        state: 'APPROVED',
+                        authorCanPushToRepository,
+                      },
+                    ],
+                  },
+                },
+              },
+            }
+          : { repository: { pullRequest: { headRefOid: head.sha, reviewDecision } } },
+    },
+  } as unknown as DeliveryContext;
+  const submittedReview = { id: 41, login: 'reviewer-app[bot]' };
+  const insufficient = await readRequiredReviewState(context, 19, head.sha, submittedReview);
+  assert.equal(insufficient.status, 'still-required');
+  assert.equal(insufficient.submittedReviewAuthorCanPushToRepository, false);
+  assert.match(insufficient.nextAction, /reviewer App.*write access/iu);
+
+  authorCanPushToRepository = true;
+  const writeCapable = await readRequiredReviewState(context, 19, head.sha, submittedReview);
+  assert.equal(writeCapable.status, 'still-required');
+  assert.equal(writeCapable.submittedReviewAuthorCanPushToRepository, true);
+
+  reviewAuthor = 'unrelated-reviewer[bot]';
+  assert.equal(
+    (await readRequiredReviewState(context, 19, head.sha, submittedReview)).submittedReviewAuthorCanPushToRepository,
+    null,
+  );
+  reviewAuthor = 'reviewer-app';
+  reviewId = '42';
+  assert.equal(
+    (await readRequiredReviewState(context, 19, head.sha, submittedReview)).submittedReviewAuthorCanPushToRepository,
+    null,
+  );
+  reviewId = '41';
+  reviewCommit = 'd'.repeat(40);
+  assert.equal(
+    (await readRequiredReviewState(context, 19, head.sha, submittedReview)).submittedReviewAuthorCanPushToRepository,
+    null,
+  );
+  reviewCommit = head.sha;
+  authorCanPushToRepository = false;
+  reviewDecision = 'APPROVED';
+  const satisfied = await readRequiredReviewState(context, 19, head.sha, submittedReview);
+  assert.equal(satisfied.status, 'satisfied');
+  assert.equal(satisfied.submittedReviewAuthorCanPushToRepository, false);
+});
+
 test('prepublication review route reports selected actors and unknown approval eligibility', async () => {
   const author = {
     authSource: 'personal',
@@ -229,6 +296,7 @@ test('prepublication review route reports selected actors and unknown approval e
   const reviewer = {
     authSource: 'app',
     credentialSource: 'app:102:installation:202',
+    effectiveContentsPermission: 'read',
     role: 'reviewer',
     appActorLogin: async () => 'reviewer-app[bot]',
     rest: { repos: { get: async () => ({ data: { full_name: 'example/repo' } }) } },
@@ -247,8 +315,19 @@ test('prepublication review route reports selected actors and unknown approval e
   assert.equal(route.reviewer.repositoryAccess, 'readable');
   assert.equal(route.rules.visibility, 'partial');
   assert.equal(route.rules.observedRequiredApprovals, 1);
-  assert.equal(route.approvalEligibility, 'unknown');
-  assert.match(route.nextAction, /confirm whether the reviewer approval counts/u);
+  assert.equal(route.approvalEligibility, 'insufficient-permission');
+  assert.match(route.nextAction, /Contents: write/u);
+  const writeCapable = await preflightReviewRoute(context, 'main', {
+    ...reviewer,
+    effectiveContentsPermission: 'write',
+  } as never);
+  assert.equal(writeCapable.approvalEligibility, 'unknown');
+  assert.match(writeCapable.nextAction, /confirm whether the reviewer approval counts/u);
+  const missingGrant = await preflightReviewRoute(context, 'main', {
+    ...reviewer,
+    effectiveContentsPermission: undefined,
+  } as never);
+  assert.equal(missingGrant.approvalEligibility, 'unknown');
   const unreadable = await preflightReviewRoute(
     {
       ...context,
@@ -262,6 +341,28 @@ test('prepublication review route reports selected actors and unknown approval e
   );
   assert.equal(unreadable.rules.visibility, 'unknown');
   assert.equal(unreadable.rules.observedRequiredApprovals, null);
+  assert.equal(unreadable.approvalEligibility, 'unknown');
+  const noRequiredReview = await preflightReviewRoute(
+    {
+      ...context,
+      clients: {
+        ...author,
+        rest: {
+          request: async (route: string) =>
+            route === 'GET /repos/{owner}/{repo}/rules/branches/{branch}'
+              ? { data: [] }
+              : { data: { required_pull_request_reviews: null } },
+        },
+      },
+    } as unknown as DeliveryContext,
+    'main',
+    reviewer as never,
+  );
+  assert.equal(noRequiredReview.rules.visibility, 'complete');
+  assert.equal(noRequiredReview.rules.observedRequiredApprovals, null);
+  assert.equal(noRequiredReview.approvalEligibility, 'unknown');
+  assert.match(noRequiredReview.nextAction, /No required approving review was observed/u);
+  assert.doesNotMatch(noRequiredReview.nextAction, /Contents: write/u);
   const appRoute = await preflightReviewRoute(
     {
       ...context,
@@ -350,6 +451,7 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
   } as DeliveryConfig;
   const requests: string[] = [];
   let appReadbackOverride: number | null = null;
+  let reviewerContentsPermission: 'read' | 'write' = 'read';
   globalThis.fetch = async (url, init) => {
     const requestUrl = new URL(url instanceof Request ? url.url : String(url));
     const authorization = new Headers(init?.headers).get('authorization') ?? '';
@@ -373,7 +475,7 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
         expires_at: new Date(Date.now() + 3600000).toISOString(),
         permissions: isAuthor
           ? { contents: 'write', issues: 'write', organization_projects: 'write', pull_requests: 'write' }
-          : { contents: 'read', pull_requests: 'write' },
+          : { contents: reviewerContentsPermission, pull_requests: 'write' },
         repository_selection: 'all',
       }),
       {
@@ -390,6 +492,7 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
       role: 'reviewer',
     });
     assert.equal(await clients.appActorLogin?.(), 'synthetic-reviewer[bot]');
+    assert.equal(clients.effectiveContentsPermission, 'read');
     assert.deepEqual(requests, ['POST /app/installations/202/access_tokens', 'GET /app']);
     await assert.rejects(
       withAuthorGitToken(clients, () => undefined),
@@ -510,6 +613,14 @@ exit 97
       ),
       /transport configuration/u,
     );
+    reviewerContentsPermission = 'write';
+    const writeCapableReviewer = await createDeliveryGitHubClients({
+      config,
+      env,
+      identity: 'synthetic-reviewer',
+      role: 'reviewer',
+    });
+    assert.equal(writeCapableReviewer.effectiveContentsPermission, 'write');
   } finally {
     globalThis.fetch = originalFetch;
     if (originalPath === undefined) delete process.env.PATH;
