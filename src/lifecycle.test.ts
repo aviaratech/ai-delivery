@@ -375,6 +375,16 @@ export default {
   }
 }
 
+test('published package and bundled plugin agree on the admission version', () => {
+  const packageManifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    version: string;
+  };
+  const pluginManifest = JSON.parse(
+    readFileSync(new URL('../plugins/ai-delivery/.claude-plugin/plugin.json', import.meta.url), 'utf8'),
+  ) as { packageVersion: string };
+  assert.equal(pluginManifest.packageVersion, packageManifest.version);
+});
+
 test('installed CLI and MCP admission fails before a worktree mutation on source or capability drift', async () => {
   const { root, runtimeEntryPath } = await fixture();
   try {
