@@ -2,6 +2,28 @@ name: Publish npm package
 
 on:
   workflow_dispatch:
+    inputs:
+      reviewed_source_sha:
+        description: Independently accepted protected main commit (40 lowercase hex characters)
+        required: true
+        type: string
+      package_version:
+        description: Independently accepted stable package version
+        required: true
+        type: string
+      archive_sha256:
+        description: Independently accepted npm archive SHA256 (64 lowercase hex characters)
+        required: true
+        type: string
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  REVIEWED_SOURCE_SHA: ${{ inputs.reviewed_source_sha }}
+  RELEASE_VERSION: ${{ inputs.package_version }}
+  REVIEWED_ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
 
 permissions:
   contents: read
@@ -22,9 +44,16 @@ jobs:
           package-manager-cache: false
       - name: Pin npm
         run: npm install --global npm@11.19.0
-      - name: Check release metadata
+      - name: Check reviewed source and release metadata
         run: |
-          node --input-type=module -e "import pkg from './package.json' with { type: 'json' }; if (pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') process.exit(1)"
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import pkg from './package.json' with { type: 'json' };
+          const { REVIEWED_SOURCE_SHA: source, RELEASE_VERSION: version, REVIEWED_ARCHIVE_SHA256: digest } = process.env;
+          if (!/^[a-f0-9]{40}$/.test(source ?? '') || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version ?? '') || !/^[a-f0-9]{64}$/.test(digest ?? '')) throw new Error('Missing or invalid reviewed release inputs.');
+          if (process.env.GITHUB_SHA !== source || execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== source) throw new Error('Dispatch or checkout differs from the reviewed source.');
+          if (pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Reviewed release metadata differs from the source package.');
+          JS
       - name: Verify and pack
         run: |
           npm ci
@@ -33,6 +62,8 @@ jobs:
           mkdir -p package-artifact
           npm pack --pack-destination package-artifact
           cd package-artifact
+          test "$(find . -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
+          printf '%s  %s\n' "$REVIEWED_ARCHIVE_SHA256" "aviaratech-ai-delivery-$RELEASE_VERSION.tgz" | shasum -a 256 -c -
           shasum -a 256 ./*.tgz > SHA256SUMS
       - name: Scan source history
         uses: trufflesecurity/trufflehog@f714bf454f350590f4a24c3ddb1aef02c35bf5b6 # v3.97.5
@@ -49,6 +80,7 @@ jobs:
 
   publish:
     needs: package
+    if: github.ref == 'refs/heads/main' && github.ref_protected && github.repository == 'aviaratech/ai-delivery'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: npm-publish
@@ -69,9 +101,12 @@ jobs:
           name: npm-package
           path: package-artifact
       - name: Publish with npm trusted publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           test "$(find package-artifact -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
           cd package-artifact
+          printf '%s  %s\n' "$REVIEWED_ARCHIVE_SHA256" "aviaratech-ai-delivery-$RELEASE_VERSION.tgz" | shasum -a 256 -c -
           shasum -a 256 -c SHA256SUMS
           mkdir unpacked repacked
           tar -xzf ./*.tgz -C unpacked
@@ -79,4 +114,56 @@ jobs:
           npm pack --ignore-scripts --pack-destination ../../repacked
           test "$(find ../../repacked -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
           cmp ../../*.tgz ../../repacked/*.tgz
-          npm publish . --ignore-scripts --access public
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          import { spawnSync } from 'node:child_process';
+          import pkg from './package.json' with { type: 'json' };
+          const { REVIEWED_SOURCE_SHA: source, RELEASE_VERSION: version, REVIEWED_ARCHIVE_SHA256: digest } = process.env;
+          const archive = readFileSync(`../../aviaratech-ai-delivery-${version}.tgz`);
+          const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+          const integrity = `sha512-${createHash('sha512').update(archive).digest('base64')}`;
+          if (process.env.GITHUB_SHA !== source || sha256(archive) !== digest || pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Downloaded package differs from the reviewed release.');
+          const request = (url, options = {}) => fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(30_000) });
+          const requireMain = async () => {
+            const response = await request('https://api.github.com/repos/aviaratech/ai-delivery/branches/main', { headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' } });
+            if (!response.ok) throw new Error(`Main readback failed: ${response.status}`);
+            const branch = await response.json();
+            const checks = branch.protection?.required_status_checks;
+            if (branch.name !== 'main' || branch.protected !== true || branch.commit?.sha !== source || checks?.enforcement_level !== 'everyone' || !['checks', 'secrets'].every(name => checks.contexts?.includes(name))) throw new Error('Protected main or its required checks drifted from the reviewed release.');
+          };
+          const registry = 'https://registry.npmjs.org';
+          const packageUrl = `${registry}/@aviaratech%2fai-delivery`;
+          const readPackage = async () => {
+            const response = await request(packageUrl);
+            if (!response.ok) throw new Error(`Package registry readback failed: ${response.status}`);
+            return response.json();
+          };
+          const readVersion = () => request(`${packageUrl}/${version}`);
+          const verifyPublished = async response => {
+            if (!response.ok) throw new Error(`Version registry readback failed: ${response.status}; read the registry before retrying.`);
+            const published = await response.json();
+            if (published.name !== pkg.name || published.version !== version || published.dist?.integrity !== integrity || published.dist?.attestations?.provenance?.predicateType !== 'https://slsa.dev/provenance/v1') throw new Error('Registry version, integrity or provenance evidence differs from the reviewed release.');
+            const tarball = new URL(published.dist.tarball);
+            if (tarball.origin !== registry || tarball.username || tarball.password) throw new Error('Unexpected registry tarball origin.');
+            const bytes = await request(tarball);
+            if (!bytes.ok || sha256(Buffer.from(await bytes.arrayBuffer())) !== digest) throw new Error('Registry archive differs from the reviewed bytes.');
+            if ((await readPackage())['dist-tags']?.latest !== version) throw new Error('Registry latest tag differs from the reviewed release; refusing to retag.');
+          };
+          await requireMain();
+          const response = await readVersion();
+          if (response.status === 404) {
+            const latest = (await readPackage())['dist-tags']?.latest;
+            if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(latest ?? '')) throw new Error('Missing or non-stable latest registry version.');
+            const next = version.split('.').map(BigInt), prior = latest.split('.').map(BigInt);
+            const difference = next.findIndex((part, index) => part !== prior[index]);
+            if (difference < 0 || next[difference] < prior[difference]) throw new Error('Release would not advance latest; refusing to publish.');
+            await requireMain();
+            const result = spawnSync('npm', ['publish', '.', '--ignore-scripts', '--access', 'public', '--tag', 'latest', '--registry', registry, '--provenance'], { stdio: 'inherit' });
+            await verifyPublished(await readVersion());
+            if (result.status !== 0) throw new Error('npm publish failed or was ambiguous; matching registry readback was recorded. Retry only after qualification.');
+          } else {
+            await verifyPublished(response);
+            console.log('The exact reviewed release is already published with latest and provenance evidence; no publication repeated.');
+          }
+          JS
