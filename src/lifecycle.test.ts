@@ -3132,6 +3132,7 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
   );
   const validInputs = {
     issue_create: { title: 'Synthetic tracking parent' },
+    issue_update: { issueNumber: 17, park: true },
     issue_ready_check: { issueNumber: 17 },
     issue_develop: { issueNumber: 17 },
     issue_verify: { issueNumber: 17 },
@@ -3140,6 +3141,8 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
     issue_pr_merge: { issueNumber: 17, prNumber: 23, strategy: 'merge' },
     issue_finish: { issueNumber: 17, prNumber: 23, strategy: 'merge' },
   };
+  const updateTool = AI_DELIVERY_MCP_TOOLS.find((tool) => tool.name === 'issue_update')!;
+  assert.equal(updateTool.inputSchema.safeParse({ issueNumber: 17, park: false }).success, false);
   for (const [name, input] of Object.entries(validInputs)) {
     const tool = AI_DELIVERY_MCP_TOOLS.find((candidate) => candidate.name === name);
     assert.ok(tool, `${name} has an MCP definition`);
@@ -3216,6 +3219,9 @@ async function syntheticLifecycle(routing: {
   let trackingParent = false;
   let failFirstBlockerLink = true;
   let failNextProjectSync = false;
+  let interruptNextStatusUpdate = false;
+  let conflictNextStatusReadback = false;
+  let projectStatusWrites = 0;
   let checksPassed = true;
   let prDraft = true;
   let prState = 'open';
@@ -3324,6 +3330,12 @@ async function syntheticLifecycle(routing: {
                   ? []
                   : [
                       {
+                        id: 'UNRELATED-ITEM',
+                        isArchived: false,
+                        content: { id: 'UNRELATED-ISSUE' },
+                        fieldValueByName: { name: 'Active', optionId: 'STATUS-1' },
+                      },
+                      {
                         id: 'ITEM-17',
                         isArchived: false,
                         content: { id: issue.node_id },
@@ -3346,19 +3358,29 @@ async function syntheticLifecycle(routing: {
       return { addProjectV2ItemById: { item: { id: 'ITEM-17' } } };
     }
     if (query.includes('UpdateProjectDeliveryStatus')) {
+      assert.equal(variables.projectId, 'PROJECT-1');
+      assert.equal(variables.itemId, 'ITEM-17');
+      projectStatusWrites += 1;
       projectStatus = statusName(String(variables.optionId)) ?? null;
+      if (interruptNextStatusUpdate) {
+        interruptNextStatusUpdate = false;
+        throw new Error('synthetic ambiguous status write');
+      }
       return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM-17' } } };
     }
-    if (query.includes('ProjectDeliveryItemReadback'))
+    if (query.includes('ProjectDeliveryItemReadback')) {
+      const contentId = conflictNextStatusReadback ? 'UNRELATED-ISSUE' : issue.node_id;
+      conflictNextStatusReadback = false;
       return {
         node: {
           id: 'ITEM-17',
           isArchived: false,
           project: { id: 'PROJECT-1', number: 1 },
-          content: { id: issue.node_id },
+          content: { id: contentId },
           fieldValueByName: { name: projectStatus, optionId: statuses[projectStatus as keyof typeof statuses] },
         },
       };
+    }
     if (query.includes('blockedBy(first:'))
       return {
         repository: {
@@ -3378,6 +3400,10 @@ async function syntheticLifecycle(routing: {
       }
       blockerOpen = true;
       return { addBlockedBy: { issue: { number: issueNumber } } };
+    }
+    if (query.includes('removeBlockedBy')) {
+      blockerOpen = false;
+      return { removeBlockedBy: { issue: { number: issueNumber } } };
     }
     if (query.includes('RepositoryId')) return { repository: { id: 'REPO-1' } };
     if (query.includes('UpdateExactRefs')) {
@@ -3696,6 +3722,41 @@ async function syntheticLifecycle(routing: {
     assert.equal(started.issueNumber, issueNumber);
     assert.equal(started.title, issue.title);
     const row = started as unknown as { path: string; branch: string };
+    assert.equal(projectStatus, 'Active');
+    const parked = await updateIssue(context, { issueNumber, park: true });
+    assert.equal(parked.projectStatus, 'Todo');
+    assert.equal(existsSync(row.path), true);
+    assert.equal((await updateIssue(context, { issueNumber, title: issue.title })).projectStatus, 'Todo');
+    await developIssue(context, issueNumber);
+    assert.equal(projectStatus, 'Active');
+    const blockedUpdate = await updateIssue(context, { issueNumber, blockedBy: [9] });
+    assert.deepEqual(blockedUpdate.blockedBy, [9]);
+    assert.equal(blockedUpdate.projectStatus, 'Blocked');
+    assert.equal(projectStatus, 'Waiting');
+    const blockedWrites = projectStatusWrites;
+    assert.equal((await updateIssue(context, { issueNumber, blockedBy: [9] })).projectStatus, 'Blocked');
+    assert.equal(projectStatusWrites, blockedWrites);
+    assert.equal((await updateIssue(context, { issueNumber, park: true })).projectStatus, 'Blocked');
+    await assert.rejects(developIssue(context, issueNumber), /not ready/u);
+    interruptNextStatusUpdate = true;
+    await assert.rejects(updateIssue(context, { issueNumber, blockedBy: [] }), /ambiguous status write/u);
+    assert.equal(blockerOpen, false);
+    assert.equal(projectStatus, 'Queued');
+    const interruptedWrites = projectStatusWrites;
+    const unblockedUpdate = await updateIssue(context, { issueNumber, blockedBy: [] });
+    assert.equal(projectStatusWrites, interruptedWrites);
+    assert.deepEqual(unblockedUpdate.blockedBy, []);
+    assert.equal(unblockedUpdate.projectStatus, 'Todo');
+    conflictNextStatusReadback = true;
+    await assert.rejects(updateIssue(context, { issueNumber, blockedBy: [9] }), /exact issue item/u);
+    assert.equal(blockerOpen, true);
+    assert.equal((await updateIssue(context, { issueNumber, blockedBy: [9] })).projectStatus, 'Blocked');
+    assert.equal((await updateIssue(context, { issueNumber, state: 'closed' })).projectStatus, 'Done');
+    assert.equal((await updateIssue(context, { issueNumber, park: true })).projectStatus, 'Done');
+    assert.equal((await resumeCreatedIssue(context, { issueNumber })).projectStatus, 'Done');
+    assert.equal((await updateIssue(context, { issueNumber, state: 'open', blockedBy: [] })).projectStatus, 'Done');
+    assert.equal(existsSync(row.path), true);
+    await developIssue(context, issueNumber);
     assert.equal(projectStatus, 'Active');
     writeFileSync(join(row.path, 'change.txt'), 'feature\n');
     git(row.path, 'add', 'change.txt');

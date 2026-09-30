@@ -184,7 +184,8 @@ program
   .option('--milestone <number>')
   .option('--parent <number>')
   .option('--state <state>')
-  .action(async (o: Record<string, string>) =>
+  .option('--park', 'Park execution while retaining the issue worktree')
+  .action(async (o: Record<string, string> & { park?: boolean }) =>
     run('issue_update', {
       issueNumber: int(o.issue),
       title: o.title,
@@ -197,6 +198,7 @@ program
       milestone: int(o.milestone),
       parentIssueNumber: int(o.parent),
       state: o.state,
+      park: o.park === true ? true : undefined,
     }),
   );
 
