@@ -13,7 +13,7 @@ procedure before any lifecycle write.
 ```sh
 node --version # 24.21.0
 npm --version  # 11.19.0
-npm install --save-dev @aviaratech/ai-delivery@0.3.1
+npm install --save-dev @aviaratech/ai-delivery@0.3.4
 npx ai-delivery --help
 npx ai-delivery --repo-root /absolute/path/to/consumer --identity configured-author info --issue 17
 npx ai-delivery --repo-root /absolute/path/to/consumer --identity configured-author mcp:serve
