@@ -23,8 +23,14 @@ the `npm-publish` environment. Before enabling it, the repository owner must:
 
 1. Confirm the confidentiality review covers the exact source ref and built
    archive. Confirm the MIT license and the exact package repository URL.
-2. Protect `main` and the `npm-publish` environment with required reviewers,
-   restricted deployment branches and no self-review. Require both CI jobs.
+2. Protect `main` with counted independent pull request approval, stale-review
+   dismissal, strict required `checks` and `secrets` jobs, administrator
+   enforcement and no force pushes or deletion. Restrict `npm-publish`
+   deployments to the `main` branch. Once the exact guarded workflow and
+   environment transition have independent acceptance, the repository owner
+   may remove the environment's repeated human reviewer requirement under
+   explicit release authority. Preserve all other protection rules and the npm
+   trusted-publisher binding; diagnose unexpected settings before changing them.
 3. For a new npm package name, have the package owner establish it with a
    separately authorized and reviewed initial version before configuring
    trusted publishing. npm cannot bind a trusted publisher before the package
@@ -35,13 +41,34 @@ the `npm-publish` environment. Before enabling it, the repository owner must:
    `release.yml`, and environment name `npm-publish`. Enable direct `npm publish`
    for that trusted publisher. The npm environment restriction must match the
    protected GitHub environment in the workflow.
-5. Review the source head, package version, archive inventory and secret scan.
-   Dispatch the release workflow on `main` once. The build job checks and
-   packages without OIDC permission; only the approved publish job receives
-   `id-token: write` and publishes that archived tarball.
+5. Independently review the exact protected `main` source head, stable package
+   version, actual built archive, complete inventory and confidentiality scan.
+   Dispatch the workflow on `main` with `reviewed_source_sha`, `package_version`
+   and `archive_sha256` from that accepted candidate. Missing or mismatched
+   inputs fail closed. The build job checks, scans and packages without OIDC
+   permission; only the publish job receives `id-token: write`. It checks the
+   downloaded archive against the accepted digest, compares an inert repack
+   byte for byte, and rejects observed protected-main or required-check drift
+   before publishing through the existing trusted publisher. Inputs are passed
+   as environment values, never interpolated into shell commands.
+
+Release dispatch remains an explicit action by the authorized delivery owner;
+it does not run on every commit or need a scheduler. Runs serialize through the
+`npm-publish` concurrency group. The workflow publishes only an unused stable
+version newer than registry `latest`. An occupied version is accepted only when
+its actual archive bytes, integrity, provenance metadata and `latest` tag match
+the reviewed candidate; it never republishes or retags that version. Registry
+errors and conflicting occupied versions fail closed.
 
 npm provenance is generated automatically by trusted publishing only when both
 repository and package are public. A release has not occurred merely because
-the workflow exists; verify npm registry readback after the protected job
-finishes. A failed or ambiguous publish requires registry readback before retrying
-the same version.
+the workflow exists; verify actual registry archive bytes and cryptographic
+provenance against the accepted source and artifact after the job finishes. The
+workflow checks registry bytes, integrity, provenance metadata and `latest`
+after publication, including a failed or ambiguous publish command, and never
+automatically retries publication. Read the registry before any explicit retry.
+Metadata presence alone does not verify a provenance signature or source identity.
+
+Any packaged-file edit, including this guide, changes the release candidate.
+Preserve previously accepted archives as evidence and independently qualify a
+new exact source/archive before dispatching; never substitute it silently.
