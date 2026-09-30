@@ -31,3 +31,6 @@ export { verifyIssue, createIssuePhaseEvidence } from './verification.js';
 export { discoverDeliveryRouting } from './github/discovery.js';
 export type { DeliveryRouting, DiscoveryClients } from './github/discovery.js';
 export type { DeliveryOverrides, DeliveryPolicySettings, LoadedDeliverySettings } from './config/deliveryConfig.js';
+
+export { stageRuntime, admitRuntime, RuntimeAdmissionCommitUnknownError } from './setup.js';
+export type { StageRuntimeInput, AdmitRuntimeInput, RuntimeStageResult } from './setup.js';

@@ -19,7 +19,47 @@ const Tracking = {
   title: z.string().trim().min(1).max(256),
 };
 
+const RuntimeController = {
+  identity: z.string().min(1).optional(),
+  expectedSourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
+  expectedConfigDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  runtimeDirectory: z.string().min(1),
+};
+
 export const AI_DELIVERY_MCP_TOOLS = [
+  {
+    name: 'runtime_stage',
+    commandName: 'runtime:stage',
+    description: 'Explicitly stage a reviewed local public archive without host activation or admission',
+    inputSchema: z.strictObject({
+      ...RuntimeController,
+      authority: z.literal('runtime:stage'),
+      archivePath: z.string().min(1),
+      expectedArchiveSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      packageVersion: z.string().regex(/^\d+\.\d+\.\d+$/u),
+      resourceBounds: z
+        .strictObject({
+          maxAggregateRssBytes: z.number().int().positive().safe(),
+          minFreeDiskBytes: z.number().int().positive().safe(),
+          maxNewOutputBytes: z.number().int().positive().safe(),
+        })
+        .optional(),
+    }),
+  },
+  {
+    name: 'runtime_admit',
+    commandName: 'runtime:admit',
+    description: 'Explicitly admit an exact completed stage with prior-byte compare-and-swap and reconciliation',
+    inputSchema: z.strictObject({
+      ...RuntimeController,
+      authority: z.literal('runtime:admit'),
+      stageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      expectedPriorAdmissionSha256: z
+        .string()
+        .regex(/^sha256:[a-f0-9]{64}$/u)
+        .nullable(),
+    }),
+  },
   {
     name: 'issue_create',
     commandName: 'create',

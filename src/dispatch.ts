@@ -32,6 +32,7 @@ import {
   verifyIssue,
   type VerificationResourceBounds,
 } from './verification.js';
+import { stageRuntime, admitRuntime, type StageRuntimeInput, type AdmitRuntimeInput } from './setup.js';
 import { prepareStandaloneWorktree } from './worktree.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 
@@ -330,9 +331,23 @@ export async function executeTool(
   if (!definition) throw new DeliveryError(`Unknown ai-delivery tool ${name}.`);
   const input = definition.inputSchema.parse(raw) as Record<string, unknown>;
   assertRepositorySelector(input, execution);
+  if (name === 'runtime_stage' || name === 'runtime_admit') {
+    const setup = {
+      ...input,
+      repoRoot: execution.repoRoot,
+      identity: optionalString(input, 'identity') ?? execution.identity ?? '',
+      ...(execution.personalAuth === undefined ? {} : { personalAuth: execution.personalAuth }),
+      ...(execution.signal === undefined ? {} : { signal: execution.signal }),
+    };
+    return name === 'runtime_stage'
+      ? stageRuntime(setup as unknown as StageRuntimeInput)
+      : admitRuntime(setup as unknown as AdmitRuntimeInput);
+  }
   if (name === 'issue_info' && input.cached === true)
     return cachedIssueInfo(execution.repoRoot, requiredNumber(input, 'issueNumber'));
   const commands: Record<AiDeliveryMcpToolName, string> = {
+    runtime_stage: 'runtime:stage',
+    runtime_admit: 'runtime:admit',
     issue_create: 'create',
     issue_start: 'start',
     issue_update: 'update',

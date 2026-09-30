@@ -255,6 +255,7 @@ async function fixture(
     secondStageScript?: string;
     personalAuthor?: boolean;
     componentPolicy?: boolean;
+    omitRuntimeAdmission?: boolean;
   } = {},
 ): Promise<{
   root: string;
@@ -393,7 +394,10 @@ export default {
       mkdirSync(dirname(path), { recursive: true });
     }
     writeFileSync(runtimeEntryPath, 'synthetic CLI bytes\n');
-    writeFileSync(packagePath, JSON.stringify({ name: '@aviaratech/ai-delivery', version: '0.1.0' }));
+    writeFileSync(
+      packagePath,
+      JSON.stringify({ name: '@aviaratech/ai-delivery', version: '0.1.0', bin: { 'ai-delivery': './dist/cli.js' } }),
+    );
     writeFileSync(mcpLauncherPath, 'synthetic MCP launcher bytes\n');
     writeFileSync(
       pluginManifestPath,
@@ -418,7 +422,8 @@ export default {
     };
     const admissionPath = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
     mkdirSync(dirname(admissionPath), { recursive: true });
-    writeFileSync(admissionPath, JSON.stringify({ ...content, admissionId: digestValue(content) }), { mode: 0o600 });
+    if (!options.omitRuntimeAdmission)
+      writeFileSync(admissionPath, JSON.stringify({ ...content, admissionId: digestValue(content) }), { mode: 0o600 });
     return { root, counter, secondCounter, failSecond, runtimeEntryPath };
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
@@ -2102,6 +2107,40 @@ test('filesystem output from a sampled detached child crosses its declared root 
   }
 });
 
+test('contained npm bin aliases are counted once and target growth still enforces the output bound', async () => {
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-contained-alias-')));
+  const target = join(outside, 'output', 'actual');
+  const { root } = await fixture({
+    firstStageScript: `require('fs').appendFileSync(${JSON.stringify(target)},'x'.repeat(512));`,
+  });
+  try {
+    mkdirSync(dirname(target));
+    writeFileSync(target, 'baseline');
+    symlinkSync('./actual', join(dirname(target), 'alias'));
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const bounds = {
+      maxAggregateRssBytes: 1_000_000_000,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 600,
+      outputRoots: [dirname(target)],
+    };
+    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.equal(run.resources?.maxSampledNewOutputBytes, 512);
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: { ...bounds, maxNewOutputBytes: 100 } }),
+      /filesystem output.*exceeded/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test('a symbolic link in declared output roots fails before publishing sampled output evidence', async () => {
   const { root } = await fixture();
   const outside = mkdtempSync(join(tmpdir(), 'ai-delivery-output-link-'));
@@ -3074,6 +3113,8 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
   assert.deepEqual(
     AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name),
     [
+      'runtime_stage',
+      'runtime_admit',
       'issue_create',
       'issue_start',
       'issue_update',
@@ -3137,8 +3178,16 @@ test('MCP request rejects unsupported legacy options before lifecycle dispatch',
   }
 });
 
-async function syntheticLifecycle(routing: { remote: string; divergentOrigin: boolean }): Promise<void> {
-  const { root, runtimeEntryPath } = await fixture(routing);
+async function syntheticLifecycle(routing: {
+  remote: string;
+  divergentOrigin: boolean;
+  producerOnboarding?: boolean;
+}): Promise<void> {
+  const created = await fixture({ ...routing, omitRuntimeAdmission: routing.producerOnboarding === true });
+  const root = created.root;
+  let runtimeEntryPath = created.runtimeEntryPath;
+  const originalPath = process.env.PATH;
+  let restoreTransport: (() => void) | undefined;
   const remoteName = routing.remote;
   assert.equal(defaultBaseRef(root, remoteName), `refs/remotes/${remoteName}/main`);
   const remote = join(root, '.git', 'remote.git');
@@ -3510,6 +3559,70 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
   } as unknown as DeliveryContext;
   let restoreDispatchClient: (() => void) | undefined;
   try {
+    if (routing.producerOnboarding) {
+      assert.equal(existsSync(join(root, 'AGENTS.md')), false);
+      const archiveBase = join(root, '.git', 'producer-fixture');
+      const packageSource = join(archiveBase, 'package');
+      mkdirSync(archiveBase);
+      cpSync(dirname(dirname(created.runtimeEntryPath)), packageSource, { recursive: true });
+      cpSync(join(root, '.git/synthetic-runtime/plugin'), join(packageSource, 'plugins/ai-delivery'), {
+        recursive: true,
+      });
+      const archive = join(archiveBase, 'reviewed.tgz');
+      execFileSync('tar', ['-czf', archive, '-C', archiveBase, 'package']);
+      const shimDir = join(archiveBase, 'bin');
+      mkdirSync(shimDir);
+      const npmShim = join(shimDir, 'npm');
+      // Only installer and GitHub transports are synthetic; the public producer and validator are real.
+      writeFileSync(
+        npmShim,
+        `#!${process.execPath}\nconst fs=require('fs'),path=require('path');const args=process.argv.slice(2);if(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(91);const target=path.join(args[args.indexOf('--prefix')+1],'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(path.dirname(target),{recursive:true});fs.cpSync(${JSON.stringify(packageSource)},target,{recursive:true});\n`,
+      );
+      chmodSync(npmShim, 0o700);
+      process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
+      const server = createAiDeliveryMcpServer({ repoRoot: root, identity: 'synthetic-author' });
+      const client = new Client({ name: 'unrelated-public-onboarding', version: '1.0.0' });
+      const [ct, st] = InMemoryTransport.createLinkedPair();
+      await server.connect(st);
+      await client.connect(ct);
+      const setup = {
+        expectedSourceCommit: baseSha,
+        expectedConfigDigest: configuration.configDigest,
+        runtimeDirectory: join(root, '.git', 'public-runtime-stage'),
+      };
+      try {
+        const stageResponse = await client.callTool({
+          name: 'runtime_stage',
+          arguments: {
+            ...setup,
+            authority: 'runtime:stage',
+            archivePath: archive,
+            expectedArchiveSha256: sha256(archive),
+            packageVersion: '0.1.0',
+          },
+        });
+        assert.equal(stageResponse.isError, undefined);
+        const stage = JSON.parse((stageResponse.content as Array<{ text: string }>)[0]!.text) as {
+          stageId: string;
+          admission: { cliPath: string };
+        };
+        const admitted = await client.callTool({
+          name: 'runtime_admit',
+          arguments: {
+            ...setup,
+            authority: 'runtime:admit',
+            stageId: stage.stageId,
+            expectedPriorAdmissionSha256: null,
+          },
+        });
+        assert.equal(admitted.isError, undefined);
+        runtimeEntryPath = stage.admission.cliPath;
+      } finally {
+        await client.close();
+        await server.close();
+      }
+      await assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath });
+    }
     await assert.rejects(
       startTrackedIssue(context, { request: 'Unready task', develop: true }),
       /New issue is not ready/u,
@@ -3590,40 +3703,81 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
     headSha = git(row.path, 'rev-parse', 'HEAD');
     const run = await verifyIssue({ issueNumber, repoRoot: row.path });
     await assert.rejects(publishPr(context, { issueNumber, body: 'Closes #17' }), /Delivery Impact/);
-    await assert.rejects(publishPr(context, { issueNumber }), /Git push requires the selected author credential token/);
-    // The public push requires a real author App installation token. Bind a synthetic
-    // publication at that external boundary so the remaining public phases run offline.
-    git(row.path, 'push', '-q', remoteName, `${headSha}:refs/heads/issue/17`);
-    const publishEvidence = await createIssuePhaseEvidence({ issueNumber, phase: 'publish', repoRoot: row.path });
-    const publicationContent = {
-      baseSha,
-      evidenceId: publishEvidence.evidenceId,
-      headSha,
-      issueNumber,
-      prNumber,
-      schemaVersion: 'ai-delivery.publication@1' as const,
-    };
-    const publicationPath = join(
-      gitCommonDir(row.path),
-      'ai-delivery',
-      'publications',
-      String(issueNumber),
-      `${headSha}.json`,
-    );
-    mkdirSync(dirname(publicationPath), { recursive: true });
-    writeFileSync(
-      publicationPath,
-      JSON.stringify({ ...publicationContent, publicationId: digestValue(publicationContent) }),
-      { mode: 0o600 },
-    );
-    await updateIssueWorktreeDelivery({
-      branch: row.branch,
-      issueNumber,
-      path: row.path,
-      prNumber,
-      projectRoot: root,
-      status: 'pr-published',
-    });
+    if (routing.producerOnboarding) {
+      const realGit = execFileSync('/usr/bin/which', ['git'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: originalPath },
+      }).trim();
+      const shimDir = join(root, '.git/producer-fixture/bin');
+      git(root, 'config', '--unset', `url.${remote}.insteadOf`);
+      const gitShim = join(shimDir, 'git');
+      writeFileSync(
+        gitShim,
+        `#!/bin/sh
+if [ "$1" = -c ] && [ "$2" = credential.helper= ]; then
+  [ "$AI_DELIVERY_GIT_TOKEN" = synthetic-selected-author-token ] || exit 92
+  shift 2
+  operation="$1"; shift
+  [ "$1" = https://github.com/example/widget.git ] || exit 93
+  shift
+  exec "${realGit}" -c credential.helper= "$operation" "${remote}" "$@"
+fi
+if [ "$1" = push ] && [ "$2" = -q ] && [ "$3" = "${remoteName}" ]; then
+  shift 3
+  exec "${realGit}" push -q "${remote}" "$@"
+fi
+exec "${realGit}" "$@"
+`,
+      );
+      chmodSync(gitShim, 0o700);
+      const transport = vi.spyOn(githubClient, 'withAuthorGitToken').mockImplementation(async (clients, callback) => {
+        assert.equal(clients.role, 'author');
+        return callback('synthetic-selected-author-token');
+      });
+      restoreTransport = () => transport.mockRestore();
+      const published = await publishPr(context, { issueNumber });
+      assert.equal(published.prNumber, prNumber);
+      assert.equal(published.reviewRoute?.author.actorLogin, 'synthetic-author[bot]');
+      assert.equal(published.reviewRoute?.approvalEligibility, 'unknown');
+    } else {
+      await assert.rejects(
+        publishPr(context, { issueNumber }),
+        /Git push requires the selected author credential token/,
+      );
+      // The public push requires a real author App installation token. Bind a synthetic
+      // publication at that external boundary so the remaining public phases run offline.
+      git(row.path, 'push', '-q', remoteName, `${headSha}:refs/heads/issue/17`);
+      const publishEvidence = await createIssuePhaseEvidence({ issueNumber, phase: 'publish', repoRoot: row.path });
+      const publicationContent = {
+        baseSha,
+        evidenceId: publishEvidence.evidenceId,
+        headSha,
+        issueNumber,
+        prNumber,
+        schemaVersion: 'ai-delivery.publication@1' as const,
+      };
+      const publicationPath = join(
+        gitCommonDir(row.path),
+        'ai-delivery',
+        'publications',
+        String(issueNumber),
+        `${headSha}.json`,
+      );
+      mkdirSync(dirname(publicationPath), { recursive: true });
+      writeFileSync(
+        publicationPath,
+        JSON.stringify({ ...publicationContent, publicationId: digestValue(publicationContent) }),
+        { mode: 0o600 },
+      );
+      await updateIssueWorktreeDelivery({
+        branch: row.branch,
+        issueNumber,
+        path: row.path,
+        prNumber,
+        projectRoot: root,
+        status: 'pr-published',
+      });
+    }
     assert.equal((await listPrs(context)).pullRequests[0]?.number, prNumber);
     assert.equal((await prInfo(context, { prNumber })).authorLogin, 'synthetic-author[bot]');
     assert.equal((await prChecks(context, prNumber)).combinedStatus, 'success');
@@ -3807,6 +3961,8 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
     assert.equal(resumedTracking.status, 'started');
     assert.equal(calls.filter((call) => call === 'issue:create').length, beforeTracking + 1);
   } finally {
+    restoreTransport?.();
+    process.env.PATH = originalPath;
     restoreDispatchClient?.();
     rmSync(root, { recursive: true, force: true });
   }
@@ -3820,4 +3976,52 @@ test.each([
   'synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin',
   syntheticLifecycle,
   15_000,
+);
+
+test('an unrelated consumer uses public MCP setup through verified configured-author publication, counted review readback, merge and cleanup', async () => {
+  await syntheticLifecycle({ remote: 'origin', divergentOrigin: false, producerOnboarding: true });
+}, 15_000);
+
+test.each(['escape', 'broken', 'cycle'] as const)(
+  'output observation rejects %s aliases without running policy commands',
+  async (kind) => {
+    const { root, counter } = await fixture();
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-output-alias-')));
+    try {
+      const output = join(base, 'output');
+      mkdirSync(output);
+      if (kind === 'escape') {
+        writeFileSync(join(base, 'outside'), 'outside');
+        symlinkSync('../outside', join(output, 'alias'));
+      }
+      if (kind === 'broken') symlinkSync('./absent', join(output, 'alias'));
+      if (kind === 'cycle') {
+        symlinkSync('./other', join(output, 'alias'));
+        symlinkSync('./alias', join(output, 'other'));
+      }
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      await assert.rejects(
+        verifyIssue({
+          issueNumber: 17,
+          repoRoot: row.path,
+          resourceBounds: {
+            maxAggregateRssBytes: 1_000_000_000,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: 1024,
+            outputRoots: [output],
+          },
+        }),
+        /escaping|broken|cyclic/u,
+      );
+      assert.equal(existsSync(counter), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  },
 );
