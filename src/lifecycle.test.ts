@@ -43,7 +43,7 @@ import {
   type DeliveryContext,
 } from './issue.js';
 import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, prInfo, publishPr, submitFormalReview } from './pr.js';
-import { updateIssueWorktreeDelivery } from './services/worktreeRegistry.js';
+import { addWorktreeEntry, removeWorktreeEntry, updateIssueWorktreeDelivery } from './services/worktreeRegistry.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
 import { createIssuePhaseEvidence, loadVerifiedRun, verifyIssue } from './verification.js';
@@ -67,6 +67,10 @@ const personalRoute = vi.hoisted(() => ({
     html_url: string;
   }>,
   submitted: 0,
+  created: false,
+  failCreate: false,
+  ready: false,
+  readyPromotions: 0,
 }));
 
 vi.mock('./github/client.js', async (importOriginal) => {
@@ -82,7 +86,7 @@ vi.mock('./github/client.js', async (importOriginal) => {
           head: { sha: personalRoute.headSha, ref: 'issue/17' },
           base: { sha: personalRoute.baseSha, ref: 'main' },
           state: 'open',
-          draft: true,
+          draft: !personalRoute.ready,
           user: { login: 'host-user' },
         });
         if (input.role === 'reviewer') {
@@ -140,6 +144,13 @@ vi.mock('./github/client.js', async (importOriginal) => {
                   },
                 };
               }
+              if (
+                query.includes('DeliveryDiscovery') ||
+                query.includes('DeliveryRepository') ||
+                query.includes('ProjectDeliveryConfiguration')
+              ) {
+                throw Object.assign(new Error('Reviewer cannot discover author routing metadata'), { status: 403 });
+              }
               return syntheticDiscoveryClients().graphql(query, variables);
             },
           };
@@ -151,14 +162,29 @@ vi.mock('./github/client.js', async (importOriginal) => {
         });
         Object.assign(clients, {
           authenticatedAuthor: async () => ({ actorLogin: 'host-user', credentialIdentity: 'user:37' }),
-          graphql: syntheticDiscoveryClients().graphql,
+          graphql: async (query: string, variables: Record<string, unknown>) => {
+            if (query.includes('markPullRequestReadyForReview')) {
+              personalRoute.ready = true;
+              personalRoute.readyPromotions += 1;
+              return { markPullRequestReadyForReview: { pullRequest: { id: 'PR-23', isDraft: false } } };
+            }
+            return syntheticDiscoveryClients().graphql(query, variables);
+          },
           rest: {
             issues: { get: async () => ({ data: { title: 'Synthetic issue' } }) },
             git: { getRef: async () => ({ data: { object: { sha: personalRoute.baseSha } } }) },
             pulls: {
-              list: async () => ({ data: [] }),
-              create: async () => ({ data: pr() }),
+              list: async () => ({ data: personalRoute.created ? [pr()] : [] }),
+              create: async () => {
+                if (personalRoute.failCreate) {
+                  personalRoute.failCreate = false;
+                  throw new Error('Synthetic response lost after branch push');
+                }
+                personalRoute.created = true;
+                return { data: pr() };
+              },
               get: async () => ({ data: pr() }),
+              listReviews: async () => ({ data: personalRoute.reviews }),
             },
             request: async () => Promise.reject(Object.assign(new Error('Rules unreadable'), { status: 403 })),
           },
@@ -2423,32 +2449,67 @@ test('public PR dry run retains a configured host author and App reviewer', asyn
   }
 }, 15_000);
 
-test('public dispatch publishes with selected host token and submits the configured App review once', async () => {
-  const { root, runtimeEntryPath } = await fixture({ personalAuthor: true });
-  const originalPath = process.env.PATH;
-  try {
-    const row = await prepareIssueWorktree({
-      baseRef: 'main',
-      identity: 'host-author',
-      issueNumber: 17,
-      repoRoot: root,
-    });
-    writeFileSync(join(row.path, 'change.txt'), 'host author publication\n');
-    git(row.path, 'add', 'change.txt');
-    git(row.path, 'commit', '-qm', 'synthetic host publication');
-    const realGit = (originalPath ?? '')
-      .split(':')
-      .map((directory) => join(directory, 'git'))
-      .find(existsSync);
-    if (!realGit) throw new Error('Git executable unavailable for public transport test.');
-    git(root, 'config', '--local', '--unset', `url.${join(root, '.git', 'remote.git')}.insteadOf`);
-    const shimDir = join(root, '.git', 'git-shim');
-    const pushMarker = join(root, '.git', 'selected-host-push');
-    mkdirSync(shimDir);
-    const shim = join(shimDir, 'git');
-    writeFileSync(
-      shim,
-      `#!/bin/sh
+test.each([
+  { transition: false, entry: 'source', highRisk: false, mcp: false },
+  { transition: true, entry: 'primary', highRisk: false, mcp: false },
+  { transition: true, entry: 'source', highRisk: false, mcp: false },
+  { transition: true, entry: 'primary', highRisk: true, mcp: false },
+  { transition: true, entry: 'source', highRisk: true, mcp: false },
+  { transition: true, entry: 'primary', highRisk: true, mcp: true },
+])(
+  'public dispatch publishes and reviews from $entry across policy transition $transition high risk $highRisk MCP $mcp',
+  async ({ transition, entry, highRisk, mcp }) => {
+    const { root, runtimeEntryPath } = await fixture({ personalAuthor: !transition });
+    const originalPath = process.env.PATH;
+    const driftEnv = 'AI_DELIVERY_TEST_CANDIDATE_CHECK';
+    const previousDrift = process.env[driftEnv];
+    delete process.env[driftEnv];
+    let closeMcp: (() => Promise<void>) | undefined;
+    try {
+      const admissionPath = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
+      const admissionBefore = readFileSync(admissionPath, 'utf8');
+      const primaryConfiguration = await loadDeliveryConfig(root);
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: transition ? 'synthetic-author' : 'host-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      if (transition) {
+        const policyPath = join(row.path, 'policy.mjs');
+        writeFileSync(
+          policyPath,
+          readFileSync(policyPath, 'utf8')
+            .replace(
+              JSON.stringify(primaryConfiguration.config.roles.author),
+              JSON.stringify({
+                authSource: 'personal',
+                credentialEnv: { token: 'AUTHOR_TOKEN' },
+                identity: 'host-author',
+              }),
+            )
+            .replace("risk: 'standard'", `risk: '${highRisk ? 'high' : 'standard'}'`) +
+            `
+Object.defineProperty(deliverySettings.commandPolicy.checks, 'test', { get: () => process.env.${driftEnv} ?? 'REQUIRED' });
+`,
+        );
+      }
+      writeFileSync(join(row.path, 'change.txt'), 'host author publication\n');
+      git(row.path, 'add', '.');
+      git(row.path, 'commit', '-qm', 'synthetic host publication');
+      const realGit = (originalPath ?? '')
+        .split(':')
+        .map((directory) => join(directory, 'git'))
+        .find(existsSync);
+      if (!realGit) throw new Error('Git executable unavailable for public transport test.');
+      git(root, 'config', '--local', '--unset', `url.${join(root, '.git', 'remote.git')}.insteadOf`);
+      const shimDir = join(root, '.git', 'git-shim');
+      const pushMarker = join(root, '.git', 'selected-host-push');
+      mkdirSync(shimDir);
+      const shim = join(shimDir, 'git');
+      writeFileSync(
+        shim,
+        `#!/bin/sh
 if [ "$1" = -c ] && [ "$2" = credential.helper= ] && [ "$3" = push ]; then
   [ "$AI_DELIVERY_GIT_TOKEN" = selected-personal-token ] || exit 91
   [ "$("$GIT_ASKPASS" Password)" = selected-personal-token ] || exit 92
@@ -2457,68 +2518,300 @@ if [ "$1" = -c ] && [ "$2" = credential.helper= ] && [ "$3" = push ]; then
 fi
 exec "${realGit}" "$@"
 `,
-    );
-    chmodSync(shim, 0o700);
-    process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
-    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
-    personalRoute.baseSha = run.classification.base.sha;
-    personalRoute.headSha = run.classification.head.sha;
-    personalRoute.reviews.length = 0;
-    personalRoute.submitted = 0;
-    personalRoute.active = true;
+      );
+      chmodSync(shim, 0o700);
+      process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
+      const execution = { repoRoot: entry === 'primary' ? root : row.path, runtimeEntryPath, identity: 'host-author' };
+      let call = (name: Parameters<typeof executeTool>[0], args: Record<string, unknown>) =>
+        executeTool(name, args, execution);
+      if (mcp) {
+        const server = createAiDeliveryMcpServer(execution);
+        const client = new Client({ name: 'policy-transition-test', version: '1.0.0' });
+        closeMcp = async () => {
+          await client.close();
+          await server.close();
+        };
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        await server.connect(serverTransport);
+        await client.connect(clientTransport);
+        call = async (name, args) => {
+          const result = await client.callTool({ name, arguments: args });
+          const text = (result.content as Array<{ type: string; text: string }>).find(
+            (block) => block.type === 'text',
+          )!.text;
+          if (result.isError) throw new Error(text);
+          return JSON.parse(text) as unknown;
+        };
+      }
+      const classified = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+      const reviewContent = {
+        authorIdentity: 'host-author',
+        checks: ['verified exact diff'],
+        diffScopeHash: digestValue(classified.classification.changedPaths),
+        elapsedMs: 1,
+        findings: [],
+        head: classified.classification.head,
+        issueNumber: 17,
+        prNumber: null,
+        readOnly: true,
+        requestedEffort: 'xhigh',
+        requestedModel: 'gpt-6-astra',
+        effectiveEffort: 'xhigh',
+        effectiveModel: 'gpt-6-astra',
+        reviewerIdentity: 'synthetic-reviewer',
+        schemaVersion: 'ai-delivery.review-artifact@1',
+        summary: 'Independent exact-head review',
+        verdict: 'approve',
+      };
+      const prepublicationReview = join(root, '.git', 'prepublication-review.json');
+      if (highRisk) {
+        await assert.rejects(call('issue_verify', { issueNumber: 17 }), /independent exact-head approval/u);
+        writeFileSync(
+          prepublicationReview,
+          JSON.stringify({ ...reviewContent, artifactId: digestValue(reviewContent) }),
+        );
+      }
+      const verified = (await call('issue_verify', {
+        issueNumber: 17,
+        ...(highRisk ? { prepublicationReview } : {}),
+      })) as { evidenceId: string };
+      const run = loadVerifiedRun(row.path, 17);
+      const candidateConfiguration = await loadDeliveryConfig(row.path);
+      assert.equal(run.classification.configDigest, candidateConfiguration.configDigest);
+      assert.equal(run.classification.policyDigest, sha256(join(row.path, 'policy.mjs')));
+      if (transition) assert.notEqual(run.classification.configDigest, primaryConfiguration.configDigest);
+      assert.equal(readFileSync(admissionPath, 'utf8'), admissionBefore);
+      const phaseEvidence = JSON.parse(
+        readFileSync(
+          join(
+            root,
+            '.git',
+            'ai-delivery',
+            'receipts',
+            'delivery@1',
+            run.classification.head.sha,
+            `${verified.evidenceId.slice(7)}.json`,
+          ),
+          'utf8',
+        ),
+      ) as {
+        configDigest: string;
+        aggregateId: string;
+        approval: { authorIdentity: string; reviewerIdentity: string } | null;
+      };
+      assert.equal(phaseEvidence.configDigest, candidateConfiguration.configDigest);
+      assert.equal(phaseEvidence.aggregateId, run.aggregate.aggregateId);
+      if (highRisk) {
+        assert.equal(phaseEvidence.approval?.authorIdentity, 'host-author');
+        assert.equal(phaseEvidence.approval?.reviewerIdentity, 'synthetic-reviewer');
+      }
+      personalRoute.baseSha = run.classification.base.sha;
+      personalRoute.headSha = run.classification.head.sha;
+      personalRoute.reviews.length = 0;
+      personalRoute.submitted = 0;
+      personalRoute.created = false;
+      personalRoute.failCreate = false;
+      personalRoute.ready = false;
+      personalRoute.readyPromotions = 0;
+      personalRoute.active = true;
 
-    const execution = { repoRoot: row.path, runtimeEntryPath, identity: 'host-author' };
-    const published = (await executeTool('issue_pr_create', { issueNumber: 17 }, execution)) as {
-      prNumber: number;
-      reviewRoute: { author: { actorLogin: string; credentialSource: string }; reviewer: { actorLogin: string } };
-    };
-    assert.equal(published.prNumber, 23);
-    assert.equal(existsSync(pushMarker), true);
-    assert.equal(published.reviewRoute.author.actorLogin, 'host-user');
-    assert.equal(published.reviewRoute.author.credentialSource, 'env:AUTHOR_TOKEN');
-    assert.equal(published.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer[bot]');
-    const info = (await executeTool('issue_pr_info', { prNumber: 23 }, execution)) as { authorLogin: string };
-    assert.equal(info.authorLogin, 'host-user');
+      if (transition) {
+        await assert.rejects(
+          executeTool('issue_pr_create', { issueNumber: 17 }, { ...execution, identity: 'synthetic-author' }),
+          /configured author identity/u,
+        );
+        writeFileSync(join(row.path, 'dirty.txt'), 'unverified');
+        await assert.rejects(executeTool('issue_pr_create', { issueNumber: 17 }, execution), /clean worktree/u);
+        rmSync(join(row.path, 'dirty.txt'));
+        git(row.path, 'commit', '--allow-empty', '-qm', 'unverified head');
+        await assert.rejects(executeTool('issue_pr_create', { issueNumber: 17 }, execution));
+        assert.equal(existsSync(pushMarker), false);
+        git(row.path, 'reset', '--hard', run.classification.head.sha);
+        personalRoute.baseSha = 'f'.repeat(40);
+        await assert.rejects(call('issue_pr_create', { issueNumber: 17 }), /Remote base changed/u);
+        assert.equal(existsSync(pushMarker), false);
+        personalRoute.baseSha = run.classification.base.sha;
+        personalRoute.failCreate = true;
+        await assert.rejects(call('issue_pr_create', { issueNumber: 17 }), /response lost after branch push/u);
+        assert.equal(existsSync(pushMarker), true);
+        assert.equal(personalRoute.created, false);
+      }
+      const published = (await call('issue_pr_create', { issueNumber: 17 })) as {
+        prNumber: number;
+        reviewRoute: { author: { actorLogin: string; credentialSource: string }; reviewer: { actorLogin: string } };
+      };
+      assert.equal(published.prNumber, 23);
+      assert.equal(existsSync(pushMarker), true);
+      assert.equal(published.reviewRoute.author.actorLogin, 'host-user');
+      assert.equal(published.reviewRoute.author.credentialSource, 'env:AUTHOR_TOKEN');
+      assert.equal(published.reviewRoute.reviewer.actorLogin, 'synthetic-reviewer[bot]');
+      const info = (await call('issue_pr_info', { issueNumber: 17, prNumber: 23 })) as { authorLogin: string };
+      assert.equal(info.authorLogin, 'host-user');
+      assert.equal(readFileSync(admissionPath, 'utf8'), admissionBefore);
 
-    const artifactContent = {
-      authorIdentity: 'host-author',
-      checks: ['verified exact diff'],
-      diffScopeHash: digestValue(run.classification.changedPaths),
-      elapsedMs: 1,
-      findings: [],
-      head: run.classification.head,
+      const artifactContent = { ...reviewContent, prNumber: 23 };
+      const artifact = JSON.stringify({ ...artifactContent, artifactId: digestValue(artifactContent) });
+      const reviewInput = { issueNumber: 17, prNumber: 23, identity: 'synthetic-reviewer', artifact };
+      if (transition) {
+        personalRoute.headSha = 'b'.repeat(40);
+        await assert.rejects(call('issue_pr_review', reviewInput), /head/u);
+        assert.equal(personalRoute.submitted, 0);
+        personalRoute.headSha = run.classification.head.sha;
+      }
+      if (transition && entry === 'source') {
+        process.env[driftEnv] = 'SKIP';
+        assert.notEqual((await loadDeliveryConfig(row.path)).configDigest, candidateConfiguration.configDigest);
+        assert.equal((await loadDeliveryConfig(root)).configDigest, primaryConfiguration.configDigest);
+        await assert.rejects(call('issue_pr_review', reviewInput), /classification is stale against config/u);
+        assert.equal(personalRoute.submitted, 0);
+        delete process.env[driftEnv];
+      }
+      const first = (await call('issue_pr_review', reviewInput)) as {
+        receiptId: string;
+        reviewState: { status: string; submittedReviewAuthorCanPushToRepository: boolean | null };
+      };
+      assert.equal(first.reviewState.status, 'still-required');
+      assert.equal(first.reviewState.submittedReviewAuthorCanPushToRepository, false);
+      assert.equal(personalRoute.submitted, 1);
+      if (transition && entry === 'primary') {
+        process.env[driftEnv] = 'SKIP';
+        assert.notEqual((await loadDeliveryConfig(row.path)).configDigest, candidateConfiguration.configDigest);
+        assert.equal((await loadDeliveryConfig(root)).configDigest, primaryConfiguration.configDigest);
+        await assert.rejects(
+          call('issue_pr_create', { issueNumber: 17, draft: false }),
+          /classification is stale against config/u,
+        );
+        assert.equal(personalRoute.readyPromotions, 0);
+        delete process.env[driftEnv];
+        await call('issue_pr_create', { issueNumber: 17, draft: false });
+        assert.equal(personalRoute.readyPromotions, 1);
+      }
+      const second = (await call('issue_pr_review', reviewInput)) as { receiptId: string };
+      assert.equal(second.receiptId, first.receiptId);
+      assert.equal(personalRoute.submitted, 1);
+    } finally {
+      await closeMcp?.();
+      personalRoute.active = false;
+      personalRoute.created = false;
+      personalRoute.failCreate = false;
+      personalRoute.reviews.length = 0;
+      personalRoute.ready = false;
+      personalRoute.readyPromotions = 0;
+      if (previousDrift === undefined) delete process.env[driftEnv];
+      else process.env[driftEnv] = previousDrift;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  15_000,
+);
+
+test.each(['runtime', 'primary-policy', 'witness', 'sibling', 'foreign-repository', 'missing-source'])(
+  'source-bound dispatch rejects invalid %s before running candidate stages',
+  async (invalid) => {
+    const { root, runtimeEntryPath, counter } = await fixture();
+    let foreignRoot: string | undefined;
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      let requestedRoot = root;
+      const expected = {
+        runtime: /source, capability or repository admission/u,
+        'primary-policy': /source, capability or repository admission/u,
+        witness: /ownership witness/u,
+        sibling: /primary or exact registered issue checkout/u,
+        'foreign-repository': /primary Git repository/u,
+        'missing-source': /git rev-parse failed/u,
+      }[invalid]!;
+      if (invalid === 'runtime') writeFileSync(join(dirname(runtimeEntryPath), 'changed.js'), 'unadmitted');
+      if (invalid === 'primary-policy')
+        writeFileSync(
+          join(root, 'policy.mjs'),
+          `${readFileSync(join(root, 'policy.mjs'), 'utf8')}\n// unadmitted controller policy\n`,
+        );
+      if (invalid === 'witness') rmSync(join(root, '.git', 'ai-delivery', 'worktree-owners'), { recursive: true });
+      if (invalid === 'sibling')
+        requestedRoot = (
+          await prepareStandaloneWorktree({
+            name: 'sibling',
+            branch: 'scratch/sibling',
+            identity: 'synthetic-author',
+            repoRoot: root,
+          })
+        ).path;
+      if (invalid === 'foreign-repository') {
+        foreignRoot = (await fixture()).root;
+        const foreign = await prepareIssueWorktree({
+          baseRef: 'main',
+          identity: 'synthetic-author',
+          issueNumber: 17,
+          repoRoot: foreignRoot,
+        });
+        await removeWorktreeEntry(row.path, root);
+        await addWorktreeEntry(foreign, root);
+      }
+      if (invalid === 'missing-source') git(root, 'worktree', 'remove', row.path);
+      await assert.rejects(
+        executeTool('issue_verify', { issueNumber: 17 }, { repoRoot: requestedRoot, runtimeEntryPath }),
+        expected,
+      );
+      assert.equal(existsSync(counter), false);
+    } finally {
+      if (foreignRoot !== undefined) rmSync(foreignRoot, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('source-bound publication preserves rejection of a legacy personal override for an App author', async () => {
+  const { root, runtimeEntryPath } = await fixture();
+  let restore: (() => void) | undefined;
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
       issueNumber: 17,
-      prNumber: 23,
-      readOnly: true,
-      requestedEffort: 'xhigh',
-      requestedModel: 'gpt-6-astra',
-      effectiveEffort: 'xhigh',
-      effectiveModel: 'gpt-6-astra',
-      reviewerIdentity: 'synthetic-reviewer',
-      schemaVersion: 'ai-delivery.review-artifact@1',
-      summary: 'Independent exact-head review',
-      verdict: 'approve',
-    };
-    const artifact = JSON.stringify({ ...artifactContent, artifactId: digestValue(artifactContent) });
-    const reviewInput = { issueNumber: 17, prNumber: 23, identity: 'synthetic-reviewer', artifact };
-    const first = (await executeTool('issue_pr_review', reviewInput, execution)) as {
-      receiptId: string;
-      reviewState: { status: string; submittedReviewAuthorCanPushToRepository: boolean | null };
-    };
-    assert.equal(first.reviewState.status, 'still-required');
-    assert.equal(first.reviewState.submittedReviewAuthorCanPushToRepository, false);
-    assert.equal(personalRoute.submitted, 1);
-    const second = (await executeTool('issue_pr_review', reviewInput, execution)) as { receiptId: string };
-    assert.equal(second.receiptId, first.receiptId);
-    assert.equal(personalRoute.submitted, 1);
+      repoRoot: root,
+    });
+    const run = await verifyIssue({ issueNumber: 17, repoRoot: row.path });
+    const factory = githubClient.createDeliveryGitHubClients;
+    const selected = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockImplementation(async (input) => {
+      const clients = await factory(input);
+      if (input.role !== 'author') return clients;
+      Object.assign(clients.rest.issues, { get: async () => ({ data: { title: 'Synthetic issue' } }) });
+      Object.assign(clients.rest.git, {
+        getRef: async () => ({ data: { object: { sha: run.classification.base.sha } } }),
+      });
+      return { ...clients, authSource: 'personal', credentialSource: 'legacy:personal' };
+    });
+    restore = () => selected.mockRestore();
+    await assert.rejects(
+      executeTool(
+        'issue_pr_create',
+        { issueNumber: 17 },
+        {
+          repoRoot: root,
+          runtimeEntryPath,
+          identity: 'personal',
+          personalAuth: true,
+        },
+      ),
+      /requires the configured author credential/u,
+    );
+    assert.equal(
+      git(join(root, '.git', 'remote.git'), 'for-each-ref', '--format=%(refname)', 'refs/heads/issue/17'),
+      '',
+    );
   } finally {
-    personalRoute.active = false;
-    personalRoute.reviews.length = 0;
-    if (originalPath === undefined) delete process.env.PATH;
-    else process.env.PATH = originalPath;
+    restore?.();
     rmSync(root, { recursive: true, force: true });
   }
-}, 15_000);
+});
 
 test('scratch start derives safe names and reports the requested worktree', async () => {
   const { root, runtimeEntryPath } = await fixture();
@@ -2612,7 +2905,7 @@ test('MCP request rejects unsupported legacy options before lifecycle dispatch',
 });
 
 async function syntheticLifecycle(routing: { remote: string; divergentOrigin: boolean }): Promise<void> {
-  const { root } = await fixture(routing);
+  const { root, runtimeEntryPath } = await fixture(routing);
   const remoteName = routing.remote;
   assert.equal(defaultBaseRef(root, remoteName), `refs/remotes/${remoteName}/main`);
   const remote = join(root, '.git', 'remote.git');
@@ -2652,7 +2945,7 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
   let reviewDecision: 'APPROVED' | 'REVIEW_REQUIRED' = 'REVIEW_REQUIRED';
   const calls: string[] = [];
   const createPayloads: Record<string, unknown>[] = [];
-  const statuses = { Queued: 'todo', Active: 'active', Waiting: 'blocked', Shipped: 'done' };
+  const statuses = { Queued: 'STATUS-0', Active: 'STATUS-1', Waiting: 'STATUS-2', Shipped: 'STATUS-3' };
   const statusName = (option: string) => Object.entries(statuses).find(([, id]) => id === option)?.[0];
   const pageInfo = { endCursor: null, hasNextPage: false };
   const issueFieldValues = (number = issueNumber) => [
@@ -2982,6 +3275,7 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
       }),
     },
   } as unknown as DeliveryContext;
+  let restoreDispatchClient: (() => void) | undefined;
   try {
     await assert.rejects(
       startTrackedIssue(context, { request: 'Unready task', develop: true }),
@@ -3204,7 +3498,28 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
     );
     assert.equal(existsSync(row.path), false);
     rmSync(blockedRecordPath, { recursive: true });
-    const finished = await finishIssue(context, { issueNumber, prNumber, strategy: 'merge' });
+    const dispatchClient = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockImplementation(async () => ({
+      ...context.clients,
+      graphql: (async (query: string, variables: Record<string, unknown>) =>
+        query.includes('DeliveryDiscovery') ||
+        query.includes('DeliveryRepository') ||
+        query.includes('ProjectDeliveryConfiguration')
+          ? syntheticDiscoveryClients().graphql(query, variables)
+          : graphql(query, variables)) as typeof context.clients.graphql,
+    }));
+    restoreDispatchClient = () => dispatchClient.mockRestore();
+    const execution = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
+    const terminalMerge = (await executeTool(
+      'issue_pr_merge',
+      { issueNumber, prNumber, strategy: 'merge' },
+      execution,
+    )) as { mergeSha: string };
+    assert.equal(terminalMerge.mergeSha, git(remote, 'rev-parse', 'refs/heads/main'));
+    const finished = (await executeTool('issue_finish', { issueNumber, prNumber, strategy: 'merge' }, execution)) as {
+      mergeSha: string;
+      issueClosed: true;
+      cleaned: true;
+    };
     assert.equal(finished.issueClosed, true);
     assert.equal(finished.cleaned, true);
     assert.equal(projectStatus, 'Shipped');
@@ -3213,7 +3528,15 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
     assert.equal(getDeliveryRecords(root).length, 1);
     assert.equal(getDeliveryRecords(root)[0]?.points, 4);
     assert.deepEqual(calls, ['issue:create', 'review:create', 'git:createCommit']);
-    assert.deepEqual(await finishIssue(context, { issueNumber, prNumber, strategy: 'merge' }), finished);
+    assert.deepEqual(
+      await executeTool('issue_finish', { issueNumber, prNumber, strategy: 'merge' }, execution),
+      finished,
+    );
+    await assert.rejects(
+      executeTool('issue_finish', { issueNumber, prNumber: 24 }, execution),
+      /exact terminal merge receipts/u,
+    );
+    dispatchClient.mockRestore();
     assert.equal(getDeliveryRecords(root).length, 1);
     await assert.rejects(finishIssue(context, { issueNumber, prNumber: 24 }), /exact terminal merge receipts/u);
     const newlyStarted = await startTrackedIssue(context, { request: 'New synthetic task' });
@@ -3251,6 +3574,7 @@ async function syntheticLifecycle(routing: { remote: string; divergentOrigin: bo
     assert.equal(resumedTracking.status, 'started');
     assert.equal(calls.filter((call) => call === 'issue:create').length, beforeTracking + 1);
   } finally {
+    restoreDispatchClient?.();
     rmSync(root, { recursive: true, force: true });
   }
 }

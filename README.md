@@ -214,6 +214,32 @@ For a bounded run, pass `--max-aggregate-rss-bytes`, `--min-free-disk-bytes`, an
 
 Bounded stage checkpoints bind the limits and sampled observations. Older unmeasured stages and stages with different limits rerun. Current manifests use `ai-delivery.run@3`, bind the worktree and producer, and live under `runs@2/<worktree-digest>/<head>.json`. Bounded manifests also record limits, sample count, and sampled RSS, output, and disk extrema. Historical run versions 1 and 2 remain historical and are available for merged-issue recovery; current publication requires current-producer verification. `processCoverage: "observed-processes-only"` means a passing aggregate is not proof that every detached descendant was drained. A descendant that detaches and closes inherited pipes between samples can evade observation; a pipe holder that prevents command closure fails with unverified cleanup and no checkpoint. Output baselines are retained across retries, including failed stages. They are range scoped: a changed baseline regenerates the measured stage proof. Consumers must confirm their command graph remains observable and declare all relevant output roots; this contract does not assert ownership of undeclared output locations or other concurrent writers.
 
+A reviewed policy transition can be verified and published before activating
+its new configuration. For `verify`, issue-bound PR operations, and `finish`,
+invoke from the primary checkout or the exact registered issue checkout. The
+dispatcher selects that issue's witnessed, clean source for operation policy,
+configuration and author/reviewer roles. Runtime admission continues to bind
+the unchanged primary controller configuration and installed CLI/MCP bytes.
+Controller metadata discovery uses the configured source author; a review
+operation still authenticates independently as the configured reviewer App.
+Both contexts must select the same repository and share its Git common
+directory. Tracking and worktree preparation continue to use their caller's
+configuration and admission.
+
+Use the candidate's configured identities and obtain fresh verification and,
+when required, prepublication review for its exact base, head, tree and
+configuration. Formal review and ready promotion recheck that candidate
+configuration against the verified classification. Source drift, a changed
+remote base, missing ownership or
+unadmitted controller bytes/configuration reject the operation. The selected
+author credential makes the normal push and PR; formal review, counted approval
+and exact-head merge checks remain required. Publication does not activate the
+candidate configuration or rewrite runtime admission. After merge, the
+consumer's supported installation/admission process owns that transition.
+If cleanup has removed the checkout or registry row, merge/finish recovery uses
+the admitted primary context and retained terminal receipts with remote
+readback; it does not reconstruct source configuration or issue another merge.
+
 For recovery, inspect the original issue/PR, worktree registry and exact source
 head before retrying. A `created-not-started` response includes `safeResume`
 arguments; use those arguments unchanged to resume the known issue. `verify`
