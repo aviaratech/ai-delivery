@@ -1,9 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 import { loadDeliveryConfig, loadDeliverySettings, readDeliveryOverrides } from './config/deliveryConfig.js';
 import { resolveRepoFromRemote } from './github/repo.js';
+import { assertRepositoryClassificationCurrent } from './delivery/index.js';
 import { DeliveryError } from './errors.js';
-import { defaultBaseRef, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
+import { assertClean, defaultBaseRef, gitCommonDir, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
+import { createDeliveryGitHubClients } from './github/client.js';
 import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js';
 import { resolveNativeRelationshipTargets } from './github/relationships.js';
 import {
@@ -117,6 +119,40 @@ export async function contextFor(input: ExecutionContext, commandName: string, r
     repoRoot: input.repoRoot,
     role,
   });
+}
+
+function sourceRootFor(name: AiDeliveryMcpToolName, input: Record<string, unknown>, execution: ExecutionContext) {
+  if (
+    name !== 'issue_verify' &&
+    name !== 'issue_pr_create' &&
+    name !== 'issue_pr_review' &&
+    name !== 'issue_pr_merge' &&
+    name !== 'issue_finish' &&
+    !(name === 'issue_pr_info' && input.issueNumber !== undefined)
+  )
+    return undefined;
+  const primary = primaryGitRoot(execution.repoRoot);
+  const requested = gitRoot(execution.repoRoot);
+  const issueNumber = requiredNumber(input, 'issueNumber');
+  if (
+    name === 'issue_finish' &&
+    !listWorktreesStrict(primary).some((row) => row.type === 'issue' && row.issueNumber === issueNumber)
+  )
+    return primary;
+  const row = getIssueWorktreeStrict(issueNumber, primary);
+  if (requested !== primary && requested !== row.path) {
+    throw new DeliveryError('Source-bound operations require the primary or exact registered issue checkout.');
+  }
+  // Terminal owners validate retained immutable receipts and the remote result.
+  // A removed merged checkout must not be imported or reconstructed here.
+  if ((name === 'issue_finish' || name === 'issue_pr_merge') && row.status === 'merged' && !existsSync(row.path)) {
+    return primary;
+  }
+  if (gitCommonDir(row.path) !== gitCommonDir(primary)) {
+    throw new DeliveryError('Registered issue source must belong to the primary Git repository.');
+  }
+  assertClean(row.path);
+  return row.path;
 }
 
 /** @internal Keep CLI and MCP start routing on the same native lifecycle owner. */
@@ -312,15 +348,48 @@ export async function executeTool(
   };
   const requestedIdentity = name === 'issue_pr_review' ? optionalString(input, 'identity') : undefined;
   const selectedExecution = requestedIdentity === undefined ? execution : { ...execution, identity: requestedIdentity };
+  const sourceRoot = sourceRootFor(name, input, execution);
   const context = await contextFor(
-    selectedExecution,
+    sourceRoot === undefined ? selectedExecution : { ...selectedExecution, repoRoot: sourceRoot },
     commands[name],
     name === 'issue_pr_review' ? 'reviewer' : 'author',
   );
+  let controllerConfiguration = context.configuration;
+  if (sourceRoot !== undefined) {
+    const primary = primaryGitRoot(execution.repoRoot);
+    const settings = await loadDeliverySettings(primary);
+    if (settings.repository.toLowerCase() !== context.config.repository.toLowerCase()) {
+      throw new DeliveryError('Registered issue source and primary controller must select the same repository.');
+    }
+    const authorClients =
+      name === 'issue_pr_review'
+        ? await createDeliveryGitHubClients({
+            config: context.config,
+            identity: context.config.roles.author.identity,
+            ...(execution.personalAuth ? { personalAuth: { enabled: true as const } } : {}),
+            role: 'author',
+          })
+        : context.clients;
+    // Discover the controller's metadata through the configured source author,
+    // while retaining the controller's policy, settings and admission digest.
+    controllerConfiguration = await loadDeliveryConfig(primary, { clients: authorClients });
+  }
   if (MUTATING_TOOLS.has(name) && input.dryRun !== true) {
     await assertDeliveryRuntimeAdmitted({
       ...execution,
-      ...(context.configuration === undefined ? {} : { configuration: context.configuration }),
+      repoRoot: sourceRoot === undefined ? execution.repoRoot : primaryGitRoot(execution.repoRoot),
+      ...(controllerConfiguration === undefined ? {} : { configuration: controllerConfiguration }),
+    });
+  }
+  if (sourceRoot !== undefined && (name === 'issue_pr_create' || name === 'issue_pr_review')) {
+    if (context.configuration === undefined)
+      throw new DeliveryError('Source-bound operation requires discovered candidate configuration.');
+    const run = loadVerifiedRun(sourceRoot, requiredNumber(input, 'issueNumber'));
+    assertRepositoryClassificationCurrent({
+      classification: run.classification,
+      configDigest: context.configuration.configDigest,
+      policySourcePath: context.config.policy.module,
+      repoRoot: sourceRoot,
     });
   }
   switch (name) {
