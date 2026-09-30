@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { existsSync, unlinkSync, lstatSync, readFileSync, readdirSync, statfsSync } from 'node:fs';
+import { existsSync, unlinkSync, lstatSync, readFileSync, readdirSync, realpathSync, statfsSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -236,7 +236,17 @@ function scanOutputRoots(roots: readonly string[]): Map<string, number> {
       throw error;
     }
     if (metadata.isSymbolicLink()) {
-      throw new DeliveryError('Filesystem output observation encountered a symbolic link.');
+      let target: string;
+      try {
+        target = realpathSync(path);
+      } catch {
+        throw new DeliveryError('Filesystem output observation encountered a broken or cyclic symbolic link.');
+      }
+      if (!roots.some((root) => target === root || target.startsWith(`${root}${sep}`))) {
+        throw new DeliveryError('Filesystem output observation encountered an escaping symbolic link.');
+      }
+      // Observe physical targets through their declared root only, never traverse aliases.
+      return;
     }
     if (metadata.isDirectory()) {
       for (const name of readdirSync(path)) visit(join(path, name));
@@ -248,7 +258,11 @@ function scanOutputRoots(roots: readonly string[]): Map<string, number> {
     files.set(path, metadata.size);
     if (files.size > 1_000_000) throw new DeliveryError('Filesystem output observation exceeded its file limit.');
   };
-  for (const root of roots) visit(root);
+  for (const root of roots) {
+    if (existsSync(root) && realpathSync(root) !== root)
+      throw new DeliveryError('Filesystem output roots must not be symbolic links.');
+    visit(root);
+  }
   return files;
 }
 
@@ -585,6 +599,7 @@ interface VerificationWriter {
   starting(): void;
   observed(state: OwnedProcessState): void;
   idle(): void;
+  assertQuiescent(): void;
 }
 
 async function withVerificationWriter<T>(
@@ -656,6 +671,11 @@ async function withVerificationWriter<T>(
           });
         },
         idle: () => persist({ phase: 'idle' }),
+        assertQuiescent: () => {
+          const current = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
+          if (current.writerId !== state.writerId || current.command.phase !== 'idle')
+            throw new DeliveryError('Verification writer command quiescence is not confirmed.');
+        },
       };
       const releaseWriter = (): void => {
         const current = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
@@ -1440,4 +1460,74 @@ export function loadRemovedMergedRun(primaryRepoRoot: string, issueNumber: numbe
     throw new DeliveryError('Recovered merged run disagrees with the registered branch.');
   }
   return run;
+}
+
+/** @internal Runtime setup shares the existing writer, ownership handshake and bounded command runner. */
+export async function withRuntimeSetupWriter<T>(
+  root: string,
+  operation: (runner: {
+    assertQuiescent(): void;
+    run(argv: readonly string[], bounds: VerificationResourceBounds, signal?: AbortSignal): Promise<Buffer>;
+  }) => Promise<T>,
+): Promise<T> {
+  return withVerificationWriter(root, async (writer) =>
+    operation({
+      assertQuiescent: () => writer.assertQuiescent(),
+      run: async (argv, bounds, signal) => {
+        assertResourceBounds(bounds);
+        const roots = bounds.outputRoots?.map((path) => resolve(root, path)).sort();
+        if (roots !== undefined) {
+          for (let i = 1; i < roots.length; i++)
+            if (roots[i] === roots[i - 1] || roots[i]!.startsWith(`${roots[i - 1]}${sep}`))
+              throw new DeliveryError('Filesystem output roots must not overlap.');
+        }
+        const files = roots === undefined ? undefined : scanOutputRoots(roots);
+        const baseline =
+          roots === undefined || files === undefined
+            ? undefined
+            : {
+                roots,
+                files,
+                baselineId: digestValue([...files]),
+              };
+        assertDiskHeadroom(root, bounds, baseline);
+        const started = Date.now();
+        const output = await runStageCommand(
+          root,
+          argv,
+          signal,
+          (capturedOutputBytes, sample) =>
+            reportVerificationProgress({
+              state: 'running',
+              stageId: 'runtime-setup',
+              completedStages: 0,
+              reusedStages: 0,
+              remainingStages: 1,
+              elapsedMs: Date.now() - started,
+              capturedOutputBytes,
+              ...(sample === undefined
+                ? {}
+                : {
+                    sampledAggregateRssBytes: sample.aggregateRssBytes,
+                    sampledFreeDiskBytes: sample.freeDiskBytes,
+                    sampledNewOutputBytes: sample.newOutputBytes,
+                  }),
+            }),
+          bounds,
+          baseline,
+          undefined,
+          writer,
+        );
+        reportVerificationProgress({
+          state: 'completed',
+          stageId: 'runtime-setup',
+          completedStages: 1,
+          reusedStages: 0,
+          remainingStages: 0,
+          elapsedMs: Date.now() - started,
+        });
+        return output;
+      },
+    }),
+  );
 }

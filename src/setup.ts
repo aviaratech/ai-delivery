@@ -1,0 +1,458 @@
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { z } from 'zod';
+
+import { assertPrivateFile, writeCreateOnly } from './delivery/common.js';
+import { digestBytes, digestValue } from './delivery/index.js';
+import { DeliveryError } from './errors.js';
+import { assertClean, coordinate, gitCommonDir, gitRoot, primaryGitRoot } from './git.js';
+import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js';
+import { loadDeliveryContext } from './issue.js';
+import { preflightReviewRoute } from './pr.js';
+import {
+  buildRuntimeAdmission,
+  RuntimeAdmissionSchema,
+  validateRuntimeAdmission,
+  type RuntimeAdmission,
+} from './services/deliveryAdmission.js';
+import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
+import { withLock } from './utils/lockfile.js';
+import { withRuntimeSetupWriter } from './verification.js';
+
+const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
+const IntentSchema = z.strictObject({
+  archivePath: z.string().min(1),
+  archiveSha256: Digest,
+  configDigest: Digest,
+  packageVersion: z.string().regex(/^\d+\.\d+\.\d+$/u),
+  repoRoot: z.string().min(1),
+  repository: z.string().min(1),
+  reviewRouteDigest: Digest,
+  runtimeDirectory: z.string().min(1),
+  sourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
+});
+const StageSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.runtime-stage@1'),
+    stageId: Digest,
+    intent: IntentSchema,
+    directory: z.strictObject({ device: z.number().int(), inode: z.number().int() }),
+    admission: RuntimeAdmissionSchema.optional(),
+    status: z.enum(['incomplete', 'complete']),
+    recordId: Digest,
+  })
+  .superRefine((value, context) => {
+    const { recordId, ...content } = value;
+    if (
+      recordId !== digestValue(content) ||
+      value.stageId !== digestValue(value.intent) ||
+      (value.status === 'complete') !== (value.admission !== undefined) ||
+      (value.admission !== undefined &&
+        (value.admission.sourceCommit !== value.intent.sourceCommit ||
+          value.admission.sourceArchiveSha256 !== value.intent.archiveSha256 ||
+          value.admission.packageVersion !== value.intent.packageVersion ||
+          value.admission.configDigest !== value.intent.configDigest ||
+          value.admission.repository !== value.intent.repository ||
+          value.admission.cliPath !==
+            join(value.intent.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/dist/cli.js') ||
+          value.admission.mcpLauncherPath !==
+            join(
+              value.intent.runtimeDirectory,
+              'node_modules/@aviaratech/ai-delivery/plugins/ai-delivery/dist/mcp-launcher.js',
+            ) ||
+          value.admission.pluginManifestPath !==
+            join(
+              value.intent.runtimeDirectory,
+              'node_modules/@aviaratech/ai-delivery/plugins/ai-delivery/.claude-plugin/plugin.json',
+            )))
+    )
+      context.addIssue({ code: 'custom', message: 'Runtime stage identity or completion is corrupt.' });
+  });
+type StageRecord = z.infer<typeof StageSchema>;
+
+interface SetupControllerInput {
+  repoRoot: string;
+  identity: string;
+  personalAuth?: boolean;
+  expectedSourceCommit: string;
+  expectedConfigDigest: string;
+  runtimeDirectory: string;
+}
+export interface StageRuntimeInput extends SetupControllerInput {
+  authority: 'runtime:stage';
+  archivePath: string;
+  expectedArchiveSha256: string;
+  packageVersion: string;
+  signal?: AbortSignal;
+  resourceBounds?: { maxAggregateRssBytes: number; minFreeDiskBytes: number; maxNewOutputBytes: number };
+}
+export interface AdmitRuntimeInput extends SetupControllerInput {
+  authority: 'runtime:admit';
+  stageId: string;
+  expectedPriorAdmissionSha256: string | null;
+}
+export interface RuntimeStageResult {
+  stageId: string;
+  admission: RuntimeAdmission;
+  reused: boolean;
+  launch: { cli: { command: string; args: string[] }; mcp: { command: string; args: string[] } };
+  reviewRoute: Awaited<ReturnType<typeof preflightReviewRoute>>;
+}
+
+/** Paths are explicit canonical locations; setup never traverses host aliases or current links. */
+function canonicalPath(path: string): string {
+  if (!isAbsolute(path) || resolve(path) !== path)
+    throw new DeliveryError('Runtime setup paths must be absolute and canonical.');
+  const parts = path.split(sep).filter(Boolean);
+  let parent: string = sep;
+  for (const part of parts) {
+    parent = join(parent, part);
+    try {
+      if (lstatSync(parent).isSymbolicLink()) throw new DeliveryError('Runtime setup path contains a symbolic link.');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return path;
+}
+function assertArchive(path: string, expected: string): Buffer {
+  canonicalPath(path);
+  Digest.parse(expected);
+  const metadata = lstatSync(path);
+  if (!metadata.isFile() || metadata.nlink !== 1)
+    throw new DeliveryError('Reviewed runtime archive bytes do not match the expected digest.');
+  const bytes = readFileSync(path);
+  if (digestBytes(bytes) !== expected)
+    throw new DeliveryError('Reviewed runtime archive bytes do not match the expected digest.');
+  return bytes;
+}
+function assertArchiveSnapshot(intent: StageRecord['intent']): string {
+  const path = canonicalPath(join(intent.runtimeDirectory, 'reviewed-archive.tgz'));
+  if (digestBytes(assertPrivateFile(path)) !== intent.archiveSha256)
+    throw new DeliveryError('Runtime stage archive snapshot bytes changed.');
+  return path;
+}
+async function controller(input: SetupControllerInput, command: 'runtime:stage' | 'runtime:admit') {
+  if (typeof input.identity !== 'string' || !input.identity.trim())
+    throw new DeliveryError('Runtime setup requires an explicit configured author identity.');
+  const root = gitRoot(input.repoRoot);
+  if (root !== primaryGitRoot(root))
+    throw new DeliveryError('Runtime setup requires the primary consumer controller checkout.');
+  assertClean(root);
+  if (coordinate(root).sha !== input.expectedSourceCommit)
+    throw new DeliveryError('Primary controller source commit changed.');
+  canonicalPath(input.runtimeDirectory);
+  const context = await loadDeliveryContext({
+    identity: input.identity,
+    repoRoot: root,
+    role: 'author',
+    ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
+  });
+  const policy = evaluateCommandIdentityPolicy({
+    commandName: command,
+    deliveryConfig: context.config,
+    identity: input.identity,
+    ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
+  });
+  if (policy.error) throw new DeliveryError(policy.error);
+  if (!context.configuration || context.configuration.configDigest !== input.expectedConfigDigest)
+    throw new DeliveryError('Primary controller resolver config digest changed.');
+  const reviewRoute = await preflightReviewRoute(context);
+  // Publication preflight requires the actual configured author credential, not a development override.
+  assertClean(root);
+  if (coordinate(root).sha !== input.expectedSourceCommit)
+    throw new DeliveryError('Primary controller source commit changed during preflight.');
+  return { root, configuration: context.configuration, reviewRoute };
+}
+function readStage(directory: string): StageRecord {
+  canonicalPath(directory);
+  const metadata = lstatSync(directory);
+  if (!metadata.isDirectory() || (metadata.mode & 0o777) !== 0o700)
+    throw new DeliveryError('Runtime stage directory must be private and owned.');
+  let record: StageRecord;
+  try {
+    record = StageSchema.parse(JSON.parse(assertPrivateFile(join(directory, 'runtime-stage.json')).toString('utf8')));
+  } catch {
+    throw new DeliveryError('Runtime stage is unowned, incompatible or corrupt.');
+  }
+  if (
+    record.intent.runtimeDirectory !== directory ||
+    metadata.dev !== record.directory.device ||
+    metadata.ino !== record.directory.inode
+  )
+    throw new DeliveryError('Runtime stage directory ownership changed.');
+  if (record.status === 'complete') assertArchiveSnapshot(record.intent);
+  return record;
+}
+function writeStage(directory: string, content: Omit<StageRecord, 'recordId'>): StageRecord {
+  const record = StageSchema.parse({ ...content, recordId: digestValue(content) });
+  writePrivateJsonFileAtomically(join(directory, 'runtime-stage.json'), record);
+  const readback = readStage(directory);
+  if (readback.recordId !== record.recordId) throw new DeliveryError('Runtime stage completion readback changed.');
+  return readback;
+}
+function syncDirectory(directory: string): void {
+  const descriptor = openSync(directory, 'r');
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+function durability(path: string): void {
+  const bytes = assertPrivateFile(path);
+  const fd = openSync(path, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  syncDirectory(dirname(path));
+  if (!assertPrivateFile(path).equals(bytes))
+    throw new DeliveryError('Runtime admission third-party replacement conflict.');
+}
+function stageResult(
+  record: StageRecord,
+  reviewRoute: RuntimeStageResult['reviewRoute'],
+  reused: boolean,
+): RuntimeStageResult {
+  if (!record.admission) throw new DeliveryError('Runtime stage completion is missing.');
+  return {
+    stageId: record.stageId,
+    admission: record.admission,
+    reused,
+    reviewRoute,
+    launch: {
+      cli: { command: process.execPath, args: [record.admission.cliPath] },
+      mcp: { command: process.execPath, args: [record.admission.mcpLauncherPath] },
+    },
+  };
+}
+function assertStageController(
+  record: StageRecord,
+  current: Awaited<ReturnType<typeof controller>>,
+  input: SetupControllerInput,
+): void {
+  if (
+    record.intent.repoRoot !== current.root ||
+    record.intent.repository !== current.configuration.config.repository ||
+    record.intent.sourceCommit !== input.expectedSourceCommit ||
+    record.intent.configDigest !== input.expectedConfigDigest
+  )
+    throw new DeliveryError('Runtime stage primary controller source or configuration changed.');
+  if (record.intent.reviewRouteDigest !== digestValue(current.reviewRoute))
+    throw new DeliveryError('Runtime stage configured actors or review route changed.');
+}
+
+/** Stage one reviewed local archive without activating host references or issuing admission. */
+export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeStageResult> {
+  if (input.authority !== 'runtime:stage') throw new DeliveryError('Explicit runtime:stage authority is required.');
+  const current = await controller(input, 'runtime:stage');
+  assertArchive(input.archivePath, input.expectedArchiveSha256);
+  const intent = IntentSchema.parse({
+    archivePath: input.archivePath,
+    archiveSha256: input.expectedArchiveSha256,
+    configDigest: input.expectedConfigDigest,
+    sourceCommit: input.expectedSourceCommit,
+    packageVersion: input.packageVersion,
+    repoRoot: current.root,
+    repository: current.configuration.config.repository,
+    reviewRouteDigest: digestValue(current.reviewRoute),
+    runtimeDirectory: input.runtimeDirectory,
+  });
+  const stageId = digestValue(intent);
+  return withRuntimeSetupWriter(current.root, async (runner) => {
+    if (existsSync(input.runtimeDirectory)) {
+      const prior = readStage(input.runtimeDirectory);
+      if (prior.stageId !== stageId) throw new DeliveryError('Runtime stage belongs to an incompatible setup intent.');
+      if (prior.status === 'complete') {
+        const reread = await controller(input, 'runtime:stage');
+        assertStageController(prior, reread, input);
+        assertArchive(intent.archivePath, intent.archiveSha256);
+        durability(join(input.runtimeDirectory, 'reviewed-archive.tgz'));
+        assertArchiveSnapshot(intent);
+        validateRuntimeAdmission(prior.admission!, reread.configuration, prior.admission!.cliPath);
+        durability(join(input.runtimeDirectory, 'runtime-stage.json'));
+        syncDirectory(dirname(input.runtimeDirectory));
+        return stageResult(prior, reread.reviewRoute, true);
+      }
+      runner.assertQuiescent();
+      rmSync(input.runtimeDirectory, { recursive: true });
+    }
+    ensurePrivateDirectoryDurably(dirname(input.runtimeDirectory));
+    mkdirSync(input.runtimeDirectory, { mode: 0o700 });
+    const directory = lstatSync(input.runtimeDirectory);
+    const content: Omit<StageRecord, 'recordId'> = {
+      schemaVersion: 'ai-delivery.runtime-stage@1',
+      stageId,
+      intent,
+      directory: { device: directory.dev, inode: directory.ino },
+      status: 'incomplete',
+    };
+    let owned = false;
+    try {
+      syncDirectory(dirname(input.runtimeDirectory));
+      writeStage(input.runtimeDirectory, content);
+      owned = true;
+      if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
+      const bounds = input.resourceBounds ?? {
+        maxAggregateRssBytes: 1024 ** 3,
+        minFreeDiskBytes: 256 * 1024 ** 2,
+        maxNewOutputBytes: 512 * 1024 ** 2,
+      };
+      // Hash and persist the same captured bytes. npm must never reopen the mutable transport pathname.
+      const archiveBytes = assertArchive(input.archivePath, input.expectedArchiveSha256);
+      if (!Number.isSafeInteger(bounds.maxNewOutputBytes) || archiveBytes.length >= bounds.maxNewOutputBytes)
+        throw new DeliveryError('Reviewed archive snapshot exceeds the stage output limit.');
+      writeCreateOnly(join(input.runtimeDirectory, 'reviewed-archive.tgz'), archiveBytes);
+      const snapshot = assertArchiveSnapshot(intent);
+      await runner.run(
+        [
+          'npm',
+          'install',
+          '--prefix',
+          input.runtimeDirectory,
+          '--omit=dev',
+          '--ignore-scripts',
+          '--no-audit',
+          '--no-fund',
+          '--package-lock=false',
+          snapshot,
+        ],
+        {
+          ...bounds,
+          maxNewOutputBytes: bounds.maxNewOutputBytes - archiveBytes.length,
+          outputRoots: [input.runtimeDirectory],
+        },
+        input.signal,
+      );
+      const reread = await controller(input, 'runtime:stage');
+      assertStageController({ ...content, recordId: digestValue(content) }, reread, input);
+      assertArchive(input.archivePath, input.expectedArchiveSha256);
+      assertArchiveSnapshot(intent);
+      const packageRoot = join(input.runtimeDirectory, 'node_modules', '@aviaratech', 'ai-delivery');
+      const plugin = join(packageRoot, 'plugins', 'ai-delivery');
+      const admission = buildRuntimeAdmission({
+        cliPath: join(packageRoot, 'dist', 'cli.js'),
+        mcpLauncherPath: join(plugin, 'dist', 'mcp-launcher.js'),
+        pluginManifestPath: join(plugin, '.claude-plugin', 'plugin.json'),
+        packageVersion: input.packageVersion,
+        sourceArchiveSha256: input.expectedArchiveSha256,
+        sourceCommit: input.expectedSourceCommit,
+        configuration: reread.configuration,
+      });
+      if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
+      runner.assertQuiescent();
+      const complete = writeStage(input.runtimeDirectory, { ...content, status: 'complete', admission });
+      validateRuntimeAdmission(complete.admission!, reread.configuration, complete.admission!.cliPath);
+      return stageResult(complete, reread.reviewRoute, false);
+    } catch (error) {
+      // Completion is a durable unit. Never prune it after a lost write response.
+      if (!owned) {
+        runner.assertQuiescent();
+        const retained = lstatSync(input.runtimeDirectory);
+        if (retained.dev !== directory.dev || retained.ino !== directory.ino || retained.isSymbolicLink())
+          throw new DeliveryError('Runtime stage cleanup ownership changed.');
+        rmSync(input.runtimeDirectory, { recursive: true });
+      } else {
+        runner.assertQuiescent();
+        const retained = readStage(input.runtimeDirectory);
+        if (retained.stageId !== stageId) throw new DeliveryError('Runtime stage cleanup ownership changed.');
+        if (retained.status === 'incomplete') rmSync(input.runtimeDirectory, { recursive: true });
+        else {
+          const final = await controller(input, 'runtime:stage');
+          assertStageController(retained, final, input);
+          assertArchive(intent.archivePath, intent.archiveSha256);
+          durability(join(input.runtimeDirectory, 'reviewed-archive.tgz'));
+          assertArchiveSnapshot(intent);
+          validateRuntimeAdmission(retained.admission!, final.configuration, retained.admission!.cliPath);
+          durability(join(input.runtimeDirectory, 'runtime-stage.json'));
+          syncDirectory(dirname(input.runtimeDirectory));
+          return stageResult(retained, final.reviewRoute, true);
+        }
+      }
+      throw error;
+    }
+  });
+}
+
+export class RuntimeAdmissionCommitUnknownError extends DeliveryError {
+  readonly status = 'commit-status-unknown';
+  constructor(
+    readonly admissionId: string,
+    readonly stageId: string,
+  ) {
+    super(
+      `Runtime admission commit-status-unknown for ${admissionId}; retry runtime:admit with the same stage ${stageId} to reconcile durability.`,
+    );
+  }
+}
+
+/** Explicit final binding, with prior-byte compare-and-swap and same-stage ambiguous-commit reconciliation. */
+export async function admitRuntime(
+  input: AdmitRuntimeInput,
+): Promise<{ admission: RuntimeAdmission; reused: boolean }> {
+  if (input.authority !== 'runtime:admit') throw new DeliveryError('Explicit runtime:admit authority is required.');
+  Digest.parse(input.stageId);
+  if (input.expectedPriorAdmissionSha256 !== null) Digest.parse(input.expectedPriorAdmissionSha256);
+  const initial = await controller(input, 'runtime:admit');
+  const path = join(gitCommonDir(initial.root), 'ai-delivery', 'runtime-admission.json');
+  canonicalPath(path);
+  ensurePrivateDirectoryDurably(dirname(path));
+  return withLock(path, {
+    projectRoot: initial.root,
+    timeout: 200,
+    operation: async () => {
+      const record = readStage(input.runtimeDirectory);
+      if (record.stageId !== input.stageId || record.status !== 'complete' || !record.admission)
+        throw new DeliveryError('Exact completed runtime stage identity is required.');
+      const current = await controller(input, 'runtime:admit');
+      assertStageController(record, current, input);
+      assertArchive(record.intent.archivePath, record.intent.archiveSha256);
+      assertArchiveSnapshot(record.intent);
+      validateRuntimeAdmission(record.admission, current.configuration, record.admission.cliPath);
+      const desired = Buffer.from(`${JSON.stringify(record.admission, null, 2)}\n`);
+      canonicalPath(path);
+      const existing = existsSync(path) ? assertPrivateFile(path) : undefined;
+      const reconcile = (): { admission: RuntimeAdmission; reused: boolean } => {
+        canonicalPath(path);
+        assertArchiveSnapshot(record.intent);
+        validateRuntimeAdmission(record.admission!, current.configuration, record.admission!.cliPath);
+        if (!existsSync(path) || !assertPrivateFile(path).equals(desired))
+          throw new DeliveryError('Runtime admission third-party replacement conflict; current bytes preserved.');
+        try {
+          durability(path);
+        } catch {
+          if (!existsSync(path) || !assertPrivateFile(path).equals(desired))
+            throw new DeliveryError('Runtime admission third-party replacement conflict; current bytes preserved.');
+          throw new RuntimeAdmissionCommitUnknownError(record.admission!.admissionId, record.stageId);
+        }
+        return { admission: record.admission!, reused: true };
+      };
+      if (existing?.equals(desired)) return reconcile();
+      if ((existing === undefined ? null : digestBytes(existing)) !== input.expectedPriorAdmissionSha256)
+        throw new DeliveryError('Runtime admission prior-byte compare-and-swap conflict; current bytes preserved.');
+      // Recheck exact staged/source/config/actor bindings immediately before the sole publication write.
+      const final = await controller(input, 'runtime:admit');
+      assertStageController(record, final, input);
+      assertArchive(record.intent.archivePath, record.intent.archiveSha256);
+      assertArchiveSnapshot(record.intent);
+      validateRuntimeAdmission(record.admission, final.configuration, record.admission.cliPath);
+      canonicalPath(path);
+      const priorNow = existsSync(path) ? assertPrivateFile(path) : undefined;
+      if ((priorNow === undefined ? null : digestBytes(priorNow)) !== input.expectedPriorAdmissionSha256)
+        throw new DeliveryError('Runtime admission prior-byte compare-and-swap conflict; current bytes preserved.');
+      try {
+        writePrivateJsonFileAtomically(path, record.admission);
+      } catch (error) {
+        const after = existsSync(path) ? assertPrivateFile(path) : undefined;
+        if (after?.equals(desired)) return reconcile();
+        if ((after === undefined ? null : digestBytes(after)) !== input.expectedPriorAdmissionSha256)
+          throw new DeliveryError('Runtime admission third-party replacement conflict; current bytes preserved.');
+        throw error;
+      }
+      reconcile();
+      return { admission: record.admission, reused: false };
+    },
+  });
+}

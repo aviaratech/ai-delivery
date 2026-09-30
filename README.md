@@ -182,15 +182,71 @@ same App review cannot resolve that state. CLI and MCP use the same asynchronous
 resolved routing. An MCP server stays bound to its startup checkout; use separate
 bindings or explicit CLI checkout selection for multiple repositories.
 
-The consumer installer must issue a private `ai-delivery.runtime-admission@2`
-record at `<git-common-dir>/ai-delivery/runtime-admission.json`. It binds the
-verified archive, package version, capability 2, actual CLI/MCP/plugin bytes and
-paths, repository and the resolver's `configDigest`. That digest includes the
-policy/settings source, validated effective roles and checks, optional overrides
-and effective discovered routing;
-**do not substitute a JSON-file hash**. Drift in the Project, fields, options,
-policy, overrides or installed bytes invalidates admission and verification
-receipts. Resolution never refreshes its own admission during a mutation.
+Public runtime setup has two explicit operations: `runtime:stage` and
+`runtime:admit` (MCP: `runtime_stage` and `runtime_admit`; API:
+`stageRuntime` and `admitRuntime` from `@aviaratech/ai-delivery/agent`). Both
+require the clean primary consumer checkout, its expected Git HEAD, the actual
+`loadDeliveryConfig` digest, an explicit configured author identity and separate
+operation authority. The authenticated author and distinct reviewer App must
+pass the existing repository-access preflight. Unknown rule visibility or
+approval eligibility remains unknown; setup does not establish counted approval.
+
+First read `config:resolve` with the configured author, then stage a reviewed
+local archive using its independently accepted SHA-256 and package version:
+
+```sh
+ai-delivery --repo-root /absolute/consumer --identity configured-author config:resolve
+ai-delivery --repo-root /absolute/consumer --identity configured-author runtime:stage \
+  --authorize-stage --archive /absolute/reviewed-package.tgz \
+  --archive-sha256 sha256:<reviewed-archive-digest> --package-version 0.3.5 \
+  --source-commit <clean-primary-consumer-head> --config-digest sha256:<resolver-digest> \
+  --runtime-directory /absolute/private-runtimes/ai-delivery-0.3.5
+```
+
+Stage captures and hashes the exact reviewed archive bytes, durably retains a
+private copy in its owned directory, and gives that copy to npm. The snapshot
+counts toward the stage output allowance and is revalidated on completion,
+reuse and admission. Stage installs production dependencies with scripts, audit
+and funding disabled.
+It validates actual CLI, full distribution, package manifest, bundled MCP launcher
+and plugin bytes and capability 2. Its private completion record binds these
+bytes to the reviewed archive and primary controller; `sourceCommit` means the
+consumer/controller HEAD, not the public package's release commit. Matching
+completed stages are read back and reused without npm. Incomplete recovery uses
+the existing durable verification writer and identity-checked command cleanup.
+A live or stopped owner remains busy; ambiguous command ownership fails closed.
+Failure or cancellation removes only owned incomplete output after confirmed
+quiescence. Stage returns actual CLI/MCP launch descriptors and leaves host
+references and current links for the consuming installer to manage.
+
+Admission is the separate explicitly authorized final binding. Use the returned
+stage ID and either explicit absence or the SHA-256 of the exact prior admission
+file bytes:
+
+```sh
+ai-delivery --repo-root /absolute/consumer --identity configured-author runtime:admit \
+  --authorize-admit --stage-id sha256:<returned-stage-id> --expected-absent \
+  --source-commit <clean-primary-consumer-head> --config-digest sha256:<resolver-digest> \
+  --runtime-directory /absolute/private-runtimes/ai-delivery-0.3.5
+# For replacement, use --expected-prior sha256:<current-admission-byte-digest>
+```
+
+The operation rechecks archive, installed bytes, primary source, resolver routing
+and configured actors before atomically publishing the existing private
+`ai-delivery.runtime-admission@2` record at
+`<git-common-dir>/ai-delivery/runtime-admission.json`, mode 0600. Precommit
+failures preserve the prior record. A lost response or post-rename failure is
+reconciled against exact desired bytes and confirmed file/directory durability.
+A `commit-status-unknown` error identifies the admission and stage; retry the
+same stage to reconcile. Conflicting third-party bytes are preserved. The
+consuming installer's reviewed host activation and rollback determine when this
+final write occurs.
+
+The resolver's `configDigest` includes policy/settings source, validated
+effective roles and checks, optional overrides and discovered routing;
+**do not substitute a JSON-file hash**. Drift invalidates admission and
+verification receipts. Ordinary lifecycle operations never refresh admission
+implicitly, and candidate issue configuration is never activated by setup.
 
 To migrate from 0.1: move `roles` and `commandPolicy` into the existing policy's
 `deliverySettings` export; replace the old JSON with only necessary overrides
@@ -222,9 +278,9 @@ Verification holds one file lease per worktree and durably records its writer an
 
 The `--admit` flag explicitly admits additional resource classes. Publication creates a draft PR only after exact-head verification; a high-risk policy also requires a prepublication review artifact. Ready promotion and merge require a submitted formal review. Merge checks live blockers, checks, base/head coordinates, and the policy boundary. Repositories may require an exact base/head lease for merge.
 
-For a bounded run, pass `--max-aggregate-rss-bytes`, `--min-free-disk-bytes`, and optionally `--max-new-output-bytes` with one or more `--output-root` paths to `verify`. `issue_verify` accepts the same values in `resourceBounds`. RSS is sampled across the observed child process tree, including observed detached descendants; free disk is checked before commands and during execution on the worktree and declared output filesystems. Positive file-size growth is sampled under the declared roots, with previously measured completed stages carried across a resume. The caller must declare every output root relevant to its allowance; symbolic links inside those roots fail closed. The roots are relative to the issue worktree unless absolute. Output growth is separate from the 8 MiB captured stdout/stderr limit. Resource limits are opt in and do not impose a total runtime deadline.
+For a bounded run, pass `--max-aggregate-rss-bytes`, `--min-free-disk-bytes`, and optionally `--max-new-output-bytes` with one or more `--output-root` paths to `verify`. `issue_verify` accepts the same values in `resourceBounds`. RSS is sampled across the observed child process tree, including observed detached descendants; free disk is checked before commands and during execution on the worktree and declared output filesystems. Positive file-size growth is sampled under the declared roots, with previously measured completed stages carried across a resume. The caller must declare every output root relevant to its allowance; aliases must resolve within those roots. The roots are relative to the issue worktree unless absolute. Output growth is separate from the 8 MiB captured stdout/stderr limit. Resource limits are opt in and do not impose a total runtime deadline.
 
-Bounded stage checkpoints bind the limits and sampled observations. Older unmeasured stages and stages with different limits rerun. Current manifests use `ai-delivery.run@3`, bind the worktree and producer, and live under `runs@2/<worktree-digest>/<head>.json`. Bounded manifests also record limits, sample count, and sampled RSS, output, and disk extrema. Historical run versions 1 and 2 remain historical and are available for merged-issue recovery; current publication requires current-producer verification. `processCoverage: "observed-processes-only"` means a passing aggregate is not proof that every detached descendant was drained. A descendant that detaches and closes inherited pipes between samples can evade observation; a pipe holder that prevents command closure fails with unverified cleanup and no checkpoint. Output baselines are retained across retries, including failed stages. They are range scoped: a changed baseline regenerates the measured stage proof. Consumers must confirm their command graph remains observable and declare all relevant output roots; this contract does not assert ownership of undeclared output locations or other concurrent writers.
+Bounded stage checkpoints bind the limits and sampled observations. Older unmeasured stages and stages with different limits rerun. Current manifests use `ai-delivery.run@3`, bind the worktree and producer, and live under `runs@2/<worktree-digest>/<head>.json`. Bounded manifests also record limits, sample count, and sampled RSS, output, and disk extrema. Historical run versions 1 and 2 remain historical and are available for merged-issue recovery; current publication requires current-producer verification. `processCoverage: "observed-processes-only"` means a passing aggregate is not proof that every detached descendant was drained. A descendant that detaches and closes inherited pipes between samples can evade observation; a pipe holder that prevents command closure fails with unverified cleanup and no checkpoint. Output roots must be canonical and nonoverlapping. Resolvable aliases such as npm `.bin` links may point only within the declared roots; aliases are not traversed or counted twice, and growth of their physical targets remains measured. Escaping, broken and cyclic links fail closed. Output baselines are retained across retries, including failed stages. They are range scoped: a changed baseline regenerates the measured stage proof. Consumers must confirm their command graph remains observable and declare all relevant output roots; this contract does not assert ownership of undeclared output locations or other concurrent writers.
 
 A reviewed policy transition can be verified and published before activating
 its new configuration. For `verify`, issue-bound PR operations, and `finish`,

@@ -11,7 +11,7 @@ import { gitCommonDir, gitRoot } from '../git.js';
 
 const Sha256 = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const CAPABILITY = 2;
-const RuntimeAdmissionSchema = z
+export const RuntimeAdmissionSchema = z
   .object({
     admissionId: Sha256,
     capability: z.object({ cli: z.number().int().positive(), mcp: z.number().int().positive() }).strict(),
@@ -94,7 +94,16 @@ export async function assertDeliveryRuntimeAdmitted(input: {
       'Missing or invalid private ai-delivery runtime admission; refresh the installed binding before lifecycle mutation.',
     );
   }
-  const entry = input.runtimeEntryPath ?? process.argv[1];
+  return validateRuntimeAdmission(admission, loaded, input.runtimeEntryPath);
+}
+
+/** @internal Shared installed-byte validation for explicit setup and lifecycle admission. */
+export function validateRuntimeAdmission(
+  admission: RuntimeAdmission,
+  loaded: LoadedDeliveryConfig,
+  runtimeEntryPath?: string,
+): RuntimeAdmission {
+  const entry = runtimeEntryPath ?? process.argv[1];
   if (!entry) throw new DeliveryError('Running ai-delivery entry path is unavailable.');
   try {
     const cliPath = realpathSync(entry);
@@ -133,4 +142,54 @@ export async function assertDeliveryRuntimeAdmitted(input: {
     throw new DeliveryError('Installed CLI/MCP source or capability readback is unavailable.');
   }
   return admission;
+}
+
+/** @internal Build the existing schema from actual installed bytes, never caller-supplied hashes. */
+export function buildRuntimeAdmission(input: {
+  cliPath: string;
+  mcpLauncherPath: string;
+  pluginManifestPath: string;
+  packageVersion: string;
+  sourceArchiveSha256: string;
+  sourceCommit: string;
+  configuration: LoadedDeliveryConfig;
+}): RuntimeAdmission {
+  for (const path of [input.cliPath, input.mcpLauncherPath, input.pluginManifestPath]) {
+    if (realpathSync(path) !== path)
+      throw new DeliveryError('Installed runtime paths must be canonical regular files.');
+  }
+  const dist = dirname(input.cliPath);
+  const packagePath = join(dirname(dist), 'package.json');
+  const packageManifest = manifest(packagePath);
+  const bin = packageManifest.bin;
+  if (
+    typeof bin !== 'object' ||
+    bin === null ||
+    !('ai-delivery' in bin) ||
+    (bin as Record<string, unknown>)['ai-delivery'] !== './dist/cli.js'
+  ) {
+    throw new DeliveryError('Installed package CLI entry is not the supported ai-delivery executable.');
+  }
+  const content = {
+    capability: { cli: CAPABILITY, mcp: CAPABILITY },
+    cliPath: input.cliPath,
+    cliSha256: fileDigest(input.cliPath),
+    configDigest: input.configuration.configDigest,
+    mcpLauncherPath: input.mcpLauncherPath,
+    mcpLauncherSha256: fileDigest(input.mcpLauncherPath),
+    packageDistSha256: directoryDigest(dist),
+    packageManifestSha256: fileDigest(packagePath),
+    packageVersion: input.packageVersion,
+    pluginManifestPath: input.pluginManifestPath,
+    pluginManifestSha256: fileDigest(input.pluginManifestPath),
+    repository: input.configuration.config.repository,
+    schemaVersion: 'ai-delivery.runtime-admission@2' as const,
+    sourceArchiveSha256: input.sourceArchiveSha256,
+    sourceCommit: input.sourceCommit,
+  };
+  return validateRuntimeAdmission(
+    RuntimeAdmissionSchema.parse({ ...content, admissionId: digestValue(content) }),
+    input.configuration,
+    input.cliPath,
+  );
 }

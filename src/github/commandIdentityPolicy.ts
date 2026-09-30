@@ -8,6 +8,8 @@ export interface CommandIdentityPolicyEvaluation {
 }
 
 const AUTHOR_COMMANDS = new Set([
+  'runtime:stage',
+  'runtime:admit',
   'cleanup',
   'close',
   'comment',

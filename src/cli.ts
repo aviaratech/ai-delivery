@@ -20,7 +20,7 @@ const program = new Command();
 program
   .name('ai-delivery')
   .description('Generic GitHub issue and pull request delivery')
-  .version('0.3.4')
+  .version('0.3.5')
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit legacy personal-token author override')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
@@ -60,6 +60,51 @@ function run(name: AiDeliveryMcpToolName, input: Record<string, unknown>): Promi
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
+
+program
+  .command('runtime:stage')
+  .description('Stage a reviewed archive in a private directory; does not activate or admit it')
+  .requiredOption('--archive <path>')
+  .requiredOption('--archive-sha256 <digest>')
+  .requiredOption('--package-version <version>')
+  .requiredOption('--source-commit <sha>')
+  .requiredOption('--config-digest <digest>')
+  .requiredOption('--runtime-directory <path>')
+  .option('--authorize-stage', 'Explicit authority to stage this reviewed archive')
+  .action(async (o: Record<string, string | boolean>) =>
+    run('runtime_stage', {
+      authority: o.authorizeStage === true ? 'runtime:stage' : '',
+      archivePath: o.archive,
+      expectedArchiveSha256: o.archiveSha256,
+      packageVersion: o.packageVersion,
+      expectedSourceCommit: o.sourceCommit,
+      expectedConfigDigest: o.configDigest,
+      runtimeDirectory: o.runtimeDirectory,
+    }),
+  );
+
+program
+  .command('runtime:admit')
+  .description('Explicitly publish the existing admission for an exact completed stage')
+  .requiredOption('--stage-id <digest>')
+  .requiredOption('--source-commit <sha>')
+  .requiredOption('--config-digest <digest>')
+  .requiredOption('--runtime-directory <path>')
+  .option('--expected-prior <digest>', 'SHA-256 of the exact current private admission bytes')
+  .option('--expected-absent', 'Explicitly require no current admission')
+  .option('--authorize-admit', 'Explicit authority for the final admission write')
+  .action(async (o: Record<string, string | boolean>) => {
+    if ((o.expectedPrior === undefined) === (o.expectedAbsent !== true))
+      throw new Error('Choose exactly one of --expected-prior or --expected-absent.');
+    return run('runtime_admit', {
+      authority: o.authorizeAdmit === true ? 'runtime:admit' : '',
+      stageId: o.stageId,
+      expectedSourceCommit: o.sourceCommit,
+      expectedConfigDigest: o.configDigest,
+      runtimeDirectory: o.runtimeDirectory,
+      expectedPriorAdmissionSha256: o.expectedAbsent === true ? null : o.expectedPrior,
+    });
+  });
 
 program
   .command('create')
