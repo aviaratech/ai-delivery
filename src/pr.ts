@@ -431,20 +431,25 @@ function requiredApprovalCount(value: unknown): number | null {
   return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null;
 }
 
-/** Check the selected actors and available rule evidence before the first remote mutation. */
+/** Check selected actors and rule evidence; publication also requires the configured author source. */
 export async function preflightReviewRoute(
   context: DeliveryContext,
   base = baseBranch(context.root, context.configuration?.remote),
   selectedReviewer?: GitHubClients,
+  purpose: 'development' | 'publication' = 'publication',
 ): Promise<ReviewRoutePreflight> {
   const configuredAuthorSource = context.config.roles.author.authSource ?? 'app';
-  if (context.clients.authSource !== configuredAuthorSource) {
+  const personalDevelopmentOverride =
+    purpose === 'development' && configuredAuthorSource === 'app' && context.clients.authSource === 'personal';
+  if (context.clients.authSource !== configuredAuthorSource && !personalDevelopmentOverride) {
     throw new DeliveryError(
-      'PR publication requires the configured author credential; configure the personal author role for personal publication.',
+      purpose === 'publication'
+        ? 'PR publication requires the configured author credential; configure the personal author role for personal publication.'
+        : 'Development access preflight requires the configured author credential or the explicit personal author override.',
     );
   }
   if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor) {
-    throw new DeliveryError('PR publication requires authenticated author identity readback.');
+    throw new DeliveryError('Delivery access preflight requires authenticated author identity readback.');
   }
   const author = await context.clients.authenticatedAuthor();
   if (!author.actorLogin || !author.credentialIdentity) {
@@ -456,6 +461,7 @@ export async function preflightReviewRoute(
       config: context.config,
       identity: context.config.roles.reviewer.identity,
       role: 'reviewer',
+      selectedAuthor: context.clients,
     }));
   if (reviewer.role !== 'reviewer' || reviewer.authSource !== 'app' || !reviewer.appActorLogin) {
     throw new DeliveryError('Configured reviewer GitHub App identity is unavailable.');
@@ -514,7 +520,7 @@ export async function preflightReviewRoute(
       actorLogin: author.actorLogin,
       authSource: context.clients.authSource,
       credentialSource: context.clients.credentialSource ?? 'unreported',
-      identity: context.config.roles.author.identity,
+      identity: personalDevelopmentOverride ? 'personal' : context.config.roles.author.identity,
     },
     reviewer: {
       actorLogin: reviewerActor,

@@ -399,6 +399,168 @@ test('prepublication review route reports selected actors and unknown approval e
   );
 });
 
+test.each([
+  'available',
+  'missing-reviewer',
+  'reviewer-permission',
+  'author-readback',
+  'same-actor',
+  'wrong-repository',
+])(
+  'development personal override uses the real reviewer factory with unused author App credentials absent: %s',
+  async (scenario) => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-delivery-personal-preflight-'));
+    const originalFetch = globalThis.fetch;
+    const keyPath = join(root, 'reviewer.pem');
+    const config = {
+      roles: {
+        author: {
+          identity: 'unused-author-app',
+          credentialEnv: {
+            appId: 'PREFLIGHT_UNUSED_AUTHOR_APP_ID',
+            installationId: 'PREFLIGHT_UNUSED_AUTHOR_INSTALLATION_ID',
+            privateKeyPath: 'PREFLIGHT_UNUSED_AUTHOR_KEY_PATH',
+          },
+        },
+        reviewer: {
+          identity: 'reviewer-app',
+          credentialEnv: {
+            appId: 'PREFLIGHT_REVIEWER_APP_ID',
+            installationId: 'PREFLIGHT_REVIEWER_INSTALLATION_ID',
+            privateKeyPath: 'PREFLIGHT_REVIEWER_KEY_PATH',
+          },
+        },
+      },
+    } as DeliveryConfig;
+    const reviewerEnv = {
+      PREFLIGHT_REVIEWER_APP_ID: '102',
+      PREFLIGHT_REVIEWER_INSTALLATION_ID: '202',
+      PREFLIGHT_REVIEWER_KEY_PATH: keyPath,
+    };
+    const envNames = [...Object.values(config.roles.author.credentialEnv), ...Object.keys(reviewerEnv)];
+    const savedEnv = new Map(envNames.map((name) => [name, process.env[name]]));
+    const requests: string[] = [];
+    try {
+      writeFileSync(
+        keyPath,
+        generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'pem', type: 'pkcs8' }),
+      );
+      for (const name of envNames) delete process.env[name];
+      if (scenario !== 'missing-reviewer') Object.assign(process.env, reviewerEnv);
+      globalThis.fetch = async (url, init) => {
+        const pathname = new URL(url instanceof Request ? url.url : String(url)).pathname;
+        const authorization = new Headers(init?.headers).get('authorization') ?? '';
+        requests.push(`${init?.method ?? 'GET'} ${pathname}`);
+        const response = (data: unknown, status = 200) =>
+          new Response(JSON.stringify(data), {
+            status,
+            headers: { 'content-type': 'application/json' },
+          });
+        if (pathname === '/user') {
+          assert.equal(authorization, 'token synthetic-development-author');
+          return response({
+            id: 37,
+            login: scenario === 'author-readback' ? '' : scenario === 'same-actor' ? 'reviewer-app[bot]' : 'host-user',
+          });
+        }
+        if (pathname === '/app' || pathname === '/app/installations/202/access_tokens') {
+          assert.match(authorization, /^bearer [^.]+\.[^.]+\.[^.]+$/u);
+          const jwt = JSON.parse(Buffer.from(authorization.split('.')[1]!, 'base64url').toString()) as { iss: string };
+          assert.equal(String(jwt.iss), '102');
+          if (pathname === '/app') return response({ id: 102, slug: 'reviewer-app' });
+          return response(
+            {
+              token: 'ghs_synthetic_reviewer',
+              expires_at: new Date(Date.now() + 3600000).toISOString(),
+              permissions: {
+                contents: 'read',
+                ...(scenario === 'reviewer-permission' ? {} : { pull_requests: 'write' }),
+              },
+              repository_selection: 'all',
+            },
+            201,
+          );
+        }
+        if (pathname === '/repos/example/repo') {
+          assert.equal(authorization, 'token ghs_synthetic_reviewer');
+          return response({ full_name: scenario === 'wrong-repository' ? 'example/other' : 'example/repo' });
+        }
+        assert.ok(
+          ['/repos/example/repo/rules/branches/main', '/repos/example/repo/branches/main/protection'].includes(
+            pathname,
+          ),
+        );
+        assert.equal(authorization, 'token synthetic-development-author');
+        return response({ message: 'Rules unavailable' }, 403);
+      };
+      const author = await createDeliveryGitHubClients({
+        config,
+        env: {},
+        identity: 'personal',
+        personalAuth: { enabled: true, token: 'synthetic-development-author' },
+        role: 'author',
+      });
+      const context = { root, repo: { owner: 'example', repo: 'repo' }, config, clients: author } as DeliveryContext;
+      if (scenario === 'available') {
+        const route = await preflightReviewRoute(context, 'main', undefined, 'development');
+        assert.equal(route.author.actorLogin, 'host-user');
+        assert.equal(route.author.identity, 'personal');
+        assert.equal(route.reviewer.actorLogin, 'reviewer-app[bot]');
+        assert.equal(route.reviewer.repositoryAccess, 'readable');
+        assert.equal(route.reviewer.effectiveContentsPermission, 'read');
+        assert.equal(route.rules.visibility, 'unknown');
+        assert.equal(route.approvalEligibility, 'unknown');
+        assert.deepEqual(requests, [
+          'GET /user',
+          'POST /app/installations/202/access_tokens',
+          'GET /app',
+          'GET /repos/example/repo',
+          'GET /repos/example/repo/rules/branches/main',
+          'GET /repos/example/repo/branches/main/protection',
+        ]);
+        await assert.rejects(preflightReviewRoute(context, 'main'), /requires the configured author credential/u);
+        // Ordinary configured App/App factory calls still require the author App and distinct credentials.
+        await assert.rejects(
+          createDeliveryGitHubClients({ config, env: reviewerEnv, identity: 'reviewer-app', role: 'reviewer' }),
+          /Missing GitHub App credentials for author role/u,
+        );
+        await assert.rejects(
+          createDeliveryGitHubClients({
+            config,
+            env: {
+              ...reviewerEnv,
+              PREFLIGHT_UNUSED_AUTHOR_APP_ID: '102',
+              PREFLIGHT_UNUSED_AUTHOR_INSTALLATION_ID: '201',
+              PREFLIGHT_UNUSED_AUTHOR_KEY_PATH: join(root, 'unused-author.pem'),
+            },
+            identity: 'reviewer-app',
+            role: 'reviewer',
+          }),
+          /distinct GitHub App credentials/u,
+        );
+      } else {
+        await assert.rejects(
+          preflightReviewRoute(context, 'main', undefined, 'development'),
+          {
+            'missing-reviewer': /Missing GitHub App credentials for reviewer role/u,
+            'reviewer-permission': /reviewer role lacks required pull_requests:write/u,
+            'author-readback': /Personal author identity readback is incomplete/u,
+            'same-actor': /same GitHub actor/u,
+            'wrong-repository': /repository readback disagrees/u,
+          }[scenario]!,
+        );
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const [name, value] of savedEnv) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test('App client resolves its bot from JWT GET /app and keeps author token scoped', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-app-auth-'));
   const originalFetch = globalThis.fetch;
@@ -500,6 +662,30 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
     );
     const author = await createDeliveryGitHubClients({ config, env, identity: 'synthetic-author', role: 'author' });
     assert.equal(await withAuthorGitToken(author, (token) => token), 'ghs_synthetic_author');
+    await assert.rejects(
+      createDeliveryGitHubClients({
+        config,
+        env: {
+          REVIEWER_APP_ID: env.REVIEWER_APP_ID,
+          REVIEWER_INSTALLATION_ID: env.REVIEWER_INSTALLATION_ID,
+          REVIEWER_KEY_PATH: env.REVIEWER_KEY_PATH,
+        },
+        identity: 'synthetic-reviewer',
+        role: 'reviewer',
+        selectedAuthor: author,
+      }),
+      /Missing GitHub App credentials for author role/u,
+    );
+    await assert.rejects(
+      createDeliveryGitHubClients({
+        config,
+        env: { ...env, REVIEWER_APP_ID: env.AUTHOR_APP_ID },
+        identity: 'synthetic-reviewer',
+        role: 'reviewer',
+        selectedAuthor: author,
+      }),
+      /distinct GitHub App credentials/u,
+    );
     assert.deepEqual(requests, [
       'POST /app/installations/202/access_tokens',
       'GET /app',

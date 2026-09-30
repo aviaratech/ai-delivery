@@ -29,7 +29,7 @@ import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { loadDeliveryConfig, parseDeliveryConfig } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/index.js';
-import { executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
+import { contextFor, executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
 import { defaultBaseRef, gitCommonDir } from './git.js';
 import * as githubClient from './github/client.js';
 import * as atomicJson from './utils/atomicJson.js';
@@ -2833,6 +2833,239 @@ test('scratch start derives safe names and reports the requested worktree', asyn
     assert.equal(overridden.branch, 'scratch/custom/parser');
     assert.equal(overridden.worktreePath, join(dirname(first.worktreePath), 'scratch-scratch-custom-parser'));
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['direct-develop', 'direct-start', 'develop', 'existing-start', 'new-start', 'scratch', 'standalone'])(
+  'development access preflight rejects absent reviewer credentials before %s preparation',
+  async (entry) => {
+    const { root, runtimeEntryPath } = await fixture();
+    const admissionPath = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
+    const admissionBefore = readFileSync(admissionPath, 'utf8');
+    const syntheticClients = githubClient.createDeliveryGitHubClients;
+    const actual = await vi.importActual<typeof githubClient>('./github/client.js');
+    const mocked = vi
+      .spyOn(githubClient, 'createDeliveryGitHubClients')
+      .mockImplementation((input) =>
+        input.role === 'reviewer' ? actual.createDeliveryGitHubClients({ ...input, env: {} }) : syntheticClients(input),
+      );
+    const execution = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
+    const tracking = {
+      title: 'Synthetic change',
+      body: '## Outcome\nDeliver a verified change.\n\n## Scope\n- `artifact.txt`\n\n## Acceptance Criteria\n- [ ] Change is verified\n- [ ] Review is recorded\n\n## Verification\nRun `node --version`.',
+      points: 2,
+      develop: true,
+    };
+    try {
+      const run = async () => {
+        if (entry === 'direct-develop' || entry === 'direct-start') {
+          const context = await contextFor(execution, 'develop');
+          return entry === 'direct-develop' ? developIssue(context, 17) : startTrackedIssue(context, tracking);
+        }
+        if (entry === 'develop') return executeTool('issue_develop', { issueNumber: 17 }, execution);
+        if (entry === 'existing-start') return executeTool('issue_start', { issueNumber: 17 }, execution);
+        if (entry === 'new-start') return executeTool('issue_start', tracking, execution);
+        if (entry === 'scratch')
+          return executeTool('issue_start', { scratch: true, request: 'Inspect parser' }, execution);
+        return executeTool('issue_worktree_create', { name: 'scratch-access', branch: 'scratch/access' }, execution);
+      };
+      await assert.rejects(run(), /Missing GitHub App credentials for reviewer role/u);
+      assert.equal(existsSync(join(root, '.worktrees')), false);
+      assert.equal(existsSync(join(root, '.issue-cli', 'worktrees.json')), false);
+      assert.equal(readFileSync(admissionPath, 'utf8'), admissionBefore);
+    } finally {
+      mocked.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['author-source', 'author-readback', 'same-actor', 'reviewer-repository'])(
+  'development access preflight rejects a mismatched %s route before issue reads or writes',
+  async (failure) => {
+    const { root, runtimeEntryPath } = await fixture({ personalAuthor: true });
+    const syntheticClients = githubClient.createDeliveryGitHubClients;
+    const mocked = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockImplementation(async (input) => {
+      const clients = await syntheticClients(input);
+      if (input.role === 'author' && failure === 'author-source') return { ...clients, authSource: 'app' };
+      if (input.role === 'author' && failure === 'author-readback')
+        return { ...clients, authenticatedAuthor: async () => ({ actorLogin: '', credentialIdentity: '' }) };
+      if (input.role === 'reviewer' && failure === 'same-actor')
+        return { ...clients, appActorLogin: async () => 'host-user' };
+      if (input.role === 'reviewer' && failure === 'reviewer-repository')
+        Object.assign(clients.rest.repos, { get: async () => ({ data: { full_name: 'example/other' } }) });
+      return clients;
+    });
+    try {
+      const context = await contextFor({ repoRoot: root, runtimeEntryPath, identity: 'host-author' }, 'develop');
+      await assert.rejects(
+        developIssue(context, 17),
+        {
+          'author-source': /requires the configured author credential/u,
+          'author-readback': /Author GitHub identity readback is incomplete/u,
+          'same-actor': /same GitHub actor/u,
+          'reviewer-repository': /repository readback disagrees/u,
+        }[failure]!,
+      );
+      assert.equal(existsSync(join(root, '.worktrees')), false);
+      assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'issue-info')), false);
+    } finally {
+      mocked.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('development access preflight permits the configured host author and independent App with unreadable rules', async () => {
+  const { root, runtimeEntryPath } = await fixture({ personalAuthor: true });
+  const admissionPath = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
+  const admissionBefore = readFileSync(admissionPath, 'utf8');
+  try {
+    const row = (await executeTool(
+      'issue_worktree_create',
+      { name: 'scratch-host', branch: 'scratch/host' },
+      { repoRoot: root, runtimeEntryPath, identity: 'host-author' },
+    )) as { path: string; identity: string };
+    assert.equal(row.identity, 'host-author');
+    assert.equal(row.path, join(root, '.worktrees', 'scratch-host'));
+    assert.equal(existsSync(row.path), true);
+    assert.equal(readFileSync(admissionPath, 'utf8'), admissionBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  'direct-develop',
+  'direct-start',
+  'develop',
+  'existing-start',
+  'new-start',
+  'scratch',
+  'standalone',
+  'config-resolve',
+])('development access preflight preserves the explicit personal override for %s', async (entry) => {
+  const { root, runtimeEntryPath } = await fixture();
+  const admissionPath = join(root, '.git', 'ai-delivery', 'runtime-admission.json');
+  const admissionBefore = readFileSync(admissionPath, 'utf8');
+  const factory = githubClient.createDeliveryGitHubClients;
+  const actual = await vi.importActual<typeof githubClient>('./github/client.js');
+  const downstream = new Error('Reached the downstream issue API with the selected author');
+  const selected = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockImplementation(async (input) => {
+    const clients = await factory(input);
+    if (input.role !== 'author' || input.personalAuth === undefined) return clients;
+    const personal = await actual.createDeliveryGitHubClients({
+      ...input,
+      env: { GH_TOKEN: 'synthetic-development-token' },
+    });
+    Object.assign(clients.rest.issues, {
+      get: async () => {
+        throw downstream;
+      },
+      create: async () => {
+        throw downstream;
+      },
+    });
+    Object.assign(clients.rest, { request: async () => Promise.reject(new Error('Rules unavailable')) });
+    return {
+      ...personal,
+      graphql: clients.graphql,
+      rest: clients.rest,
+      authenticatedAuthor: async () => ({ actorLogin: 'host-user', credentialIdentity: 'user:37' }),
+    };
+  });
+  const execution = { repoRoot: root, runtimeEntryPath, identity: 'personal', personalAuth: true };
+  const tracking = {
+    title: 'Synthetic change',
+    body: '## Outcome\nDeliver a verified change.\n\n## Scope\n- `artifact.txt`\n\n## Acceptance Criteria\n- [ ] Change is verified\n- [ ] Review is recorded\n\n## Verification\nRun `node --version`.',
+    points: 2,
+    develop: true,
+  };
+  try {
+    if (entry === 'config-resolve') {
+      // The prescribed CLI read must inspect this development selection without admission.
+      rmSync(admissionPath);
+      const originalArgv = process.argv;
+      const originalExitCode = process.exitCode;
+      let stdout = '';
+      let stderr = '';
+      let completed: () => void = () => {};
+      const output = new Promise<void>((resolve) => {
+        completed = resolve;
+      });
+      const out = vi.spyOn(process.stdout, 'write').mockImplementation((value) => {
+        stdout += String(value);
+        completed();
+        return true;
+      });
+      const err = vi.spyOn(process.stderr, 'write').mockImplementation((value) => {
+        stderr += String(value);
+        completed();
+        return true;
+      });
+      try {
+        process.argv = [
+          process.execPath,
+          'ai-delivery',
+          '--repo-root',
+          root,
+          '--identity',
+          'personal',
+          '--personal-auth',
+          'config:resolve',
+        ];
+        await import('./cli.js');
+        await output;
+        assert.equal(stderr, '');
+        const resolved = JSON.parse(stdout) as {
+          reviewRoute: {
+            author: { identity: string; authSource: string; actorLogin: string };
+            approvalEligibility: string;
+            rules: { visibility: string };
+          };
+        };
+        assert.equal(resolved.reviewRoute.author.identity, 'personal');
+        assert.equal(resolved.reviewRoute.author.authSource, 'personal');
+        assert.equal(resolved.reviewRoute.author.actorLogin, 'host-user');
+        assert.equal(resolved.reviewRoute.approvalEligibility, 'unknown');
+        assert.equal(resolved.reviewRoute.rules.visibility, 'unknown');
+        assert.equal(existsSync(admissionPath), false);
+        assert.equal(existsSync(join(root, '.worktrees')), false);
+      } finally {
+        out.mockRestore();
+        err.mockRestore();
+        process.argv = originalArgv;
+        process.exitCode = originalExitCode;
+      }
+    } else if (entry === 'scratch' || entry === 'standalone') {
+      const row = (
+        entry === 'scratch'
+          ? await executeTool('issue_start', { scratch: true, request: 'Inspect parser' }, execution)
+          : await executeTool(
+              'issue_worktree_create',
+              { name: 'scratch-override', branch: 'scratch/override' },
+              execution,
+            )
+      ) as { path: string; worktreePath: string; identity: string };
+      if (entry === 'standalone') assert.equal(row.identity, 'personal');
+      assert.equal(existsSync(entry === 'scratch' ? row.worktreePath : row.path), true);
+    } else {
+      const run = async () => {
+        if (entry === 'direct-develop' || entry === 'direct-start') {
+          const context = await contextFor(execution, 'develop');
+          return entry === 'direct-develop' ? developIssue(context, 17) : startTrackedIssue(context, tracking);
+        }
+        if (entry === 'develop') return executeTool('issue_develop', { issueNumber: 17 }, execution);
+        if (entry === 'existing-start') return executeTool('issue_start', { issueNumber: 17 }, execution);
+        return executeTool('issue_start', tracking, execution);
+      };
+      await assert.rejects(run(), (error) => error === downstream);
+      assert.equal(existsSync(join(root, '.worktrees')), false);
+    }
+    if (entry !== 'config-resolve') assert.equal(readFileSync(admissionPath, 'utf8'), admissionBefore);
+  } finally {
+    selected.mockRestore();
     rmSync(root, { recursive: true, force: true });
   }
 });

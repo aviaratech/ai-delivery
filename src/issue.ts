@@ -27,6 +27,7 @@ import {
 } from './github/relationships.js';
 import { resolveDeliveryRepo, type RepoCoordinates } from './github/repo.js';
 import { gitCommonDir, gitRoot, primaryGitRoot } from './git.js';
+import { preflightReviewRoute } from './pr.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
 import { assertNoForeignIssueWorktree, getWorktreeByIssue } from './services/worktreeRegistry.js';
 import { prepareIssueWorktree } from './worktree.js';
@@ -446,6 +447,7 @@ export async function developIssue(
   context: DeliveryContext,
   issueNumber: number,
 ): Promise<{ path: string; branch: string }> {
+  await preflightReviewRoute(context, undefined, undefined, 'development');
   const initialIssue = (await context.clients.rest.issues.get({ issue_number: issueNumber, ...context.repo })).data;
   if (initialIssue.state === 'closed')
     throw new DeliveryError(`Issue #${issueNumber} is closed. Reopen it before developing.`);

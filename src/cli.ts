@@ -385,7 +385,7 @@ program
     print({
       configDigest: context.configuration?.configDigest,
       routing: context.configuration?.routing,
-      reviewRoute: await preflightReviewRoute(context),
+      reviewRoute: await preflightReviewRoute(context, undefined, undefined, 'development'),
     });
   });
 program.command('mcp:serve').action(async () => serveAiDeliveryMcp(execution()));
