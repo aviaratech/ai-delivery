@@ -132,9 +132,9 @@ Set `DELIVERY_AUTHOR_TOKEN` outside source control to a token for the intended
 user. The runtime reads only that named variable for this route, uses the same
 token for Git HTTP push and GitHub API calls, and verifies the user login. It
 does not use an ambient `gh` session or another environment token. The legacy
-`--identity personal --personal-auth` override remains explicit; configure the
-personal author role above for complete PR delivery with matching review
-artifacts and policy evidence.
+`--identity personal --personal-auth` override remains explicit for development
+and `config:resolve`; configure the personal author role above for complete PR
+delivery with matching review artifacts and policy evidence.
 
 | Route | Package behavior | Native required approval |
 | --- | --- | --- |
@@ -150,19 +150,31 @@ author. The independent artifact records its reviewer identity and effective
 model, while the submitted review receipt records the GitHub actor. Keep these
 identities separate when diagnosing a blocked PR.
 
-Inspect the result before issuing a new runtime admission:
+Inspect the delivery access route before development and before issuing a new
+runtime admission:
 
 ```sh
 npx ai-delivery --repo-root /absolute/path/to/consumer --identity host-author config:resolve
-npx ai-delivery --repo-root /absolute/path/to/consumer --identity host-author pr:create --issue 17 --dry-run
+# For the explicit development override under an App author policy:
+npx ai-delivery --repo-root /absolute/path/to/consumer --identity personal --personal-auth config:resolve
 ```
 
-These reads return `routing` (repository, Project/field/option identities and
+This read returns `routing` (repository, Project/field/option identities and
 selection source), `configDigest`, effective author and reviewer actors,
 credential sources, reviewer repository read access, and available branch-rule
 evidence. A partial or unknown rule view stays labeled unknown; it does not
-require broader administrator access. Before publication, resolve a same-actor
-error or missing configured credential. After `issue_pr_review`, inspect its
+require broader administrator access. Resolve a same-actor error, missing
+configured credential or reviewer repository-access mismatch before development.
+`develop`/`issue_develop`, starts that prepare worktrees, and
+`worktree:create`/`issue_worktree_create` also run this existing access preflight
+before preparing work. A new start with
+`develop: true` checks it before creating the issue. Plain issue creation and
+readiness checks retain their existing behavior. Access preflight does not issue
+or refresh runtime admission, and does not prove that an approval will count.
+The development override still checks the independent reviewer route; publication
+requires the configured author credential.
+Before publication, use `pr:create --issue 17 --dry-run` to inspect the current
+route again. After `issue_pr_review`, inspect its
 `reviewState` and `pr:checks`. If GitHub still reports `REVIEW_REQUIRED`, inspect
 the active rule and obtain a qualifying independent approval; repeating the
 same App review cannot resolve that state. CLI and MCP use the same asynchronous

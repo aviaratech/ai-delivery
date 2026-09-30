@@ -61,6 +61,7 @@ export async function createDeliveryGitHubClients(input: {
   env?: NodeJS.ProcessEnv;
   identity: string;
   personalAuth?: { enabled: true; token?: string };
+  selectedAuthor?: GitHubClients;
   additionalPermissions?: Readonly<Record<string, DeliveryPermission>>;
   role: DeliveryRole;
 }): Promise<GitHubClients> {
@@ -99,7 +100,11 @@ export async function createDeliveryGitHubClients(input: {
   }
   const credentials = resolveDeliveryRoleCredentials({ config: input.config, env, role: input.role });
   const otherRole: DeliveryRole = input.role === 'author' ? 'reviewer' : 'author';
-  if (input.config.roles[otherRole].authSource !== 'personal') {
+  const personalAuthorSelected =
+    input.role === 'reviewer' &&
+    input.selectedAuthor?.role === 'author' &&
+    input.selectedAuthor.authSource === 'personal';
+  if (!personalAuthorSelected && input.config.roles[otherRole].authSource !== 'personal') {
     const other = resolveDeliveryRoleCredentials({ config: input.config, env, role: otherRole });
     if (
       credentials.appId === other.appId ||

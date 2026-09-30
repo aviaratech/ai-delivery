@@ -7,6 +7,8 @@ description: Prepare an issue-backed or explicitly standalone worktree, develop 
 
 Use a registered prepared worktree for implementation so changes and delivery evidence stay associated with the intended issue.
 
+Before development, run the read-only `ai-delivery --identity <configured-author> config:resolve` in the selected checkout, or use `--identity personal --personal-auth config:resolve` for the explicit development override under an App author policy. Inspect the selected author and independent reviewer actors, credential sources, repository access and available review rules. Resolve missing credentials or actor/repository mismatches before preparing work. Unknown approval eligibility remains unknown; runtime admission is still required separately for lifecycle writes. Publication requires the configured author credential.
+
 ## MCP tools first
 
 1. For tracked work, inspect the issue with `issue_info`, check it with `issue_ready_check`, then prepare it with `issue_develop`.
@@ -17,6 +19,7 @@ Use a registered prepared worktree for implementation so changes and delivery ev
 ## CLI fallback
 
 ```bash
+ai-delivery --identity <configured-author> config:resolve
 ai-delivery ready:check --issue <number>
 ai-delivery develop --issue <number>
 # edit, run focused checks, and commit in the prepared worktree

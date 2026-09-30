@@ -286,6 +286,7 @@ async function preflightStartDevelopment(
   ) {
     throw new DeliveryError('Default base ref is missing before tracked issue creation.');
   }
+  await preflightReviewRoute(context, undefined, undefined, 'development');
 }
 
 function scratchStart(input: Record<string, unknown>, execution: ExecutionContext, identity: string, remote?: string) {
@@ -405,6 +406,7 @@ export async function executeTool(
         if (input.issueNumber !== undefined || input.develop === true || input.resumeCreated === true) {
           throw new DeliveryError('Scratch worktree cannot claim a tracked issue.');
         }
+        await preflightReviewRoute(context, undefined, undefined, 'development');
         return scratchStart(input, execution, identity, context.configuration?.remote);
       }
       return startTrackedIssue(context, input);
@@ -543,6 +545,7 @@ export async function executeTool(
     }
     case 'issue_worktree_create': {
       const identity = await identityFor(execution, 'worktree:create');
+      await preflightReviewRoute(context, undefined, undefined, 'development');
       return prepareStandaloneWorktree({
         ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
         branch: requireString(input, 'branch'),
