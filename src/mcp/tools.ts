@@ -97,6 +97,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       labels: Labels.optional(),
       milestone: Positive.nullable().optional(),
       parentIssueNumber: Positive.nullable().optional(),
+      park: z.literal(true).optional(),
       points: Positive.optional(),
       priority: z.string().min(1).optional(),
       state: z.enum(['open', 'closed']).optional(),

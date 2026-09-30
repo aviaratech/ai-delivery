@@ -16,6 +16,8 @@ Before development, run the read-only `ai-delivery --identity <configured-author
 3. Make changes in the prepared worktree, run the focused checks, and commit the change.
 4. Run `issue_verify` after the commit. Continue to pull request handoff with the exact verified commit.
 
+To park execution without removing the worktree, call `issue_update` with `park: true` or `ai-delivery update --issue <number> --park`. The Project shows Todo or Blocked from current native blockers; closed/Done remains Done. Resume through `issue_develop`/`develop` with the existing readiness checks. A retained worktree does not establish active execution.
+
 ## CLI fallback
 
 ```bash

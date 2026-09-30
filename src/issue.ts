@@ -215,6 +215,7 @@ export interface UpdateIssueInput {
   labels?: string[];
   milestone?: number | null;
   parentIssueNumber?: number | null;
+  park?: true;
   points?: number;
   priority?: string;
   state?: 'open' | 'closed';
@@ -307,22 +308,35 @@ export async function updateIssue(
       repo,
       rest: clients.rest,
     });
+  const info = await issueInfo(context, input.issueNumber);
+  const status =
+    info.state === 'closed' || info.projectStatus === 'Done'
+      ? 'Done'
+      : info.blockedBy.length > 0
+        ? 'Blocked'
+        : input.park === true ||
+            input.blockedBy !== undefined ||
+            info.projectStatus === 'Blocked' ||
+            info.projectStatus === null
+          ? 'Todo'
+          : info.projectStatus === 'In Progress'
+            ? 'In Progress'
+            : 'Todo';
+  const issue = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
+  await syncIssueProjectStatus({
+    graphql: clients.graphql,
+    issueNodeId: issue.node_id,
+    org: config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+    settings: projectSettingsFromDeliveryConfig(config),
+    status,
+  });
   return issueInfo(context, input.issueNumber);
 }
 
 /** Complete the native tracking and Project state of an issue created before an interrupted response. */
 export async function resumeCreatedIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<IssueInfo> {
-  const info = await updateIssue(context, input);
-  const issue = (await context.clients.rest.issues.get({ issue_number: input.issueNumber, ...context.repo })).data;
-  await syncIssueProjectStatus({
-    graphql: context.clients.graphql,
-    issueNodeId: issue.node_id,
-    org: context.config.native.organization,
-    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-    settings: projectSettingsFromDeliveryConfig(context.config),
-    status: info.blockedBy.length > 0 ? 'Blocked' : 'Todo',
-  });
-  return issueInfo(context, input.issueNumber);
+  return updateIssue(context, input);
 }
 
 export interface IssueInfo {
