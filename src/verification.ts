@@ -503,6 +503,20 @@ const OutputBaselineStateSchema = z.strictObject({
   status: z.enum(['preparing', 'complete']),
 });
 
+class OutputObservationError extends DeliveryError {
+  override readonly cause: unknown;
+  readonly code: string | undefined;
+
+  constructor(message: string, path: string, cause: unknown) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    super(
+      `${message} Path ${JSON.stringify(path)} (${code ?? 'unknown errno'}): ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    this.code = code;
+    this.cause = cause;
+  }
+}
+
 function scanOutputRoots(roots: readonly string[]): Map<string, number> {
   const files = new Map<string, number>();
   const visit = (path: string): void => {
@@ -511,27 +525,42 @@ function scanOutputRoots(roots: readonly string[]): Map<string, number> {
       metadata = lstatSync(path);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-      throw error;
+      throw new OutputObservationError('Filesystem output lstat failed.', path, error);
     }
     if (metadata.isSymbolicLink()) {
       let target: string;
       try {
         target = realpathSync(path);
-      } catch {
-        throw new DeliveryError('Filesystem output observation encountered a broken or cyclic symbolic link.');
+      } catch (error) {
+        throw new OutputObservationError(
+          'Filesystem output observation encountered a broken or cyclic symbolic link.',
+          path,
+          error,
+        );
       }
       if (!roots.some((root) => target === root || target.startsWith(`${root}${sep}`))) {
-        throw new DeliveryError('Filesystem output observation encountered an escaping symbolic link.');
+        throw new DeliveryError(
+          `Filesystem output observation encountered an escaping symbolic link. Path ${JSON.stringify(path)} resolves to ${JSON.stringify(target)}.`,
+        );
       }
       // Observe physical targets through their declared root only, never traverse aliases.
       return;
     }
     if (metadata.isDirectory()) {
-      for (const name of readdirSync(path)) visit(join(path, name));
+      let names: string[];
+      try {
+        names = readdirSync(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw new OutputObservationError('Filesystem output readdir failed.', path, error);
+      }
+      for (const name of names) visit(join(path, name));
       return;
     }
     if (!metadata.isFile() || !Number.isSafeInteger(metadata.size)) {
-      throw new DeliveryError('Filesystem output observation encountered an unsupported file.');
+      throw new DeliveryError(
+        `Filesystem output observation encountered an unsupported file. Path ${JSON.stringify(path)}.`,
+      );
     }
     files.set(path, metadata.size);
     if (files.size > 1_000_000) throw new DeliveryError('Filesystem output observation exceeded its file limit.');
@@ -631,14 +660,45 @@ async function outputBaseline(
   return { baselineId, roots, files: new Map(checkpoint.files), ...(gate === undefined ? {} : { gate }) };
 }
 
-async function positiveNewOutputBytes(baseline: OutputBaseline, signal?: AbortSignal): Promise<number> {
+async function positiveNewOutputBytes(
+  baseline: OutputBaseline,
+  signal?: AbortSignal,
+  commandRunning = false,
+  onUnavailable?: (reason: string) => void,
+): Promise<number> {
+  let files: Map<string, number>;
+  let firstFailure: OutputObservationError | undefined;
+  let lastFailure: OutputObservationError | undefined;
+  const started = Date.now();
+  const assertObservationWindow = (): void => {
+    if (firstFailure !== undefined && Date.now() - started >= 1_000) {
+      throw new DeliveryError(
+        `Filesystem output observation remained unavailable for 1 second. First observation: ${firstFailure.message} Last observation: ${lastFailure!.message}`,
+      );
+    }
+  };
+  for (;;) {
+    if (signal?.aborted) throw new DeliveryError('Filesystem output observation cancelled.');
+    assertObservationWindow();
+    try {
+      files = await withOutputGateLock(baseline.gate, 'scan', () => scanOutputRoots(baseline.roots), signal);
+      assertObservationWindow();
+      break;
+    } catch (error) {
+      // Removal can unlink a physical target before its alias. Never accept an incomplete scan:
+      // retry ENOENT only during a command, with one bounded observation-stall window.
+      if (!commandRunning || !(error instanceof OutputObservationError) || error.code !== 'ENOENT') throw error;
+      lastFailure = error;
+      if (firstFailure === undefined) {
+        firstFailure = error;
+        onUnavailable?.(error.message);
+      }
+      assertObservationWindow();
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  }
   let bytes = 0;
-  for (const [path, size] of await withOutputGateLock(
-    baseline.gate,
-    'scan',
-    () => scanOutputRoots(baseline.roots),
-    signal,
-  )) {
+  for (const [path, size] of files) {
     bytes += Math.max(0, size - (baseline.files.get(path) ?? 0));
     if (!Number.isSafeInteger(bytes)) throw new DeliveryError('Filesystem output observation overflowed.');
   }
@@ -1342,7 +1402,7 @@ function runStageCommand(
   repoRoot: string,
   argv: readonly string[],
   abortSignal?: AbortSignal,
-  onRunning?: (capturedOutputBytes: number, resource?: ResourceSample) => void,
+  onRunning?: (capturedOutputBytes: number, resource?: ResourceSample, reason?: string) => void,
   resourceBounds?: VerificationResourceBounds,
   baseline?: OutputBaseline,
   onResourceSample?: (sample: ResourceSample) => void,
@@ -1385,8 +1445,21 @@ function runStageCommand(
     let closed = false;
     let settled = false;
     let commandReleased = false;
+    let firstOutputObservationFailure: string | undefined;
     let pendingOutput: Promise<void> | undefined;
     const scanCancellation = new AbortController();
+    const failedOutput = (): string => {
+      const observation =
+        firstOutputObservationFailure === undefined
+          ? ''
+          : ` First filesystem observation: ${firstOutputObservationFailure}`;
+      try {
+        const bytes = Buffer.concat([...stdout, ...stderr]);
+        return ` Command output ${writeRepositoryCommandOutput({ bytes, gitCommonDir: gitCommonDir(repoRoot) })}.${observation}`;
+      } catch (error) {
+        return ` Command output persistence failed (${error instanceof Error ? error.message : String(error)}).${observation}`;
+      }
+    };
     let closeTimer: NodeJS.Timeout | undefined;
     let exitPipeTimer: NodeJS.Timeout | undefined;
     let resourceTimer: NodeJS.Timeout | undefined;
@@ -1443,7 +1516,7 @@ function runStageCommand(
           child.unref();
           reject(
             new DeliveryError(
-              `Selected policy stage command failed (${failure}).${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`} Owned process cleanup failed (owned command pipes did not close; descendant cleanup could not be verified).`,
+              `Selected policy stage command failed (${failure}).${failedOutput()}${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`} Owned process cleanup failed (owned command pipes did not close; descendant cleanup could not be verified).`,
             ),
           );
         }, 2_000);
@@ -1489,7 +1562,15 @@ function runStageCommand(
           if (closed || pendingOutput !== undefined) return;
           pendingOutput = (async () => {
             if (resourceBounds !== undefined && baseline !== undefined) {
-              const bytes = await positiveNewOutputBytes(baseline, scanCancellation.signal);
+              const bytes = await positiveNewOutputBytes(
+                baseline,
+                scanCancellation.signal,
+                commandReleased,
+                (reason) => {
+                  firstOutputObservationFailure ??= reason;
+                  onRunning?.(outputBytes, undefined, reason);
+                },
+              );
               if (failure !== undefined) return;
               const result = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline, bytes);
               onResourceSample?.(result);
@@ -1566,7 +1647,7 @@ function runStageCommand(
         settled = true;
         reject(
           new DeliveryError(
-            `Selected policy stage command failed (${reason}).${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`}${cleanupFailure === undefined ? '' : ` Owned process cleanup failed (${cleanupFailure}).`}`,
+            `Selected policy stage command failed (${reason}). Command exit ${String(code)}${signal === null ? '' : ` signal ${signal}`}.${failedOutput()}${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`}${cleanupFailure === undefined ? '' : ` Owned process cleanup failed (${cleanupFailure}).`}`,
           ),
         );
         return;
@@ -1770,7 +1851,7 @@ async function verifyIssueOwned(
     for (const command of stage.commands) {
       const commandStartedAtMs = Date.now();
       if (input.resourceBounds !== undefined) assertDiskHeadroom(root, input.resourceBounds, baseline);
-      const progress = (capturedOutputBytes: number, sample?: ResourceSample): void =>
+      const progress = (capturedOutputBytes: number, sample?: ResourceSample, reason?: string): void =>
         report({
           state: 'running',
           stageId: stage.id,
@@ -1780,6 +1861,7 @@ async function verifyIssueOwned(
           reusedStages,
           elapsedMs: Date.now() - startedAtMs,
           capturedOutputBytes,
+          ...(reason === undefined ? {} : { reason }),
           commandElapsedMs: Date.now() - commandStartedAtMs,
           ...(sample === undefined
             ? {}
@@ -2004,7 +2086,7 @@ export async function withRuntimeSetupWriter<T>(
             root,
             argv,
             signal,
-            (capturedOutputBytes, sample) =>
+            (capturedOutputBytes, sample, reason) =>
               reportVerificationProgress({
                 state: 'running',
                 stageId: 'runtime-setup',
@@ -2013,6 +2095,7 @@ export async function withRuntimeSetupWriter<T>(
                 remainingStages: 1,
                 elapsedMs: Date.now() - started,
                 capturedOutputBytes,
+                ...(reason === undefined ? {} : { reason }),
                 ...(sample === undefined
                   ? {}
                   : {

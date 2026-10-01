@@ -4234,6 +4234,201 @@ test(
   },
 );
 
+test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
+  'ordinary owned symlink teardown preserves observation and %s command evidence',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-ordinary-teardown-')));
+    const { root } = await fixture();
+    const controller = new AbortController();
+    const events = join(output, 'events');
+    const ready = join(output, 'ready');
+    const release = join(output, 'release');
+    writeFileSync(join(output, 'unrelated'), 'preserved');
+    writeFileSync(join(output, 'target'), 'x'.repeat(128));
+    symlinkSync('./target', join(output, 'alias'));
+    let observedGap = false;
+    const observations: string[] = [];
+    let releaseTimer: NodeJS.Timeout | undefined;
+    const progress = vi.spyOn(process.stderr, 'write').mockImplementation((line) => {
+      if (String(line).includes('ENOENT')) observations.push(String(line));
+      if (!observedGap && existsSync(ready) && String(line).includes('sampledAggregateRssBytes')) {
+        observedGap = true;
+        // Synchronize real removal with the sample preceding the synchronous filesystem scan.
+        releaseTimer = setTimeout(() => {
+          if (mode === 'cancel') controller.abort();
+          else if (mode !== 'persistent') writeFileSync(release, 'continue');
+        }, 100);
+      }
+      return true;
+    });
+    const script = `
+(async () => {
+  const fs = require('node:fs');
+  const trace = value => fs.appendFileSync(${JSON.stringify(events)}, value + '\\n');
+  trace('command-started');
+  if (['command-error', 'persistent'].includes(${JSON.stringify(mode)})) console.error('synthetic buffered preparation failure');
+  fs.unlinkSync(${JSON.stringify(join(output, 'target'))});
+  trace('target-removed'); fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+  if (${JSON.stringify(mode)} === 'limit') fs.writeFileSync(${JSON.stringify(join(output, 'retained'))}, 'x'.repeat(512));
+  while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 10));
+  fs.unlinkSync(${JSON.stringify(join(output, 'alias'))}); trace('alias-removed');
+  process.exitCode = ${mode === 'command-error' ? 7 : 0};
+})().catch(error => { console.error(error); process.exitCode = 1; });`;
+    try {
+      const { withRuntimeSetupWriter } = await import('./verification.js');
+      const run = withRuntimeSetupWriter(root, (runner) =>
+        runner.run(
+          [process.execPath, '-e', script],
+          {
+            maxAggregateRssBytes: 1_000_000_000,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: mode === 'limit' ? 256 : 4096,
+            outputRoots: [output],
+          },
+          controller.signal,
+        ),
+      );
+      if (mode === 'pass') await run;
+      else
+        await assert.rejects(run, (error: unknown) => {
+          const message = String(error);
+          assert.match(
+            message,
+            mode === 'cancel'
+              ? /cancelled/u
+              : mode === 'persistent'
+                ? /remained unavailable.*First observation:.*ENOENT/u
+                : mode === 'limit'
+                  ? /filesystem output.*exceeded/u
+                  : /exit 7/u,
+          );
+          assert.doesNotMatch(message, /cleanup failed/u);
+          assert.ok(message.includes(join(output, 'alias')));
+          assert.match(message, /ENOENT/u);
+          if (mode === 'command-error' || mode === 'persistent') {
+            const digest = /Command output (sha256:[a-f0-9]{64})/u.exec(message)?.[1];
+            assert.ok(digest);
+            assert.match(
+              readFileSync(
+                join(root, '.git', 'ai-delivery', 'verification@1', 'command-output', `${digest.slice(7)}.bin`),
+                'utf8',
+              ),
+              /synthetic buffered preparation failure/u,
+            );
+          }
+          return true;
+        });
+      assert.ok(observedGap);
+      assert.ok(
+        observations.some((line) => {
+          const observation = JSON.parse(line.slice(line.indexOf('{'))) as { reason: string };
+          return observation.reason.includes(join(output, 'alias'));
+        }),
+      );
+      assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
+      console.log(
+        JSON.stringify({
+          scenario: 'ordinary-owned-symlink-teardown',
+          mode,
+          firstObservation: (JSON.parse(observations[0]!.slice(observations[0]!.indexOf('{'))) as { reason: string })
+            .reason,
+          events: readFileSync(events, 'utf8').trim().split('\n'),
+          unrelatedPreserved: true,
+          aliasRetained: readdirSync(output).includes('alias'),
+        }),
+      );
+      assert.deepEqual(
+        readFileSync(events, 'utf8').trim().split('\n'),
+        mode === 'cancel' || mode === 'persistent'
+          ? ['command-started', 'target-removed']
+          : ['command-started', 'target-removed', 'alias-removed'],
+      );
+      if (mode === 'cancel' || mode === 'persistent') {
+        await assert.rejects(
+          withRuntimeSetupWriter(root, (runner) =>
+            runner.run([process.execPath, '-e', ''], {
+              maxAggregateRssBytes: 1_000_000_000,
+              minFreeDiskBytes: 1,
+              maxNewOutputBytes: 4096,
+              outputRoots: [output],
+            }),
+          ),
+          (error: unknown) => {
+            assert.ok(String(error).includes(join(output, 'alias')));
+            assert.match(String(error), /ENOENT/u);
+            return true;
+          },
+        );
+      }
+    } finally {
+      controller.abort();
+      if (releaseTimer !== undefined) clearTimeout(releaseTimer);
+      progress.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
+
+test('injected observation deadline rejects a late complete real filesystem retry', async () => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-observation-deadline-')));
+  const { root } = await fixture();
+  const target = join(output, 'target'),
+    alias = join(output, 'alias'),
+    release = join(output, 'release');
+  writeFileSync(target, 'target');
+  symlinkSync('./target', alias);
+  const now = Date.now.bind(Date);
+  let offset = 0;
+  let firstObservation: string | undefined;
+  let advance: NodeJS.Timeout | undefined;
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + offset);
+  const progress = vi.spyOn(process.stderr, 'write').mockImplementation((line) => {
+    if (firstObservation === undefined && String(line).includes('ENOENT')) {
+      firstObservation = String(line);
+      advance = setTimeout(() => {
+        // This test injects only the deadline. Alias removal and the subsequent complete scan are real.
+        unlinkSync(alias);
+        offset = 1100;
+        writeFileSync(release, 'finish');
+      }, 0);
+    }
+    return true;
+  });
+  const script = `(async () => {
+    const fs = require('node:fs'); fs.unlinkSync(${JSON.stringify(target)});
+    while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 10));
+  })().catch(error => { console.error(error); process.exitCode = 1; });`;
+  try {
+    const { withRuntimeSetupWriter } = await import('./verification.js');
+    await assert.rejects(
+      withRuntimeSetupWriter(root, (runner) =>
+        runner.run([process.execPath, '-e', script], {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 4096,
+          outputRoots: [output],
+        }),
+      ),
+      (error: unknown) => {
+        assert.match(String(error), /remained unavailable for 1 second/u);
+        assert.ok(String(error).includes(alias));
+        assert.match(String(error), /ENOENT/u);
+        assert.doesNotMatch(String(error), /cleanup failed/u);
+        return true;
+      },
+    );
+    assert.ok(firstObservation);
+    assert.equal(readdirSync(output).includes('alias'), false);
+  } finally {
+    if (advance !== undefined) clearTimeout(advance);
+    progress.mockRestore();
+    clock.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+  }
+});
+
 test.each(['escape', 'broken', 'cycle'] as const)(
   'output observation rejects %s aliases without running policy commands',
   async (kind) => {
