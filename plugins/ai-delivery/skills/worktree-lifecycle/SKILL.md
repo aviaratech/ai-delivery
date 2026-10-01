@@ -18,6 +18,10 @@ Before development, run the read-only `ai-delivery --identity <configured-author
 
 To park execution without removing the worktree, call `issue_update` with `park: true` or `ai-delivery update --issue <number> --park`. The Project shows Todo or Blocked from current native blockers; closed/Done remains Done. Resume through `issue_develop`/`develop` with the existing readiness checks. A retained worktree does not establish active execution.
 
+For an unwitnessed legacy issue row, use the read-only `issue_worktree_transition_inspect` with purpose `active-resume` or `merged-cleanup`. Installation does not adopt the row. Preserve unknown historical evidence as original bytes; never treat it as current verification/review or operational closure. The supported closure family is the retained official public 0.3.5 archive/installed runtime admission, producer-bound run@3 and writers@1 on supported POSIX hosts. Missing closure, operative issue-cli v1/v2 or unknown resources must remain refused.
+
+Apply only the exact plan with authenticated personal-operator native relinquishment and distinct configured reviewer-App whole-plan native acceptance. `issue_worktree_transition_apply` requires explicit authority, the saved plan/plan ID and both native comment IDs. Use the same inputs for interruption recovery. Pending and terminal-purpose intent blocks ordinary source mutations and re-registration. Active resume needs fresh current verification and review; original receipts retain their historical schema/accounting. Terminal disposition retains source/holds by default. Explicit unheld removal uses existing non-force cleanup; this skill grants no hold release, private adoption, launcher change, shared admission or legacy-protocol retirement authority.
+
 ## CLI fallback
 
 ```bash

@@ -198,6 +198,33 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Prepare one explicit standalone worktree without an issue',
     inputSchema: z.strictObject({ name: z.string().min(1), branch: z.string().min(1) }),
   },
+  {
+    name: 'issue_worktree_transition_inspect',
+    commandName: 'worktree:transition:inspect',
+    description: 'Read a legacy issue row, original evidence and exact closure gaps without changing ownership',
+    inputSchema: z.strictObject({
+      issueNumber: Positive,
+      purpose: z.enum(['active-resume', 'merged-cleanup']),
+      disposition: z.enum(['retain', 'remove']).optional(),
+      terminalPrNumber: Positive.optional(),
+      retainedHoldCommentIds: z.array(Positive).optional(),
+      retainedAdmissionPath: z.string().min(1).optional(),
+      retainedArchivePath: z.string().min(1).optional(),
+    }),
+  },
+  {
+    name: 'issue_worktree_transition_apply',
+    commandName: 'worktree:transition:apply',
+    description:
+      'Apply or resume one exact independently accepted transition with immutable preservation and closure proof',
+    inputSchema: z.strictObject({
+      authority: z.literal('worktree:transition'),
+      planPath: z.string().min(1),
+      expectedPlanId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      relinquishmentCommentId: Positive,
+      acceptanceCommentId: Positive,
+    }),
+  },
 ] as const;
 
 export type AiDeliveryMcpToolName = (typeof AI_DELIVERY_MCP_TOOLS)[number]['name'];

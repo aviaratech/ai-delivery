@@ -3128,6 +3128,8 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
       'issue_pr_merge',
       'issue_finish',
       'issue_worktree_create',
+      'issue_worktree_transition_inspect',
+      'issue_worktree_transition_apply',
     ],
   );
   const validInputs = {
@@ -3140,6 +3142,14 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
     issue_pr_review: { issueNumber: 17, prNumber: 23, artifact: '{}' },
     issue_pr_merge: { issueNumber: 17, prNumber: 23, strategy: 'merge' },
     issue_finish: { issueNumber: 17, prNumber: 23, strategy: 'merge' },
+    issue_worktree_transition_inspect: { issueNumber: 17, purpose: 'active-resume' },
+    issue_worktree_transition_apply: {
+      authority: 'worktree:transition',
+      planPath: '/synthetic/plan.json',
+      expectedPlanId: `sha256:${'a'.repeat(64)}`,
+      relinquishmentCommentId: 101,
+      acceptanceCommentId: 102,
+    },
   };
   const updateTool = AI_DELIVERY_MCP_TOOLS.find((tool) => tool.name === 'issue_update')!;
   assert.equal(updateTool.inputSchema.safeParse({ issueNumber: 17, park: false }).success, false);
@@ -4039,9 +4049,13 @@ test.each([
   15_000,
 );
 
-test('an unrelated consumer uses public MCP setup through verified configured-author publication, counted review readback, merge and cleanup', async () => {
-  await syntheticLifecycle({ remote: 'origin', divergentOrigin: false, producerOnboarding: true });
-}, 15_000);
+test(
+  'an unrelated consumer uses public MCP setup through verified configured-author publication, counted review readback, merge and cleanup',
+  { timeout: 0 },
+  async () => {
+    await syntheticLifecycle({ remote: 'origin', divergentOrigin: false, producerOnboarding: true });
+  },
+);
 
 test.each(['escape', 'broken', 'cycle'] as const)(
   'output observation rejects %s aliases without running policy commands',

@@ -257,6 +257,53 @@ rows in `.issue-cli/worktrees.json` remain with their original runtime unless
 they already have an exact `ai-delivery.worktree-owner@1` witness. Installing this
 package never adopts or switches an active legacy writer.
 
+Legacy worktree transitions are explicit and separate from installation. Use
+`worktree:transition:inspect` (`issue_worktree_transition_inspect`) with the issue
+and purpose `active-resume` or `merged-cleanup`. Inspection reads the canonical
+row, clean source, native PR lineage, original evidence and writer inventory. It
+returns an exact plan or specific closure gaps without writing ownership or
+running the retained producer.
+
+The supported operational closure family is the retained official public
+`@aviaratech/ai-delivery@0.3.5` archive and installed bytes, its private
+`ai-delivery.runtime-admission@2`, producer-bound `ai-delivery.run@3`, and
+`ai-delivery.verification-writer@1` on supported POSIX hosts. Supply
+`--retained-admission` and `--retained-archive`. Operative `issue-cli`
+verification-stages v1/v2, unknown process ownership, external resource families
+or incomplete inventory refuse apply. Historical producer identity may remain
+`UNKNOWN`; its original schemas, bytes, failed diagnostics and accounting are
+preserved without becoming current verification, review or retirement authority.
+
+The configured authenticated personal operator must publish the returned whole
+relinquishment body as a native comment on the terminal PR, or on the issue for
+active resume. The distinct configured reviewer App must independently accept
+the same complete plan and relinquishment comment ID through a native exact-body
+acceptance comment. A caller-authored local receipt does not supply this
+authority. Changed/deleted comments, wrong actors or subjects, and an authenticated
+exact relinquishment revocation invalidate acceptance. These comments have their
+own acceptance semantics; they do not count as a GitHub PR review.
+The bodies bind the complete saved plan and inventory by their recomputed IDs;
+the operator and reviewer must inspect that complete plan before accepting it.
+
+Save the returned `plan` object, then call `worktree:transition:apply`
+(`issue_worktree_transition_apply`) with `--plan`, `--plan-id`,
+`--relinquishment-comment`, `--acceptance-comment`, and
+`--authorize-transition`. Apply preserves immutable original copies and records
+intent before ownership changes. Repeat the same plan and authority IDs after
+interruption; pending intent blocks ordinary resume, verification, publication,
+review, merge and re-registration. Active resume requires fresh current
+verification and review. Terminal transition witnesses permanently restrict
+ordinary source operations.
+
+Terminal disposition defaults to `retain`, preserving source and all holds.
+Supply native retained-hold comment IDs with `--retained-holds`. `remove` requires
+an independently accepted personal assertion that no holds remain, exact native
+merged-result lineage and the existing non-force clean-source cleanup proof.
+Source delivery never releases a hold, retires a legacy protocol, changes a host
+launcher or admits a shared runtime. Transition artifacts remain under the
+existing private Git `ai-delivery/worktree-owners` evidence directory; no second
+worktree registry is introduced.
+
 `verify` classifies a clean Git base/head range, runs only the stages selected by the repository policy, and persists content-addressed private checkpoints under the Git common directory. It reuses compatible complete stages and rejects corrupt or stale inputs. Selected stage commands run asynchronously without a total-duration deadline. Bounded JSON status lines on stderr show the current stage and command, completed/reused/remaining stage and command counts, elapsed time, captured output bytes, executed-command throughput, command age and time since completed work. They appear when a command starts and every five seconds while it runs; bounded resource observations are reported at each sample. A quiet command remains cancellable and diagnosable from its age and unchanged completion counts. Process activity and output do not establish useful progress; only complete receipts and the exact-source aggregate are checkpoints.
 
 For independent component reuse, export `schemaVersion: "RepositoryDeliveryPolicy@2"` from the existing policy. Each selected stage supplies both its ordered `semanticInputKeys` and matching explicit `semanticInputs`, for example:

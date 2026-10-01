@@ -1,7 +1,18 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { existsSync, unlinkSync, lstatSync, readFileSync, readdirSync, realpathSync, statfsSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  unlinkSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statfsSync,
+} from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -602,12 +613,52 @@ interface VerificationWriter {
   assertQuiescent(): void;
 }
 
+/** @internal Durable transition evidence must precede changes to the existing writer slot. */
+export interface WorktreeTransitionWriterLeaseInput {
+  repoRoot: string;
+  worktreePath?: string;
+  writerId: string;
+  beforeClaim(input: {
+    previousBytes: Buffer | undefined;
+    owner: { pid: number; identity: string };
+  }): void | Promise<void>;
+  recordClaim(bytes: Buffer): void | Promise<void>;
+  afterClaim?(bytes: Buffer): void | Promise<void>;
+  recordRelease(bytes: Buffer): void | Promise<void>;
+  afterRelease?(): void | Promise<void>;
+}
+
+/** @internal Read-only closure check shared by inspection and the locked transition lease. */
+export function assertWorktreeTransitionWriterQuiescent(worktreePath: string, bytes: Buffer | undefined): void {
+  if (bytes === undefined) return;
+  const previous = WriterStateSchema.parse(JSON.parse(bytes.toString('utf8')));
+  if (previous.worktreeDigest !== worktreeDigest(worktreePath))
+    throw new DeliveryError('Verification writer belongs to another worktree.');
+  const snapshot = processSnapshot();
+  const owner = snapshot.get(previous.owner.pid);
+  if (owner?.identity === previous.owner.identity && !owner.status.startsWith('Z'))
+    throw new DeliveryError('A live verification writer still owns this worktree.');
+  if (previous.command.phase === 'starting')
+    throw new DeliveryError('Interrupted writer has unknown command ownership; reconcile before retrying.');
+  if (previous.command.phase === 'running') {
+    const identities = [previous.command.root, ...previous.command.tracked];
+    const groups = new Set([previous.command.root.pid, ...previous.command.tracked.map((member) => member.pgid)]);
+    if (
+      identities.some((member) => snapshot.has(member.pid)) ||
+      [...snapshot.values()].some((member) => groups.has(member.pgid))
+    )
+      throw new DeliveryError('Transition requires identity-bound command and process-group absence.');
+  }
+}
+
 async function withVerificationWriter<T>(
   root: string,
   operation: (writer: VerificationWriter) => Promise<T>,
+  transition?: WorktreeTransitionWriterLeaseInput,
+  commonDirectory?: string,
 ): Promise<T> {
   const digest = worktreeDigest(root);
-  const path = join(gitCommonDir(root), 'ai-delivery', 'writers@1', `${digest.slice(7)}.json`);
+  const path = join(commonDirectory ?? gitCommonDir(root), 'ai-delivery', 'writers@1', `${digest.slice(7)}.json`);
   ensurePrivateDirectoryDurably(dirname(path));
   return withLock(path, {
     projectRoot: root,
@@ -617,8 +668,18 @@ async function withVerificationWriter<T>(
       const owner = snapshot.get(process.pid);
       if (owner === undefined || owner.status.startsWith('Z'))
         throw new DeliveryError('Verification writer identity is unknown.');
-      if (existsSync(path)) {
-        const previous = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
+      let previousBytes: Buffer | undefined;
+      if (transition) {
+        try {
+          lstatSync(path);
+          previousBytes = assertPrivateFile(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      } else if (existsSync(path)) previousBytes = assertPrivateFile(path);
+      if (transition) assertWorktreeTransitionWriterQuiescent(root, previousBytes);
+      if (previousBytes !== undefined && !transition) {
+        const previous = WriterStateSchema.parse(JSON.parse(previousBytes.toString('utf8')));
         if (previous.worktreeDigest !== digest)
           throw new DeliveryError('Verification writer belongs to another worktree.');
         const priorOwner = snapshot.get(previous.owner.pid);
@@ -648,9 +709,15 @@ async function withVerificationWriter<T>(
           });
         }
       }
+      if (transition) {
+        await transition.beforeClaim({
+          previousBytes: previousBytes === undefined ? undefined : Buffer.from(previousBytes),
+          owner: { pid: owner.pid, identity: owner.identity },
+        });
+      }
       let state: Omit<z.infer<typeof WriterStateSchema>, 'stateId'> = {
         schemaVersion: 'ai-delivery.verification-writer@1',
-        writerId: randomUUID(),
+        writerId: transition?.writerId ?? randomUUID(),
         worktreeDigest: digest,
         owner: { pid: owner.pid, identity: owner.identity },
         command: { phase: 'idle' },
@@ -659,6 +726,22 @@ async function withVerificationWriter<T>(
         state = { ...state, command };
         writePrivateJsonFileAtomically(path, { ...state, stateId: digestValue(state) });
       };
+      if (transition) {
+        const bytes = Buffer.from(`${JSON.stringify({ ...state, stateId: digestValue(state) }, null, 2)}\n`);
+        await transition.recordClaim(Buffer.from(bytes));
+        let actual: Buffer | undefined;
+        try {
+          lstatSync(path);
+          actual = assertPrivateFile(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        if (
+          (actual === undefined) !== (previousBytes === undefined) ||
+          (actual !== undefined && previousBytes !== undefined && !actual.equals(previousBytes))
+        )
+          throw new DeliveryError('Writer changed after transition intent preservation.');
+      }
       persist({ phase: 'idle' });
       const writer: VerificationWriter = {
         starting: () => persist({ phase: 'starting' }),
@@ -677,18 +760,91 @@ async function withVerificationWriter<T>(
             throw new DeliveryError('Verification writer command quiescence is not confirmed.');
         },
       };
-      const releaseWriter = (): void => {
-        const current = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
+      const releaseWriter = async (): Promise<void> => {
+        const bytes = assertPrivateFile(path);
+        const current = WriterStateSchema.parse(JSON.parse(bytes.toString('utf8')));
         if (current.writerId !== state.writerId) throw new DeliveryError('Verification writer ownership changed.');
-        if (current.command.phase === 'idle') unlinkSync(path);
+        if (current.command.phase === 'idle') {
+          if (transition) {
+            await transition.recordRelease(Buffer.from(bytes));
+            if (!assertPrivateFile(path).equals(bytes))
+              throw new DeliveryError('Writer changed before recorded release.');
+          }
+          unlinkSync(path);
+          if (transition) {
+            const descriptor = openSync(dirname(path), 'r');
+            try {
+              fsyncSync(descriptor);
+            } finally {
+              closeSync(descriptor);
+            }
+            try {
+              lstatSync(path);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+              await transition.afterRelease?.();
+              return;
+            }
+            throw new DeliveryError('Writer absence is not confirmed after recorded release.');
+          }
+        }
       };
       try {
+        await transition?.afterClaim?.(Buffer.from(assertPrivateFile(path)));
         return await operation(writer);
       } finally {
-        releaseWriter();
+        await releaseWriter();
       }
     },
   });
+}
+
+/** @internal Hold the existing writer lock while reading a sealed transition; never claim or recover its slot. */
+export async function withWorktreeTransitionWriterAbsent<T>(
+  repoRoot: string,
+  worktreePath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const path = join(
+    gitCommonDir(repoRoot),
+    'ai-delivery',
+    'writers@1',
+    `${worktreeDigest(worktreePath).slice(7)}.json`,
+  );
+  return withLock(path, {
+    projectRoot: repoRoot,
+    timeout: 200,
+    operation: async () => {
+      try {
+        lstatSync(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        return operation();
+      }
+      throw new DeliveryError('Sealed transition writer absence postcondition drifted.');
+    },
+  });
+}
+
+/** @internal Check-only lease for the explicit transition owner; never recovers or signals old commands. */
+export async function withWorktreeTransitionWriterLease<T>(
+  input: WorktreeTransitionWriterLeaseInput,
+  operation: () => Promise<T>,
+): Promise<T> {
+  z.uuid().parse(input.writerId);
+  const repository = gitRoot(input.repoRoot);
+  const subject = input.worktreePath === undefined ? repository : resolve(input.worktreePath);
+  return withVerificationWriter(
+    subject,
+    async (writer) => {
+      writer.assertQuiescent();
+      const result = await operation();
+      writer.assertQuiescent();
+      return result;
+    },
+    input,
+    gitCommonDir(repository),
+  );
 }
 
 function primaryRoot(worktreeRoot: string): string {
@@ -712,8 +868,7 @@ function assertRegisteredIssue(worktreeRoot: string, issueNumber: number, allowM
 function worktreeDigest(root: string): string {
   return digestValue(resolve(root));
 }
-function producerDigest(): string {
-  const root = dirname(fileURLToPath(import.meta.url));
+function producerContent(root: string) {
   const code: { path: string; digest: string }[] = [];
   const collect = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -757,7 +912,28 @@ function producerDigest(): string {
     }
   };
   collectDependencies(join(dirname(root), 'package.json'));
-  return digestValue({ code, dependencies: [...dependencies].sort(([a], [b]) => a.localeCompare(b)) });
+  return { code, dependencies: [...dependencies].sort(([a], [b]) => a.localeCompare(b)) };
+}
+
+function producerDigest(root = dirname(fileURLToPath(import.meta.url))): string {
+  return digestValue(producerContent(root));
+}
+
+/** @internal Retained public code is hashed as data; it is never imported or executed. */
+export function retainedWorktreeTransitionProducerDigest(distDirectory: string): string {
+  return producerDigest(realpathSync(distDirectory));
+}
+
+/** @internal Preserve the same dependency manifests that participate in the existing producer digest. */
+export function retainedWorktreeTransitionDependencyManifests(
+  distDirectory: string,
+): { source: string; digest: string }[] {
+  return producerContent(realpathSync(distDirectory)).dependencies.map(([source, digest]) => ({ source, digest }));
+}
+
+/** @internal Original manifests validate as history and cannot authorize current verification. */
+export function readWorktreeTransitionRun(bytes: Buffer): VerificationRun {
+  return parseRun(JSON.parse(bytes.toString('utf8')) as unknown);
 }
 function manifestPath(common: string, headSha: string, root?: string): string {
   return root === undefined

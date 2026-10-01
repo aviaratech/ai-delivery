@@ -25,7 +25,16 @@ import { finishIssue, mergePr, preflightReviewRoute, prInfo, publishPr, submitFo
 import { parseReviewArtifact, reviewArtifactApproval, savePrepublicationArtifact } from './review.js';
 import { evaluateAgentReadiness } from './services/agentReadinessService.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
-import { getIssueWorktreeStrict, listWorktreesStrict } from './services/worktreeRegistry.js';
+import {
+  assertIssueWorktreeTransitionAdmission,
+  getIssueWorktreeStrict,
+  listWorktreesStrict,
+} from './services/worktreeRegistry.js';
+import {
+  applyWorktreeTransition,
+  inspectWorktreeTransition,
+  type InspectWorktreeTransitionInput,
+} from './worktreeTransition.js';
 import {
   createIssuePhaseEvidence,
   loadVerifiedRun,
@@ -56,6 +65,7 @@ const MUTATING_TOOLS = new Set<AiDeliveryMcpToolName>([
   'issue_pr_merge',
   'issue_finish',
   'issue_worktree_create',
+  'issue_worktree_transition_apply',
 ]);
 
 function requiredNumber(input: Record<string, unknown>, key: string): number {
@@ -361,6 +371,8 @@ export async function executeTool(
     issue_pr_merge: 'pr:merge',
     issue_finish: 'finish',
     issue_worktree_create: 'worktree:create',
+    issue_worktree_transition_inspect: 'worktree:transition:inspect',
+    issue_worktree_transition_apply: 'worktree:transition:apply',
   };
   const requestedIdentity = name === 'issue_pr_review' ? optionalString(input, 'identity') : undefined;
   const selectedExecution = requestedIdentity === undefined ? execution : { ...execution, identity: requestedIdentity };
@@ -391,6 +403,8 @@ export async function executeTool(
     controllerConfiguration = await loadDeliveryConfig(primary, { clients: authorClients });
   }
   if (MUTATING_TOOLS.has(name) && input.dryRun !== true) {
+    if (name !== 'issue_worktree_transition_apply' && typeof input.issueNumber === 'number')
+      assertIssueWorktreeTransitionAdmission(input.issueNumber, primaryGitRoot(execution.repoRoot));
     await assertDeliveryRuntimeAdmitted({
       ...execution,
       repoRoot: sourceRoot === undefined ? execution.repoRoot : primaryGitRoot(execution.repoRoot),
@@ -409,6 +423,20 @@ export async function executeTool(
     });
   }
   switch (name) {
+    case 'issue_worktree_transition_inspect':
+      return inspectWorktreeTransition(context, {
+        ...input,
+        ...(execution.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: execution.runtimeEntryPath }),
+      } as unknown as InspectWorktreeTransitionInput);
+    case 'issue_worktree_transition_apply':
+      return applyWorktreeTransition(context, {
+        authority: 'worktree:transition',
+        planPath: requireString(input, 'planPath'),
+        expectedPlanId: requireString(input, 'expectedPlanId'),
+        relinquishmentCommentId: requiredNumber(input, 'relinquishmentCommentId'),
+        acceptanceCommentId: requiredNumber(input, 'acceptanceCommentId'),
+        ...(execution.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: execution.runtimeEntryPath }),
+      });
     case 'issue_create': {
       return createIssue(context, input as unknown as CreateIssueInput);
     }
