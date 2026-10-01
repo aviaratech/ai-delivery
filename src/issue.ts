@@ -243,22 +243,22 @@ export async function updateIssue(
       issueNumber: input.issueNumber,
       repo,
     });
-    const related = new Set([
-      current.parentNumber,
-      ...current.blockers.map((blocker) => blocker.number),
-      input.parentIssueNumber,
-      ...(input.blockedBy ?? []),
-    ]);
-    for (const number of related) {
-      if (number !== null && number !== undefined) assertNoForeignIssueWorktree(number, context.root);
-    }
-  }
-  if (input.blockedBy !== undefined)
+    // Tracking edges validate native endpoints without adopting their source worktrees.
     await resolveNativeRelationshipTargets({
-      blockers: input.blockedBy,
+      blockers: current.blockers.map((blocker) => blocker.number),
+      ...(current.parentNumber === null ? {} : { parentIssueNumber: current.parentNumber }),
       repo,
       rest: clients.rest,
     });
+    await resolveNativeRelationshipTargets({
+      blockers: input.blockedBy ?? [],
+      ...(input.parentIssueNumber === undefined || input.parentIssueNumber === null
+        ? {}
+        : { parentIssueNumber: input.parentIssueNumber }),
+      repo,
+      rest: clients.rest,
+    });
+  }
   await clients.rest.issues.update({
     issue_number: input.issueNumber,
     owner: repo.owner,
