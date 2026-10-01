@@ -1486,7 +1486,7 @@ function runStageCommand(
             onResourceSample?.(result);
             onRunning?.(outputBytes, result);
           }
-          if (pendingOutput !== undefined) return;
+          if (closed || pendingOutput !== undefined) return;
           pendingOutput = (async () => {
             if (resourceBounds !== undefined && baseline !== undefined) {
               const bytes = await positiveNewOutputBytes(baseline, scanCancellation.signal);
@@ -1524,7 +1524,6 @@ function runStageCommand(
     const handleClose = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
       closed = true;
       if (settled) return;
-      clearWatchers();
       await pendingOutput;
       if (failure === undefined && owned !== undefined) {
         try {
@@ -1577,10 +1576,12 @@ function runStageCommand(
       resolve(Buffer.concat([...stdout, ...stderr], outputBytes));
     };
     child.once('close', (code, signal) => {
-      void handleClose(code, signal).catch((error: unknown) => {
-        settled = true;
-        reject(error);
-      });
+      void handleClose(code, signal)
+        .catch((error: unknown) => {
+          settled = true;
+          reject(error);
+        })
+        .finally(clearWatchers);
     });
   });
 }
@@ -2025,6 +2026,7 @@ export async function withRuntimeSetupWriter<T>(
             undefined,
             writer,
           );
+          if (signal?.aborted) throw new DeliveryError('Runtime setup cancelled.');
           reportVerificationProgress({
             state: 'completed',
             stageId: 'runtime-setup',

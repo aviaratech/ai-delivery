@@ -4299,6 +4299,101 @@ test('filesystem fixture gate still enforces positive byte limits after determin
   }
 });
 
+test.each(['verification', 'runtime'] as const)(
+  'filesystem fixture gate preserves observation and cancellation after direct %s command closure',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-close-')));
+    writeFileSync(join(output, 'unrelated'), 'preserved');
+    const script = `
+(async () => {
+  const fs = require('node:fs'), cp = require('node:child_process');
+  const child = cp.spawn(process.execPath, ['-e', ${JSON.stringify(filesystemFixtureScript(output, 'cancel'))}], { stdio: 'ignore' });
+  child.unref();
+  fs.writeFileSync(${JSON.stringify(join(output, 'pids'))}, JSON.stringify({ root: process.pid, descendant: child.pid }));
+  while (!fs.existsSync(${JSON.stringify(join(output, 'exit-parent'))})) await new Promise(resolve => setTimeout(resolve, 10));
+  process.exit(0);
+})().catch(error => { console.error(error.message); process.exitCode = 1; });`;
+    const { root } = await fixture({ firstStageScript: script });
+    const controller = new AbortController();
+    const progress = vi.spyOn(process.stderr, 'write');
+    let running: Promise<unknown> | undefined;
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const bounds = {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 4096,
+        outputRoots: [output],
+      };
+      const { withRuntimeSetupWriter } = await import('./verification.js');
+      running = (
+        mode === 'verification'
+          ? verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds, signal: controller.signal })
+          : withRuntimeSetupWriter(row.path, (runner) =>
+              runner.run([process.execPath, '-e', script], bounds, controller.signal),
+            )
+      ).catch((error: unknown) => error);
+      for (let attempt = 0; attempt < 300 && !existsSync(join(output, 'capability')); attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(existsSync(join(output, 'capability')));
+      const cap = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+      const pids = JSON.parse(readFileSync(join(output, 'pids'), 'utf8')) as { root: number; descendant: number };
+      const writerPath = join(root, '.git', 'ai-delivery', 'writers@1', digestValue(row.path).slice(7) + '.json');
+      const descendantObserved = (): boolean => {
+        const state = JSON.parse(readFileSync(writerPath, 'utf8')) as { command: { tracked?: { pid: number }[] } };
+        return state.command.tracked?.some((member) => member.pid === pids.descendant) === true;
+      };
+      for (
+        let attempt = 0;
+        attempt < 300 && (!descendantObserved() || readdirSync(join(cap.directory, 'requests')).length === 0);
+        attempt++
+      )
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(descendantObserved());
+      assert.ok(readdirSync(join(cap.directory, 'requests')).length > 0);
+      writeFileSync(join(output, 'exit-parent'), 'exit');
+      const parentAlive = (): boolean =>
+        spawnSync('ps', ['-p', String(pids.root), '-o', 'stat='], { encoding: 'utf8' }).stdout.trim().length > 0;
+      for (let attempt = 0; attempt < 100 && parentAlive(); attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(parentAlive(), false);
+      const samples = (): number =>
+        progress.mock.calls.filter(([line]) => String(line).includes('sampledAggregateRssBytes')).length;
+      const afterExit = samples();
+      for (let attempt = 0; attempt < 100 && samples() === afterExit; attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      const observedAfterExit = samples() > afterExit;
+      controller.abort();
+      const failure = String(await running);
+      assert.match(failure, /cancelled/u);
+      assert.doesNotMatch(failure, /cleanup failed|live holder/u);
+      assert.ok(observedAfterExit, 'RSS and disk observation continues while the closed command awaits its scan');
+      assert.equal(existsSync(cap.directory), false);
+      assert.ok(existsSync(join(output, 'fifo')));
+      assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
+      assert.equal(
+        spawnSync('ps', ['-p', String(pids.descendant), '-o', 'stat='], { encoding: 'utf8' }).stdout.trim().length,
+        0,
+      );
+      assert.equal(
+        progress.mock.calls.some(([line]) => String(line).includes('"state":"completed"')),
+        false,
+      );
+    } finally {
+      controller.abort();
+      await running;
+      progress.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
+
 test('filesystem fixture helper runs standalone and fails closed on malformed capability', async () => {
   const { withVerificationFilesystemFixture } = await import('./agent.js');
   assert.equal(await withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
