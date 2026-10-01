@@ -327,6 +327,23 @@ The `--admit` flag explicitly admits additional resource classes. Publication cr
 
 For a bounded run, pass `--max-aggregate-rss-bytes`, `--min-free-disk-bytes`, and optionally `--max-new-output-bytes` with one or more `--output-root` paths to `verify`. `issue_verify` accepts the same values in `resourceBounds`. RSS is sampled across the observed child process tree, including observed detached descendants; free disk is checked before commands and during execution on the worktree and declared output filesystems. Positive file-size growth is sampled under the declared roots, with previously measured completed stages carried across a resume. The caller must declare every output root relevant to its allowance; aliases must resolve within those roots. The roots are relative to the issue worktree unless absolute. Output growth is separate from the 8 MiB captured stdout/stderr limit. Resource limits are opt in and do not impose a total runtime deadline.
 
+Real filesystem-negative tests can use `withVerificationFilesystemFixture` from `@aviaratech/ai-delivery` (or its `agent` export):
+
+```js
+import { withVerificationFilesystemFixture } from '@aviaratech/ai-delivery';
+
+await withVerificationFilesystemFixture(async () => {
+  // Create the real negative fixture inside a declared output root.
+  try {
+    // Assert the actual reader rejects it without blocking.
+  } finally {
+    // Remove every negative fixture before returning or throwing.
+  }
+});
+```
+
+Bounded verification supplies an inherited, run-owned filesystem coordination capability. The helper serializes the fixture's lifetime against strict scans of every declared root; nested verification and runtime setup join the same boundary. Without an inherited observer the helper runs its callback normally. Malformed, foreign or stale capabilities fail closed. The callback must contain only the negative test and its teardown, and must not start verification while holding the fixture. A queued scan takes priority over new fixtures. RSS, disk, captured-log limits and cancellation continue while the scan waits; waiting observations do not claim a new filesystem measurement. A fixture that fails to release a waiting scan within five seconds is a stalled reader/teardown failure: the command is terminated through the existing identity-checked cleanup, without stealing the live fixture lease. This is an operation-specific observation-stall bound, not a verification runtime limit. Successful commands and fully cached resumes receive fresh strict scans; ordinary or leaked unsupported entries still fail. Abrupt termination can prevent callback teardown; leaked fixtures remain visible and fail subsequent verification. After existing writer recovery confirms command quiescence, only validated abandoned control metadata from that worktree is retired. No output roots, special-file kinds or byte growth are exempted.
+
 Bounded stage checkpoints bind the limits and sampled observations. Older unmeasured stages and stages with different limits rerun. Current manifests use `ai-delivery.run@3`, bind the worktree and producer, and live under `runs@2/<worktree-digest>/<head>.json`. Bounded manifests also record limits, sample count, and sampled RSS, output, and disk extrema. Historical run versions 1 and 2 remain historical and are available for merged-issue recovery; current publication requires current-producer verification. `processCoverage: "observed-processes-only"` means a passing aggregate is not proof that every detached descendant was drained. A descendant that detaches and closes inherited pipes between samples can evade observation; a pipe holder that prevents command closure fails with unverified cleanup and no checkpoint. Output roots must be canonical and nonoverlapping. Resolvable aliases such as npm `.bin` links may point only within the declared roots; aliases are not traversed or counted twice, and growth of their physical targets remains measured. Escaping, broken and cyclic links fail closed. Output baselines are retained across retries, including failed stages. They are range scoped: a changed baseline regenerates the measured stage proof. Consumers must confirm their command graph remains observable and declare all relevant output roots; this contract does not assert ownership of undeclared output locations or other concurrent writers.
 
 A reviewed policy transition can be verified and published before activating
