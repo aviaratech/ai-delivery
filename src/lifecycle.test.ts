@@ -28,7 +28,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { loadDeliveryConfig, parseDeliveryConfig } from './config/deliveryConfig.js';
-import { digestValue } from './delivery/index.js';
+import { digestValue, stableJson } from './delivery/index.js';
 import { contextFor, executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
 import { defaultBaseRef, gitCommonDir } from './git.js';
 import * as githubClient from './github/client.js';
@@ -249,6 +249,7 @@ function directoryHash(path: string): string {
 async function fixture(
   options: {
     twoStages?: boolean;
+    serialResourceStages?: boolean;
     remote?: string;
     divergentOrigin?: boolean;
     firstStageScript?: string;
@@ -261,6 +262,7 @@ async function fixture(
   root: string;
   counter: string;
   secondCounter: string;
+  thirdCounter: string;
   failSecond: string;
   runtimeEntryPath: string;
 }> {
@@ -268,6 +270,7 @@ async function fixture(
   const remoteName = options.remote ?? 'origin';
   const counter = join(root, '.git', 'stage-count.txt');
   const secondCounter = join(root, '.git', 'second-stage-count.txt');
+  const thirdCounter = join(root, '.git', 'third-stage-count.txt');
   const failSecond = join(root, '.git', 'fail-second-stage');
   try {
     git(root, 'init', '-q', '-b', 'main');
@@ -353,11 +356,18 @@ export default {
         ${options.componentPolicy ? "semanticInputs: [{ key: 'source', digest: bytes(readFileSync(new URL('./artifact.txt', import.meta.url))) }]," : ''}
         resourceClass: 'source_only', commands: [{ label: 'count', argv: [process.execPath, '-e',
           ${JSON.stringify(options.firstStageScript ?? `const fs=require('fs');const p=${JSON.stringify(counter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));`)}] }] }${
-            options.twoStages
+            options.twoStages || options.serialResourceStages
               ? `, { id: 'second', dependsOn: ['check'], semanticInputKeys: ['source'],
         ${options.componentPolicy ? "semanticInputs: [{ key: 'source', digest: bytes(readFileSync(new URL('./component.txt', import.meta.url))) }]," : ''}
-        resourceClass: 'source_only', commands: [{ label: 'retry', argv: [process.execPath, '-e',
+        resourceClass: '${options.serialResourceStages ? 'model' : 'source_only'}', commands: [{ label: 'retry', argv: [process.execPath, '-e',
           ${JSON.stringify(options.secondStageScript ?? `const fs=require('fs');const p=${JSON.stringify(secondCounter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));if(fs.existsSync(${JSON.stringify(failSecond)}))process.exit(7);`)}] }] }`
+              : ''
+          }${
+            options.serialResourceStages
+              ? `, { id: 'postgres', dependsOn: ['second'], semanticInputKeys: ['source'],
+        ${options.componentPolicy ? "semanticInputs: [{ key: 'source', digest: bytes(readFileSync(new URL('./component.txt', import.meta.url))) }]," : ''}
+        resourceClass: 'postgres_docker', commands: [{ label: 'count', argv: [process.execPath, '-e',
+          ${JSON.stringify(`const fs=require('fs');const p=${JSON.stringify(thirdCounter)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1));`)}] }] }`
               : ''
           }],
       risk: 'standard' };
@@ -424,7 +434,7 @@ export default {
     mkdirSync(dirname(admissionPath), { recursive: true });
     if (!options.omitRuntimeAdmission)
       writeFileSync(admissionPath, JSON.stringify({ ...content, admissionId: digestValue(content) }), { mode: 0o600 });
-    return { root, counter, secondCounter, failSecond, runtimeEntryPath };
+    return { root, counter, secondCounter, thirdCounter, failSecond, runtimeEntryPath };
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
     throw error;
@@ -2009,6 +2019,241 @@ test('a bounded passing run records measured resources in versioned evidence', a
       { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' },
     )) as { resources?: { processCoverage?: string } };
     assert.equal(dispatched.resources?.processCoverage, 'observed-processes-only');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  { bounded: false, componentPolicy: false },
+  { bounded: true, componentPolicy: false },
+  { bounded: true, componentPolicy: true },
+])(
+  'serial admission reuses complete stages with bounds $bounded and component policy $componentPolicy',
+  async ({ bounded, componentPolicy }) => {
+    const { root, counter, secondCounter, thirdCounter } = await fixture({
+      serialResourceStages: true,
+      componentPolicy,
+    });
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const input = {
+        issueNumber: 17,
+        repoRoot: row.path,
+        ...(bounded ? { resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 } } : {}),
+      };
+      await assert.rejects(
+        verifyIssue({ ...input, admittedResourceClasses: ['source_only'] }),
+        /Stage 'second' requires explicit model admission/u,
+      );
+      assert.equal(readFileSync(counter, 'utf8'), '1');
+      assert.equal(existsSync(secondCounter), false);
+      assert.equal(existsSync(thirdCounter), false);
+      await assert.rejects(
+        verifyIssue({ ...input, admittedResourceClasses: ['model'] }),
+        /Stage 'postgres' requires explicit postgres_docker admission/u,
+      );
+      assert.equal(readFileSync(counter, 'utf8'), '1');
+      assert.equal(readFileSync(secondCounter, 'utf8'), '1');
+      assert.equal(existsSync(thirdCounter), false);
+      const completed = await verifyIssue({ ...input, admittedResourceClasses: ['postgres_docker'] });
+      const repeated = await verifyIssue({ ...input, admittedResourceClasses: [] });
+      assert.deepEqual(repeated.stageReceipts, completed.stageReceipts);
+      for (const path of [counter, secondCounter, thirdCounter]) assert.equal(readFileSync(path, 'utf8'), '1');
+      if (bounded) {
+        assert.deepEqual(repeated.resources, completed.resources);
+        assert.ok((repeated.resources?.sampleCount ?? 0) > 0);
+        const first = completed.stageReceipts[0]!;
+        const stagePath = join(
+          root,
+          '.git',
+          'ai-delivery',
+          first.input.schemaVersion === 'ai-delivery.stage-input@2' ? 'verification@2' : 'verification@1',
+          'stages',
+          'check',
+          `${first.input.inputId.slice(7)}.json`,
+        );
+        rmSync(stagePath);
+        const repaired = await verifyIssue({ ...input, admittedResourceClasses: [] });
+        assert.deepEqual(repaired.stageReceipts, completed.stageReceipts);
+        assert.deepEqual(repaired.resources, completed.resources);
+        assert.equal(existsSync(stagePath), true);
+        assert.equal(readFileSync(counter, 'utf8'), '1');
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['missing', 'unmeasured', 'source', 'command', 'environment', 'runtime', 'producer', 'bounds'] as const)(
+  'serial admission refuses execution after %s proof invalidation',
+  async (changed) => {
+    const { root, counter, secondCounter, thirdCounter } = await fixture({ serialResourceStages: true });
+    const previousPath = process.env.PATH;
+    const versionDescriptor = Object.getOwnPropertyDescriptor(process, 'version')!;
+    const producerPath = join(import.meta.dirname, 'serial-producer-fixture.js');
+    let producerOwned = false;
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const input = {
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+      };
+      const completed = await verifyIssue({
+        ...(changed === 'unmeasured' ? { issueNumber: input.issueNumber, repoRoot: input.repoRoot } : input),
+        admittedResourceClasses: ['source_only', 'model', 'postgres_docker'],
+      });
+      if (changed === 'missing') {
+        const id = completed.stageReceipts[0]!.input.inputId.slice(7);
+        rmSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check', `${id}.json`));
+        rmSync(join(root, '.git', 'ai-delivery', 'resource-stages@1', `${id}.json`));
+      } else if (changed === 'source' || changed === 'command') {
+        const path = join(row.path, changed === 'source' ? 'change.txt' : 'policy.mjs');
+        writeFileSync(
+          path,
+          changed === 'source'
+            ? 'changed source\n'
+            : readFileSync(path, 'utf8').replace("label: 'count'", "label: 'changed-count'"),
+        );
+        git(row.path, 'add', '.');
+        git(row.path, 'commit', '-qm', 'synthetic checkpoint invalidation');
+      } else if (changed === 'environment') process.env.PATH = `${previousPath ?? ''}:/synthetic-environment`;
+      else if (changed === 'runtime') Object.defineProperty(process, 'version', { value: 'v0.0.0' });
+      else if (changed === 'producer') {
+        assert.equal(existsSync(producerPath), false);
+        writeFileSync(producerPath, '// changed synthetic runner identity\n');
+        producerOwned = true;
+      } else if (changed === 'bounds') input.resourceBounds.maxAggregateRssBytes -= 1;
+      await assert.rejects(
+        verifyIssue({ ...input, admittedResourceClasses: ['postgres_docker'] }),
+        /Stage 'check' requires explicit source_only admission/u,
+      );
+      for (const path of [counter, secondCounter, thirdCounter]) assert.equal(readFileSync(path, 'utf8'), '1');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      Object.defineProperty(process, 'version', versionDescriptor);
+      if (producerOwned) rmSync(producerPath);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([
+  'stage',
+  'canonical',
+  'artifact',
+  'output',
+  'resource',
+  'resource-bounds',
+  'resource-samples',
+  'missing-resource',
+  'baseline',
+] as const)('serial admission rejects corrupt %s proof before considering execution', async (corrupt) => {
+  const { root, counter, secondCounter, thirdCounter } = await fixture({ serialResourceStages: true });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    mkdirSync(join(row.path, '.issue-cli'), { recursive: true });
+    const input = {
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 1_000_000,
+        outputRoots: ['.issue-cli'],
+      },
+    };
+    const completed = await verifyIssue({
+      ...input,
+      admittedResourceClasses: ['source_only', 'model', 'postgres_docker'],
+    });
+    const first = completed.stageReceipts[0]!;
+    const common = join(root, '.git', 'ai-delivery');
+    const id = first.input.inputId.slice(7);
+    const stagePath = join(common, 'verification@1', 'stages', 'check', `${id}.json`);
+    const resourcePath = join(common, 'resource-stages@1', `${id}.json`);
+    if (corrupt === 'stage') writeFileSync(stagePath, 'corrupt stage proof\n');
+    else if (corrupt === 'canonical') writeFileSync(stagePath, `${readFileSync(stagePath, 'utf8')}\n`);
+    else if (corrupt === 'artifact') {
+      const { receiptId: _receiptId, ...content } = first;
+      const altered = { ...content, artifacts: [{ path: 'artifact.txt', digest: digestValue('corrupt artifact') }] };
+      writeFileSync(stagePath, stableJson({ ...altered, receiptId: digestValue(altered) }));
+    } else if (corrupt === 'output') {
+      writeFileSync(
+        join(common, 'verification@1', 'command-output', `${first.commands[0]!.outputDigest.slice(7)}.bin`),
+        'corrupt output',
+      );
+    } else if (corrupt === 'resource') writeFileSync(resourcePath, 'corrupt resource proof\n');
+    else if (corrupt === 'missing-resource') rmSync(resourcePath);
+    else if (corrupt === 'baseline') {
+      const directory = join(common, 'output-baselines@1');
+      const file = readdirSync(directory).find((name) => name.endsWith('.json') && !name.endsWith('.state.json'))!;
+      writeFileSync(join(directory, file), 'corrupt baseline proof\n');
+    } else {
+      const { checkpointId: _checkpointId, ...content } = JSON.parse(readFileSync(resourcePath, 'utf8')) as {
+        checkpointId: string;
+        resources: { bounds: { maxAggregateRssBytes: number }; sampleCount: number };
+      };
+      if (corrupt === 'resource-bounds') content.resources.bounds.maxAggregateRssBytes += 1;
+      else content.resources.sampleCount = 0;
+      writeFileSync(resourcePath, JSON.stringify({ ...content, checkpointId: digestValue(content) }));
+    }
+    await assert.rejects(
+      verifyIssue({ ...input, admittedResourceClasses: ['postgres_docker'] }),
+      (error: unknown) => error instanceof Error && !error.message.includes('admission'),
+    );
+    for (const path of [counter, secondCounter, thirdCounter]) assert.equal(readFileSync(path, 'utf8'), '1');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('serial admission requires dependent execution after a real upstream rerun', async () => {
+  const { root, counter, secondCounter, thirdCounter } = await fixture({ serialResourceStages: true });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const input = {
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: { maxAggregateRssBytes: 1_000_000_000, minFreeDiskBytes: 1 },
+    };
+    const completed = await verifyIssue({
+      ...input,
+      admittedResourceClasses: ['source_only', 'model', 'postgres_docker'],
+    });
+    const id = completed.stageReceipts[0]!.input.inputId.slice(7);
+    rmSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check', `${id}.json`));
+    rmSync(join(root, '.git', 'ai-delivery', 'resource-stages@1', `${id}.json`));
+    await assert.rejects(
+      verifyIssue({ ...input, admittedResourceClasses: ['source_only'] }),
+      /Stage 'second' requires explicit model admission/u,
+    );
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '1');
+    assert.equal(readFileSync(thirdCounter, 'utf8'), '1');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1779,9 +1779,6 @@ async function verifyIssueOwned(
   };
   for (const stage of classification.requiredStages) {
     assertNotCancelled();
-    if (!admitted.has(stage.resourceClass)) {
-      throw new DeliveryError(`Stage '${stage.id}' requires explicit ${stage.resourceClass} admission.`);
-    }
     const stageInput = createRepositoryStageInput({
       classification,
       environmentDigest,
@@ -1845,6 +1842,9 @@ async function verifyIssueOwned(
       continue;
     }
     assertNotCancelled();
+    if (!admitted.has(stage.resourceClass)) {
+      throw new DeliveryError(`Stage '${stage.id}' requires explicit ${stage.resourceClass} admission.`);
+    }
     stageResources = normalizedBounds === undefined ? undefined : emptyResources();
     const startedAt = new Date().toISOString();
     const commands: { exitCode: number; label: string; outputDigest: string }[] = [];
