@@ -659,7 +659,7 @@ test('an old active issue remains pinned while a new row uses the same canonical
       /ownership witness/u,
     );
     await assert.rejects(
-      updateIssue(relationshipContext, { issueNumber: 19, parentIssueNumber: null }),
+      updateIssue(relationshipContext, { issueNumber: 17, parentIssueNumber: null }),
       /ownership witness/u,
     );
     assert.equal(issueWrites, 0);
@@ -681,6 +681,183 @@ test('an old active issue remains pinned while a new row uses the same canonical
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test.each(['current-blocker', 'new-blocker', 'current-parent', 'new-parent'] as const)(
+  'tracking-only relationships preserve the related legacy worktree for %s',
+  async (relationship) => {
+    const { root } = await fixture();
+    try {
+      const legacyPath = join(root, '.worktrees', 'issue-17');
+      git(root, 'worktree', 'add', '-b', 'issue/17', legacyPath, 'main');
+      writeFileSync(join(legacyPath, 'artifact.txt'), 'legacy source remains untouched\n');
+      const evidencePath = join(root, '.git', 'legacy-evidence');
+      mkdirSync(evidencePath);
+      writeFileSync(join(evidencePath, 'receipt.json'), '{"producer":"synthetic-legacy"}\n');
+      const legacy = {
+        branch: 'issue/17',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        identity: 'synthetic-legacy',
+        issueNumber: 17,
+        path: legacyPath,
+        status: 'active',
+        type: 'issue',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      };
+      const registryPath = join(root, '.issue-cli', 'worktrees.json');
+      mkdirSync(dirname(registryPath), { recursive: true });
+      const registryBytes = JSON.stringify({ worktrees: [legacy] });
+      writeFileSync(registryPath, registryBytes);
+      const sourceBefore = directoryHash(legacyPath);
+      const evidenceBefore = directoryHash(evidencePath);
+      const loaded = await loadDeliveryConfig(root);
+      const pageInfo = { endCursor: null, hasNextPage: false };
+      let parent = relationship === 'current-parent' ? 17 : null;
+      let blockers = relationship === 'current-blocker' ? [17] : [];
+      let missingRelated = true;
+      let malformedRelationships = false;
+      let writes = 0;
+      let projectOption = 'STATUS-0';
+      const statuses = ['Queued', 'Active', 'Waiting', 'Shipped'];
+      const projectItem = () => ({
+        id: 'ITEM-19',
+        isArchived: false,
+        content: { id: 'ISSUE-19' },
+        fieldValueByName: { name: statuses[Number(projectOption.slice(-1))], optionId: projectOption },
+      });
+      const context = {
+        root,
+        repo: { owner: 'example', repo: 'widget' },
+        config: loaded.config,
+        clients: {
+          rest: {
+            request: async (route: string, input: { owner: string; repo: string }) => {
+              assert.equal(input.owner, 'example');
+              assert.equal(input.repo, 'widget');
+              assert.equal(route, 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values');
+              return { data: [] };
+            },
+            issues: {
+              get: async (input: { issue_number: number; owner: string; repo: string }) => {
+                assert.equal(input.owner, 'example');
+                assert.equal(input.repo, 'widget');
+                if (input.issue_number === 17 && missingRelated) throw new Error('Synthetic issue not found');
+                return {
+                  data: {
+                    id: input.issue_number * 10,
+                    number: input.issue_number,
+                    node_id: `ISSUE-${String(input.issue_number)}`,
+                    title: 'Synthetic tracking issue',
+                    state: 'open',
+                    html_url: `https://example.test/issues/${String(input.issue_number)}`,
+                  },
+                };
+              },
+              update: async () => {
+                writes += 1;
+                return { data: {} };
+              },
+              removeSubIssue: async (input: { issue_number: number; sub_issue_id: number }) => {
+                assert.equal(input.issue_number, 17);
+                assert.equal(input.sub_issue_id, 190);
+                writes += 1;
+                parent = null;
+                return { data: {} };
+              },
+              addSubIssue: async (input: { issue_number: number; sub_issue_id: number }) => {
+                assert.equal(input.issue_number, 17);
+                assert.equal(input.sub_issue_id, 190);
+                writes += 1;
+                parent = 17;
+                return { data: {} };
+              },
+              listSubIssues: async () => ({ data: [] }),
+            },
+            paginate: async () => (parent === 17 ? [{ number: 19 }] : []),
+          },
+          graphql: async (query: string, variables: Record<string, unknown>) => {
+            if (query.includes('blockedBy(first:')) {
+              assert.equal(variables.owner, 'example');
+              assert.equal(variables.name, 'widget');
+              assert.equal(variables.number, 19);
+              if (malformedRelationships) return { repository: null };
+              return {
+                repository: {
+                  issue: {
+                    parent: parent === null ? null : { id: 'ISSUE-17', number: parent },
+                    blockedBy: {
+                      nodes: blockers.map((number) => ({
+                        id: `ISSUE-${String(number)}`,
+                        number,
+                        state: 'OPEN',
+                        title: 'Synthetic blocker',
+                      })),
+                      pageInfo,
+                    },
+                  },
+                },
+              };
+            }
+            if (query.includes('removeBlockedBy') || query.includes('addBlockedBy')) {
+              assert.equal(variables.issue, 'ISSUE-19');
+              assert.equal(variables.blocking, 'ISSUE-17');
+              writes += 1;
+              blockers = query.includes('addBlockedBy') ? [17] : [];
+              return {};
+            }
+            if (query.includes('ProjectDeliveryItems'))
+              return { organization: { projectV2: { items: { nodes: [projectItem()], pageInfo } } } };
+            if (query.includes('UpdateProjectDeliveryStatus')) {
+              projectOption = String(variables.optionId);
+              writes += 1;
+              return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM-19' } } };
+            }
+            if (query.includes('ProjectDeliveryItemReadback'))
+              return { node: { ...projectItem(), project: { id: 'PROJECT-1', number: 1 } } };
+            return syntheticDiscoveryClients().graphql(query, variables);
+          },
+        },
+      } as unknown as DeliveryContext;
+      const input = relationship.endsWith('blocker')
+        ? { issueNumber: 19, blockedBy: relationship === 'new-blocker' ? [17] : [] }
+        : { issueNumber: 19, parentIssueNumber: relationship === 'new-parent' ? 17 : null };
+      await assert.rejects(updateIssue(context, input), /Unable to resolve (?:blocker|parent) issue/u);
+      assert.equal(writes, 0);
+      missingRelated = false;
+      malformedRelationships = true;
+      await assert.rejects(updateIssue(context, input), /invalid blocked-by relationship evidence/u);
+      assert.equal(writes, 0);
+      malformedRelationships = false;
+      await assert.rejects(updateIssue(context, { ...input, issueNumber: 17 }), /ownership witness/u);
+      assert.equal(writes, 0);
+      writeFileSync(registryPath, JSON.stringify({ worktrees: [{ ...legacy, schemaVersion: 'unknown@99' }] }));
+      await assert.rejects(updateIssue(context, input), /unsupported fields/u);
+      assert.equal(writes, 0);
+      writeFileSync(registryPath, registryBytes);
+      const transitionPath = join(root, '.git', 'ai-delivery', 'worktree-owners', 'issue-19.transition.json');
+      mkdirSync(dirname(transitionPath), { recursive: true });
+      writeFileSync(transitionPath, '{"schemaVersion":"unknown-transition@99"}', { mode: 0o600 });
+      await assert.rejects(updateIssue(context, input), /transition is incomplete or unreadable/u);
+      assert.equal(writes, 0);
+      unlinkSync(transitionPath);
+      const result = await updateIssue(context, input);
+      assert.equal(result.worktree, null);
+      assert.deepEqual(result.blockedBy, relationship === 'new-blocker' ? [17] : []);
+      assert.equal(result.parentIssueNumber, relationship === 'new-parent' ? 17 : null);
+      assert.equal(result.projectStatus, relationship === 'new-blocker' ? 'Blocked' : 'Todo');
+      assert.ok(writes > 0);
+      await assert.rejects(
+        prepareIssueWorktree({ identity: 'synthetic-author', issueNumber: 17, repoRoot: root }),
+        /ownership witness/u,
+      );
+      await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: legacyPath }), /ownership witness/u);
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes);
+      assert.equal(directoryHash(legacyPath), sourceBefore);
+      assert.equal(directoryHash(evidencePath), evidenceBefore);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('synthetic cutover restores exact pre-write state and resumes an incomplete verification stage', async () => {
   const { root, counter, secondCounter, failSecond } = await fixture({ twoStages: true });
