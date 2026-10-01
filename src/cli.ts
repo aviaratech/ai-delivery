@@ -20,7 +20,7 @@ const program = new Command();
 program
   .name('ai-delivery')
   .description('Generic GitHub issue and pull request delivery')
-  .version('0.3.5')
+  .version('0.3.6')
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit legacy personal-token author override')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
@@ -373,6 +373,42 @@ program
   .requiredOption('--name <name>')
   .requiredOption('--branch <branch>')
   .action(async (o: { name: string; branch: string }) => run('issue_worktree_create', o));
+program
+  .command('worktree:transition:inspect')
+  .requiredOption('--issue <number>')
+  .requiredOption('--purpose <purpose>', 'active-resume or merged-cleanup')
+  .option('--disposition <disposition>', 'retain (default) or explicitly unheld remove')
+  .option('--terminal-pr <number>')
+  .option('--retained-holds <comment-ids>', 'Comma-separated native retained-hold comment IDs')
+  .option('--retained-admission <path>')
+  .option('--retained-archive <path>')
+  .action(async (o: Record<string, string | undefined>) =>
+    run('issue_worktree_transition_inspect', {
+      issueNumber: int(o.issue),
+      purpose: o.purpose,
+      ...(o.disposition === undefined ? {} : { disposition: o.disposition }),
+      ...(o.terminalPr === undefined ? {} : { terminalPrNumber: int(o.terminalPr) }),
+      ...(o.retainedHolds === undefined ? {} : { retainedHoldCommentIds: ints(o.retainedHolds) }),
+      ...(o.retainedAdmission === undefined ? {} : { retainedAdmissionPath: o.retainedAdmission }),
+      ...(o.retainedArchive === undefined ? {} : { retainedArchivePath: o.retainedArchive }),
+    }),
+  );
+program
+  .command('worktree:transition:apply')
+  .requiredOption('--plan <path>')
+  .requiredOption('--plan-id <digest>')
+  .requiredOption('--relinquishment-comment <id>')
+  .requiredOption('--acceptance-comment <id>')
+  .option('--authorize-transition', 'Explicit authority for this exact independently accepted plan')
+  .action(async (o: Record<string, string | boolean>) =>
+    run('issue_worktree_transition_apply', {
+      authority: o.authorizeTransition === true ? 'worktree:transition' : '',
+      planPath: o.plan,
+      expectedPlanId: o.planId,
+      relinquishmentCommentId: Number(o.relinquishmentComment),
+      acceptanceCommentId: Number(o.acceptanceComment),
+    }),
+  );
 program.command('worktrees:list').action(() => print(listWorktreesStrict(primaryGitRoot(execution().repoRoot))));
 program.command('worktrees:status').action(() => {
   const root = primaryGitRoot(execution().repoRoot);

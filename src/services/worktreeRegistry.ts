@@ -1,9 +1,10 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-import { assertPrivateFile, writeCreateOnly } from '../delivery/common.js';
+import { assertPrivateFile, stableJson, writeCreateOnly } from '../delivery/common.js';
 import { digestValue } from '../delivery/index.js';
 import { gitCommonDir } from '../git.js';
+import type { WorktreeTransitionPlan } from '../worktreeTransition.js';
 import { logInfo, logWarn } from '../logger.js';
 import { ensureDataDirectory, ISSUE_CLI_DATA_DIR } from '../utils/filesystem.js';
 import { writeJsonFileAtomically } from '../utils/atomicJson.js';
@@ -49,8 +50,66 @@ function ownerPath(root: string, entry: WorktreeEntry): string {
   return join(gitCommonDir(root), 'ai-delivery', 'worktree-owners', `${id}.json`);
 }
 
+function assertNoIncompleteWorktreeTransition(entry: WorktreeEntry, root: string): void {
+  if (entry.type !== 'issue' || entry.issueNumber === undefined) return;
+  const path = join(
+    gitCommonDir(root),
+    'ai-delivery',
+    'worktree-owners',
+    `issue-${String(entry.issueNumber)}.transition.json`,
+  );
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw new Error('Worktree transition is incomplete or unreadable.');
+  }
+  try {
+    const intent = JSON.parse(assertPrivateFile(path).toString('utf8')) as {
+      schemaVersion: string;
+      intentId: string;
+      plan: WorktreeTransitionPlan;
+    };
+    const { intentId, ...content } = intent;
+    const { planId, ...planContent } = intent.plan;
+    if (
+      intent.schemaVersion !== 'ai-delivery.worktree-transition-intent@1' ||
+      intentId !== digestValue(content) ||
+      planId !== digestValue(planContent) ||
+      intent.plan.repoRoot !== resolve(root) ||
+      intent.plan.row.issueNumber !== entry.issueNumber
+    )
+      throw new Error('Invalid transition intent.');
+    if (intent.plan.purpose === 'merged-cleanup')
+      throw new Error('Worktree transition is terminal and cannot authorize ordinary source operations.');
+    const completionPath = join(`${path}.evidence`, 'completion.json');
+    const completion = JSON.parse(assertPrivateFile(completionPath).toString('utf8')) as {
+      schemaVersion: string;
+      planId: string;
+      intentId: string;
+      completed: boolean;
+      completionId: string;
+    };
+    const { completionId, ...completionContent } = completion;
+    if (
+      completion.schemaVersion !== 'ai-delivery.worktree-transition-completion@1' ||
+      completion.planId !== planId ||
+      completion.intentId !== intentId ||
+      completion.completed !== true ||
+      completionId !== digestValue(completionContent) ||
+      JSON.stringify(ownerContent(entry)) !== JSON.stringify(ownerContent(intent.plan.row as WorktreeEntry))
+    )
+      throw new Error('Invalid transition completion.');
+    return;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('transition is terminal')) throw error;
+    throw new Error('Worktree transition is incomplete or unreadable; resume its exact approved plan.');
+  }
+}
+
 /** An immutable witness separates new rows from legacy rows in the same canonical registry. */
 export function assertAiDeliveryWorktreeOwner(entry: WorktreeEntry, root: string): void {
+  assertNoIncompleteWorktreeTransition(entry, root);
   const content = ownerContent(entry);
   const path = ownerPath(root, entry);
   let stored: unknown;
@@ -64,10 +123,132 @@ export function assertAiDeliveryWorktreeOwner(entry: WorktreeEntry, root: string
   }
 }
 
-function writeWorktreeOwner(entry: WorktreeEntry, root: string): void {
+/** Ordinary source mutations also refuse terminal/pending issue intent after the row was removed. */
+export function assertIssueWorktreeTransitionAdmission(issueNumber: number, root: string): void {
+  const path = join(
+    gitCommonDir(root),
+    'ai-delivery',
+    'worktree-owners',
+    `issue-${String(issueNumber)}.transition.json`,
+  );
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw new Error('Worktree transition is incomplete or unreadable.');
+  }
+  let row: WorktreeEntry;
+  try {
+    row = (JSON.parse(assertPrivateFile(path).toString('utf8')) as { plan: { row: WorktreeEntry } }).plan.row;
+    if (row.type !== 'issue' || row.issueNumber !== issueNumber)
+      throw new Error('Transition embedded issue identity disagrees.');
+  } catch {
+    throw new Error('Worktree transition is incomplete or unreadable.');
+  }
+  assertNoIncompleteWorktreeTransition(row, root);
+}
+
+function writeWorktreeOwner(entry: WorktreeEntry, root: string, transition = false): void {
   const content = ownerContent(entry);
   writeCreateOnly(ownerPath(root, entry), Buffer.from(JSON.stringify({ ...content, ownerId: digestValue(content) })));
-  assertAiDeliveryWorktreeOwner(entry, root);
+  if (!transition) assertAiDeliveryWorktreeOwner(entry, root);
+}
+
+/** @internal The explicit transition owner holds the existing registry lock through its exact planned mutation. */
+export async function withWorktreeTransitionRegistry<T>(
+  plan: WorktreeTransitionPlan,
+  operation: (input: {
+    current: WorktreeEntry | undefined;
+    writeOwner(this: void): void;
+    commitRow(this: void): WorktreeEntry;
+    removeRow(this: void): void;
+  }) => Promise<T>,
+): Promise<T> {
+  const root = plan.repoRoot;
+  ensureRegistryDirectory(root);
+  return withLock(REGISTRY_PATH, {
+    projectRoot: root,
+    timeout: 5000,
+    operation: async () => {
+      const registry = loadRegistryStrict(root);
+      const matches = registry.worktrees.filter(
+        (entry) => entry.type === 'issue' && entry.issueNumber === plan.row.issueNumber,
+      );
+      if (matches.length > 1) throw new Error('Transition has duplicate canonical issue rows.');
+      if (
+        registry.worktrees.some(
+          (entry) => !matches.includes(entry) && registryIdentitiesOverlap(entry, plan.row as WorktreeEntry),
+        )
+      )
+        throw new Error('Transition conflicts with another canonical registry path, branch or PR identity.');
+      let current = matches[0];
+      const original: WorktreeEntry = {
+        ...plan.row,
+        ...(plan.row.prNumber === undefined ? {} : { prNumber: plan.row.prNumber }),
+      } as WorktreeEntry;
+      const replacement: WorktreeEntry =
+        plan.purpose === 'active-resume'
+          ? original
+          : {
+              ...original,
+              prNumber: plan.terminalPrNumber!,
+              status: 'merged',
+            };
+      if (
+        current !== undefined &&
+        ![original, replacement].some((allowed) => stableJson(current) === stableJson(allowed))
+      )
+        throw new Error('Transition canonical row drifted.');
+      const intentPath = join(
+        gitCommonDir(root),
+        'ai-delivery',
+        'worktree-owners',
+        `issue-${String(plan.row.issueNumber)}.transition.json`,
+      );
+      const requireIntent = () => {
+        const intent = JSON.parse(assertPrivateFile(intentPath).toString('utf8')) as { plan?: { planId?: string } };
+        if (intent.plan?.planId !== plan.planId) throw new Error('Transition lacks its exact durable intent.');
+      };
+      return operation({
+        current,
+        writeOwner: () => {
+          requireIntent();
+          writeWorktreeOwner(replacement, root, true);
+        },
+        commitRow: () => {
+          requireIntent();
+          if (current === undefined) throw new Error('Transition cannot recreate a removed canonical row.');
+          registry.worktrees.splice(registry.worktrees.indexOf(current), 1, replacement);
+          current = replacement;
+          saveRegistryStrict(root, registry);
+          return replacement;
+        },
+        removeRow: () => {
+          requireIntent();
+          if (
+            plan.purpose !== 'merged-cleanup' ||
+            plan.disposition !== 'remove' ||
+            plan.retainedHoldCommentIds.length !== 0
+          )
+            throw new Error('Transition lacks explicit unheld terminal source disposition.');
+          if (current !== undefined) {
+            registry.worktrees.splice(registry.worktrees.indexOf(current), 1);
+            saveRegistryStrict(root, registry);
+            current = undefined;
+          }
+        },
+      });
+    },
+  });
+}
+
+/** @internal Validate the existing immutable witness without granting ordinary terminal admission. */
+export function assertTransitionOwnerWitness(plan: WorktreeTransitionPlan): void {
+  const row = plan.row as WorktreeEntry;
+  const content = ownerContent(row);
+  const stored = JSON.parse(assertPrivateFile(ownerPath(plan.repoRoot, row)).toString('utf8')) as unknown;
+  if (stableJson(stored) !== stableJson({ ...content, ownerId: digestValue(content) }))
+    throw new Error('Sealed transition owner witness drifted.');
 }
 
 /**
@@ -114,6 +295,7 @@ export async function addWorktreeEntry(entry: WorktreeEntry, projectRoot?: strin
       logWarn(LOCK_RETRY_MESSAGE);
     },
     operation: () => {
+      assertNoIncompleteWorktreeTransition(normalizedEntry, root);
       const registry = loadRegistryStrict(root);
 
       const collisions = registry.worktrees.filter((existing) => registryIdentitiesOverlap(existing, normalizedEntry));
@@ -167,6 +349,7 @@ export function getIssueWorktreeStrict(issueNumber: number, projectRoot?: string
 
 /** Tracking writes may target an issue without a worktree, but never adopt a foreign active row. */
 export function assertNoForeignIssueWorktree(issueNumber: number, root: string): void {
+  assertIssueWorktreeTransitionAdmission(issueNumber, root);
   const matches = listWorktreesStrict(root).filter(
     (entry) => entry.type === 'issue' && entry.issueNumber === issueNumber,
   );

@@ -4,10 +4,12 @@ import { join, relative, resolve } from 'node:path';
 import { resolveGitRemoteName } from './github/repo.js';
 
 import { DeliveryError } from './errors.js';
+import type { WorktreeTransitionPlan } from './worktreeTransition.js';
 import { assertClean, defaultBaseRef, git, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
 import {
   addWorktreeEntry,
   assertAiDeliveryWorktreeOwner,
+  assertIssueWorktreeTransitionAdmission,
   getIssueWorktreeStrict,
   listWorktreesStrict,
   removeWorktreeEntry,
@@ -34,6 +36,7 @@ export async function prepareIssueWorktree(input: {
 }): Promise<WorktreeEntry> {
   assertIssueNumber(input.issueNumber);
   const root = primaryGitRoot(input.repoRoot);
+  assertIssueWorktreeTransitionAdmission(input.issueNumber, root);
   const branch = `issue/${input.issueNumber}`;
   const target = join(root, '.worktrees', `issue-${input.issueNumber}`);
   assertSafePath(root, target);
@@ -276,27 +279,38 @@ export async function cleanupMergedIssueWorktree(input: {
   assertIssueNumber(input.issueNumber);
   const root = primaryGitRoot(input.repoRoot);
   const row = getIssueWorktreeStrict(input.issueNumber, root);
+  removeMergedIssueSource(row, root, input.remote, input.merge, input.afterRemoval !== undefined);
+  await input.afterRemoval?.();
+  await removeWorktreeEntry(row.path, root);
+}
+
+function removeMergedIssueSource(
+  row: WorktreeEntry,
+  root: string,
+  remote: string | undefined,
+  attestation: MergeCleanupAttestation | undefined,
+  allowAbsent: boolean,
+): void {
   assertSafePath(root, row.path);
-  if (row.status !== 'merged' || row.path !== join(root, '.worktrees', `issue-${input.issueNumber}`)) {
+  if (row.status !== 'merged' || row.path !== join(root, '.worktrees', `issue-${String(row.issueNumber)}`)) {
     throw new DeliveryError('Only the exact registered merged issue worktree can be cleaned.');
   }
   const present = existsSync(row.path);
   if (present && gitRoot(row.path) !== realpathSync(row.path)) {
     throw new DeliveryError('Registered worktree points elsewhere.');
   }
-  if (!present && input.afterRemoval === undefined) {
+  if (!present && !allowAbsent) {
     throw new DeliveryError('Registered worktree is missing.');
   }
   if (present) assertClean(row.path);
-  const base = defaultBaseRef(root, input.remote);
+  const base = defaultBaseRef(root, remote);
   const branchIncluded = gitExitCode(root, 'merge-base', '--is-ancestor', row.branch, base) === 0;
-  const attestation = input.merge;
   if (attestation) {
     if (
       attestation.headBranch !== row.branch ||
       attestation.headSha !== git(present ? row.path : root, 'rev-parse', present ? 'HEAD' : row.branch) ||
       (attestation.remoteHeadSha !== null && attestation.remoteHeadSha !== attestation.headSha) ||
-      attestation.baseBranch !== base.slice(`refs/remotes/${resolveGitRemoteName(root, input.remote)}/`.length) ||
+      attestation.baseBranch !== base.slice(`refs/remotes/${resolveGitRemoteName(root, remote)}/`.length) ||
       attestation.remoteBaseSha !== git(root, 'rev-parse', base) ||
       gitExitCode(root, 'merge-base', '--is-ancestor', attestation.baseSha, attestation.mergeSha) !== 0 ||
       gitExitCode(root, 'merge-base', '--is-ancestor', attestation.mergeSha, base) !== 0 ||
@@ -311,6 +325,39 @@ export async function cleanupMergedIssueWorktree(input: {
     );
   }
   if (present) git(root, 'worktree', 'remove', row.path);
-  await input.afterRemoval?.();
-  await removeWorktreeEntry(row.path, root);
+}
+
+/** @internal Exact terminal transition uses the existing non-force removal and retaining-ref proof. */
+export function removeMergedSourceForTransition(plan: WorktreeTransitionPlan, remote: string | undefined): void {
+  if (plan.purpose !== 'merged-cleanup' || plan.disposition !== 'remove' || plan.retainedHoldCommentIds.length !== 0)
+    throw new DeliveryError('Transition cannot remove held or nonterminal source.');
+  const terminal = plan.lineage.find((pr) => pr.prNumber === plan.terminalPrNumber);
+  if (!terminal?.merged || !terminal.mergeSha)
+    throw new DeliveryError('Transition lacks exact native terminal merge lineage.');
+  const mergeTree = git(plan.repoRoot, 'rev-parse', `${terminal.mergeSha}^{tree}`);
+  const strategy =
+    gitExitCode(plan.repoRoot, 'merge-base', '--is-ancestor', plan.head.sha, terminal.mergeSha) === 0
+      ? 'merge'
+      : 'squash';
+  if (strategy === 'squash' && mergeTree !== plan.head.tree)
+    throw new DeliveryError('Transition lacks exact retained tree proof for non-merge source removal.');
+  if (!plan.remoteRefs || (plan.remoteRefs.headSha !== null && plan.remoteRefs.headSha !== plan.head.sha))
+    throw new DeliveryError('Transition lacks exact authenticated remote branch readback.');
+  removeMergedIssueSource(
+    { ...plan.row, status: 'merged', prNumber: terminal.prNumber } as WorktreeEntry,
+    plan.repoRoot,
+    remote,
+    {
+      baseBranch: terminal.baseBranch,
+      baseSha: terminal.baseSha,
+      headBranch: plan.row.branch,
+      headSha: plan.head.sha,
+      mergeSha: terminal.mergeSha,
+      mergeTree,
+      remoteBaseSha: plan.remoteRefs.baseSha,
+      remoteHeadSha: plan.remoteRefs.headSha,
+      strategy,
+    },
+    true,
+  );
 }
