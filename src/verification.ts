@@ -8,6 +8,9 @@ import {
   openSync,
   unlinkSync,
   lstatSync,
+  mkdirSync,
+  rmdirSync,
+  renameSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -212,7 +215,271 @@ function assertResourceBounds(bounds: VerificationResourceBounds): void {
   if (process.platform === 'win32') throw new DeliveryError('Resource observation requires POSIX process support.');
 }
 
+const OUTPUT_GATE_ENV = 'AI_DELIVERY_OUTPUT_OBSERVATION_GATE';
+const GateOwnerSchema = z.strictObject({ pid: z.number().int().positive(), identity: z.string().min(1) });
+const OutputGateSchema = z.strictObject({ directory: z.string().min(1), id: z.uuid(), owner: GateOwnerSchema });
+const GateClaimSchema = z.strictObject({
+  gateId: z.uuid(),
+  id: z.uuid(),
+  kind: z.enum(['scan', 'fixture']),
+  owner: GateOwnerSchema,
+});
+type OutputGate = z.infer<typeof OutputGateSchema>;
+type GateClaim = z.infer<typeof GateClaimSchema>;
+
+function gateOwner(): z.infer<typeof GateOwnerSchema> {
+  const owner = processSnapshot().get(process.pid);
+  if (!owner) throw new DeliveryError('Filesystem observation gate owner is unavailable.');
+  return { pid: owner.pid, identity: owner.identity };
+}
+
+function assertGateDirectory(path: string): void {
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || (metadata.mode & 0o077) !== 0 || realpathSync(path) !== path)
+    throw new DeliveryError('Filesystem observation gate directory is invalid.');
+}
+
+function readOutputGate(value: string): OutputGate {
+  try {
+    const gate = OutputGateSchema.parse(JSON.parse(value) as unknown);
+    assertOutputGate(gate);
+    return gate;
+  } catch (error) {
+    throw new DeliveryError(
+      'Filesystem observation gate capability is invalid or stale: ' +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
+}
+
+function gateOwnerAlive(owner: z.infer<typeof GateOwnerSchema>, snapshot = processSnapshot()): boolean {
+  const current = snapshot.get(owner.pid);
+  return current?.identity === owner.identity && !current.status.startsWith('Z');
+}
+
+function assertOutputGate(gate: OutputGate, abandoned = false): void {
+  assertGateDirectory(gate.directory);
+  const manifest = OutputGateSchema.parse(
+    JSON.parse(assertPrivateFile(join(gate.directory, 'gate.json')).toString('utf8')) as unknown,
+  );
+  const snapshot = processSnapshot();
+  let actor = snapshot.get(process.pid);
+  const ancestors = new Set<number>();
+  while (actor && actor.pid !== gate.owner.pid && !ancestors.has(actor.pid)) {
+    ancestors.add(actor.pid);
+    actor = snapshot.get(actor.ppid);
+  }
+  if (
+    digestValue(manifest) !== digestValue(gate) ||
+    (abandoned
+      ? gateOwnerAlive(gate.owner, snapshot)
+      : !gateOwnerAlive(gate.owner, snapshot) || actor?.identity !== gate.owner.identity)
+  )
+    throw new DeliveryError(
+      'Filesystem observation gate ownership changed, was abandoned or is not an inherited ancestor.',
+    );
+}
+
+function readGateClaim(gate: OutputGate, path: string): GateClaim {
+  const claim = GateClaimSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')) as unknown);
+  if (claim.gateId !== gate.id) throw new DeliveryError('Filesystem observation gate claim belongs to another run.');
+  return claim;
+}
+
+function gateScanRequests(gate: OutputGate): string[] {
+  const directory = join(gate.directory, 'requests');
+  assertGateDirectory(directory);
+  const requests = readdirSync(directory);
+  if (requests.length > 1024 || requests.some((name) => !/^[a-f0-9-]{36}\.json$/u.test(name)))
+    throw new DeliveryError('Filesystem observation gate scan requests are invalid.');
+  const live: string[] = [];
+  const snapshot = processSnapshot();
+  for (const name of requests) {
+    let claim: GateClaim;
+    try {
+      claim = readGateClaim(gate, join(directory, name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (claim.kind !== 'scan' || name !== claim.id + '.json' || !gateOwnerAlive(claim.owner, snapshot))
+      throw new DeliveryError('Filesystem observation gate scan request was abandoned.');
+    live.push(name);
+  }
+  return live;
+}
+
+function removeGateClaim(gate: OutputGate, path: string, claim: GateClaim): void {
+  if (digestValue(readGateClaim(gate, path)) !== digestValue(claim))
+    throw new DeliveryError('Filesystem observation gate claim changed before release.');
+  unlinkSync(path);
+}
+
+async function withOutputGateLock<T>(
+  gate: OutputGate | undefined,
+  kind: 'scan' | 'fixture',
+  operation: () => T | Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!gate) return operation();
+  assertOutputGate(gate);
+  const claim: GateClaim = { gateId: gate.id, id: randomUUID(), kind, owner: gateOwner() };
+  const request = kind === 'scan' ? join(gate.directory, 'requests', claim.id + '.json') : undefined;
+  const lock = join(gate.directory, 'held');
+  const holder = join(lock, 'owner.json');
+  if (request) {
+    const staging = join(gate.directory, claim.id + '.pending');
+    writePrivateJsonFileAtomically(staging, claim);
+    renameSync(staging, request);
+  }
+  let acquired: { dev: number; ino: number } | undefined;
+  let incompleteSince: number | undefined;
+  let fixtureWait: { claimId: string; since: number } | undefined;
+  const release = (): void => {
+    if (!acquired) return;
+    const metadata = lstatSync(lock);
+    if (!metadata.isDirectory() || metadata.dev !== acquired.dev || metadata.ino !== acquired.ino)
+      throw new DeliveryError('Filesystem observation gate lock changed before release.');
+    if (readdirSync(lock).join(',') !== 'owner.json')
+      throw new DeliveryError('Filesystem observation gate lock has unrelated metadata.');
+    removeGateClaim(gate, holder, claim);
+    rmdirSync(lock);
+    acquired = undefined;
+  };
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new DeliveryError('Filesystem observation gate wait cancelled.');
+      assertOutputGate(gate);
+      const requests = gateScanRequests(gate);
+      if (kind === 'scan' || requests.length === 0) {
+        let created = false;
+        try {
+          mkdirSync(lock, { mode: 0o700 });
+          created = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        if (created) {
+          const metadata = lstatSync(lock);
+          acquired = { dev: metadata.dev, ino: metadata.ino };
+          writePrivateJsonFileAtomically(holder, claim);
+          // A scan may queue between the fixture's request check and atomic lock acquisition.
+          if (kind === 'scan' || gateScanRequests(gate).length === 0) return await operation();
+          release();
+        }
+      }
+      if (existsSync(lock)) {
+        try {
+          assertGateDirectory(lock);
+          const current = readGateClaim(gate, holder);
+          incompleteSince = undefined;
+          if (!gateOwnerAlive(current.owner))
+            throw new DeliveryError('Filesystem observation gate fixture or scanner was abandoned.');
+          if (kind === 'scan' && current.kind === 'fixture') {
+            if (fixtureWait?.claimId !== current.id) fixtureWait = { claimId: current.id, since: Date.now() };
+            // A negative reader that blocks prevents strict output observation; terminate this command, never steal its live lease.
+            if (Date.now() - fixtureWait.since > 5000)
+              throw new DeliveryError(
+                'Filesystem-negative fixture did not release a waiting output scan within 5 seconds; reader or teardown is stalled.',
+              );
+          } else fixtureWait = undefined;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          incompleteSince ??= Date.now();
+          // A concrete publication failure, never an elapsed fixture-work allowance or stale-lock takeover.
+          if (Date.now() - incompleteSince > 2000)
+            throw new DeliveryError('Filesystem observation gate owner publication is incomplete.');
+        }
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+  } finally {
+    try {
+      release();
+    } finally {
+      if (request) removeGateClaim(gate, request, claim);
+    }
+  }
+}
+
+/** Run a real filesystem-negative fixture between strict scans; the callback must clean it up before returning. */
+export async function withVerificationFilesystemFixture<T>(operation: () => T | Promise<T>): Promise<T> {
+  const capability = process.env[OUTPUT_GATE_ENV];
+  return withOutputGateLock(capability === undefined ? undefined : readOutputGate(capability), 'fixture', operation);
+}
+
+function retireOutputGate(gate: OutputGate, abandoned = false): void {
+  assertOutputGate(gate, abandoned);
+  const requests = join(gate.directory, 'requests');
+  const held = join(gate.directory, 'held');
+  if (readdirSync(gate.directory).some((name) => !['gate.json', 'requests', 'held'].includes(name)))
+    throw new DeliveryError('Filesystem observation gate has unrelated or incomplete metadata.');
+  if (existsSync(held)) {
+    assertGateDirectory(held);
+    if (readdirSync(held).join(',') !== 'owner.json')
+      throw new DeliveryError('Filesystem observation gate lock has unrelated metadata.');
+    const claim = readGateClaim(gate, join(held, 'owner.json'));
+    if (gateOwnerAlive(claim.owner)) throw new DeliveryError('Filesystem observation gate still has a live holder.');
+    removeGateClaim(gate, join(held, 'owner.json'), claim);
+    rmdirSync(held);
+  }
+  for (const name of readdirSync(requests)) {
+    if (!/^[a-f0-9-]{36}\.json$/u.test(name))
+      throw new DeliveryError('Filesystem observation gate has unrelated metadata.');
+    const path = join(requests, name);
+    const claim = readGateClaim(gate, path);
+    if (claim.kind !== 'scan' || name !== claim.id + '.json')
+      throw new DeliveryError('Filesystem observation gate has unrelated scan metadata.');
+    if (gateOwnerAlive(claim.owner))
+      throw new DeliveryError('Filesystem observation gate still has a live scan request.');
+    removeGateClaim(gate, path, claim);
+  }
+  rmdirSync(requests);
+  if (
+    digestValue(JSON.parse(assertPrivateFile(join(gate.directory, 'gate.json')).toString('utf8')) as unknown) !==
+    digestValue(gate)
+  )
+    throw new DeliveryError('Filesystem observation gate changed before retirement.');
+  unlinkSync(join(gate.directory, 'gate.json'));
+  rmdirSync(gate.directory);
+}
+
+async function withOutputObservationGate<T>(
+  root: string,
+  enabled: boolean,
+  operation: (gate: OutputGate | undefined) => Promise<T>,
+): Promise<T> {
+  const inherited = process.env[OUTPUT_GATE_ENV];
+  if (inherited !== undefined) return operation(readOutputGate(inherited));
+  if (!enabled) return operation(undefined);
+  const id = randomUUID();
+  const namespace = join(gitCommonDir(root), 'ai-delivery', 'output-observation', worktreeDigest(root).slice(7));
+  ensurePrivateDirectoryDurably(namespace);
+  // The existing writer has recovered and confirmed old command quiescence before this operation.
+  for (const priorId of readdirSync(namespace)) {
+    z.uuid().parse(priorId);
+    const path = join(namespace, priorId);
+    assertGateDirectory(path);
+    const prior = OutputGateSchema.parse(
+      JSON.parse(assertPrivateFile(join(path, 'gate.json')).toString('utf8')) as unknown,
+    );
+    if (prior.id !== priorId || prior.directory !== path || gateOwnerAlive(prior.owner))
+      throw new DeliveryError('Prior filesystem observation gate is live or has conflicting ownership.');
+    retireOutputGate(prior, true);
+  }
+  const directory = join(namespace, id);
+  ensurePrivateDirectoryDurably(join(directory, 'requests'));
+  const gate: OutputGate = { directory, id, owner: gateOwner() };
+  writePrivateJsonFileAtomically(join(directory, 'gate.json'), gate);
+  try {
+    return await operation(gate);
+  } finally {
+    retireOutputGate(gate);
+  }
+}
+
 interface OutputBaseline {
+  gate?: OutputGate;
   baselineId: string;
   files: Map<string, number>;
   roots: string[];
@@ -277,12 +544,14 @@ function scanOutputRoots(roots: readonly string[]): Map<string, number> {
   return files;
 }
 
-function outputBaseline(
+async function outputBaseline(
   repoRoot: string,
   common: string,
   classificationReceiptId: string,
   bounds: VerificationResourceBounds,
-): OutputBaseline | undefined {
+  gate?: OutputGate,
+  signal?: AbortSignal,
+): Promise<OutputBaseline | undefined> {
   if (bounds.outputRoots === undefined) return undefined;
   const roots = bounds.outputRoots.map((path) => resolve(repoRoot, path)).sort();
   for (let i = 1; i < roots.length; i++) {
@@ -329,7 +598,9 @@ function outputBaseline(
   let checkpoint: z.infer<typeof OutputBaselineCheckpointSchema>;
   if (state?.status !== 'complete') {
     const content = {
-      files: [...scanOutputRoots(roots)].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+      files: [...(await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots), signal))].sort(
+        ([left], [right]) => (left < right ? -1 : left > right ? 1 : 0),
+      ),
       inputId,
       roots,
       schemaVersion: 'ai-delivery.output-baseline@1' as const,
@@ -357,12 +628,17 @@ function outputBaseline(
     )
   )
     throw new DeliveryError('Filesystem output baseline checkpoint is corrupt or belongs to another input.');
-  return { baselineId, roots, files: new Map(checkpoint.files) };
+  return { baselineId, roots, files: new Map(checkpoint.files), ...(gate === undefined ? {} : { gate }) };
 }
 
-function positiveNewOutputBytes(baseline: OutputBaseline): number {
+async function positiveNewOutputBytes(baseline: OutputBaseline, signal?: AbortSignal): Promise<number> {
   let bytes = 0;
-  for (const [path, size] of scanOutputRoots(baseline.roots)) {
+  for (const [path, size] of await withOutputGateLock(
+    baseline.gate,
+    'scan',
+    () => scanOutputRoots(baseline.roots),
+    signal,
+  )) {
     bytes += Math.max(0, size - (baseline.files.get(path) ?? 0));
     if (!Number.isSafeInteger(bytes)) throw new DeliveryError('Filesystem output observation overflowed.');
   }
@@ -497,6 +773,7 @@ function sampleOwnedTree(
   repoRoot: string,
   bounds: VerificationResourceBounds,
   baseline?: OutputBaseline,
+  newOutputBytes?: number,
 ): ResourceSample {
   const owned = observeOwnedProcesses(state, processSnapshot());
   const rssBytes = owned.reduce((total, member) => total + member.rssBytes, 0);
@@ -508,7 +785,6 @@ function sampleOwnedTree(
   const available = freeDiskBytes(repoRoot, baseline);
   if (available < bounds.minFreeDiskBytes)
     throw new DeliveryError(`Free disk fell below limit ${bounds.minFreeDiskBytes}.`);
-  const newOutputBytes = baseline === undefined ? undefined : positiveNewOutputBytes(baseline);
   if (newOutputBytes !== undefined && !Number.isSafeInteger(newOutputBytes)) {
     throw new DeliveryError('Filesystem output observation overflowed.');
   }
@@ -1091,6 +1367,9 @@ function runStageCommand(
         cwd: repoRoot,
         detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'pipe'],
+        ...(baseline?.gate === undefined
+          ? {}
+          : { env: { ...process.env, [OUTPUT_GATE_ENV]: JSON.stringify(baseline.gate) } }),
       },
     );
     const stdout: Buffer[] = [];
@@ -1106,6 +1385,8 @@ function runStageCommand(
     let closed = false;
     let settled = false;
     let commandReleased = false;
+    let pendingOutput: Promise<void> | undefined;
+    const scanCancellation = new AbortController();
     let closeTimer: NodeJS.Timeout | undefined;
     let exitPipeTimer: NodeJS.Timeout | undefined;
     let resourceTimer: NodeJS.Timeout | undefined;
@@ -1150,6 +1431,7 @@ function runStageCommand(
     const stop = (reason: string): void => {
       if (failure !== undefined) return;
       failure = reason;
+      scanCancellation.abort();
       killOwned();
       if (!closed) {
         closeTimer = setTimeout(() => {
@@ -1204,10 +1486,24 @@ function runStageCommand(
             onResourceSample?.(result);
             onRunning?.(outputBytes, result);
           }
-          if (!commandReleased) {
-            commandReleased = true;
-            child.stdin.end('run\n');
-          }
+          if (pendingOutput !== undefined) return;
+          pendingOutput = (async () => {
+            if (resourceBounds !== undefined && baseline !== undefined) {
+              const bytes = await positiveNewOutputBytes(baseline, scanCancellation.signal);
+              if (failure !== undefined) return;
+              const result = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline, bytes);
+              onResourceSample?.(result);
+              onRunning?.(outputBytes, result);
+            }
+            if (failure === undefined && !commandReleased) {
+              commandReleased = true;
+              child.stdin.end('run\n');
+            }
+          })()
+            .catch((error: unknown) => stop(error instanceof Error ? error.message : String(error)))
+            .finally(() => {
+              pendingOutput = undefined;
+            });
         } catch (error) {
           stop(error instanceof Error ? error.message : String(error));
         }
@@ -1229,10 +1525,17 @@ function runStageCommand(
       closed = true;
       if (settled) return;
       clearWatchers();
+      await pendingOutput;
       if (failure === undefined && owned !== undefined) {
         try {
           if (resourceBounds !== undefined) {
-            const sample = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline);
+            const sample = sampleOwnedTree(
+              owned,
+              repoRoot,
+              resourceBounds,
+              baseline,
+              baseline === undefined ? undefined : await positiveNewOutputBytes(baseline, scanCancellation.signal),
+            );
             onResourceSample?.(sample);
             onRunning?.(outputBytes, sample);
           }
@@ -1291,12 +1594,17 @@ export async function verifyIssue(input: {
   signal?: AbortSignal;
 }): Promise<VerificationRun> {
   const root = gitRoot(input.repoRoot);
-  return withVerificationWriter(root, (writer) => verifyIssueOwned(input, writer));
+  return withVerificationWriter(root, (writer) =>
+    withOutputObservationGate(root, input.resourceBounds?.outputRoots !== undefined, (gate) =>
+      verifyIssueOwned(input, writer, gate),
+    ),
+  );
 }
 
 async function verifyIssueOwned(
   input: Parameters<typeof verifyIssue>[0],
   writer: VerificationWriter,
+  gate?: OutputGate,
 ): Promise<VerificationRun> {
   const assertNotCancelled = (): void => {
     if (input.signal?.aborted) throw new DeliveryError('Verification cancelled.');
@@ -1329,7 +1637,7 @@ async function verifyIssueOwned(
   const baseline =
     input.resourceBounds === undefined
       ? undefined
-      : outputBaseline(root, common, classification.receiptId, input.resourceBounds);
+      : await outputBaseline(root, common, classification.receiptId, input.resourceBounds, gate, input.signal);
   if (input.resourceBounds !== undefined) assertDiskHeadroom(root, input.resourceBounds, baseline);
   const receipts: RepositoryStageReceipt[] = [];
   const admitted = new Set(input.admittedResourceClasses ?? ['source_only']);
@@ -1479,6 +1787,9 @@ async function verifyIssueOwned(
                 sampledFreeDiskBytes: sample.freeDiskBytes,
                 ...(sample.newOutputBytes === undefined ? {} : { sampledNewOutputBytes: sample.newOutputBytes }),
                 ownedProcessCount: sample.ownedProcessCount,
+                ...(baseline !== undefined && sample.newOutputBytes === undefined
+                  ? { reason: 'waiting for strict filesystem output scan' }
+                  : {}),
               }),
         });
       progress(0);
@@ -1546,6 +1857,21 @@ async function verifyIssueOwned(
       remainingStages: classification.requiredStages.length - receipts.length,
       reusedStages,
       elapsedMs: Date.now() - startedAtMs,
+    });
+  }
+  assertNotCancelled();
+  if (baseline !== undefined && input.resourceBounds !== undefined) {
+    const bytes = await positiveNewOutputBytes(baseline, input.signal);
+    if (bytes > input.resourceBounds.maxNewOutputBytes!)
+      throw new DeliveryError(
+        'Positive new filesystem output ' + bytes + ' exceeded limit ' + input.resourceBounds.maxNewOutputBytes! + '.',
+      );
+    assertDiskHeadroom(root, input.resourceBounds, baseline);
+    recordResourceSample({
+      aggregateRssBytes: 0,
+      freeDiskBytes: freeDiskBytes(root, baseline),
+      newOutputBytes: bytes,
+      ownedProcessCount: 0,
     });
   }
   assertNotCancelled();
@@ -1657,52 +1983,58 @@ export async function withRuntimeSetupWriter<T>(
             if (roots[i] === roots[i - 1] || roots[i]!.startsWith(`${roots[i - 1]}${sep}`))
               throw new DeliveryError('Filesystem output roots must not overlap.');
         }
-        const files = roots === undefined ? undefined : scanOutputRoots(roots);
-        const baseline =
-          roots === undefined || files === undefined
-            ? undefined
-            : {
-                roots,
-                files,
-                baselineId: digestValue([...files]),
-              };
-        assertDiskHeadroom(root, bounds, baseline);
-        const started = Date.now();
-        const output = await runStageCommand(
-          root,
-          argv,
-          signal,
-          (capturedOutputBytes, sample) =>
-            reportVerificationProgress({
-              state: 'running',
-              stageId: 'runtime-setup',
-              completedStages: 0,
-              reusedStages: 0,
-              remainingStages: 1,
-              elapsedMs: Date.now() - started,
-              capturedOutputBytes,
-              ...(sample === undefined
-                ? {}
-                : {
-                    sampledAggregateRssBytes: sample.aggregateRssBytes,
-                    sampledFreeDiskBytes: sample.freeDiskBytes,
-                    sampledNewOutputBytes: sample.newOutputBytes,
-                  }),
-            }),
-          bounds,
-          baseline,
-          undefined,
-          writer,
-        );
-        reportVerificationProgress({
-          state: 'completed',
-          stageId: 'runtime-setup',
-          completedStages: 1,
-          reusedStages: 0,
-          remainingStages: 0,
-          elapsedMs: Date.now() - started,
+        return withOutputObservationGate(root, roots !== undefined, async (gate) => {
+          const files =
+            roots === undefined
+              ? undefined
+              : await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots), signal);
+          const baseline =
+            roots === undefined || files === undefined
+              ? undefined
+              : {
+                  roots,
+                  files,
+                  baselineId: digestValue([...files]),
+                  ...(gate === undefined ? {} : { gate }),
+                };
+          assertDiskHeadroom(root, bounds, baseline);
+          const started = Date.now();
+          const output = await runStageCommand(
+            root,
+            argv,
+            signal,
+            (capturedOutputBytes, sample) =>
+              reportVerificationProgress({
+                state: 'running',
+                stageId: 'runtime-setup',
+                completedStages: 0,
+                reusedStages: 0,
+                remainingStages: 1,
+                elapsedMs: Date.now() - started,
+                capturedOutputBytes,
+                ...(sample === undefined
+                  ? {}
+                  : {
+                      sampledAggregateRssBytes: sample.aggregateRssBytes,
+                      sampledFreeDiskBytes: sample.freeDiskBytes,
+                      sampledNewOutputBytes: sample.newOutputBytes,
+                    }),
+              }),
+            bounds,
+            baseline,
+            undefined,
+            writer,
+          );
+          reportVerificationProgress({
+            state: 'completed',
+            stageId: 'runtime-setup',
+            completedStages: 1,
+            reusedStages: 0,
+            remainingStages: 0,
+            elapsedMs: Date.now() - started,
+          });
+          return output;
         });
-        return output;
       },
     }),
   );

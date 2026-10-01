@@ -4100,3 +4100,352 @@ test.each(['escape', 'broken', 'cycle'] as const)(
     }
   },
 );
+
+test('fully cached bounded verification still rejects a newly leaked FIFO', async () => {
+  const { root, counter } = await fixture();
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-cached-fifo-')));
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const bounds = {
+      maxAggregateRssBytes: 1_000_000_000,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 1024,
+      outputRoots: [output],
+    };
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    execFileSync('mkfifo', [join(output, 'leaked')]);
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }),
+      /unsupported file/u,
+    );
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+  } finally {
+    rmSync(output, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function filesystemFixtureScript(output: string, mode: 'pass' | 'assertion' | 'abrupt' | 'block' | 'cancel'): string {
+  return `
+(async () => {
+  const fs = require('node:fs'), cp = require('node:child_process'), path = require('node:path'), assert = require('node:assert/strict');
+  const { withVerificationFilesystemFixture } = await import(${JSON.stringify(new URL('./agent.js', import.meta.url).href)});
+  const { assertPrivateFile } = await import(${JSON.stringify(new URL('./delivery/common.js', import.meta.url).href)});
+  const output = ${JSON.stringify(output)}, fifo = path.join(output, 'fifo'), events = path.join(output, 'events');
+  const gate = JSON.parse(process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE);
+  const trace = value => fs.appendFileSync(events, value + '\\n');
+  await withVerificationFilesystemFixture(async () => {
+    cp.execFileSync('mkfifo', ['-m', '600', fifo]);
+    fs.writeFileSync(path.join(output, 'capability'), JSON.stringify(gate));
+    trace('created');
+    try {
+      if (${JSON.stringify(mode)} === 'abrupt') process.exit(9);
+      if (${JSON.stringify(mode)} === 'cancel') await new Promise(() => { setInterval(() => {}, 1000); });
+      if (${JSON.stringify(mode)} === 'block') fs.readFileSync(fifo);
+      while (fs.readdirSync(path.join(gate.directory, 'requests')).length === 0) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.ok(fs.existsSync(fifo)); trace('scan-queued');
+      assert.throws(() => assertPrivateFile(fifo), /private regular file/); trace('reader-rejected');
+      const regular = path.join(output, 'regular'), hard = path.join(output, 'hard'), alias = path.join(output, 'alias');
+      fs.writeFileSync(regular, 'x'.repeat(128), { mode: 0o600 });
+      fs.linkSync(regular, hard); assert.throws(() => assertPrivateFile(hard), /private regular file/); fs.unlinkSync(hard);
+      fs.symlinkSync('./regular', alias); assert.throws(() => assertPrivateFile(alias), /private regular file/); fs.unlinkSync(alias);
+      if (${JSON.stringify(mode)} === 'assertion') throw new Error('synthetic reader assertion failure');
+    } finally { fs.unlinkSync(fifo); trace('cleaned'); }
+  });
+  trace('released');
+})().catch(error => { console.error(error.message); process.exitCode = 1; });`;
+}
+
+test.each(['pass', 'assertion'] as const)(
+  'filesystem fixture gate deterministically queues a scan through reader rejection and %s teardown',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-gate-')));
+    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode) });
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const run = verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 2048,
+          outputRoots: [output],
+        },
+      });
+      if (mode === 'assertion') await assert.rejects(run, /exit 1/u);
+      else assert.ok((await run).resources!.maxSampledNewOutputBytes! >= 128);
+      assert.equal(existsSync(join(output, 'fifo')), false);
+      const events = readFileSync(join(output, 'events'), 'utf8').trim().split('\n');
+      assert.deepEqual(
+        events,
+        mode === 'pass'
+          ? ['created', 'scan-queued', 'reader-rejected', 'cleaned', 'released']
+          : ['created', 'scan-queued', 'reader-rejected', 'cleaned'],
+      );
+      const capability = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+      assert.equal(existsSync(capability.directory), false);
+      assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['abrupt', 'block', 'cancel'] as const)(
+  'filesystem fixture gate preserves leaked FIFO and unrelated files after %s',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-failure-')));
+    writeFileSync(join(output, 'unrelated'), 'preserved');
+    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode) });
+    const controller = new AbortController();
+    let running: Promise<unknown> | undefined;
+    const progress = vi.spyOn(process.stderr, 'write');
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const bounds = {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 2048,
+        outputRoots: [output],
+      };
+      running = verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: bounds,
+        signal: controller.signal,
+      }).catch((error: unknown) => error);
+      if (mode === 'cancel') {
+        for (let attempt = 0; attempt < 300 && !existsSync(join(output, 'capability')); attempt++)
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.ok(existsSync(join(output, 'capability')));
+        const cap = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+        for (let attempt = 0; attempt < 300 && readdirSync(join(cap.directory, 'requests')).length === 0; attempt++)
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.ok(readdirSync(join(cap.directory, 'requests')).length > 0);
+        controller.abort();
+      }
+      const failure = String(await running);
+      assert.match(
+        failure,
+        mode === 'abrupt' ? /exit 9/u : mode === 'block' ? /reader or teardown is stalled/u : /cancelled/u,
+      );
+      assert.doesNotMatch(failure, /cleanup failed|live holder/u);
+      const capability = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+      assert.equal(existsSync(capability.directory), false);
+      assert.ok(existsSync(join(output, 'fifo')));
+      assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
+      if (mode !== 'abrupt')
+        assert.ok(progress.mock.calls.filter(([line]) => String(line).includes('sampledAggregateRssBytes')).length > 2);
+      await assert.rejects(
+        verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }),
+        /unsupported file/u,
+      );
+    } finally {
+      controller.abort();
+      await running;
+      progress.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
+
+test('filesystem fixture gate still enforces positive byte limits after deterministic contention', async () => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-limit-')));
+  const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, 'pass') });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    await assert.rejects(
+      verifyIssue({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 64,
+          outputRoots: [output],
+        },
+      }),
+      /filesystem output.*exceeded/u,
+    );
+    assert.equal(existsSync(join(output, 'fifo')), false);
+    assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+  }
+});
+
+test('filesystem fixture helper runs standalone and fails closed on malformed capability', async () => {
+  const { withVerificationFilesystemFixture } = await import('./agent.js');
+  assert.equal(await withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
+  const prior = process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
+  try {
+    process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = '{}';
+    let executed = false;
+    await assert.rejects(
+      withVerificationFilesystemFixture(() => {
+        executed = true;
+      }),
+      /invalid or stale/u,
+    );
+    assert.equal(executed, false);
+  } finally {
+    if (prior === undefined) delete process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
+    else process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = prior;
+  }
+});
+
+test('nested runtime setup inherits the outer gate for its baseline and child command', async () => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-nested-fixture-')));
+  const inner = await fixture();
+  const worker = filesystemFixtureScript(output, 'pass');
+  const { root } = await fixture({
+    firstStageScript: `
+(async () => {
+  const fs = require('node:fs'), cp = require('node:child_process'), assert = require('node:assert/strict');
+  const { withRuntimeSetupWriter } = await import(${JSON.stringify(new URL('./verification.js', import.meta.url).href)});
+  const capability = process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
+  const child = cp.spawn(process.execPath, ['-e', ${JSON.stringify(worker)}], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const closed = new Promise((resolve, reject) => child.once('exit', code => code === 0 ? resolve() : reject(new Error('fixture child exit ' + code))));
+  while (!fs.existsSync(${JSON.stringify(join(output, 'capability'))})) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(fs.readFileSync(${JSON.stringify(join(output, 'capability'))}, 'utf8'), capability);
+  await withRuntimeSetupWriter(${JSON.stringify(inner.root)}, async runner => {
+    await runner.run([process.execPath, '-e', 'require("node:assert/strict").equal(process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE, ' + JSON.stringify(capability) + ')'], { maxAggregateRssBytes: 1000000000, minFreeDiskBytes: 1, maxNewOutputBytes: 2048, outputRoots: [${JSON.stringify(output)}] });
+  });
+  await closed;
+})().catch(error => { console.error(error.message); process.exitCode = 1; });`,
+  });
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    await verifyIssue({
+      issueNumber: 17,
+      repoRoot: row.path,
+      resourceBounds: {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 2048,
+        outputRoots: [output],
+      },
+    });
+    assert.deepEqual(readFileSync(join(output, 'events'), 'utf8').trim().split('\n'), [
+      'created',
+      'scan-queued',
+      'reader-rejected',
+      'cleaned',
+      'released',
+    ]);
+    assert.equal(existsSync(join(inner.root, '.git', 'ai-delivery', 'output-observation')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(inner.root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+  }
+});
+
+test('interrupted fixture owner recovers its gate, preserves completed work and rejects a leaked FIFO before resume', async () => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-recovery-')));
+  const marker = join(output, 'capability');
+  const { root, counter, secondCounter, failSecond } = await fixture({ twoStages: true });
+  let child: ReturnType<typeof spawn> | undefined;
+  let childOutput = '';
+  try {
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'synthetic-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const bounds = {
+      maxAggregateRssBytes: 1_000_000_000,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 2048,
+      outputRoots: [output],
+    };
+    writeFileSync(failSecond, 'fail once');
+    await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }), /exit 7/u);
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    child = spawn(
+      process.execPath,
+      [
+        '-e',
+        `(async () => {
+      const { withRuntimeSetupWriter } = await import(${JSON.stringify(new URL('./verification.js', import.meta.url).href)});
+      await withRuntimeSetupWriter(${JSON.stringify(row.path)}, runner => runner.run([process.execPath, '-e', ${JSON.stringify(filesystemFixtureScript(output, 'cancel'))}], ${JSON.stringify(bounds)}));
+    })().catch(error => { console.error(error.message); process.exitCode = 1; });`,
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const capture = (chunk: Buffer): void => {
+      childOutput += chunk.toString();
+      if (childOutput.length > 1024 * 1024) child!.kill('SIGKILL');
+    };
+    child.stdout!.on('data', capture);
+    child.stderr!.on('data', capture);
+    const closed = new Promise<void>((resolve) => child!.once('exit', () => resolve()));
+    for (let attempt = 0; attempt < 500 && !existsSync(marker); attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(marker), childOutput);
+    const priorGate = JSON.parse(readFileSync(marker, 'utf8')) as { directory: string };
+    child.kill('SIGKILL');
+    await closed;
+    assert.equal(child.signalCode, 'SIGKILL');
+    // Exercise the existing writer's stale-file recovery after the exact parent has exited.
+    const writerPath = join(root, '.git', 'ai-delivery', 'writers@1', digestValue(row.path).slice(7) + '.json');
+    const stale = new Date(Date.now() - 20_000);
+    utimesSync(writerPath + '.lock', stale, stale);
+    await assert.rejects(
+      verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }),
+      /unsupported file/u,
+    );
+    assert.equal(existsSync(priorGate.directory), false);
+    assert.ok(existsSync(join(output, 'fifo')));
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    unlinkSync(join(output, 'fifo'));
+    unlinkSync(failSecond);
+    const resumed = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.equal(resumed.stageReceipts.length, 2);
+    assert.equal(readFileSync(counter, 'utf8'), '1');
+    assert.equal(readFileSync(secondCounter, 'utf8'), '2');
+    assert.ok(resumed.stageReceipts.every((receipt) => receipt.commands.every((command) => command.exitCode === 0)));
+    const cached = await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds });
+    assert.deepEqual(
+      cached.stageReceipts.map((receipt) => receipt.receiptId),
+      resumed.stageReceipts.map((receipt) => receipt.receiptId),
+    );
+    await verifyIssue({ issueNumber: 17, repoRoot: row.path, resourceBounds: { ...bounds, maxNewOutputBytes: 4096 } });
+    assert.equal(readFileSync(counter, 'utf8'), '2');
+  } finally {
+    child?.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+  }
+});
