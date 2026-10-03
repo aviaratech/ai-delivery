@@ -10,6 +10,15 @@ Install the versioned package from npm or a reviewed package archive. The
 consuming repository must run its own configuration and runtime-admission
 procedure before any lifecycle write.
 
+The selected CLI, MCP server and verification controller use Node 24.21.0 and
+npm 11.19.0. The public library exports also support Node 26.2.0 consumers.
+Package checks run the Node 24 controller against actual npm-packed Node 26
+consumers, including filesystem fixture contention, reader and link rejection,
+success/failure teardown, cancellation, leaked fixtures and positive byte limits.
+For package development, set `AI_DELIVERY_NODE26_EXECUTABLE` to the absolute
+Node 26.2.0 executable before `npm run checks`; CI retains that executable while
+selecting Node 24 for the canonical commands.
+
 ```sh
 node --version # 24.21.0
 npm --version  # 11.19.0
