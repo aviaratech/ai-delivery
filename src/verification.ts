@@ -565,8 +565,9 @@ function scanOutputRoots(
         if (!commandRunning || failure.code !== 'ENOENT' || previous?.identity !== identity) throw failure;
         // A validated alias contributes no physical file bytes. Resolve the missing suffix through
         // its current existing ancestor, so an ancestor retarget cannot hide an escaping output.
-        const lexical = resolve(dirname(path), link);
-        let ancestor = dirname(lexical);
+        let lexical = resolve(dirname(path), link);
+        let ancestor = lexical;
+        const expanded = new Set([path]);
         for (;;) {
           try {
             target = join(realpathSync(ancestor), lexical.slice(ancestor.length));
@@ -578,6 +579,47 @@ function scanOutputRoots(
                 ancestor,
                 ancestorError,
               );
+            let ancestorMetadata;
+            try {
+              ancestorMetadata = lstatSync(ancestor);
+            } catch (metadataError) {
+              if ((metadataError as NodeJS.ErrnoException).code !== 'ENOENT')
+                throw new OutputObservationError('Filesystem output ancestor lstat failed.', ancestor, metadataError);
+            }
+            if (ancestorMetadata?.isSymbolicLink()) {
+              let ancestorLink, currentAncestor;
+              try {
+                ancestorLink = readlinkSync(ancestor);
+                currentAncestor = lstatSync(ancestor);
+              } catch (aliasError) {
+                throw new OutputObservationError('Filesystem output ancestor alias read failed.', ancestor, aliasError);
+              }
+              const ancestorIdentity = digestValue({
+                device: ancestorMetadata.dev,
+                inode: ancestorMetadata.ino,
+                changed: ancestorMetadata.ctimeMs,
+                modified: ancestorMetadata.mtimeMs,
+                link: ancestorLink,
+              });
+              const previousAncestor = links.get(ancestor);
+              if (previousAncestor === undefined) throw failure;
+              if (
+                expanded.has(ancestor) ||
+                previousAncestor.identity !== ancestorIdentity ||
+                !currentAncestor.isSymbolicLink() ||
+                currentAncestor.dev !== ancestorMetadata.dev ||
+                currentAncestor.ino !== ancestorMetadata.ino ||
+                currentAncestor.ctimeMs !== ancestorMetadata.ctimeMs ||
+                currentAncestor.mtimeMs !== ancestorMetadata.mtimeMs
+              )
+                throw new DeliveryError(
+                  `Filesystem output ancestor alias identity changed. Path ${JSON.stringify(ancestor)}.`,
+                );
+              expanded.add(ancestor);
+              lexical = join(resolve(dirname(ancestor), ancestorLink), lexical.slice(ancestor.length));
+              ancestor = lexical;
+              continue;
+            }
             ancestor = dirname(ancestor);
           }
         }
