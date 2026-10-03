@@ -12,6 +12,7 @@ import {
   rmdirSync,
   renameSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   statfsSync,
@@ -482,6 +483,7 @@ interface OutputBaseline {
   gate?: OutputGate;
   baselineId: string;
   files: Map<string, number>;
+  links: Map<string, { identity: string; target: string; missing: boolean }>;
   roots: string[];
 }
 
@@ -517,8 +519,14 @@ class OutputObservationError extends DeliveryError {
   }
 }
 
-function scanOutputRoots(roots: readonly string[]): Map<string, number> {
+function scanOutputRoots(
+  roots: readonly string[],
+  links: OutputBaseline['links'],
+  commandRunning = false,
+  onMissingTarget?: (reason: string) => void,
+): Map<string, number> {
   const files = new Map<string, number>();
+  const observedLinks: OutputBaseline['links'] = new Map();
   const visit = (path: string): void => {
     let metadata;
     try {
@@ -528,21 +536,83 @@ function scanOutputRoots(roots: readonly string[]): Map<string, number> {
       throw new OutputObservationError('Filesystem output lstat failed.', path, error);
     }
     if (metadata.isSymbolicLink()) {
+      let link: string;
+      try {
+        link = readlinkSync(path);
+      } catch (error) {
+        throw new OutputObservationError('Filesystem output readlink failed.', path, error);
+      }
+      const identity = digestValue({
+        device: metadata.dev,
+        inode: metadata.ino,
+        changed: metadata.ctimeMs,
+        modified: metadata.mtimeMs,
+        link,
+      });
       let target: string;
+      let missing = false;
       try {
         target = realpathSync(path);
       } catch (error) {
-        throw new OutputObservationError(
+        const failure = new OutputObservationError(
           'Filesystem output observation encountered a broken or cyclic symbolic link.',
           path,
           error,
         );
+        const previous = links.get(path);
+        if (previous !== undefined && previous.identity !== identity)
+          throw new DeliveryError(`Filesystem output alias identity changed. Path ${JSON.stringify(path)}.`);
+        if (!commandRunning || failure.code !== 'ENOENT' || previous?.identity !== identity) throw failure;
+        // A validated alias contributes no physical file bytes. Resolve the missing suffix through
+        // its current existing ancestor, so an ancestor retarget cannot hide an escaping output.
+        const lexical = resolve(dirname(path), link);
+        let ancestor = dirname(lexical);
+        for (;;) {
+          try {
+            target = join(realpathSync(ancestor), lexical.slice(ancestor.length));
+            break;
+          } catch (ancestorError) {
+            if ((ancestorError as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(ancestor) === ancestor)
+              throw new OutputObservationError(
+                'Filesystem output ancestor resolution failed.',
+                ancestor,
+                ancestorError,
+              );
+            ancestor = dirname(ancestor);
+          }
+        }
+        if (target !== previous.target)
+          throw new DeliveryError(`Filesystem output alias target identity changed. Path ${JSON.stringify(path)}.`);
+        missing = true;
+        onMissingTarget?.(failure.message);
       }
+      const previous = links.get(path);
+      if (previous?.missing && (previous.identity !== identity || previous.target !== target))
+        throw new DeliveryError(
+          `Filesystem output alias identity changed after target absence. Path ${JSON.stringify(path)}.`,
+        );
       if (!roots.some((root) => target === root || target.startsWith(`${root}${sep}`))) {
         throw new DeliveryError(
           `Filesystem output observation encountered an escaping symbolic link. Path ${JSON.stringify(path)} resolves to ${JSON.stringify(target)}.`,
         );
       }
+      let current;
+      try {
+        current = lstatSync(path);
+      } catch (error) {
+        throw new OutputObservationError('Filesystem output alias identity readback failed.', path, error);
+      }
+      if (
+        !current.isSymbolicLink() ||
+        current.dev !== metadata.dev ||
+        current.ino !== metadata.ino ||
+        current.ctimeMs !== metadata.ctimeMs ||
+        current.mtimeMs !== metadata.mtimeMs
+      )
+        throw new DeliveryError(
+          `Filesystem output alias identity changed during observation. Path ${JSON.stringify(path)}.`,
+        );
+      observedLinks.set(path, { identity, target, missing });
       // Observe physical targets through their declared root only, never traverse aliases.
       return;
     }
@@ -570,6 +640,9 @@ function scanOutputRoots(roots: readonly string[]): Map<string, number> {
       throw new DeliveryError('Filesystem output roots must not be symbolic links.');
     visit(root);
   }
+  // Publish alias identities only with the complete physical-file scan that validated them.
+  links.clear();
+  for (const [path, link] of observedLinks) links.set(path, link);
   return files;
 }
 
@@ -583,6 +656,7 @@ async function outputBaseline(
 ): Promise<OutputBaseline | undefined> {
   if (bounds.outputRoots === undefined) return undefined;
   const roots = bounds.outputRoots.map((path) => resolve(repoRoot, path)).sort();
+  const links: OutputBaseline['links'] = new Map();
   for (let i = 1; i < roots.length; i++) {
     if (roots[i] === roots[i - 1] || roots[i]!.startsWith(`${roots[i - 1]}${sep}`)) {
       throw new DeliveryError('Filesystem output roots must not overlap.');
@@ -627,7 +701,7 @@ async function outputBaseline(
   let checkpoint: z.infer<typeof OutputBaselineCheckpointSchema>;
   if (state?.status !== 'complete') {
     const content = {
-      files: [...(await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots), signal))].sort(
+      files: [...(await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots, links), signal))].sort(
         ([left], [right]) => (left < right ? -1 : left > right ? 1 : 0),
       ),
       inputId,
@@ -657,7 +731,7 @@ async function outputBaseline(
     )
   )
     throw new DeliveryError('Filesystem output baseline checkpoint is corrupt or belongs to another input.');
-  return { baselineId, roots, files: new Map(checkpoint.files), ...(gate === undefined ? {} : { gate }) };
+  return { baselineId, roots, files: new Map(checkpoint.files), links, ...(gate === undefined ? {} : { gate }) };
 }
 
 async function positiveNewOutputBytes(
@@ -669,11 +743,11 @@ async function positiveNewOutputBytes(
   let files: Map<string, number>;
   let firstFailure: OutputObservationError | undefined;
   let lastFailure: OutputObservationError | undefined;
-  const started = Date.now();
+  let firstFailureAt: number | undefined;
   const assertObservationWindow = (): void => {
-    if (firstFailure !== undefined && Date.now() - started >= 1_000) {
+    if (firstFailureAt !== undefined && Date.now() - firstFailureAt >= 1_000) {
       throw new DeliveryError(
-        `Filesystem output observation remained unavailable for 1 second. First observation: ${firstFailure.message} Last observation: ${lastFailure!.message}`,
+        `Filesystem output observation remained unavailable for 1 second. First observation: ${firstFailure!.message} Last observation: ${lastFailure!.message}`,
       );
     }
   };
@@ -681,15 +755,21 @@ async function positiveNewOutputBytes(
     if (signal?.aborted) throw new DeliveryError('Filesystem output observation cancelled.');
     assertObservationWindow();
     try {
-      files = await withOutputGateLock(baseline.gate, 'scan', () => scanOutputRoots(baseline.roots), signal);
+      files = await withOutputGateLock(
+        baseline.gate,
+        'scan',
+        () => scanOutputRoots(baseline.roots, baseline.links, commandRunning, onUnavailable),
+        signal,
+      );
       assertObservationWindow();
       break;
     } catch (error) {
-      // Removal can unlink a physical target before its alias. Never accept an incomplete scan:
-      // retry ENOENT only during a command, with one bounded observation-stall window.
+      // Unvalidated aliases still prevent a complete scan. Retry only during a command,
+      // with the stall window starting at the first failed scan, not before that scan.
       if (!commandRunning || !(error instanceof OutputObservationError) || error.code !== 'ENOENT') throw error;
       lastFailure = error;
       if (firstFailure === undefined) {
+        firstFailureAt = Date.now();
         firstFailure = error;
         onUnavailable?.(error.message);
       }
@@ -1446,13 +1526,14 @@ function runStageCommand(
     let settled = false;
     let commandReleased = false;
     let firstOutputObservationFailure: string | undefined;
+    let lastOutputObservationFailure: string | undefined;
     let pendingOutput: Promise<void> | undefined;
     const scanCancellation = new AbortController();
     const failedOutput = (): string => {
       const observation =
         firstOutputObservationFailure === undefined
           ? ''
-          : ` First filesystem observation: ${firstOutputObservationFailure}`;
+          : ` First filesystem observation: ${firstOutputObservationFailure} Last filesystem observation: ${lastOutputObservationFailure}`;
       try {
         const bytes = Buffer.concat([...stdout, ...stderr]);
         return ` Command output ${writeRepositoryCommandOutput({ bytes, gitCommonDir: gitCommonDir(repoRoot) })}.${observation}`;
@@ -1568,6 +1649,7 @@ function runStageCommand(
                 commandReleased,
                 (reason) => {
                   firstOutputObservationFailure ??= reason;
+                  lastOutputObservationFailure = reason;
                   onRunning?.(outputBytes, undefined, reason);
                 },
               );
@@ -2067,16 +2149,18 @@ export async function withRuntimeSetupWriter<T>(
               throw new DeliveryError('Filesystem output roots must not overlap.');
         }
         return withOutputObservationGate(root, roots !== undefined, async (gate) => {
+          const links: OutputBaseline['links'] = new Map();
           const files =
             roots === undefined
               ? undefined
-              : await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots), signal);
+              : await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots, links), signal);
           const baseline =
             roots === undefined || files === undefined
               ? undefined
               : {
                   roots,
                   files,
+                  links,
                   baselineId: digestValue([...files]),
                   ...(gate === undefined ? {} : { gate }),
                 };

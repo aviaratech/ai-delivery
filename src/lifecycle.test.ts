@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import {
   cpSync,
   chmodSync,
@@ -4480,6 +4481,172 @@ test(
   },
 );
 
+function ordinaryCliRebuildScript(output: string, mode: 'pass' | 'absent' | 'limit' | 'cancel' = 'pass'): string {
+  return `(async () => {
+    const fs = require('node:fs');
+    const trace = event => fs.appendFileSync(${JSON.stringify(join(output, 'events'))}, event + '\\n');
+    trace('command-started'); fs.unlinkSync(${JSON.stringify(join(output, 'cli.js'))}); trace('target-removed');
+    if (${JSON.stringify(mode)} === 'limit') fs.writeFileSync(${JSON.stringify(join(output, 'oversized'))}, 'x'.repeat(4096));
+    for (let unit = 0; unit < 32; unit++) {
+      fs.appendFileSync(${JSON.stringify(join(output, 'compiled'))}, 'build-unit\\n');
+      trace('build-unit-' + unit);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (${JSON.stringify(mode)} !== 'absent') {
+      fs.writeFileSync(${JSON.stringify(join(output, 'cli.js'))}, 'rebuilt CLI'); trace('target-restored');
+    }
+  })().catch(error => { console.error(error); process.exitCode = 1; });`;
+}
+
+test('ordinary bounded rebuild restores its CLI target after observable build work', async () => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-cli-rebuild-')));
+  const { root } = await fixture();
+  const target = join(output, 'cli.js');
+  const alias = join(output, 'cli');
+  const events = join(output, 'events');
+  writeFileSync(target, 'original CLI');
+  writeFileSync(join(output, 'unrelated'), 'preserved');
+  symlinkSync('./cli.js', alias);
+  const observations: string[] = [];
+  const duringAbsence: { sampledNewOutputBytes?: number; sampledAggregateRssBytes?: number }[] = [];
+  const progress = vi.spyOn(process.stderr, 'write').mockImplementation((line) => {
+    observations.push(String(line));
+    if (!existsSync(target) && String(line).includes('sampledNewOutputBytes'))
+      duringAbsence.push(JSON.parse(String(line).slice(String(line).indexOf('{'))) as (typeof duringAbsence)[number]);
+    return true;
+  });
+  const script = ordinaryCliRebuildScript(output);
+  try {
+    const { withRuntimeSetupWriter } = await import('./verification.js');
+    await withRuntimeSetupWriter(root, (runner) =>
+      runner.run([process.execPath, '-e', script], {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 8192,
+        outputRoots: [output],
+      }),
+    );
+    assert.equal(readFileSync(target, 'utf8'), 'rebuilt CLI');
+    assert.equal(readFileSync(join(output, 'compiled'), 'utf8').split('\n').length, 33);
+    assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
+    assert.ok(duringAbsence.some((sample) => (sample.sampledNewOutputBytes ?? 0) > 0));
+    assert.ok(duringAbsence.every((sample) => (sample.sampledAggregateRssBytes ?? 0) > 0));
+  } finally {
+    console.log(
+      JSON.stringify({
+        scenario: 'ordinary-cli-rebuild',
+        firstObservation: observations.find((line) => line.includes('ENOENT')),
+        events: readFileSync(events, 'utf8').trim().split('\n'),
+        targetRestored: existsSync(target),
+        unrelatedPreserved: readFileSync(join(output, 'unrelated'), 'utf8') === 'preserved',
+      }),
+    );
+    progress.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+  }
+});
+
+test.each(['bytes', 'rss', 'disk', 'fifo', 'permission', 'identity', 'ancestor', 'cycle'] as const)(
+  'a missing validated target retains complete scan and %s rejection across roots',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-rebuild-boundary-')));
+    const { root } = await fixture();
+    const first = join(output, 'first'),
+      second = join(output, 'second');
+    mkdirSync(first);
+    mkdirSync(second);
+    const directory = join(first, 'dist'),
+      target = join(directory, 'cli.js'),
+      alias = join(first, 'cli');
+    mkdirSync(directory);
+    writeFileSync(target, 'CLI');
+    symlinkSync('./dist/cli.js', alias);
+    writeFileSync(join(second, 'unrelated'), 'preserved');
+    const released = join(second, 'released');
+    const observations: string[] = [];
+    const progress = vi.spyOn(process.stderr, 'write').mockImplementation((line) => {
+      observations.push(String(line));
+      if (String(line).includes('ENOENT')) writeFileSync(released, 'observed');
+      return true;
+    });
+    const script = `(async () => {
+      const fs = require('node:fs'), cp = require('node:child_process');
+      fs.unlinkSync(${JSON.stringify(target)});
+      while (!fs.existsSync(${JSON.stringify(released)})) await new Promise(resolve => setTimeout(resolve, 10));
+      if (${JSON.stringify(mode)} === 'bytes') fs.writeFileSync(${JSON.stringify(join(second, 'oversized'))}, 'x'.repeat(4096));
+      if (${JSON.stringify(mode)} === 'rss') globalThis.retainedBuildMemory = Buffer.alloc(200 * 1024 * 1024, 1);
+      if (${JSON.stringify(mode)} === 'disk') fs.writeFileSync(${JSON.stringify(join(second, 'disk-output'))}, Buffer.alloc(64 * 1024 * 1024, 1));
+      if (${JSON.stringify(mode)} === 'fifo') cp.execFileSync('mkfifo', [${JSON.stringify(join(second, 'unsupported'))}]);
+      if (${JSON.stringify(mode)} === 'permission') {
+        fs.mkdirSync(${JSON.stringify(join(second, 'denied'))});
+        fs.chmodSync(${JSON.stringify(join(second, 'denied'))}, 0);
+      }
+      if (${JSON.stringify(mode)} === 'identity') {
+        fs.unlinkSync(${JSON.stringify(alias)}); fs.writeFileSync(${JSON.stringify(join(first, 'other'))}, 'other');
+        fs.symlinkSync('./other', ${JSON.stringify(alias)});
+      }
+      if (${JSON.stringify(mode)} === 'ancestor') {
+        fs.rmdirSync(${JSON.stringify(directory)}); fs.symlinkSync(${JSON.stringify(second)}, ${JSON.stringify(directory)});
+      }
+      if (${JSON.stringify(mode)} === 'cycle') fs.symlinkSync('./cli.js', ${JSON.stringify(target)});
+      for (let unit = 0; unit < 32; unit++) {
+        fs.appendFileSync(${JSON.stringify(join(second, 'work'))}, 'unit\\n');
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      fs.writeFileSync(${JSON.stringify(target)}, 'rebuilt CLI');
+    })().catch(error => { console.error(error); process.exitCode = 1; });`;
+    try {
+      const { withRuntimeSetupWriter } = await import('./verification.js');
+      const disk = (await import('node:fs')).statfsSync(output);
+      await assert.rejects(
+        withRuntimeSetupWriter(root, (runner) =>
+          runner.run([process.execPath, '-e', script], {
+            maxAggregateRssBytes: mode === 'rss' ? 128 * 1024 * 1024 : 1_000_000_000,
+            minFreeDiskBytes: mode === 'disk' ? disk.bavail * disk.bsize - 32 * 1024 * 1024 : 1,
+            maxNewOutputBytes: mode === 'disk' ? 128 * 1024 * 1024 : 1024,
+            outputRoots: [first, second],
+          }),
+        ),
+        (error) => {
+          const message = String(error);
+          assert.match(
+            message,
+            mode === 'bytes'
+              ? /filesystem output.*exceeded/u
+              : mode === 'rss'
+                ? /aggregate RSS.*exceeded/u
+                : mode === 'disk'
+                  ? /Free disk fell below/u
+                  : mode === 'fifo'
+                    ? /unsupported file/u
+                    : mode === 'permission'
+                      ? /readdir failed.*EACCES/u
+                      : mode === 'cycle'
+                        ? /ELOOP/u
+                        : /identity changed/u,
+          );
+          assert.match(message, /First filesystem observation:.*ENOENT.*Last filesystem observation:/u);
+          assert.doesNotMatch(message, /cleanup failed/u);
+          return true;
+        },
+      );
+      assert.ok(observations.some((line) => line.includes('ENOENT')));
+      assert.equal(
+        observations.some((line) => line.includes('"state":"completed"')),
+        false,
+      );
+      assert.equal(readFileSync(join(second, 'unrelated'), 'utf8'), 'preserved');
+    } finally {
+      const denied = join(second, 'denied');
+      if (existsSync(denied)) chmodSync(denied, 0o700);
+      progress.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
+
 test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
   'ordinary owned symlink teardown preserves observation and %s command evidence',
   async (mode) => {
@@ -4502,7 +4669,7 @@ test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
         // Synchronize real removal with the sample preceding the synchronous filesystem scan.
         releaseTimer = setTimeout(() => {
           if (mode === 'cancel') controller.abort();
-          else if (mode !== 'persistent') writeFileSync(release, 'continue');
+          else writeFileSync(release, 'continue');
         }, 100);
       }
       return true;
@@ -4517,7 +4684,9 @@ test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
   trace('target-removed'); fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
   if (${JSON.stringify(mode)} === 'limit') fs.writeFileSync(${JSON.stringify(join(output, 'retained'))}, 'x'.repeat(512));
   while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 10));
-  fs.unlinkSync(${JSON.stringify(join(output, 'alias'))}); trace('alias-removed');
+  if (${JSON.stringify(mode)} !== 'persistent') {
+    fs.unlinkSync(${JSON.stringify(join(output, 'alias'))}); trace('alias-removed');
+  }
   process.exitCode = ${mode === 'command-error' ? 7 : 0};
 })().catch(error => { console.error(error); process.exitCode = 1; });`;
     try {
@@ -4543,7 +4712,7 @@ test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
             mode === 'cancel'
               ? /cancelled/u
               : mode === 'persistent'
-                ? /remained unavailable.*First observation:.*ENOENT/u
+                ? /broken or cyclic symbolic link.*ENOENT/u
                 : mode === 'limit'
                   ? /filesystem output.*exceeded/u
                   : /exit 7/u,
@@ -4585,7 +4754,7 @@ test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
       );
       assert.deepEqual(
         readFileSync(events, 'utf8').trim().split('\n'),
-        mode === 'cancel' || mode === 'persistent'
+        mode === 'cancel' || mode === 'persistent' || mode === 'limit'
           ? ['command-started', 'target-removed']
           : ['command-started', 'target-removed', 'alias-removed'],
       );
@@ -4616,14 +4785,75 @@ test.each(['pass', 'command-error', 'cancel', 'persistent', 'limit'] as const)(
   },
 );
 
-test('injected observation deadline rejects a late complete real filesystem retry', async () => {
+test('injected first failed scan duration does not consume the subsequent observation stall window', async () => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-scan-duration-')));
+  const { root } = await fixture();
+  const target = join(output, 'target'),
+    alias = join(output, 'alias'),
+    release = join(output, 'release');
+  writeFileSync(target, 'target');
+  const fs = (await import('node:fs')).default;
+  const actualRealpath = fs.realpathSync;
+  const now = Date.now.bind(Date);
+  let offset = 0,
+    delayed = false,
+    firstObservation: string | undefined;
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + offset);
+  const scan = vi.spyOn(fs, 'realpathSync').mockImplementation((path, options) => {
+    try {
+      return actualRealpath(path, options);
+    } catch (error) {
+      if (path === alias && !delayed) {
+        delayed = true;
+        offset = 1500;
+      }
+      throw error;
+    }
+  });
+  syncBuiltinESMExports();
+  const progress = vi.spyOn(process.stderr, 'write').mockImplementation((line) => {
+    if (firstObservation === undefined && String(line).includes('ENOENT')) {
+      firstObservation = String(line);
+      unlinkSync(alias);
+      writeFileSync(release, 'finish');
+    }
+    return true;
+  });
+  const script = `(async () => {
+    const fs = require('node:fs'); fs.unlinkSync(${JSON.stringify(target)});
+    fs.symlinkSync('./target', ${JSON.stringify(alias)});
+    while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 10));
+  })().catch(error => { console.error(error); process.exitCode = 1; });`;
+  try {
+    const { withRuntimeSetupWriter } = await import('./verification.js');
+    await withRuntimeSetupWriter(root, (runner) =>
+      runner.run([process.execPath, '-e', script], {
+        maxAggregateRssBytes: 1_000_000_000,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 4096,
+        outputRoots: [output],
+      }),
+    );
+    assert.ok(delayed);
+    assert.ok(firstObservation);
+    assert.equal(existsSync(alias), false);
+  } finally {
+    progress.mockRestore();
+    scan.mockRestore();
+    syncBuiltinESMExports();
+    clock.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+  }
+});
+
+test('injected observation stall rejects a late complete retry for an unvalidated alias', async () => {
   const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-observation-deadline-')));
   const { root } = await fixture();
   const target = join(output, 'target'),
     alias = join(output, 'alias'),
     release = join(output, 'release');
   writeFileSync(target, 'target');
-  symlinkSync('./target', alias);
   const now = Date.now.bind(Date);
   let offset = 0;
   let firstObservation: string | undefined;
@@ -4643,6 +4873,7 @@ test('injected observation deadline rejects a late complete real filesystem retr
   });
   const script = `(async () => {
     const fs = require('node:fs'); fs.unlinkSync(${JSON.stringify(target)});
+    fs.symlinkSync('./target', ${JSON.stringify(alias)});
     while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 10));
   })().catch(error => { console.error(error); process.exitCode = 1; });`;
   try {
@@ -4802,6 +5033,97 @@ const child = require('node:child_process').spawnSync(${JSON.stringify(consumer.
 if (child.error) throw child.error;
 process.exit(child.status ?? 1);`;
 }
+
+test.each(['pass', 'absent', 'limit', 'cancel'] as const)(
+  'Node 26 packed public verification preserves CLI rebuild %s behavior',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-packed-rebuild-')));
+    const target = join(output, 'cli.js');
+    writeFileSync(target, 'original CLI');
+    symlinkSync('./cli.js', join(output, 'cli'));
+    writeFileSync(join(output, 'unrelated'), 'preserved');
+    const { root } = await fixture({ personalAuthor: true, firstStageScript: ordinaryCliRebuildScript(output, mode) });
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'host-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      const clients = syntheticDiscoveryClients();
+      const replies: { fragment: string; data: unknown }[] = [];
+      for (const fragment of [
+        'query DeliveryRepository',
+        'query ProjectDeliveryConfiguration',
+        'issueFields(first:',
+        'issueTypes(first:',
+      ])
+        replies.push({ fragment, data: await clients.graphql(fragment) });
+      const consumer = packedNode26Consumer();
+      const result = execFileSync(
+        consumer.executable,
+        [
+          '-e',
+          `(async () => {
+        const assert = require('node:assert/strict'), fs = require('node:fs');
+        assert.equal(process.version, 'v26.2.0');
+        const replies = ${JSON.stringify(replies)};
+        // Only GitHub discovery transport is synthetic; package, writer, scanner and child filesystem are real.
+        globalThis.fetch = async (url, options) => {
+          assert.equal(String(url), 'https://api.github.com/graphql');
+          const query = JSON.parse(options.body).query;
+          const reply = replies.find(reply => query.includes(reply.fragment));
+          assert.ok(reply, 'unexpected synthetic discovery query');
+          return new Response(JSON.stringify({ data: reply.data }), { status: 200, headers: { 'content-type': 'application/json' } });
+        };
+        process.env.AUTHOR_TOKEN = 'synthetic-author-token';
+        const { verifyIssue } = await import('@aviaratech/ai-delivery/agent');
+        const controller = new AbortController();
+        const observations = []; const write = process.stderr.write.bind(process.stderr);
+        process.stderr.write = line => {
+          observations.push(String(line));
+          if (${JSON.stringify(mode)} === 'cancel' && String(line).includes('ENOENT')) controller.abort();
+          return true;
+        };
+        try {
+          const running = verifyIssue({ issueNumber: 17, repoRoot: ${JSON.stringify(row.path)}, signal: controller.signal,
+            resourceBounds: { maxAggregateRssBytes: 1000000000, minFreeDiskBytes: 1,
+              maxNewOutputBytes: ${mode === 'limit' ? 1024 : 8192}, outputRoots: [${JSON.stringify(output)}] } });
+          if (${JSON.stringify(mode)} === 'pass') {
+            const run = await running;
+            assert.ok(run.resources.sampleCount > 0); assert.ok(run.resources.maxSampledNewOutputBytes > 0);
+            assert.equal(fs.readFileSync(${JSON.stringify(target)}, 'utf8'), 'rebuilt CLI');
+            // Compatible completed proof is reused, but the current final filesystem is still strictly scanned.
+            fs.unlinkSync(${JSON.stringify(target)});
+            await assert.rejects(verifyIssue({ issueNumber: 17, repoRoot: ${JSON.stringify(row.path)},
+              resourceBounds: { maxAggregateRssBytes: 1000000000, minFreeDiskBytes: 1, maxNewOutputBytes: 8192,
+                outputRoots: [${JSON.stringify(output)}] } }), /broken or cyclic symbolic link/);
+          } else {
+            await assert.rejects(running, error => {
+              assert.match(String(error), ${mode === 'cancel' ? '/cancelled/' : mode === 'limit' ? '/filesystem output.*exceeded/' : '/broken or cyclic symbolic link/'});
+              assert.doesNotMatch(String(error), /cleanup failed/); return true;
+            });
+          }
+          assert.ok(observations.some(line => line.includes('ENOENT')));
+          assert.equal(fs.readFileSync(${JSON.stringify(join(output, 'unrelated'))}, 'utf8'), 'preserved');
+          console.log(JSON.stringify({ scenario: 'packed-node26-cli-rebuild', mode: ${JSON.stringify(mode)},
+            firstObservation: observations.find(line => line.includes('ENOENT')), events: fs.readFileSync(${JSON.stringify(join(output, 'events'))}, 'utf8').trim().split('\\n') }));
+        } finally { controller.abort(); process.stderr.write = write; }
+      })().catch(error => { console.error(error); process.exitCode = 1; });`,
+        ],
+        {
+          cwd: consumer.root,
+          encoding: 'utf8',
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      console.log(result.trim());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
 
 function filesystemFixtureScript(
   output: string,
