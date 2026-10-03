@@ -19,7 +19,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { test, vi } from 'vitest';
+import { fileURLToPath } from 'node:url';
+import { afterAll, test, vi } from 'vitest';
 import { syntheticDiscoveryClients, syntheticOverrides } from './fixtures/discovery.js';
 import { Octokit } from '@octokit/rest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -4748,13 +4749,80 @@ test('fully cached bounded verification still rejects a newly leaked FIFO', asyn
   }
 });
 
-function filesystemFixtureScript(output: string, mode: 'pass' | 'assertion' | 'abrupt' | 'block' | 'cancel'): string {
+let node26Package: { executable: string; root: string; temporary: string } | undefined;
+
+function packedNode26Consumer(): { executable: string; root: string; temporary: string } {
+  if (node26Package !== undefined) return node26Package;
+  assert.equal(process.version, 'v24.21.0', 'canonical verification controller must remain Node 24.21.0');
+  const executable = process.env['AI_DELIVERY_NODE26_EXECUTABLE'];
+  assert.ok(executable, 'set AI_DELIVERY_NODE26_EXECUTABLE to the actual Node 26.2.0 executable');
+  assert.equal(execFileSync(executable, ['--version'], { encoding: 'utf8' }).trim(), 'v26.2.0');
+  const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-node26-')));
+  try {
+    const source = fileURLToPath(new URL('../', import.meta.url));
+    const pack = JSON.parse(
+      execFileSync('npm', ['pack', '--json', '--pack-destination', temporary], {
+        cwd: source,
+        encoding: 'utf8',
+        maxBuffer: 4 * 1024 * 1024,
+      }),
+    ) as [{ filename: string }];
+    execFileSync('tar', ['-xzf', join(temporary, pack[0].filename), '-C', temporary]);
+    const root = join(temporary, 'package');
+    symlinkSync(join(source, 'node_modules'), join(root, 'node_modules'), 'dir');
+    process.stderr.write(
+      `ai-delivery.node26-consumer ${JSON.stringify({
+        controller: process.version,
+        consumer: 'v26.2.0',
+        archiveSha256: createHash('sha256')
+          .update(readFileSync(join(temporary, pack[0].filename)))
+          .digest('hex'),
+        manifestSha256: createHash('sha256')
+          .update(readFileSync(join(root, 'package.json')))
+          .digest('hex'),
+      })}\n`,
+    );
+    node26Package = { executable: realpathSync(executable), root, temporary };
+    return node26Package;
+  } catch (error) {
+    rmSync(temporary, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+afterAll(() => {
+  if (node26Package !== undefined) rmSync(node26Package.temporary, { recursive: true, force: true });
+});
+
+function node26ConsumerScript(script: string): string {
+  const consumer = packedNode26Consumer();
   return `
+require('node:assert/strict').equal(process.version, 'v24.21.0');
+const child = require('node:child_process').spawnSync(${JSON.stringify(consumer.executable)}, ['-e', ${JSON.stringify(script)}], { cwd: ${JSON.stringify(consumer.root)}, stdio: 'inherit' });
+if (child.error) throw child.error;
+process.exit(child.status ?? 1);`;
+}
+
+function filesystemFixtureScript(
+  output: string,
+  mode: 'pass' | 'assertion' | 'abrupt' | 'block' | 'cancel',
+  runtime: 'node24' | 'node26' = 'node24',
+): string {
+  const script = `
 (async () => {
   const fs = require('node:fs'), cp = require('node:child_process'), path = require('node:path'), assert = require('node:assert/strict');
-  const { withVerificationFilesystemFixture } = await import(${JSON.stringify(new URL('./agent.js', import.meta.url).href)});
-  const { assertPrivateFile } = await import(${JSON.stringify(new URL('./delivery/common.js', import.meta.url).href)});
+  assert.equal(process.version, ${JSON.stringify(runtime === 'node26' ? 'v26.2.0' : 'v24.21.0')});
+  const { withVerificationFilesystemFixture } = await import(${JSON.stringify(runtime === 'node26' ? '@aviaratech/ai-delivery/agent' : new URL('./agent.js', import.meta.url).href)});
+  const { loadValidRepositoryDeliveryEvidence } = await import(${JSON.stringify(runtime === 'node26' ? '@aviaratech/ai-delivery/delivery' : new URL('./delivery/index.js', import.meta.url).href)});
   const output = ${JSON.stringify(output)}, fifo = path.join(output, 'fifo'), events = path.join(output, 'events');
+  const evidenceId = 'sha256:' + 'a'.repeat(64), currentHead = { sha: 'b'.repeat(40), tree: 'c'.repeat(40) };
+  const evidence = path.join(output, 'ai-delivery', 'receipts', 'delivery@1', currentHead.sha, evidenceId.slice(7) + '.json');
+  fs.mkdirSync(path.dirname(evidence), { recursive: true });
+  const rejectPrivateFile = file => {
+    fs.renameSync(file, evidence);
+    try { assert.throws(() => loadValidRepositoryDeliveryEvidence({ createInput: { gitCommonDir: output, currentHead }, evidenceId }), /private regular file/); }
+    finally { fs.renameSync(evidence, file); }
+  };
   const gate = JSON.parse(process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE);
   const trace = value => fs.appendFileSync(events, value + '\\n');
   await withVerificationFilesystemFixture(async () => {
@@ -4767,23 +4835,29 @@ function filesystemFixtureScript(output: string, mode: 'pass' | 'assertion' | 'a
       if (${JSON.stringify(mode)} === 'block') fs.readFileSync(fifo);
       while (fs.readdirSync(path.join(gate.directory, 'requests')).length === 0) await new Promise(resolve => setTimeout(resolve, 10));
       assert.ok(fs.existsSync(fifo)); trace('scan-queued');
-      assert.throws(() => assertPrivateFile(fifo), /private regular file/); trace('reader-rejected');
+      rejectPrivateFile(fifo); trace('reader-rejected');
       const regular = path.join(output, 'regular'), hard = path.join(output, 'hard'), alias = path.join(output, 'alias');
       fs.writeFileSync(regular, 'x'.repeat(128), { mode: 0o600 });
-      fs.linkSync(regular, hard); assert.throws(() => assertPrivateFile(hard), /private regular file/); fs.unlinkSync(hard);
-      fs.symlinkSync('./regular', alias); assert.throws(() => assertPrivateFile(alias), /private regular file/); fs.unlinkSync(alias);
+      fs.linkSync(regular, hard); rejectPrivateFile(hard); fs.unlinkSync(hard);
+      fs.symlinkSync('./regular', alias); rejectPrivateFile(alias); fs.unlinkSync(alias);
       if (${JSON.stringify(mode)} === 'assertion') throw new Error('synthetic reader assertion failure');
     } finally { fs.unlinkSync(fifo); trace('cleaned'); }
   });
   trace('released');
 })().catch(error => { console.error(error.message); process.exitCode = 1; });`;
+  return runtime === 'node26' ? node26ConsumerScript(script) : script;
 }
 
-test.each(['pass', 'assertion'] as const)(
-  'filesystem fixture gate deterministically queues a scan through reader rejection and %s teardown',
-  async (mode) => {
+test.each([
+  ['pass', 'node24'],
+  ['assertion', 'node24'],
+  ['pass', 'node26'],
+  ['assertion', 'node26'],
+] as const)(
+  'filesystem fixture gate deterministically queues a scan through reader rejection and %s teardown on %s',
+  async (mode, runtime) => {
     const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-gate-')));
-    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode) });
+    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
     try {
       const row = await prepareIssueWorktree({
         baseRef: 'main',
@@ -4821,12 +4895,19 @@ test.each(['pass', 'assertion'] as const)(
   },
 );
 
-test.each(['abrupt', 'block', 'cancel'] as const)(
-  'filesystem fixture gate preserves leaked FIFO and unrelated files after %s',
-  async (mode) => {
+test.each([
+  ['abrupt', 'node24'],
+  ['block', 'node24'],
+  ['cancel', 'node24'],
+  ['abrupt', 'node26'],
+  ['block', 'node26'],
+  ['cancel', 'node26'],
+] as const)(
+  'filesystem fixture gate preserves leaked FIFO and unrelated files after %s on %s',
+  async (mode, runtime) => {
     const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-failure-')));
     writeFileSync(join(output, 'unrelated'), 'preserved');
-    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode) });
+    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
     const controller = new AbortController();
     let running: Promise<unknown> | undefined;
     const progress = vi.spyOn(process.stderr, 'write');
@@ -4885,36 +4966,39 @@ test.each(['abrupt', 'block', 'cancel'] as const)(
   },
 );
 
-test('filesystem fixture gate still enforces positive byte limits after deterministic contention', async () => {
-  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-limit-')));
-  const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, 'pass') });
-  try {
-    const row = await prepareIssueWorktree({
-      baseRef: 'main',
-      identity: 'synthetic-author',
-      issueNumber: 17,
-      repoRoot: root,
-    });
-    await assert.rejects(
-      verifyIssue({
+test.each(['node24', 'node26'] as const)(
+  'filesystem fixture gate still enforces positive byte limits after deterministic contention on %s',
+  async (runtime) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-limit-')));
+    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, 'pass', runtime) });
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
         issueNumber: 17,
-        repoRoot: row.path,
-        resourceBounds: {
-          maxAggregateRssBytes: 1_000_000_000,
-          minFreeDiskBytes: 1,
-          maxNewOutputBytes: 64,
-          outputRoots: [output],
-        },
-      }),
-      /filesystem output.*exceeded/u,
-    );
-    assert.equal(existsSync(join(output, 'fifo')), false);
-    assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(output, { recursive: true, force: true });
-  }
-});
+        repoRoot: root,
+      });
+      await assert.rejects(
+        verifyIssue({
+          issueNumber: 17,
+          repoRoot: row.path,
+          resourceBounds: {
+            maxAggregateRssBytes: 1_000_000_000,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: 64,
+            outputRoots: [output],
+          },
+        }),
+        /filesystem output.*exceeded/u,
+      );
+      assert.equal(existsSync(join(output, 'fifo')), false);
+      assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
 
 test.each(['verification', 'runtime'] as const)(
   'filesystem fixture gate preserves observation and cancellation after direct %s command closure',
@@ -5010,6 +5094,42 @@ test.each(['verification', 'runtime'] as const)(
     }
   },
 );
+
+test('Node 26 packed public exports preserve standalone and malformed-capability behavior', () => {
+  const consumer = packedNode26Consumer();
+  execFileSync(
+    consumer.executable,
+    [
+      '-e',
+      `
+(async () => {
+  const assert = require('node:assert/strict');
+  assert.equal(process.version, 'v26.2.0');
+  const [root, agent, delivery, mcp] = await Promise.all([
+    import('@aviaratech/ai-delivery'), import('@aviaratech/ai-delivery/agent'),
+    import('@aviaratech/ai-delivery/delivery'), import('@aviaratech/ai-delivery/mcp'),
+  ]);
+  assert.equal(root.withVerificationFilesystemFixture, agent.withVerificationFilesystemFixture);
+  assert.equal(typeof agent.verifyIssue, 'function');
+  assert.equal(typeof delivery.loadValidRepositoryDeliveryEvidence, 'function');
+  assert.equal(typeof mcp.createAiDeliveryMcpServer, 'function');
+  const manifest = JSON.parse(require('node:fs').readFileSync('package.json', 'utf8'));
+  assert.deepEqual(Object.keys(manifest.exports).sort(), ['.', './agent', './delivery', './mcp']);
+  const prior = process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
+  delete process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
+  assert.equal(await agent.withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
+  process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE = '{}';
+  let executed = false;
+  await assert.rejects(agent.withVerificationFilesystemFixture(() => { executed = true; }), /invalid or stale/);
+  assert.equal(executed, false);
+  if (prior === undefined) delete process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
+  else process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE = prior;
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`,
+    ],
+    { cwd: consumer.root, stdio: 'pipe' },
+  );
+});
 
 test('filesystem fixture helper runs standalone and fails closed on malformed capability', async () => {
   const { withVerificationFilesystemFixture } = await import('./agent.js');
