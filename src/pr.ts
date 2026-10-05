@@ -970,7 +970,13 @@ export async function mergePr(
       : loadRemovedMergedRun(context.root, input.issueNumber);
   const head = run.classification.head;
   const publication = loadPublication(receiptRoot, input.issueNumber, head.sha);
-  if (publication.prNumber !== input.prNumber) throw new DeliveryError('Merge PR does not match publication receipt.');
+  if (
+    publication.prNumber !== input.prNumber ||
+    publication.issueNumber !== input.issueNumber ||
+    publication.headSha !== head.sha ||
+    publication.baseSha !== run.classification.base.sha
+  )
+    throw new DeliveryError('Merge publication does not match its exact issue, PR or verified coordinates.');
   const existingPath = mergePath(receiptRoot, input.issueNumber, head.sha);
   const existing = readOptionalPrivate(existingPath, (value) => MergeSchema.parse(value));
   if (existing) {
@@ -990,8 +996,27 @@ export async function mergePr(
     const intent = readOptionalPrivate(mergeIntentPath(receiptRoot, input.issueNumber, head.sha), (value) =>
       MergeIntentSchema.parse(value),
     );
-    if (!intent || intent.intentId !== existing.intentId)
-      throw new DeliveryError('Terminal merge lacks its exact intent.');
+    if (
+      !intent ||
+      intent.intentId !== existing.intentId ||
+      intent.baseSha !== run.classification.base.sha ||
+      intent.headSha !== head.sha ||
+      intent.headTree !== head.tree
+    )
+      throw new DeliveryError('Terminal merge lacks its exact verified intent.');
+    const historicalReview = loadSubmittedReview(receiptRoot, input.issueNumber, head.sha);
+    if (
+      !historicalReview ||
+      historicalReview.prNumber !== input.prNumber ||
+      historicalReview.headSha !== head.sha ||
+      historicalReview.artifact.issueNumber !== input.issueNumber ||
+      historicalReview.artifact.head.tree !== head.tree ||
+      historicalReview.artifact.diffScopeHash !== digestValue(run.classification.changedPaths) ||
+      historicalReview.artifact.verdict !== 'approve' ||
+      historicalReview.publicationEvidenceId !== publication.evidenceId ||
+      historicalReview.receiptId !== intent.reviewReceiptId
+    )
+      throw new DeliveryError('Terminal merge publication lacks its exact historical approved review.');
     const result = await readMergedResult(context, intent, existing.mergeSha);
     if (result.mergeTree !== existing.mergeTree) throw new DeliveryError('Terminal merge tree changed.');
     const { schemaVersion: _version, ...intentContent } = intent;

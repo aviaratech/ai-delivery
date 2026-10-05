@@ -814,8 +814,7 @@ test.each(['current-blocker', 'new-blocker', 'current-parent', 'new-parent'] as 
       await assert.rejects(updateIssue(context, input), /invalid blocked-by relationship evidence/u);
       assert.equal(writes, 0);
       malformedRelationships = false;
-      await assert.rejects(updateIssue(context, { ...input, issueNumber: 17 }), /ownership witness/u);
-      assert.equal(writes, 0);
+      assert.throws(() => getIssueWorktreeStrict(17, root), /ownership witness/u);
       writeFileSync(registryPath, JSON.stringify({ worktrees: [{ ...legacy, schemaVersion: 'unknown@99' }] }));
       await assert.rejects(updateIssue(context, input), /unsupported fields/u);
       assert.equal(writes, 0);
@@ -4458,6 +4457,52 @@ exec "${realGit}" "$@"
       for (const name of custody) saveReceipts(join(gitCommonDir(root), 'ai-delivery', name));
       const ownerPath = join(gitCommonDir(root), 'ai-delivery/worktree-owners');
       const ownerHash = directoryHash(ownerPath);
+      const publicationPath = join(
+        gitCommonDir(root),
+        'ai-delivery/publications',
+        String(issueNumber),
+        `${headSha}.json`,
+      );
+      const publicationBytes = readFileSync(publicationPath);
+      const { publicationId: _publicationId, ...publicationContent } = JSON.parse(
+        publicationBytes.toString(),
+      ) as Record<string, unknown>;
+      for (const stale of [
+        { issueNumber: 18 },
+        { headSha: 'c'.repeat(40) },
+        { baseSha: 'c'.repeat(40) },
+        { evidenceId: `sha256:${'c'.repeat(64)}` },
+      ]) {
+        const content = { ...publicationContent, ...stale };
+        const bytes = Buffer.from(JSON.stringify({ ...content, publicationId: digestValue(content) }));
+        writeFileSync(publicationPath, bytes, { mode: 0o600 });
+        await assert.rejects(
+          executeTool('issue_develop', { issueNumber }, execution),
+          /publication.*(?:verified coordinates|historical approved review)/u,
+        );
+        assert.deepEqual(readFileSync(registryPath), registryBytes);
+        assert.deepEqual(readFileSync(publicationPath), bytes);
+      }
+      writeFileSync(publicationPath, publicationBytes, { mode: 0o600 });
+      const reviewPath = join(gitCommonDir(root), 'ai-delivery/reviews', String(issueNumber), `${headSha}.json`);
+      const reviewBytes = readFileSync(reviewPath);
+      const {
+        receiptId: _receiptId,
+        artifact: savedArtifact,
+        ...reviewContent
+      } = JSON.parse(reviewBytes.toString()) as Record<string, unknown>;
+      const { artifactId: _artifactId, ...artifactContent } = savedArtifact as Record<string, unknown>;
+      const staleArtifact = { ...artifactContent, diffScopeHash: `sha256:${'c'.repeat(64)}` };
+      const staleReview = { ...reviewContent, artifact: { ...staleArtifact, artifactId: digestValue(staleArtifact) } };
+      const staleReviewBytes = Buffer.from(JSON.stringify({ ...staleReview, receiptId: digestValue(staleReview) }));
+      writeFileSync(reviewPath, staleReviewBytes, { mode: 0o600 });
+      await assert.rejects(
+        executeTool('issue_develop', { issueNumber }, execution),
+        /exact historical approved review/u,
+      );
+      assert.deepEqual(readFileSync(registryPath), registryBytes);
+      assert.deepEqual(readFileSync(reviewPath), staleReviewBytes);
+      writeFileSync(reviewPath, reviewBytes, { mode: 0o600 });
       await assert.rejects(
         developIssue(
           {
