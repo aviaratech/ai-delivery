@@ -3902,7 +3902,8 @@ async function syntheticLifecycle(routing: {
         parentIssueNumber = 11;
         return { data: {} };
       },
-      update: async (input: { state?: 'open' | 'closed' }) => {
+      update: async (input: { body?: string; state?: 'open' | 'closed' }) => {
+        if (input.body !== undefined) issue.body = input.body;
         if (input.state !== undefined) issue.state = input.state;
         return { data: issue };
       },
@@ -4237,6 +4238,32 @@ async function syntheticLifecycle(routing: {
     assert.equal(projectStatusWrites, interruptedWrites);
     assert.deepEqual(unblockedUpdate.blockedBy, []);
     assert.equal(unblockedUpdate.projectStatus, 'Todo');
+    projectStatus = 'Waiting';
+    parentIssueNumber = 11;
+    const heldStatusWrites = projectStatusWrites;
+    const originalBody = issue.body;
+    const metadataBody = `${originalBody}\n\nUpdated tracking context.`;
+    const heldMetadata = await updateIssue(context, { issueNumber, body: metadataBody });
+    assert.equal(heldMetadata.body, metadataBody);
+    assert.equal(heldMetadata.projectStatus, 'Blocked', 'body-only metadata must preserve a held Project status');
+    assert.equal(heldMetadata.state, 'open');
+    assert.deepEqual(heldMetadata.blockedBy, []);
+    assert.equal(heldMetadata.parentIssueNumber, 11);
+    assert.equal(projectStatusWrites, heldStatusWrites);
+    assert.equal((await updateIssue(context, { issueNumber, title: issue.title })).projectStatus, 'Blocked');
+    assert.equal(projectStatusWrites, heldStatusWrites);
+    await updateIssue(context, { issueNumber, body: originalBody });
+    parentIssueNumber = null;
+    for (const input of [{ park: true as const }, { blockedBy: [] }, { state: 'open' as const }]) {
+      projectStatus = 'Waiting';
+      const explicitUpdate = await updateIssue(context, { issueNumber, ...input });
+      assert.equal(explicitUpdate.projectStatus, 'Todo');
+      assert.deepEqual(explicitUpdate.blockedBy, []);
+    }
+    projectStatus = 'Waiting';
+    assert.equal((await updateIssue(context, { issueNumber, state: 'closed' })).projectStatus, 'Done');
+    issue.state = 'open';
+    projectStatus = 'Queued';
     conflictNextStatusReadback = true;
     await assert.rejects(updateIssue(context, { issueNumber, blockedBy: [9] }), /exact issue item/u);
     assert.equal(blockerOpen, true);

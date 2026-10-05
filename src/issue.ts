@@ -321,13 +321,10 @@ export async function updateIssue(
       ? 'Done'
       : info.blockedBy.length > 0
         ? 'Blocked'
-        : input.park === true ||
-            input.blockedBy !== undefined ||
-            info.projectStatus === 'Blocked' ||
-            info.projectStatus === null
+        : input.park === true || input.blockedBy !== undefined || info.projectStatus === null
           ? 'Todo'
-          : info.projectStatus === 'In Progress'
-            ? 'In Progress'
+          : info.projectStatus === 'In Progress' || (info.projectStatus === 'Blocked' && input.state === undefined)
+            ? info.projectStatus
             : 'Todo';
   const issue = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
   await syncIssueProjectStatus({
