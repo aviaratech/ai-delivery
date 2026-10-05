@@ -45,7 +45,13 @@ import {
   type DeliveryContext,
 } from './issue.js';
 import { checkoutPr, finishIssue, listPrs, mergePr, prChecks, prInfo, publishPr, submitFormalReview } from './pr.js';
-import { addWorktreeEntry, removeWorktreeEntry, updateIssueWorktreeDelivery } from './services/worktreeRegistry.js';
+import {
+  addWorktreeEntry,
+  assertNativeIssueTrackingAdmission,
+  getIssueWorktreeStrict,
+  removeWorktreeEntry,
+  updateIssueWorktreeDelivery,
+} from './services/worktreeRegistry.js';
 import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
 import { createIssuePhaseEvidence, loadVerifiedRun, verifyIssue } from './verification.js';
@@ -637,44 +643,13 @@ test('an old active issue remains pinned while a new row uses the same canonical
     assert.equal(readFileSync(registryPath, 'utf8'), futureBytes);
     assert.equal(existsSync(join(root, '.worktrees', 'scratch-new')), false);
     writeFileSync(registryPath, JSON.stringify({ worktrees: [old] }));
-    let issueWrites = 0;
-    const relationshipContext = {
-      root,
-      repo: { owner: 'example', repo: 'widget' },
-      config: (await loadDeliveryConfig(root)).config,
-      clients: {
-        rest: {
-          issues: {
-            get: async () => ({ data: { id: 17, number: 17, node_id: 'PARENT-17', state: 'open' } }),
-            create: async () => {
-              issueWrites += 1;
-              return { data: {} };
-            },
-            update: async () => {
-              issueWrites += 1;
-              return { data: {} };
-            },
-          },
-        },
-        graphql: async () => ({
-          repository: {
-            issue: {
-              parent: { id: 'PARENT-17', number: 17 },
-              blockedBy: { nodes: [], pageInfo: { endCursor: null, hasNextPage: false } },
-            },
-          },
-        }),
-      },
-    } as unknown as DeliveryContext;
-    await assert.rejects(
-      createIssue(relationshipContext, { title: 'Synthetic child', parentIssueNumber: 17 }),
-      /ownership witness/u,
-    );
-    await assert.rejects(
-      updateIssue(relationshipContext, { issueNumber: 17, parentIssueNumber: null }),
-      /ownership witness/u,
-    );
-    assert.equal(issueWrites, 0);
+    assert.doesNotThrow(() => assertNativeIssueTrackingAdmission(17, root));
+    const original = readFileSync(registryPath, 'utf8');
+    writeFileSync(registryPath, JSON.stringify({ worktrees: [old, old] }));
+    assert.throws(() => assertNativeIssueTrackingAdmission(17, root), /duplicate/u);
+    writeFileSync(registryPath, futureBytes);
+    assert.throws(() => assertNativeIssueTrackingAdmission(17, root), /unsupported fields/u);
+    writeFileSync(registryPath, original);
     await assert.rejects(
       prepareIssueWorktree({ identity: 'synthetic-author', issueNumber: 17, repoRoot: root }),
       /ownership witness/u,
@@ -3619,6 +3594,8 @@ async function syntheticLifecycle(routing: {
   remote: string;
   divergentOrigin: boolean;
   producerOnboarding?: boolean;
+  mergedContinuation?: boolean;
+  legacyNativeMetadata?: boolean;
 }): Promise<void> {
   const created = await fixture({ ...routing, omitRuntimeAdmission: routing.producerOnboarding === true });
   const root = created.root;
@@ -3998,7 +3975,10 @@ async function syntheticLifecycle(routing: {
         },
       }),
     },
-    repos: { getCombinedStatusForRef: async () => ({ data: { statuses: [], state: 'success' } }) },
+    repos: {
+      get: async () => ({ data: { full_name: 'example/widget' } }),
+      getCombinedStatusForRef: async () => ({ data: { statuses: [], state: 'success' } }),
+    },
   };
   let authenticatedAuthor = 'synthetic-author[bot]';
   const context = {
@@ -4018,7 +3998,83 @@ async function syntheticLifecycle(routing: {
     },
   } as unknown as DeliveryContext;
   let restoreDispatchClient: (() => void) | undefined;
+  const enableDispatch = () => {
+    const dispatchClient = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockImplementation(async (input) => ({
+      ...context.clients,
+      ...(input.role === 'reviewer'
+        ? {
+            role: 'reviewer' as const,
+            appActorLogin: async () => 'synthetic-reviewer[bot]',
+          }
+        : {}),
+      graphql: (async (query: string, variables: Record<string, unknown>) =>
+        query.includes('DeliveryDiscovery') ||
+        query.includes('DeliveryRepository') ||
+        query.includes('ProjectDeliveryConfiguration')
+          ? syntheticDiscoveryClients().graphql(query, variables)
+          : graphql(query, variables)) as typeof context.clients.graphql,
+    }));
+    restoreDispatchClient = () => dispatchClient.mockRestore();
+    return dispatchClient;
+  };
+  const execution = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
   try {
+    if (routing.legacyNativeMetadata) {
+      enableDispatch();
+      const legacyPath = join(root, '.worktrees', 'issue-17');
+      git(root, 'worktree', 'add', '-b', 'issue/17', legacyPath, 'main');
+      writeFileSync(join(legacyPath, 'artifact.txt'), 'unadopted legacy source\n');
+      const receiptRoot = join(root, '.git', 'legacy-receipts');
+      mkdirSync(receiptRoot);
+      writeFileSync(join(receiptRoot, 'run.json'), '{"producer":"synthetic-legacy"}\n');
+      const registryPath = join(root, '.issue-cli', 'worktrees.json');
+      mkdirSync(dirname(registryPath), { recursive: true });
+      const legacy = {
+        branch: 'issue/17',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        identity: 'synthetic-legacy',
+        issueNumber,
+        path: legacyPath,
+        status: 'active',
+        type: 'issue',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      };
+      const registryBytes = JSON.stringify({ worktrees: [legacy] });
+      writeFileSync(registryPath, registryBytes);
+      const source = directoryHash(legacyPath);
+      const receipts = directoryHash(receiptRoot);
+      await assert.rejects(
+        executeTool(
+          'issue_update',
+          { issueNumber, points: 2 },
+          {
+            ...execution,
+            identity: 'synthetic-reviewer',
+          },
+        ),
+        /identity|author|permitted|allowed/u,
+      );
+      const updated = (await executeTool(
+        'issue_update',
+        {
+          issueNumber,
+          parentIssueNumber: 11,
+          points: 2,
+          priority: 'High',
+        },
+        execution,
+      )) as { points: number; priority: string; parentIssueNumber: number };
+      assert.equal(updated.points, 2);
+      assert.equal(updated.priority, 'High');
+      assert.equal(parentIssueNumber, 11);
+      assert.equal(parentPoints, undefined);
+      await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /ownership witness/u);
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes);
+      assert.equal(directoryHash(legacyPath), source);
+      assert.equal(directoryHash(receiptRoot), receipts);
+      assert.equal(existsSync(join(gitCommonDir(root), 'ai-delivery/worktree-owners')), false);
+      return;
+    }
     if (routing.producerOnboarding) {
       assert.equal(existsSync(join(root, 'AGENTS.md')), false);
       const archiveBase = join(root, '.git', 'producer-fixture');
@@ -4372,6 +4428,91 @@ exec "${realGit}" "$@"
     );
     headSha = reviewedHead;
     assert.equal(calls.filter((call) => call === 'git:createCommit').length, 1);
+    if (routing.mergedContinuation) {
+      enableDispatch();
+      const terminal = await executeTool('issue_pr_merge', { issueNumber, prNumber, strategy: 'merge' }, execution);
+      assert.equal((terminal as { mergeSha: string }).mergeSha, mergeSha);
+      assert.equal(issue.state, 'open');
+      const previous = getIssueWorktreeStrict(issueNumber, root);
+      assert.equal(previous.status, 'merged');
+      const registryPath = join(root, '.issue-cli', 'worktrees.json');
+      const registryBytes = readFileSync(registryPath);
+      const custody = [
+        'runs@2',
+        'publications',
+        'reviews',
+        'merge-intents',
+        'merge-attempts',
+        'merge-results',
+        'merges',
+      ];
+      const oldReceipts: { path: string; bytes: Buffer }[] = [];
+      const saveReceipts = (path: string) => {
+        if (!existsSync(path)) return;
+        for (const entry of readdirSync(path, { withFileTypes: true })) {
+          const child = join(path, entry.name);
+          if (entry.isDirectory()) saveReceipts(child);
+          else oldReceipts.push({ path: child, bytes: readFileSync(child) });
+        }
+      };
+      for (const name of custody) saveReceipts(join(gitCommonDir(root), 'ai-delivery', name));
+      const ownerPath = join(gitCommonDir(root), 'ai-delivery/worktree-owners');
+      const ownerHash = directoryHash(ownerPath);
+      await assert.rejects(
+        developIssue(
+          {
+            ...context,
+            config: {
+              ...config,
+              roles: {
+                ...config.roles,
+                author: { ...config.roles.author, identity: 'other-owner' },
+              },
+            },
+          },
+          issueNumber,
+        ),
+        /same preparing owner/u,
+      );
+      issue.state = 'closed';
+      await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /closed/u);
+      issue.state = 'open';
+      headSha = 'b'.repeat(40);
+      await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /terminal receipt/u);
+      headSha = reviewedHead;
+      const mergePath = join(gitCommonDir(root), 'ai-delivery/merges', String(issueNumber), `${headSha}.json`);
+      const mergeBytes = readFileSync(mergePath);
+      unlinkSync(mergePath);
+      await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /exact terminal merge receipt/u);
+      writeFileSync(mergePath, mergeBytes, { mode: 0o600 });
+      assert.deepEqual(readFileSync(registryPath), registryBytes);
+      projectStatus = null;
+      failNextProjectSync = true;
+      await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /synthetic Project interruption/u);
+      const reactivated = getIssueWorktreeStrict(issueNumber, root);
+      assert.equal(reactivated.status, 'active');
+      assert.equal(reactivated.prNumber, undefined);
+      assert.equal(reactivated.identity, previous.identity);
+      assert.equal(reactivated.createdAt, previous.createdAt);
+      const resumed = await executeTool('issue_develop', { issueNumber }, execution);
+      assert.deepEqual(resumed, { path: previous.path, branch: previous.branch });
+      assert.equal(projectStatus, 'Active');
+      await assert.rejects(verifyIssue({ issueNumber, repoRoot: row.path }), /already-merged issue head/u);
+      for (const saved of oldReceipts) {
+        assert.deepEqual(readFileSync(saved.path), saved.bytes);
+      }
+      assert.equal(directoryHash(ownerPath), ownerHash);
+      // A fresh commit produces new verification slots while the complete prior head remains immutable.
+      writeFileSync(join(row.path, 'change.txt'), 'continued feature\n');
+      git(row.path, 'add', 'change.txt');
+      git(row.path, 'commit', '-qm', 'continue unfinished synthetic issue');
+      const continued = await verifyIssue({ issueNumber, repoRoot: row.path });
+      assert.notEqual(continued.classification.head.sha, reviewedHead);
+      for (const saved of oldReceipts) assert.deepEqual(readFileSync(saved.path), saved.bytes);
+      assert.equal(directoryHash(ownerPath), ownerHash);
+      assert.equal(calls.filter((call) => call === 'git:createCommit').length, 1);
+      return;
+    }
     const blockedRecordPath = join(gitCommonDir(root), 'ai-delivery', 'deliveries.json');
     mkdirSync(blockedRecordPath);
     await assert.rejects(
@@ -4380,17 +4521,8 @@ exec "${realGit}" "$@"
     );
     assert.equal(existsSync(row.path), false);
     rmSync(blockedRecordPath, { recursive: true });
-    const dispatchClient = vi.spyOn(githubClient, 'createDeliveryGitHubClients').mockImplementation(async () => ({
-      ...context.clients,
-      graphql: (async (query: string, variables: Record<string, unknown>) =>
-        query.includes('DeliveryDiscovery') ||
-        query.includes('DeliveryRepository') ||
-        query.includes('ProjectDeliveryConfiguration')
-          ? syntheticDiscoveryClients().graphql(query, variables)
-          : graphql(query, variables)) as typeof context.clients.graphql,
-    }));
-    restoreDispatchClient = () => dispatchClient.mockRestore();
-    const execution = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
+    const dispatchClient = enableDispatch();
+    execution.runtimeEntryPath = runtimeEntryPath;
     const terminalMerge = (await executeTool(
       'issue_pr_merge',
       { issueNumber, prNumber, strategy: 'merge' },
@@ -4471,6 +4603,18 @@ test.each([
   'synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin',
   syntheticLifecycle,
   15_000,
+);
+
+test(
+  'supported develop resumes an open merged issue under the same owner and preserves prior receipts',
+  { timeout: 0 },
+  async () => syntheticLifecycle({ remote: 'origin', divergentOrigin: false, mergedContinuation: true }),
+);
+
+test(
+  'supported native metadata updates a legacy target without adopting its source or receipts',
+  { timeout: 0 },
+  async () => syntheticLifecycle({ remote: 'origin', divergentOrigin: false, legacyNativeMetadata: true }),
 );
 
 test(

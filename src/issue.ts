@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { DeliveryConfig, LoadedDeliveryConfig } from './config/deliveryConfig.js';
@@ -26,11 +26,18 @@ import {
   resolveNativeRelationshipTargets,
 } from './github/relationships.js';
 import { resolveDeliveryRepo, type RepoCoordinates } from './github/repo.js';
-import { gitCommonDir, gitRoot, primaryGitRoot } from './git.js';
-import { preflightReviewRoute } from './pr.js';
+import { assertClean, git, gitCommonDir, gitRoot, primaryGitRoot } from './git.js';
+import { mergePr, preflightReviewRoute } from './pr.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
-import { assertNoForeignIssueWorktree, getWorktreeByIssue } from './services/worktreeRegistry.js';
-import { prepareIssueWorktree } from './worktree.js';
+import {
+  addWorktreeEntry,
+  assertNativeIssueTrackingAdmission,
+  getIssueWorktreeStrict,
+  getWorktreeByIssue,
+  listWorktreesStrict,
+} from './services/worktreeRegistry.js';
+import { withRuntimeSetupWriter } from './verification.js';
+import { assertIssueWorktreeLocation, prepareIssueWorktree } from './worktree.js';
 import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 export interface DeliveryContext {
@@ -135,7 +142,7 @@ export async function createIssue(
   for (const related of new Set(
     [...(input.blockedBy ?? []), input.parentIssueNumber].filter((number): number is number => number !== undefined),
   )) {
-    assertNoForeignIssueWorktree(related, context.root);
+    assertNativeIssueTrackingAdmission(related, context.root);
   }
   const created = await clients.rest.issues.create({
     body: input.body ?? '',
@@ -226,7 +233,7 @@ export async function updateIssue(
   context: DeliveryContext,
   input: UpdateIssueInput,
 ): Promise<Awaited<ReturnType<typeof issueInfo>>> {
-  assertNoForeignIssueWorktree(input.issueNumber, context.root);
+  assertNativeIssueTrackingAdmission(input.issueNumber, context.root);
   const { clients, config, repo } = context;
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
     throw new DeliveryError('Unsupported configured Issue Type.');
@@ -470,6 +477,35 @@ export async function developIssue(
     throw new DeliveryError(
       `Issue #${issueNumber} is not ready: ${readiness.failures.map((f) => f.message).join('; ')}`,
     );
+  const registered = listWorktreesStrict(context.root).filter(
+    (entry) => entry.type === 'issue' && entry.issueNumber === issueNumber,
+  );
+  if (registered.length > 1) throw new DeliveryError('Issue has duplicate worktree registry rows.');
+  if (registered[0]?.status === 'merged') {
+    const previous = getIssueWorktreeStrict(issueNumber, context.root);
+    if (previous.identity !== context.config.roles.author.identity || previous.prNumber === undefined)
+      throw new DeliveryError('Merged continuation requires the same preparing owner and exact prior PR.');
+    assertIssueWorktreeLocation(previous, context.root);
+    assertClean(previous.path);
+    const head = git(previous.path, 'rev-parse', 'HEAD');
+    if (!existsSync(join(gitCommonDir(previous.path), 'ai-delivery', 'merges', String(issueNumber), `${head}.json`)))
+      throw new DeliveryError('Merged continuation lacks its exact terminal merge receipt.');
+    await withRuntimeSetupWriter(previous.path, async (writer) => {
+      writer.assertQuiescent();
+      // Existing terminal recovery validates the historical run, publication, intent and remote merge.
+      await mergePr(context, { issueNumber, prNumber: previous.prNumber! });
+      const currentIssue = (await context.clients.rest.issues.get({ issue_number: issueNumber, ...context.repo })).data;
+      if (currentIssue.state !== 'open' || !(await readyCheck(context, issueNumber)).ready)
+        throw new DeliveryError('Merged continuation requires an open, ready unfinished issue.');
+      assertIssueWorktreeLocation(previous, context.root);
+      assertClean(previous.path);
+      if (git(previous.path, 'rev-parse', 'HEAD') !== head)
+        throw new DeliveryError('Merged continuation source changed during terminal readback.');
+      const { prNumber: _priorPr, ...sameOwner } = previous;
+      await addWorktreeEntry({ ...sameOwner, status: 'active', updatedAt: new Date().toISOString() }, context.root);
+      writer.assertQuiescent();
+    });
+  }
   const row = await prepareIssueWorktree({
     ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
     identity: context.config.roles.author.identity,
