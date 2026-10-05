@@ -19,6 +19,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, test, vi } from 'vitest';
@@ -5267,6 +5268,131 @@ const child = require('node:child_process').spawnSync(${JSON.stringify(consumer.
 if (child.error) throw child.error;
 process.exit(child.status ?? 1);`;
 }
+
+test.each([
+  ['pass', 'node24'],
+  ['limit', 'node24'],
+  ['cancel', 'node24'],
+  ['error', 'node24'],
+  ['pass', 'node26'],
+  ['limit', 'node26'],
+  ['cancel', 'node26'],
+  ['error', 'node26'],
+] as const)('Unix IPC sockets preserve regular-file output and %s verification on %s', async (mode, runtime) => {
+  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ad-socket-')));
+  const baselineSocket = join(output, 'baseline.sock'),
+    childSocket = join(output, 'child.sock');
+  const artifact = join(output, 'artifact'),
+    unrelated = join(output, 'unrelated');
+  writeFileSync(artifact, 'x'.repeat(512));
+  writeFileSync(unrelated, 'preserved');
+  const server = createServer((socket) => {
+    socket.destroy();
+  });
+  let root: string | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(baselineSocket, resolve);
+    });
+    const script = `(async () => {
+    const fs = require('node:fs'), net = require('node:net');
+    await new Promise((resolve, reject) => {
+      const socket = net.connect(${JSON.stringify(baselineSocket)});
+      socket.once('error', reject); socket.once('connect', () => { socket.destroy(); resolve(); });
+    });
+    const server = net.createServer();
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(${JSON.stringify(childSocket)}, resolve); });
+    fs.writeFileSync(${JSON.stringify(join(output, 'socket-ready'))}, 'ready');
+    try {
+      for (let unit = 0; unit < 12; unit++) {
+        fs.appendFileSync(${JSON.stringify(artifact)}, 'x'.repeat(256));
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    } finally { await new Promise(resolve => server.close(resolve)); }
+    if (${JSON.stringify(mode)} === 'error') process.exitCode = 9;
+  })().catch(error => { console.error(error); process.exitCode = 1; });`;
+    ({ root } = await fixture({ personalAuthor: true, firstStageScript: script }));
+    const row = await prepareIssueWorktree({
+      baseRef: 'main',
+      identity: 'host-author',
+      issueNumber: 17,
+      repoRoot: root,
+    });
+    const clients = syntheticDiscoveryClients();
+    const replies = [];
+    for (const fragment of [
+      'query DeliveryRepository',
+      'query ProjectDeliveryConfiguration',
+      'issueFields(first:',
+      'issueTypes(first:',
+    ])
+      replies.push({ fragment, data: await clients.graphql(fragment) });
+    const consumer =
+      runtime === 'node26'
+        ? packedNode26Consumer()
+        : { executable: process.execPath, root: fileURLToPath(new URL('../', import.meta.url)) };
+    const result = execFileSync(
+      consumer.executable,
+      [
+        '-e',
+        `(async () => {
+      const assert = require('node:assert/strict'), fs = require('node:fs');
+      assert.equal(process.version, ${JSON.stringify(runtime === 'node26' ? 'v26.2.0' : 'v24.21.0')});
+      const replies = ${JSON.stringify(replies)};
+      globalThis.fetch = async (url, options) => {
+        assert.equal(String(url), 'https://api.github.com/graphql');
+        const reply = replies.find(reply => JSON.parse(options.body).query.includes(reply.fragment));
+        assert.ok(reply); return new Response(JSON.stringify({ data: reply.data }), { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+      process.env.AUTHOR_TOKEN = 'synthetic-author-token';
+      const { verifyIssue } = await import(${JSON.stringify(runtime === 'node26' ? '@aviaratech/ai-delivery/agent' : new URL('./agent.js', import.meta.url).href)});
+      const controller = new AbortController(), observations = [];
+      const cancellation = ${JSON.stringify(mode)} === 'cancel' ? setInterval(() => {
+        if (fs.existsSync(${JSON.stringify(childSocket)})) {
+          assert.equal(fs.lstatSync(${JSON.stringify(childSocket)}).isSocket(), true);
+          controller.abort();
+        }
+      }, 10) : undefined;
+      const originalWrite = process.stderr.write;
+      process.stderr.write = line => {
+        observations.push(String(line));
+        return true;
+      };
+      try {
+        const running = verifyIssue({ issueNumber: 17, repoRoot: ${JSON.stringify(row.path)}, signal: controller.signal,
+          resourceBounds: { maxAggregateRssBytes: 1000000000, minFreeDiskBytes: 1,
+            maxNewOutputBytes: ${mode === 'limit' ? 1024 : 8192}, outputRoots: [${JSON.stringify(output)}] } });
+        if (${JSON.stringify(mode)} === 'pass') {
+          const run = await running;
+          assert.ok(run.resources.sampleCount > 0);
+          assert.ok(run.resources.maxSampledNewOutputBytes >= 3072);
+          assert.equal(fs.statSync(${JSON.stringify(artifact)}).size, 3584);
+          assert.equal(fs.existsSync(${JSON.stringify(childSocket)}), false);
+          assert.equal(fs.lstatSync(${JSON.stringify(baselineSocket)}).isSocket(), true);
+        } else await assert.rejects(running, error => {
+          assert.match(String(error), ${mode === 'limit' ? '/filesystem output.*exceeded/' : mode === 'cancel' ? '/cancelled/' : '/exit 9/'});
+          assert.doesNotMatch(String(error), /cleanup failed/); return true;
+        });
+        assert.equal(fs.readFileSync(${JSON.stringify(unrelated)}, 'utf8'), 'preserved');
+        console.log(JSON.stringify({ scenario: 'unix-ipc-socket', runtime: process.version, mode: ${JSON.stringify(mode)},
+          sampleCount: observations.length, unrelatedPreserved: true }));
+      } finally { clearInterval(cancellation); controller.abort(); process.stderr.write = originalWrite; }
+    })().catch(error => { console.error(error); process.exitCode = 1; });`,
+      ],
+      { cwd: consumer.root, encoding: 'utf8', maxBuffer: 1024 * 1024 },
+    );
+    console.log(result.trim());
+    assert.ok(existsSync(join(output, 'socket-ready')));
+  } finally {
+    if (server.listening)
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    assert.equal(existsSync(baselineSocket), false);
+    if (root !== undefined) rmSync(root, { recursive: true, force: true });
+    rmSync(output, { recursive: true, force: true });
+    assert.equal(existsSync(output), false);
+  }
+});
 
 test.each(['pass', 'absent', 'limit', 'cancel'] as const)(
   'Node 26 packed public verification preserves CLI rebuild %s behavior',

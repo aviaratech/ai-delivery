@@ -669,12 +669,13 @@ function scanOutputRoots(
       for (const name of names) visit(join(path, name));
       return;
     }
-    if (!metadata.isFile() || !Number.isSafeInteger(metadata.size)) {
+    if ((!metadata.isFile() && !metadata.isSocket()) || !Number.isSafeInteger(metadata.size)) {
       throw new DeliveryError(
         `Filesystem output observation encountered an unsupported file. Path ${JSON.stringify(path)}.`,
       );
     }
-    files.set(path, metadata.size);
+    // Unix IPC endpoints store no regular-file payload, but still count toward the scan's entry limit.
+    files.set(path, metadata.isSocket() ? 0 : metadata.size);
     if (files.size > 1_000_000) throw new DeliveryError('Filesystem output observation exceeded its file limit.');
   };
   for (const root of roots) {
