@@ -347,14 +347,13 @@ export function getIssueWorktreeStrict(issueNumber: number, projectRoot?: string
   return entry;
 }
 
-/** Tracking writes may target an issue without a worktree, but never adopt a foreign active row. */
-export function assertNoForeignIssueWorktree(issueNumber: number, root: string): void {
+/** Native metadata never adopts source; retain every transition and canonical registry fence. */
+export function assertNativeIssueTrackingAdmission(issueNumber: number, root: string): void {
   assertIssueWorktreeTransitionAdmission(issueNumber, root);
   const matches = listWorktreesStrict(root).filter(
     (entry) => entry.type === 'issue' && entry.issueNumber === issueNumber,
   );
   if (matches.length > 1) throw new Error(`Issue #${String(issueNumber)} has duplicate worktree owners.`);
-  if (matches[0] !== undefined) assertAiDeliveryWorktreeOwner(matches[0], root);
 }
 
 export function getStaleWorktrees(daysOld: number, projectRoot?: string): WorktreeEntry[] {

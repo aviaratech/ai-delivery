@@ -1820,6 +1820,11 @@ async function verifyIssueOwned(
   if (input.resourceBounds !== undefined) assertResourceBounds(input.resourceBounds);
   assertRegisteredIssue(root, input.issueNumber);
   const common = gitCommonDir(root);
+  if (existsSync(join(common, 'ai-delivery', 'merges', String(input.issueNumber), `${coordinate(root).sha}.json`))) {
+    throw new DeliveryError(
+      'Commit continuation work before verifying an already-merged issue head; retain its receipts.',
+    );
+  }
   const loaded = await loadDeliveryConfig(
     root,
     input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth },

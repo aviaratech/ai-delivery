@@ -304,6 +304,22 @@ review, merge and re-registration. Active resume requires fresh current
 verification and review. Terminal transition witnesses permanently restrict
 ordinary source operations.
 
+When a ready issue remains open after a prerequisite PR merges, `develop` or
+`issue_develop` can continue its existing worktree under the same preparing owner.
+It requires the clean original branch and exact prior verified publication,
+merge intent and native merged-PR lineage. Continuation preserves the ownership
+witness and all prior receipts, clears the prior PR from the active registry row,
+and resumes Project synchronization idempotently. Commit the continuation changes
+before verification; the already-merged HEAD cannot produce replacement evidence.
+A closed issue, different owner, stale lineage or pending/terminal transition is
+refused. Source holds and runtime admission remain in force.
+
+Native issue metadata updates may target a legacy registered issue without
+adopting its worktree. The authenticated author and admitted runtime still apply,
+and canonical registry/schema, duplicate-owner and complete transition checks
+remain mandatory. Metadata updates preserve source, registry, ownership witnesses
+and delivery receipts; source lifecycle operations still require attested custody.
+
 Terminal disposition defaults to `retain`, preserving source and all holds.
 Supply native retained-hold comment IDs with `--retained-holds`. `remove` requires
 an independently accepted personal assertion that no holds remain, exact native

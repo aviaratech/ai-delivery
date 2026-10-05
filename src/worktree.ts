@@ -5,7 +5,7 @@ import { resolveGitRemoteName } from './github/repo.js';
 
 import { DeliveryError } from './errors.js';
 import type { WorktreeTransitionPlan } from './worktreeTransition.js';
-import { assertClean, defaultBaseRef, git, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
+import { assertClean, defaultBaseRef, git, gitCommonDir, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
 import {
   addWorktreeEntry,
   assertAiDeliveryWorktreeOwner,
@@ -25,6 +25,24 @@ function assertSafePath(root: string, target: string): void {
 
 function assertIssueNumber(issueNumber: number): void {
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) throw new DeliveryError('Issue number must be positive.');
+}
+
+/** @internal Shared physical custody check for preparation and same-owner continuation. */
+export function assertIssueWorktreeLocation(row: WorktreeEntry, root: string): void {
+  assertIssueNumber(row.issueNumber ?? 0);
+  const branch = `issue/${String(row.issueNumber)}`;
+  const target = join(root, '.worktrees', `issue-${String(row.issueNumber)}`);
+  if (
+    row.type !== 'issue' ||
+    row.path !== target ||
+    row.branch !== branch ||
+    !existsSync(target) ||
+    gitRoot(target) !== realpathSync(target) ||
+    gitCommonDir(target) !== gitCommonDir(root)
+  ) {
+    throw new DeliveryError('Registered worktree disagrees with its exact repository, path or branch.');
+  }
+  if (git(target, 'branch', '--show-current') !== branch) throw new DeliveryError('Registered branch drifted.');
 }
 
 export async function prepareIssueWorktree(input: {
@@ -50,15 +68,7 @@ export async function prepareIssueWorktree(input: {
     if (row.status !== 'active' && row.status !== 'pr-published') {
       throw new DeliveryError('Only an active issue worktree can be resumed.');
     }
-    if (
-      row.path !== target ||
-      row.branch !== branch ||
-      !existsSync(target) ||
-      gitRoot(target) !== realpathSync(target)
-    ) {
-      throw new DeliveryError('Registered worktree disagrees with its exact path or branch.');
-    }
-    if (git(target, 'branch', '--show-current') !== branch) throw new DeliveryError('Registered branch drifted.');
+    assertIssueWorktreeLocation(row, root);
     return row;
   }
   if (existsSync(target)) throw new DeliveryError('An unregistered issue worktree path already exists.');

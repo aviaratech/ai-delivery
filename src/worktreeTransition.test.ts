@@ -33,7 +33,7 @@ import type { LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { gitCommonDir } from './git.js';
 import {
   addWorktreeEntry,
-  assertNoForeignIssueWorktree,
+  assertNativeIssueTrackingAdmission,
   getIssueWorktreeStrict,
   listWorktreesStrict,
   withWorktreeTransitionRegistry,
@@ -291,7 +291,7 @@ test(
           original,
           event,
         );
-        assert.throws(() => assertNoForeignIssueWorktree(17, f.root), /terminal/iu);
+        assert.throws(() => assertNativeIssueTrackingAdmission(17, f.root), /terminal/iu);
       } finally {
         rmSync(f.root, { force: true, recursive: true });
       }
@@ -916,7 +916,7 @@ test(
       assert.equal((await applyWorktreeTransition(f.context, input)).replayed, true);
       execFileSync('git', ['worktree', 'add', f.row.path, f.row.branch], { cwd: f.root });
       await assert.rejects(applyWorktreeTransition(f.context, input), /recreated|absence postcondition/iu);
-      assert.throws(() => assertNoForeignIssueWorktree(17, f.root), /terminal/iu);
+      assert.throws(() => assertNativeIssueTrackingAdmission(17, f.root), /terminal/iu);
     } finally {
       rmSync(f.root, { force: true, recursive: true });
     }
@@ -1019,7 +1019,7 @@ test('direct tracking admission refuses pending intent after its canonical row i
     writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [] }), { mode: 0o600 });
     interruptTransition(root, row);
     assert.throws(
-      () => assertNoForeignIssueWorktree(17, root),
+      () => assertNativeIssueTrackingAdmission(17, root),
       /Worktree transition.*(?:pending|incomplete|terminal)/iu,
     );
     await assert.rejects(
@@ -1040,7 +1040,7 @@ test('absent-row admission refuses valid JSON with a non-issue or mismatched emb
     const path = join(gitCommonDir(root), 'ai-delivery/worktree-owners/issue-17.transition.json');
     for (const invalid of [{ type: 'pr' }, { ...row, issueNumber: 18 }, { ...row, issueNumber: undefined }]) {
       writeFileSync(path, JSON.stringify({ plan: { row: invalid } }), { mode: 0o600 });
-      assert.throws(() => assertNoForeignIssueWorktree(17, root), /transition.*(?:incomplete|unreadable)/iu);
+      assert.throws(() => assertNativeIssueTrackingAdmission(17, root), /transition.*(?:incomplete|unreadable)/iu);
       await assert.rejects(
         prepareIssueWorktree({ identity: row.identity!, issueNumber: 17, repoRoot: root }),
         /transition.*(?:incomplete|unreadable)/iu,
