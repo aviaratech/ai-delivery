@@ -1,10 +1,11 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import {
   closeSync,
   existsSync,
   fsyncSync,
+  fstatSync,
   openSync,
   unlinkSync,
   lstatSync,
@@ -12,6 +13,7 @@ import {
   rmdirSync,
   renameSync,
   readFileSync,
+  readSync,
   readlinkSync,
   readdirSync,
   realpathSync,
@@ -51,8 +53,10 @@ import {
   type RepositoryStageInput,
 } from './delivery/index.js';
 import { DeliveryError } from './errors.js';
+import { createDeliveryGitHubClients } from './github/client.js';
 import { assertClean, changedPaths, coordinate, defaultBaseRef, git, gitCommonDir, gitRoot } from './git.js';
-import { getIssueWorktreeStrict } from './services/worktreeRegistry.js';
+import { assertAiDeliveryWorktreeOwner, getIssueWorktreeStrict } from './services/worktreeRegistry.js';
+import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import { withLock } from './utils/lockfile.js';
 import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
@@ -961,9 +965,10 @@ function sampleOwnedTree(
   bounds: VerificationResourceBounds,
   baseline?: OutputBaseline,
   newOutputBytes?: number,
+  controllerRssBytes = 0,
 ): ResourceSample {
   const owned = observeOwnedProcesses(state, processSnapshot());
-  const rssBytes = owned.reduce((total, member) => total + member.rssBytes, 0);
+  const rssBytes = owned.reduce((total, member) => total + member.rssBytes, controllerRssBytes);
   if (!Number.isSafeInteger(rssBytes))
     throw new DeliveryError('Owned aggregate RSS is outside the safe integer range.');
   if (rssBytes > bounds.maxAggregateRssBytes) {
@@ -1040,7 +1045,24 @@ function terminateOwnedProcesses(state: OwnedProcessState): void {
     try {
       process.kill(pid, 'SIGKILL');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return;
+      if (code !== 'EPERM') throw error;
+      // macOS can return EPERM when the last group member exits after our snapshot.
+      // Accept only fresh absence/zombie proof; a live target remains a cleanup failure.
+      const readback = processSnapshot();
+      if (pid < 0) {
+        const currentRoot = readback.get(state.rootPid);
+        if (currentRoot !== undefined && currentRoot.identity !== state.rootIdentity)
+          throw new DeliveryError('Owned process group identity changed during cleanup signal readback.');
+        if ([...readback.values()].some((member) => member.pgid === state.rootPid && !member.status.startsWith('Z')))
+          throw error;
+      } else {
+        const current = readback.get(pid);
+        if (current !== undefined && current.identity !== state.tracked.get(pid)?.identity)
+          throw new DeliveryError('Tracked process identity changed during cleanup signal readback.');
+        if (current !== undefined && !current.status.startsWith('Z')) throw error;
+      }
     }
   };
   if (group.length > 0) signal(-state.rootPid);
@@ -1089,6 +1111,8 @@ export interface WorktreeTransitionWriterLeaseInput {
   afterClaim?(bytes: Buffer): void | Promise<void>;
   recordRelease(bytes: Buffer): void | Promise<void>;
   afterRelease?(): void | Promise<void>;
+  onLockReleaseError?: (error: unknown) => void;
+  onLockCompromised?: (error: Error) => void;
 }
 
 /** @internal Read-only closure check shared by inspection and the locked transition lease. */
@@ -1119,6 +1143,7 @@ async function withVerificationWriter<T>(
   operation: (writer: VerificationWriter) => Promise<T>,
   transition?: WorktreeTransitionWriterLeaseInput,
   commonDirectory?: string,
+  refuseUnresolvedSourcePhase = false,
 ): Promise<T> {
   const digest = worktreeDigest(root);
   const path = join(commonDirectory ?? gitCommonDir(root), 'ai-delivery', 'writers@1', `${digest.slice(7)}.json`);
@@ -1126,7 +1151,10 @@ async function withVerificationWriter<T>(
   return withLock(path, {
     projectRoot: root,
     timeout: 200,
+    ...(transition?.onLockReleaseError === undefined ? {} : { onReleaseError: transition.onLockReleaseError }),
+    ...(transition?.onLockCompromised === undefined ? {} : { onCompromised: transition.onLockCompromised }),
     operation: async () => {
+      await assertNoUnsealedSourcePhase(commonDirectory ?? gitCommonDir(root), digest, refuseUnresolvedSourcePhase);
       const snapshot = processSnapshot();
       const owner = snapshot.get(process.pid);
       if (owner === undefined || owner.status.startsWith('Z'))
@@ -1278,6 +1306,7 @@ export async function withWorktreeTransitionWriterAbsent<T>(
     projectRoot: repoRoot,
     timeout: 200,
     operation: async () => {
+      await assertNoUnsealedSourcePhase(gitCommonDir(repoRoot), worktreeDigest(worktreePath));
       try {
         lstatSync(path);
       } catch (error) {
@@ -1534,6 +1563,11 @@ function runStageCommand(
   baseline?: OutputBaseline,
   onResourceSample?: (sample: ResourceSample) => void,
   writer?: VerificationWriter,
+  execution?: {
+    environment: NodeJS.ProcessEnv;
+    onCaptured?(bytes: number): void;
+    onCleanupFailure?(reason: string): void;
+  },
 ): Promise<Buffer> {
   const [executable, ...args] = argv;
   if (!executable) throw new DeliveryError('Policy selected an empty stage command.');
@@ -1554,9 +1588,14 @@ function runStageCommand(
         cwd: repoRoot,
         detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'pipe'],
-        ...(baseline?.gate === undefined
+        ...(baseline?.gate === undefined && execution === undefined
           ? {}
-          : { env: { ...process.env, [OUTPUT_GATE_ENV]: JSON.stringify(baseline.gate) } }),
+          : {
+              env: {
+                ...(execution?.environment ?? process.env),
+                ...(baseline?.gate === undefined ? {} : { [OUTPUT_GATE_ENV]: JSON.stringify(baseline.gate) }),
+              },
+            }),
       },
     );
     const stdout: Buffer[] = [];
@@ -1566,6 +1605,7 @@ function runStageCommand(
         ? undefined
         : { rootPid: child.pid, sampled: false, tracked: new Map() };
     let outputBytes = 0;
+    let sampledOutputBytes = 0;
     let failure: string | undefined;
     let cleanupFailure: string | undefined;
     let writerFailure: string | undefined;
@@ -1642,6 +1682,7 @@ function runStageCommand(
           child.stdout.destroy();
           child.stderr.destroy();
           child.unref();
+          execution?.onCleanupFailure?.('Owned command pipes did not close; descendant cleanup could not be verified.');
           reject(
             new DeliveryError(
               `Selected policy stage command failed (${failure}).${failedOutput()}${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`} Owned process cleanup failed (owned command pipes did not close; descendant cleanup could not be verified).`,
@@ -1652,6 +1693,15 @@ function runStageCommand(
     };
     const capture = (chunks: Buffer[], chunk: Buffer): void => {
       outputBytes += chunk.length;
+      execution?.onCaptured?.(outputBytes);
+      if (
+        execution !== undefined &&
+        resourceBounds?.maxNewOutputBytes !== undefined &&
+        outputBytes + sampledOutputBytes > resourceBounds.maxNewOutputBytes
+      ) {
+        stop('source-phase captured output exceeded remaining cumulative allowance');
+        return;
+      }
       if (outputBytes > 8 * 1024 * 1024) {
         stop('captured output exceeded 8 MiB');
         return;
@@ -1683,7 +1733,14 @@ function runStageCommand(
           observeOwnedProcesses(owned, processSnapshot());
           writer?.observed(owned);
           if (resourceBounds !== undefined) {
-            const result = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline);
+            const result = sampleOwnedTree(
+              owned,
+              repoRoot,
+              resourceBounds,
+              baseline,
+              undefined,
+              execution === undefined ? 0 : process.memoryUsage().rss,
+            );
             onResourceSample?.(result);
             onRunning?.(outputBytes, result);
           }
@@ -1701,7 +1758,15 @@ function runStageCommand(
                 },
               );
               if (failure !== undefined) return;
-              const result = sampleOwnedTree(owned, repoRoot, resourceBounds, baseline, bytes);
+              sampledOutputBytes = bytes;
+              const result = sampleOwnedTree(
+                owned,
+                repoRoot,
+                resourceBounds,
+                baseline,
+                bytes + (execution === undefined ? 0 : outputBytes),
+                execution === undefined ? 0 : process.memoryUsage().rss,
+              );
               onResourceSample?.(result);
               onRunning?.(outputBytes, result);
             }
@@ -1743,7 +1808,11 @@ function runStageCommand(
               repoRoot,
               resourceBounds,
               baseline,
-              baseline === undefined ? undefined : await positiveNewOutputBytes(baseline, scanCancellation.signal),
+              baseline === undefined
+                ? undefined
+                : (await positiveNewOutputBytes(baseline, scanCancellation.signal)) +
+                    (execution === undefined ? 0 : outputBytes),
+              execution === undefined ? 0 : process.memoryUsage().rss,
             );
             onResourceSample?.(sample);
             onRunning?.(outputBytes, sample);
@@ -1774,6 +1843,7 @@ function runStageCommand(
           }
         }
         settled = true;
+        if (cleanupFailure !== undefined) execution?.onCleanupFailure?.(cleanupFailure);
         reject(
           new DeliveryError(
             `Selected policy stage command failed (${reason}). Command exit ${String(code)}${signal === null ? '' : ` signal ${signal}`}.${failedOutput()}${writerFailure === undefined ? '' : ` Writer state persistence failed (${writerFailure}).`}${cleanupFailure === undefined ? '' : ` Owned process cleanup failed (${cleanupFailure}).`}`,
@@ -2194,6 +2264,1038 @@ export function loadRemovedMergedRun(primaryRepoRoot: string, issueNumber: numbe
     throw new DeliveryError('Recovered merged run disagrees with the registered branch.');
   }
   return run;
+}
+
+const SourceDigest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
+const SourceSha = z.string().regex(/^[a-f0-9]{40}$/u);
+const SourceArtifactSchema = z.strictObject({ path: z.string().min(1), digest: SourceDigest });
+const SourceFileSchema = SourceArtifactSchema.extend({
+  device: z.number().int().nonnegative().safe(),
+  inode: z.number().int().nonnegative().safe(),
+  uid: z.number().int().nonnegative().safe(),
+  mode: z.number().int().nonnegative().safe(),
+});
+const SourceCommandSchema = z.strictObject({
+  argv: z.array(z.string()).min(1),
+  cwd: z.string().min(1),
+  executable: SourceFileSchema,
+});
+const SourceSnapshotSchema = z.strictObject({
+  head: SourceSha,
+  indexTree: SourceSha,
+  branch: z.string().min(1),
+  configDigest: SourceDigest,
+  dirty: z.array(z.strictObject({ path: z.string().min(1), digest: SourceDigest.nullable() })),
+});
+const SourceBoundsSchema = z.strictObject({
+  maxAggregateRssBytes: z.number().int().positive().safe(),
+  maxNewOutputBytes: z.number().int().positive().safe(),
+  minFreeDiskBytes: z.number().int().positive().safe(),
+  outputRoots: z.array(z.string().min(1)).min(1),
+});
+const SourceReconciliationSchema = z.strictObject({
+  phaseId: SourceDigest,
+  recordId: SourceDigest,
+  baselineId: SourceDigest.optional(),
+  authorizationDigest: SourceDigest,
+});
+const IssueSourcePhaseInputSchema = z.strictObject({
+  repoRoot: z.string().min(1),
+  issueNumber: z.number().int().positive().safe(),
+  identity: z.string().min(1),
+  rowDigest: SourceDigest,
+  controller: z.strictObject({
+    head: SourceSha,
+    configDigest: SourceDigest,
+    admissionId: SourceDigest,
+    runtimeEntryPath: z.string().min(1),
+    packageVersion: z.string().min(1),
+    archiveDigest: SourceDigest,
+  }),
+  source: SourceSnapshotSchema.extend({
+    path: z.string().min(1),
+    effect: z.discriminatedUnion('kind', [
+      z.strictObject({ kind: z.literal('preserve') }),
+      z.strictObject({ kind: z.literal('commitOnce'), parent: SourceSha, tree: SourceSha }),
+    ]),
+  }),
+  caller: SourceArtifactSchema,
+  authorization: SourceArtifactSchema,
+  inputs: z.array(SourceArtifactSchema),
+  commands: z.array(SourceCommandSchema).min(1),
+  commandGraphDigest: SourceDigest,
+  environment: z.strictObject({ digest: SourceDigest, overrides: z.record(z.string(), z.string().nullable()) }),
+  bounds: SourceBoundsSchema,
+  completionArtifacts: z.array(z.string().min(1)),
+  reconciliation: SourceReconciliationSchema.optional(),
+});
+const SourceBindingSchema = IssueSourcePhaseInputSchema.omit({ environment: true }).extend({
+  environmentDigest: SourceDigest,
+});
+const SourcePhaseBaselineSchema = z.strictObject({
+  roots: z.array(z.string().min(1)).min(1),
+  files: z.array(z.tuple([z.string(), z.number().int().nonnegative().safe()])),
+  links: z.array(
+    z.tuple([z.string(), z.strictObject({ identity: z.string(), target: z.string(), missing: z.boolean() })]),
+  ),
+  baselineId: SourceDigest,
+});
+const SourcePhaseCommandResultSchema = z.strictObject({
+  index: z.number().int().nonnegative().safe(),
+  outputDigest: SourceDigest.nullable(),
+  outputBytes: z.number().int().nonnegative().safe(),
+  status: z.enum(['complete', 'failed']),
+});
+const SourcePhaseResultSchema = z.strictObject({
+  source: SourceSnapshotSchema,
+  artifacts: z.array(SourceFileSchema),
+  newOutputBytes: z.number().int().nonnegative().safe(),
+  writerReleased: z.literal(true),
+  lockReleased: z.literal(true),
+});
+const SourcePhaseRecordSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.source-phase@1'),
+    phaseId: SourceDigest,
+    recordId: SourceDigest,
+    worktreeDigest: SourceDigest,
+    bindingDigest: SourceDigest,
+    authorizationDigest: SourceDigest,
+    status: z.enum(['preparing', 'intent', 'complete', 'failed-quiescent', 'rejected-before-work', 'unresolved']),
+    writerId: z.uuid(),
+    binding: SourceBindingSchema.optional(),
+    baseline: SourcePhaseBaselineSchema.optional(),
+    allocation: SourceBoundsSchema.optional(),
+    owner: z.strictObject({ pid: z.number().int().positive().safe(), identity: z.string().min(1) }),
+    bootstrapFiles: z.array(z.tuple([z.string(), z.number().int().nonnegative().safe()])),
+    bootstrapBytes: z.number().int().nonnegative().safe(),
+    capturedBytes: z.number().int().nonnegative().safe(),
+    nextCommandIndex: z.number().int().nonnegative().safe(),
+    commands: z.array(SourcePhaseCommandResultSchema),
+    claimDigest: SourceDigest.optional(),
+    releaseDigest: SourceDigest.optional(),
+    preparationArtifact: SourceFileSchema.optional(),
+    writerArtifact: SourceFileSchema.optional(),
+    producerDigest: SourceDigest.optional(),
+    actor: z
+      .strictObject({
+        identity: z.string().min(1),
+        actorLogin: z.string().min(1),
+        credentialIdentity: z.string().min(1),
+      })
+      .optional(),
+    retainedArtifacts: z.array(SourceFileSchema).optional(),
+    retainedPredecessors: z.array(z.strictObject({ phaseId: SourceDigest, recordId: SourceDigest })),
+    reconciliation: SourceReconciliationSchema.optional(),
+    result: SourcePhaseResultSchema.optional(),
+    failure: z
+      .strictObject({
+        operation: z.string().optional(),
+        accounting: z.string().optional(),
+        cleanup: z.string().optional(),
+        writerRelease: z.string().optional(),
+        lockRelease: z.string().optional(),
+      })
+      .optional(),
+  })
+  .superRefine((record, context) => {
+    const { recordId, ...content } = record;
+    if (recordId !== digestValue(content) || record.phaseId !== record.bindingDigest)
+      context.addIssue({ code: 'custom', message: 'Source-phase record identity is invalid.' });
+    if (record.binding !== undefined && digestValue(record.binding) !== record.bindingDigest)
+      context.addIssue({ code: 'custom', message: 'Source-phase input binding is invalid.' });
+    if (record.baseline !== undefined) {
+      const { baselineId, ...baseline } = record.baseline;
+      if (baselineId !== digestValue(baseline))
+        context.addIssue({ code: 'custom', message: 'Source-phase baseline is invalid.' });
+    }
+    if (
+      record.status === 'rejected-before-work' &&
+      (record.commands.length !== 0 || record.nextCommandIndex !== 0 || record.capturedBytes !== 0)
+    )
+      context.addIssue({ code: 'custom', message: 'Rejected source-phase input cannot contain executed work.' });
+    if (
+      record.status === 'complete' &&
+      (record.result === undefined ||
+        record.baseline === undefined ||
+        record.binding === undefined ||
+        record.failure !== undefined)
+    )
+      context.addIssue({ code: 'custom', message: 'Source-phase completion is incomplete.' });
+    if (
+      record.status === 'complete' &&
+      (record.commands.length !== record.binding?.commands.length ||
+        record.nextCommandIndex !== record.commands.length ||
+        record.commands.some((command, index) => command.index !== index || command.status !== 'complete'))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Source-phase completion does not contain its exact successful command graph.',
+      });
+  });
+
+async function assertNoUnsealedSourcePhase(common: string, subject: string, refuseUnresolved = false): Promise<void> {
+  const directory = join(common, 'ai-delivery', 'receipts', 'source-phase@1', subject.slice(7));
+  let names: string[];
+  try {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new DeliveryError('Source-phase admission metadata is not a canonical directory.');
+    names = readdirSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (names.length > 100_000) throw new DeliveryError('Source-phase admission exceeded its entry bound.');
+  for (const name of names) {
+    const record = SourcePhaseRecordSchema.parse(JSON.parse(assertPrivateFile(join(directory, name)).toString('utf8')));
+    if (record.worktreeDigest !== subject || name !== `${record.phaseId.slice(7)}.json`)
+      throw new DeliveryError('Source-phase admission record belongs to another input or worktree.');
+    if (record.status === 'preparing' || record.status === 'intent')
+      throw new DeliveryError('An unsealed source phase still excludes another worktree writer.');
+    if (refuseUnresolved && record.status === 'unresolved')
+      throw new DeliveryError('Unresolved source phase requires owning reconciliation before another attempt.');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+export type IssueSourcePhaseInput = z.input<typeof IssueSourcePhaseInputSchema> & { signal?: AbortSignal };
+export interface IssueSourcePhaseContext {
+  readonly phaseId: string;
+  readonly signal: AbortSignal;
+  readonly source: Readonly<Omit<z.infer<typeof SourceSnapshotSchema>, 'dirty'>> & {
+    readonly dirty: readonly Readonly<{ path: string; digest: string | null }>[];
+  };
+  readonly controller: Readonly<z.infer<typeof IssueSourcePhaseInputSchema>['controller']>;
+  readonly actor: Readonly<{ identity: string; actorLogin: string; credentialIdentity: string }>;
+  readonly inputs: readonly Readonly<z.infer<typeof SourceArtifactSchema>>[];
+  readonly run: (index: number) => Promise<Buffer>;
+}
+const IssueSourcePhaseReceiptSchema = z.strictObject({
+  status: z.literal('complete'),
+  phaseId: SourceDigest,
+  recordId: SourceDigest,
+  source: SourceSnapshotSchema,
+  commands: z.array(SourcePhaseCommandResultSchema),
+});
+export type IssueSourcePhaseReceipt = z.infer<typeof IssueSourcePhaseReceiptSchema>;
+
+function sourceFile(path: string): z.infer<typeof SourceFileSchema> {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || realpathSync(path) !== path)
+    throw new DeliveryError('Source-phase artifact must be a canonical regular file.');
+  const descriptor = openSync(path, 'r');
+  const hash = createHash('sha256');
+  try {
+    const buffer = Buffer.alloc(64 * 1024);
+    let bytes: number;
+    while ((bytes = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, bytes));
+    const current = fstatSync(descriptor);
+    const named = lstatSync(path);
+    if (
+      current.dev !== stat.dev ||
+      current.ino !== stat.ino ||
+      current.size !== stat.size ||
+      current.mode !== stat.mode ||
+      current.uid !== stat.uid ||
+      current.mtimeMs !== stat.mtimeMs ||
+      current.ctimeMs !== stat.ctimeMs ||
+      named.dev !== current.dev ||
+      named.ino !== current.ino ||
+      realpathSync(path) !== path
+    )
+      throw new DeliveryError('Source-phase artifact changed during identity-bound hashing.');
+  } finally {
+    closeSync(descriptor);
+  }
+  return {
+    path,
+    digest: `sha256:${hash.digest('hex')}`,
+    device: stat.dev,
+    inode: stat.ino,
+    uid: stat.uid,
+    mode: stat.mode,
+  };
+}
+
+function sourceDirty(root: string): z.infer<typeof SourceSnapshotSchema>['dirty'] {
+  const paths = [
+    ...new Set(
+      [
+        ...git(root, 'diff', '--cached', '--name-only', '-z').split('\0'),
+        ...git(root, 'ls-files', '-m', '-o', '--exclude-standard', '-z').split('\0'),
+      ].filter(Boolean),
+    ),
+  ].sort();
+  return paths.map((path) => {
+    const absolute = resolve(root, path);
+    if (!absolute.startsWith(`${root}${sep}`)) throw new DeliveryError('Source-phase dirty path escapes the worktree.');
+    try {
+      lstatSync(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { path, digest: null };
+      throw error;
+    }
+    return { path, digest: sourceFile(absolute).digest };
+  });
+}
+
+function sourceReceipt(record: z.infer<typeof SourcePhaseRecordSchema>): IssueSourcePhaseReceipt {
+  if (record.status !== 'complete' || record.result === undefined)
+    throw new DeliveryError('Source phase is not complete.');
+  return IssueSourcePhaseReceiptSchema.parse({
+    status: 'complete',
+    phaseId: record.phaseId,
+    recordId: record.recordId,
+    source: record.result.source,
+    commands: record.commands,
+  });
+}
+
+/** Run an authorized, frozen source graph under the registered issue's existing writer fence. */
+export async function withIssueSourcePhase(
+  supplied: IssueSourcePhaseInput,
+  operation: (context: IssueSourcePhaseContext) => Promise<void>,
+): Promise<IssueSourcePhaseReceipt> {
+  const { signal, ...values } = supplied;
+  const input = IssueSourcePhaseInputSchema.parse(values);
+  assertResourceBounds(input.bounds);
+  if (signal?.aborted) throw new DeliveryError('Source phase cancelled before preparation.');
+  const root = gitRoot(input.repoRoot);
+  if (
+    root !== input.repoRoot ||
+    root !== primaryRoot(root) ||
+    realpathSync(input.source.path) !== input.source.path ||
+    gitCommonDir(root) !== gitCommonDir(input.source.path)
+  )
+    throw new DeliveryError('Source phase requires canonical primary controller and issue worktree roots.');
+  const row = getIssueWorktreeStrict(input.issueNumber, root);
+  assertAiDeliveryWorktreeOwner(row, root);
+  if (
+    row.path !== input.source.path ||
+    row.branch !== input.source.branch ||
+    !['active', 'pr-published'].includes(row.status) ||
+    digestValue(row) !== input.rowDigest
+  )
+    throw new DeliveryError('Source phase disagrees with the exact registered issue owner.');
+  const environment: NodeJS.ProcessEnv = { ...process.env };
+  delete environment[OUTPUT_GATE_ENV];
+  for (const [name, value] of Object.entries(input.environment.overrides)) {
+    if (name === OUTPUT_GATE_ENV) throw new DeliveryError('Source phase cannot supply an output observer capability.');
+    if (value === null) delete environment[name];
+    else environment[name] = value;
+  }
+  Object.freeze(environment);
+  const { environment: _environment, ...bound } = input;
+  const binding = SourceBindingSchema.parse({ ...bound, environmentDigest: input.environment.digest });
+  const phaseId = digestValue(binding);
+  const subject = worktreeDigest(row.path);
+  const common = gitCommonDir(root);
+  const directory = join(common, 'ai-delivery', 'receipts', 'source-phase@1', subject.slice(7));
+  const path = join(directory, `${phaseId.slice(7)}.json`);
+  const writerPath = join(common, 'ai-delivery', 'writers@1', `${subject.slice(7)}.json`);
+  const roots = input.bounds.outputRoots.map((value) => resolve(root, value)).sort();
+  if (
+    roots.some(
+      (value, index) => index > 0 && (value === roots[index - 1] || value.startsWith(`${roots[index - 1]}${sep}`)),
+    )
+  )
+    throw new DeliveryError('Source-phase output roots must not overlap.');
+  for (const required of [
+    directory,
+    writerPath,
+    join(common, 'ai-delivery', 'receipts'),
+    join(common, 'ai-delivery', 'output-observation', subject.slice(7)),
+  ]) {
+    if (!roots.some((value) => required === value || required.startsWith(`${value}${sep}`)))
+      throw new DeliveryError('Source-phase roots must account for writer, observer and SDK receipt metadata.');
+  }
+  const cancelled = new AbortController();
+  const combined = signal === undefined ? cancelled.signal : AbortSignal.any([signal, cancelled.signal]);
+  type PhaseRecord = z.infer<typeof SourcePhaseRecordSchema>;
+  let record: PhaseRecord | undefined;
+  let baseline: OutputBaseline | undefined;
+  let reused = false;
+  let created = false;
+  let entered = false;
+  let startedCommand = false;
+  let validated = false;
+  let writerReleased = false;
+  let lockFailure: string | undefined;
+  let releaseFailure: string | undefined;
+  let operationFailure: string | undefined;
+  let accountingFailure: string | undefined;
+  let cleanupFailure: string | undefined;
+  let active: Promise<Buffer> | undefined;
+  let expired = false;
+  let captured = 0;
+  let bootstrapCharge = 0;
+  let previousBootstrap = 0;
+  let writerBootstrap = 0;
+  let predecessorChain: PhaseRecord[] = [];
+  let accountingBounds = input.bounds;
+  let protocolFailure: string | undefined;
+  let commandFailure: string | undefined;
+  const attempted = new Set<number>();
+  let finalSource: z.infer<typeof SourceSnapshotSchema> | undefined;
+  let artifacts: z.infer<typeof SourceFileSchema>[] = [];
+  let newBytes = 0;
+  const writerId = randomUUID();
+  const started = Date.now();
+  const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+  const persist = (): void => {
+    if (record === undefined) throw new DeliveryError('Source-phase intent is unavailable.');
+    const { recordId: _recordId, ...content } = record;
+    record = SourcePhaseRecordSchema.parse({ ...content, recordId: digestValue(content) });
+    writePrivateJsonFileAtomically(path, record);
+  };
+  const readRecord = (file: string): PhaseRecord => {
+    const value = SourcePhaseRecordSchema.parse(JSON.parse(assertPrivateFile(file).toString('utf8')));
+    if (value.worktreeDigest !== subject || basename(file) !== `${value.phaseId.slice(7)}.json`)
+      throw new DeliveryError('Source-phase record belongs to another input or worktree.');
+    return value;
+  };
+  const assertArtifact = (artifact: z.infer<typeof SourceArtifactSchema>): void => {
+    if (sourceFile(artifact.path).digest !== artifact.digest)
+      throw new DeliveryError('Frozen source-phase input artifact changed.');
+  };
+  const sourceState = async (allowFinal = false): Promise<z.infer<typeof SourceSnapshotSchema>> => {
+    const head = git(row.path, 'rev-parse', 'HEAD');
+    const branch = git(row.path, 'branch', '--show-current');
+    const dirty = sourceDirty(row.path);
+    const candidate = await loadDeliveryConfig(row.path);
+    if (branch !== input.source.branch || candidate.configDigest !== input.source.configDigest)
+      throw new DeliveryError('Source-phase candidate branch or configuration changed.');
+    if (head === input.source.head) {
+      if (
+        git(row.path, 'diff', '--cached', '--name-only', input.source.indexTree) !== '' ||
+        digestValue(dirty) !== digestValue(input.source.dirty)
+      )
+        throw new DeliveryError('Source-phase frozen index or dirty source changed.');
+      return { head, branch, indexTree: input.source.indexTree, configDigest: candidate.configDigest, dirty };
+    }
+    if (!allowFinal) throw new DeliveryError('Source phase requires its exact initial source before new work.');
+    if (
+      input.source.effect.kind !== 'commitOnce' ||
+      input.source.effect.parent !== input.source.head ||
+      git(row.path, 'rev-list', '--parents', '-n', '1', head) !== `${head} ${input.source.effect.parent}` ||
+      git(row.path, 'rev-parse', 'HEAD^{tree}') !== input.source.effect.tree ||
+      git(row.path, 'diff', '--cached', '--name-only', head) !== '' ||
+      dirty.length !== 0
+    )
+      throw new DeliveryError('Source-phase commit does not match its exact parent, tree and clean postconditions.');
+    return { head, branch, indexTree: input.source.effect.tree, configDigest: candidate.configDigest, dirty };
+  };
+  let actor: z.infer<typeof SourcePhaseRecordSchema>['actor'];
+  const validate = async (allowFinal = false): Promise<void> => {
+    const currentRow = getIssueWorktreeStrict(input.issueNumber, root);
+    assertAiDeliveryWorktreeOwner(currentRow, root);
+    const configuration = await loadDeliveryConfig(root);
+    const admission = await assertDeliveryRuntimeAdmitted({
+      repoRoot: root,
+      runtimeEntryPath: input.controller.runtimeEntryPath,
+      configuration,
+    });
+    if (
+      dirname(realpathSync(input.controller.runtimeEntryPath)) !== dirname(realpathSync(fileURLToPath(import.meta.url)))
+    )
+      throw new DeliveryError('Source-phase executing SDK installation is not the selected admitted runtime.');
+    if (
+      digestValue(currentRow) !== input.rowDigest ||
+      currentRow.identity !== input.identity ||
+      configuration.config.roles.author.identity !== input.identity ||
+      git(root, 'rev-parse', 'HEAD') !== input.controller.head ||
+      configuration.configDigest !== input.controller.configDigest ||
+      admission.admissionId !== input.controller.admissionId ||
+      admission.sourceArchiveSha256 !== input.controller.archiveDigest ||
+      admission.packageVersion !== input.controller.packageVersion ||
+      digestValue(environment) !== input.environment.digest ||
+      digestValue(input.commands) !== input.commandGraphDigest
+    )
+      throw new DeliveryError(
+        'Source-phase controller, selected runtime, actor or command environment binding changed.',
+      );
+    const clients = await createDeliveryGitHubClients({
+      config: configuration.config,
+      identity: input.identity,
+      role: 'author',
+      env: environment,
+    });
+    if (clients.role !== 'author' || clients.authenticatedAuthor === undefined)
+      throw new DeliveryError('Source-phase configured author authentication is unavailable.');
+    const authenticated = await clients.authenticatedAuthor();
+    if (!authenticated.actorLogin || !authenticated.credentialIdentity)
+      throw new DeliveryError('Source-phase configured author identity readback is incomplete.');
+    const currentActor = { identity: input.identity, ...authenticated };
+    if (actor !== undefined && digestValue(actor) !== digestValue(currentActor))
+      throw new DeliveryError('Source-phase authenticated author changed.');
+    actor = currentActor;
+    for (const artifact of [input.caller, input.authorization, ...input.inputs]) assertArtifact(artifact);
+    for (const command of input.commands) {
+      if (
+        command.cwd !== row.path ||
+        command.argv[0] !== command.executable.path ||
+        digestValue(sourceFile(command.executable.path)) !== digestValue(command.executable)
+      )
+        throw new DeliveryError('Source-phase command or executable identity changed.');
+    }
+    await sourceState(allowFinal);
+  };
+  const observe = async (finishing = false): Promise<void> => {
+    if (baseline === undefined) throw new DeliveryError('Source-phase output baseline is unavailable.');
+    assertDiskHeadroom(row.path, accountingBounds, baseline);
+    newBytes = bootstrapCharge + captured + (await positiveNewOutputBytes(baseline, finishing ? undefined : combined));
+    if (newBytes > accountingBounds.maxNewOutputBytes)
+      throw new DeliveryError('Source-phase cumulative output exceeded its original allowance.');
+    if (process.memoryUsage().rss > accountingBounds.maxAggregateRssBytes)
+      throw new DeliveryError('Source-phase controller RSS exceeded its bound.');
+  };
+  try {
+    await withVerificationWriter(
+      row.path,
+      async (writer) => {
+        try {
+          ensurePrivateDirectoryDurably(directory);
+          if (created && record !== undefined) {
+            record.binding = binding;
+            record.allocation = input.bounds;
+          }
+          const names = readdirSync(directory);
+          if (names.length > 100_000)
+            throw new DeliveryError('Source-phase record observation exceeded its entry bound.');
+          const history = names
+            .map((name) => readRecord(join(directory, name)))
+            .filter((value) => value.phaseId !== phaseId);
+          if (history.some((value) => ['preparing', 'intent', 'unresolved'].includes(value.status)))
+            throw new DeliveryError('Unresolved source phase requires owning reconciliation before another attempt.');
+          const previous =
+            input.reconciliation === undefined
+              ? undefined
+              : history.find(
+                  (value) =>
+                    value.phaseId === input.reconciliation?.phaseId && value.recordId === input.reconciliation.recordId,
+                );
+          const failed = history.filter(
+            (value) =>
+              ['failed-quiescent', 'rejected-before-work'].includes(value.status) &&
+              !history.some((later) =>
+                later.retainedPredecessors.some(
+                  (retained) => retained.phaseId === value.phaseId && retained.recordId === value.recordId,
+                ),
+              ),
+          );
+          predecessorChain = [];
+          const visiting = new Set<PhaseRecord>();
+          const retained = new Set<PhaseRecord>();
+          const retain = (value: PhaseRecord): void => {
+            if (visiting.has(value)) throw new DeliveryError('Source-phase predecessor cycle is invalid.');
+            if (retained.has(value)) return;
+            visiting.add(value);
+            predecessorChain.push(value);
+            for (const link of value.retainedPredecessors) {
+              const predecessor = history.find(
+                (candidate) => candidate.phaseId === link.phaseId && candidate.recordId === link.recordId,
+              );
+              if (predecessor === undefined)
+                throw new DeliveryError('Source-phase retained predecessor is unavailable.');
+              retain(predecessor);
+            }
+            visiting.delete(value);
+            retained.add(value);
+          };
+          for (const value of failed) retain(value);
+          if (record !== undefined && created)
+            record.retainedPredecessors = failed.map(({ phaseId: retainedPhaseId, recordId }) => ({
+              phaseId: retainedPhaseId,
+              recordId,
+            }));
+          previousBootstrap = predecessorChain.reduce((sum, value) => sum + value.bootstrapBytes, 0);
+          captured = predecessorChain.reduce((sum, value) => sum + value.capturedBytes, 0);
+          const allocations = predecessorChain.map((value) => {
+            if (value.allocation === undefined)
+              throw new DeliveryError('Source-phase retained predecessor lacks its original allocation.');
+            return value.allocation;
+          });
+          const allocation = { ...(allocations[0] ?? input.bounds) };
+          for (const value of allocations) {
+            allocation.maxAggregateRssBytes = Math.min(allocation.maxAggregateRssBytes, value.maxAggregateRssBytes);
+            allocation.maxNewOutputBytes = Math.min(allocation.maxNewOutputBytes, value.maxNewOutputBytes);
+            allocation.minFreeDiskBytes = Math.max(allocation.minFreeDiskBytes, value.minFreeDiskBytes);
+          }
+          accountingBounds = {
+            ...allocation,
+            maxAggregateRssBytes: Math.min(allocation.maxAggregateRssBytes, input.bounds.maxAggregateRssBytes),
+            maxNewOutputBytes: Math.min(allocation.maxNewOutputBytes, input.bounds.maxNewOutputBytes),
+            minFreeDiskBytes: Math.max(allocation.minFreeDiskBytes, input.bounds.minFreeDiskBytes),
+          };
+          const priorBaselines = predecessorChain.flatMap((value) =>
+            value.baseline === undefined ? [] : [value.baseline],
+          );
+          const prior = priorBaselines[0];
+          if (created && record !== undefined) {
+            record.allocation = allocation;
+            if (prior !== undefined) {
+              record.baseline = prior;
+              baseline = {
+                roots: prior.roots,
+                files: new Map(prior.files),
+                links: new Map(prior.links),
+                baselineId: prior.baselineId,
+              };
+              for (const retained of [...predecessorChain, record])
+                for (const [file, size] of retained.bootstrapFiles)
+                  baseline.files.set(file, Math.max(baseline.files.get(file) ?? 0, size));
+            }
+            bootstrapCharge = previousBootstrap + record.bootstrapBytes;
+          }
+          if (allocations.some((value) => digestValue(value.outputRoots) !== digestValue(allocation.outputRoots))) {
+            accountingFailure = 'Source-phase retained original output roots disagree.';
+            throw new DeliveryError(accountingFailure);
+          }
+          if (
+            input.bounds.maxNewOutputBytes > allocation.maxNewOutputBytes ||
+            input.bounds.maxAggregateRssBytes > allocation.maxAggregateRssBytes ||
+            input.bounds.minFreeDiskBytes < allocation.minFreeDiskBytes ||
+            digestValue(input.bounds.outputRoots) !== digestValue(allocation.outputRoots)
+          )
+            throw new DeliveryError('Source-phase reconciliation cannot increase its original resource allowance.');
+          if (
+            failed.length > 0 &&
+            (previous === undefined ||
+              !predecessorChain.includes(previous) ||
+              input.reconciliation?.authorizationDigest !== input.authorization.digest)
+          )
+            throw new DeliveryError('A failed source phase requires exact authorized retained-output reconciliation.');
+          if (input.reconciliation !== undefined && (previous === undefined || !predecessorChain.includes(previous)))
+            throw new DeliveryError('Source-phase reconciliation does not name its exact terminal predecessor.');
+          if (
+            prior !== undefined &&
+            (priorBaselines.some((value) => value.baselineId !== prior.baselineId) ||
+              input.reconciliation?.baselineId !== prior.baselineId ||
+              digestValue(prior.roots) !== digestValue(roots))
+          )
+            throw new DeliveryError('Source-phase reconciliation cannot replace its original output baseline.');
+          for (const retained of predecessorChain.filter((value) => value.status === 'failed-quiescent')) {
+            const old = retained.binding;
+            if (
+              old === undefined ||
+              digestValue(old.controller) !== digestValue(input.controller) ||
+              digestValue(old.source) !== digestValue(input.source) ||
+              old.repoRoot !== root ||
+              old.issueNumber !== input.issueNumber ||
+              old.rowDigest !== input.rowDigest ||
+              old.identity !== input.identity ||
+              old.inputs.some(
+                (artifact) => !input.inputs.some((current) => digestValue(current) === digestValue(artifact)),
+              )
+            )
+              throw new DeliveryError(
+                'Source-phase reconciliation requires compatible source/runtime and retained frozen inputs.',
+              );
+            for (const artifact of [old.caller, old.authorization, ...old.inputs]) assertArtifact(artifact);
+          }
+          if (
+            predecessorChain.some((retained) =>
+              retained.retainedArtifacts?.some(
+                (artifact) => digestValue(sourceFile(artifact.path)) !== digestValue(artifact),
+              ),
+            )
+          )
+            throw new DeliveryError('Source-phase retained output artifact identity changed before reconciliation.');
+          await validate(!created);
+          const executionProducer = producerDigest();
+          if (
+            predecessorChain.some(
+              (value) =>
+                value.status === 'failed-quiescent' &&
+                (value.producerDigest !== executionProducer || digestValue(value.actor) !== digestValue(actor)),
+            )
+          )
+            throw new DeliveryError(
+              'Source-phase reconciliation requires its original authenticated actor and producer.',
+            );
+          if (!created) {
+            record = readRecord(path);
+            if (
+              record.status !== 'complete' ||
+              record.bindingDigest !== phaseId ||
+              record.producerDigest !== executionProducer ||
+              record.baseline === undefined ||
+              record.result === undefined
+            )
+              throw new DeliveryError('Existing source phase is incomplete or belongs to another producer.');
+            if (
+              digestValue(actor) !== digestValue(record.actor) ||
+              digestValue(await sourceState(true)) !== digestValue(record.result.source) ||
+              record.result.artifacts.some(
+                (artifact) => digestValue(sourceFile(artifact.path)) !== digestValue(artifact),
+              )
+            )
+              throw new DeliveryError('Completed source-phase source or artifacts changed.');
+            reused = true;
+            return;
+          }
+          validated = true;
+          if (record === undefined) throw new DeliveryError('Source phase lacks preparation intent.');
+          record.binding = binding;
+          record.producerDigest = executionProducer;
+          record.actor = actor;
+          await withOutputObservationGate(row.path, true, async (gate) => {
+            const gatePath = gate === undefined ? undefined : join(gate.directory, 'gate.json');
+            if (gatePath !== undefined) {
+              const gateBytes = lstatSync(gatePath).size;
+              record!.bootstrapBytes += gateBytes;
+              record!.bootstrapFiles.push([gatePath, gateBytes]);
+            }
+            bootstrapCharge = previousBootstrap + record!.bootstrapBytes;
+            const links: OutputBaseline['links'] = new Map();
+            const files =
+              prior === undefined
+                ? await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots, links), combined)
+                : new Map(prior.files);
+            if (prior !== undefined) for (const [name, alias] of prior.links) links.set(name, alias);
+            const content = { roots, files: [...files], links: [...links] };
+            const persistedBaseline = prior ?? { ...content, baselineId: digestValue(content) };
+            baseline = {
+              roots,
+              files,
+              links,
+              baselineId: persistedBaseline.baselineId,
+              ...(gate === undefined ? {} : { gate }),
+            };
+            record!.baseline = persistedBaseline;
+            for (const retained of [...predecessorChain, record!])
+              for (const [file, size] of retained.bootstrapFiles)
+                baseline.files.set(file, Math.max(baseline.files.get(file) ?? 0, size));
+            record!.status = 'intent';
+            persist();
+            await observe();
+            let callbackFailure: unknown;
+            let callbackRejected = false;
+            const run = (index: number): Promise<Buffer> => {
+              if (expired) return Promise.reject(new DeliveryError('Source-phase command capability has expired.'));
+              if (
+                !Number.isSafeInteger(index) ||
+                index !== record!.nextCommandIndex ||
+                attempted.has(index) ||
+                active !== undefined ||
+                index >= input.commands.length
+              ) {
+                protocolFailure = 'Source-phase commands must be ordered, single-use and awaited.';
+                cancelled.abort(new DeliveryError(protocolFailure));
+                return Promise.reject(new DeliveryError(protocolFailure));
+              }
+              attempted.add(index);
+              const command = input.commands[index]!;
+              active = (async () => {
+                let commandCaptured = 0;
+                try {
+                  await validate(true);
+                  await observe();
+                  writer.assertQuiescent();
+                  startedCommand = true;
+                  const output = await runStageCommand(
+                    command.cwd,
+                    command.argv,
+                    combined,
+                    (bytes, sample, reason) =>
+                      reportVerificationProgress({
+                        state: 'running',
+                        stageId: 'source-phase',
+                        completedStages: index,
+                        remainingStages: input.commands.length - index,
+                        reusedStages: 0,
+                        elapsedMs: Date.now() - started,
+                        capturedOutputBytes: bytes,
+                        ...(sample === undefined ? {} : { sampledNewOutputBytes: sample.newOutputBytes }),
+                        ...(reason === undefined ? {} : { reason }),
+                      }),
+                    { ...input.bounds, maxNewOutputBytes: input.bounds.maxNewOutputBytes - bootstrapCharge - captured },
+                    baseline,
+                    undefined,
+                    writer,
+                    {
+                      environment,
+                      onCaptured: (bytes) => {
+                        commandCaptured = bytes;
+                      },
+                      onCleanupFailure: (reason) => {
+                        cleanupFailure = reason;
+                      },
+                    },
+                  );
+                  record!.commands.push({
+                    index,
+                    outputDigest: digestBytes(output),
+                    outputBytes: output.length,
+                    status: 'complete',
+                  });
+                  record!.nextCommandIndex += 1;
+                  return output;
+                } catch (error) {
+                  commandFailure = message(error);
+                  record!.commands.push({ index, outputDigest: null, outputBytes: commandCaptured, status: 'failed' });
+                  throw error;
+                } finally {
+                  captured += commandCaptured;
+                  record!.capturedBytes += commandCaptured;
+                  active = undefined;
+                  persist();
+                }
+              })();
+              return active;
+            };
+            entered = true;
+            try {
+              if (actor === undefined) throw new DeliveryError('Source-phase authenticated author is unavailable.');
+              const source = await sourceState();
+              await operation(
+                Object.freeze({
+                  phaseId,
+                  signal: combined,
+                  source: Object.freeze({
+                    ...source,
+                    dirty: Object.freeze(source.dirty.map((entry) => Object.freeze(entry))),
+                  }),
+                  controller: Object.freeze({ ...input.controller }),
+                  actor: Object.freeze({ ...actor }),
+                  inputs: Object.freeze(
+                    [input.caller, input.authorization, ...input.inputs].map((artifact) =>
+                      Object.freeze({ ...artifact }),
+                    ),
+                  ),
+                  run,
+                }),
+              );
+            } catch (error) {
+              callbackRejected = true;
+              callbackFailure = error;
+            }
+            expired = true;
+            if (active !== undefined) {
+              protocolFailure = 'Source-phase callback settled with an unawaited command.';
+              cancelled.abort(new DeliveryError(protocolFailure));
+              await active.catch(() => undefined);
+            }
+            if (callbackRejected) throw callbackFailure;
+            if (protocolFailure !== undefined) throw new DeliveryError(protocolFailure);
+            if (commandFailure !== undefined) throw new DeliveryError(commandFailure);
+            if (combined.aborted) throw new DeliveryError('Source phase cancelled.');
+            if (record!.nextCommandIndex !== input.commands.length)
+              throw new DeliveryError('Source-phase callback did not complete its frozen graph.');
+            await validate(true);
+            finalSource = await sourceState(true);
+            if (input.source.effect.kind === 'commitOnce' && finalSource.head === input.source.head)
+              throw new DeliveryError('Source phase did not publish its required commit.');
+            artifacts = input.completionArtifacts.map(sourceFile);
+            writer.assertQuiescent();
+            await observe();
+          }).finally(() => {
+            if (baseline !== undefined) delete baseline.gate;
+          });
+        } catch (error) {
+          operationFailure = message(error);
+        } finally {
+          expired = true;
+          if (active !== undefined) {
+            cancelled.abort(new DeliveryError('Source phase is releasing its command capability.'));
+            await active.catch((error) => {
+              operationFailure ??= message(error);
+            });
+          }
+          if (created && baseline !== undefined) {
+            try {
+              await observe(true);
+            } catch (error) {
+              accountingFailure = message(error);
+            }
+          }
+        }
+      },
+      {
+        repoRoot: root,
+        worktreePath: row.path,
+        writerId,
+        beforeClaim: ({ previousBytes }) => {
+          if (previousBytes !== undefined)
+            throw new DeliveryError('Source phase requires an absent writer; it never recovers a prior command.');
+        },
+        recordClaim: (bytes) => {
+          ensurePrivateDirectoryDurably(directory);
+          if (existsSync(path)) return;
+          created = true;
+          writerBootstrap = bytes.length;
+          const content = {
+            schemaVersion: 'ai-delivery.source-phase@1' as const,
+            phaseId,
+            bindingDigest: phaseId,
+            authorizationDigest: input.authorization.digest,
+            worktreeDigest: subject,
+            status: 'preparing' as const,
+            writerId,
+            bootstrapBytes: bytes.length,
+            allocation: input.bounds,
+            capturedBytes: 0,
+            nextCommandIndex: 0,
+            owner: (JSON.parse(bytes.toString('utf8')) as { owner: { pid: number; identity: string } }).owner,
+            bootstrapFiles: [] as Array<[string, number]>,
+            commands: [],
+            retainedPredecessors: [],
+            claimDigest: digestBytes(bytes),
+            ...(input.reconciliation === undefined ? {} : { reconciliation: input.reconciliation }),
+          };
+          record = { ...content, recordId: digestValue(content) };
+          persist();
+          record.preparationArtifact = sourceFile(path);
+          record.bootstrapFiles.push([path, lstatSync(path).size]);
+          for (let index = 0; index < 4; index++) {
+            const size = Buffer.byteLength(`${JSON.stringify(record, null, 2)}\n`);
+            record.bootstrapFiles[0] = [path, size];
+            record.bootstrapBytes = writerBootstrap + size;
+          }
+          persist();
+        },
+        afterClaim: () => {
+          if (record !== undefined && created) record.writerArtifact = sourceFile(writerPath);
+        },
+        recordRelease: (bytes) => {
+          if (record !== undefined && !reused) record.releaseDigest = digestBytes(bytes);
+        },
+        afterRelease: () => {
+          writerReleased = true;
+        },
+        onLockReleaseError: (error) => {
+          lockFailure = message(error);
+        },
+        onLockCompromised: (error) => {
+          lockFailure = message(error);
+          cancelled.abort(error);
+        },
+      },
+      common,
+      true,
+    );
+  } catch (error) {
+    releaseFailure = message(error);
+  }
+  if (
+    reused &&
+    record !== undefined &&
+    writerReleased &&
+    lockFailure === undefined &&
+    releaseFailure === undefined &&
+    operationFailure === undefined
+  )
+    return sourceReceipt(record);
+  if (record === undefined || !created)
+    throw new DeliveryError(operationFailure ?? releaseFailure ?? 'Source-phase ownership could not be established.');
+  const failures = {
+    ...(operationFailure === undefined ? {} : { operation: operationFailure }),
+    ...(accountingFailure === undefined ? {} : { accounting: accountingFailure }),
+    ...(cleanupFailure === undefined ? {} : { cleanup: cleanupFailure }),
+    ...(writerReleased && releaseFailure === undefined
+      ? {}
+      : { writerRelease: releaseFailure ?? 'Writer absence was not confirmed.' }),
+    ...(lockFailure === undefined ? {} : { lockRelease: lockFailure }),
+  };
+  const quiescent =
+    writerReleased && releaseFailure === undefined && lockFailure === undefined && cleanupFailure === undefined;
+  let unchanged = false;
+  if (validated) {
+    try {
+      await validate(finalSource !== undefined);
+      unchanged = (await sourceState(finalSource !== undefined)).head === input.source.head;
+      if (
+        finalSource !== undefined &&
+        (existsSync(writerPath) ||
+          artifacts.some((artifact) => digestValue(sourceFile(artifact.path)) !== digestValue(artifact)))
+      )
+        throw new DeliveryError('Source-phase writer absence or completion artifact changed before sealing.');
+    } catch (error) {
+      unchanged = false;
+      if (finalSource !== undefined) failures.operation ??= message(error);
+    }
+  }
+  const successful = Object.keys(failures).length === 0 && finalSource !== undefined;
+  record.status = successful
+    ? 'complete'
+    : !entered && !startedCommand && quiescent && accountingFailure === undefined
+      ? 'rejected-before-work'
+      : quiescent && unchanged && accountingFailure === undefined && baseline !== undefined
+        ? 'failed-quiescent'
+        : 'unresolved';
+  if (successful && finalSource !== undefined)
+    record.result = {
+      source: finalSource,
+      artifacts,
+      newOutputBytes: newBytes,
+      writerReleased: true,
+      lockReleased: true,
+    };
+  else record.failure = failures;
+  if (record.status === 'failed-quiescent' && baseline !== undefined) {
+    try {
+      const files = scanOutputRoots(baseline.roots, new Map());
+      record.retainedArtifacts = [...files]
+        .filter(([file, bytes]) => file !== path && bytes > (baseline!.files.get(file) ?? 0))
+        .map(([file]) => sourceFile(file));
+    } catch (error) {
+      record.status = 'unresolved';
+      record.failure = { ...failures, accounting: message(error) };
+    }
+  }
+  if (baseline !== undefined) {
+    try {
+      await observe(true);
+      const originalSize = baseline.files.get(path) ?? 0;
+      const currentGrowth = Math.max(0, lstatSync(path).size - originalSize);
+      const observed = newBytes;
+      let projected = observed;
+      for (let index = 0; index < 4; index++) {
+        if (record.result !== undefined) record.result.newOutputBytes = projected;
+        const { recordId: _recordId, ...content } = record;
+        record.recordId = digestValue(content);
+        projected =
+          observed -
+          currentGrowth +
+          Math.max(0, Buffer.byteLength(`${JSON.stringify(record, null, 2)}\n`) - originalSize);
+      }
+      if (projected > accountingBounds.maxNewOutputBytes)
+        throw new DeliveryError('Source-phase final receipt exceeds its original output allowance.');
+      if (record.result !== undefined) record.result.newOutputBytes = projected;
+    } catch (error) {
+      record.status = 'unresolved';
+      delete record.result;
+      record.failure = { ...failures, accounting: message(error) };
+    }
+  } else {
+    for (let index = 0; index < 4; index++) {
+      const size = Buffer.byteLength(`${JSON.stringify(record, null, 2)}\n`);
+      record.bootstrapFiles[0] = [path, size];
+      record.bootstrapBytes =
+        writerBootstrap + size + record.bootstrapFiles.slice(1).reduce((sum, [, bytes]) => sum + bytes, 0);
+    }
+    if (previousBootstrap + record.bootstrapBytes + captured > accountingBounds.maxNewOutputBytes) {
+      record.status = 'unresolved';
+      record.failure = {
+        ...failures,
+        accounting: 'Retained rejected bootstrap exceeded the original output allowance.',
+      };
+      for (let index = 0; index < 4; index++) {
+        const size = Buffer.byteLength(`${JSON.stringify(record, null, 2)}\n`);
+        record.bootstrapFiles[0] = [path, size];
+        record.bootstrapBytes =
+          writerBootstrap + size + record.bootstrapFiles.slice(1).reduce((sum, [, bytes]) => sum + bytes, 0);
+      }
+    }
+  }
+  persist();
+  if (record.status !== 'complete')
+    throw new DeliveryError(
+      `Source phase ${record.status}: ${operationFailure ?? accountingFailure ?? releaseFailure ?? lockFailure ?? failures.operation ?? 'postconditions failed'}.`,
+      path,
+    );
+  return sourceReceipt(record);
 }
 
 /** @internal Runtime setup shares the existing writer, ownership handshake and bounded command runner. */

@@ -12,6 +12,8 @@ const LOCK_OPTIONS = {
 const LOCK_RETRY_DELAY_MS = 200;
 
 interface WithLockOptions<T> {
+  onCompromised?: (error: Error) => void;
+  onReleaseError?: (error: unknown) => void;
   onTimeout?: () => void;
   operation: () => Promise<T> | T;
   projectRoot?: string;
@@ -24,7 +26,7 @@ interface WithLockOptions<T> {
  */
 export async function withLock<T>(
   filePath: string,
-  { onTimeout, operation, projectRoot, timeout }: WithLockOptions<T>,
+  { onCompromised, onReleaseError, onTimeout, operation, projectRoot, timeout }: WithLockOptions<T>,
 ): Promise<T> {
   const root = projectRoot ?? process.cwd();
   const lockPath = resolve(root, filePath);
@@ -51,7 +53,10 @@ export async function withLock<T>(
       logDebug(`Acquiring lock on ${lockPath}... (attempt ${attemptLabel})`);
 
       try {
-        release = await lockfile.lock(lockPath, LOCK_OPTIONS);
+        release = await lockfile.lock(lockPath, {
+          ...LOCK_OPTIONS,
+          ...(onCompromised === undefined ? {} : { onCompromised }),
+        });
         logDebug(`Lock acquired on ${lockPath}`);
         break;
       } catch (error: unknown) {
@@ -80,6 +85,7 @@ export async function withLock<T>(
         await release();
         logDebug(`Lock released on ${lockPath}`);
       } catch (error: unknown) {
+        onReleaseError?.(error);
         // Lock release failure is non-fatal - stale lock will auto-expire
         logDebug(`Failed to release lock on ${lockPath}: ${error instanceof Error ? error.message : String(error)}`);
       }
