@@ -2316,7 +2316,12 @@ const IssueSourcePhaseInputSchema = z.strictObject({
     path: z.string().min(1),
     effect: z.discriminatedUnion('kind', [
       z.strictObject({ kind: z.literal('preserve') }),
-      z.strictObject({ kind: z.literal('commitOnce'), parent: SourceSha, tree: SourceSha }),
+      z.strictObject({
+        kind: z.literal('commitOnce'),
+        parent: SourceSha,
+        tree: SourceSha,
+        configDigest: SourceDigest.optional(),
+      }),
     ]),
   }),
   caller: SourceArtifactSchema,
@@ -2665,7 +2670,11 @@ export async function withIssueSourcePhase(
     const branch = git(row.path, 'branch', '--show-current');
     const dirty = sourceDirty(row.path);
     const candidate = await loadDeliveryConfig(row.path);
-    if (branch !== input.source.branch || candidate.configDigest !== input.source.configDigest)
+    const configDigest =
+      head === input.source.head || input.source.effect.kind !== 'commitOnce'
+        ? input.source.configDigest
+        : (input.source.effect.configDigest ?? input.source.configDigest);
+    if (branch !== input.source.branch || candidate.configDigest !== configDigest)
       throw new DeliveryError('Source-phase candidate branch or configuration changed.');
     if (head === input.source.head) {
       if (

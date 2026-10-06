@@ -457,6 +457,15 @@ cooperative callback: use its AbortSignal and issue all subprocesses through
 snapshot or produce the one declared commit with its exact parent/tree and
 clean postconditions. Normal commit hooks remain enabled.
 
+For a declared candidate policy change, set the optional
+`source.effect.configDigest` on `commitOnce` to the final resolved candidate
+configuration digest. `source.configDigest` binds the initial configuration;
+the final digest applies only to the exact declared clean child commit. Resolve
+both digests through the SDK's configuration loader; a policy file hash is not
+a resolved configuration digest. Omitting the final digest requires the initial
+configuration throughout and preserves existing record identities. `preserve`
+does not accept a final digest. The controller configuration remains fixed.
+
 The existing writer fence is published before lengthy validation/scans. The
 same runner accounts for the controller and owned descendants, captured logs,
 callback output and SDK metadata under one original cumulative physical

@@ -1083,15 +1083,231 @@ test('supported issue source phase runs fixture tests, an enabled-hook commit an
     assert.equal(git(row.path, 'rev-parse', 'HEAD^'), input.source.head);
     assert.equal(receipt.source.indexTree, input.source.indexTree);
     assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    const { environment, ...legacyBinding } = input;
+    assert.equal(receipt.phaseId, digestValue({ ...legacyBinding, environmentDigest: environment.digest }));
+    assert.equal(Object.hasOwn(input.source.effect, 'configDigest'), false);
+    const completedPath = join(
+      gitCommonDir(root),
+      'ai-delivery',
+      'receipts',
+      'source-phase@1',
+      digestValue(row.path).slice(7),
+      `${receipt.phaseId.slice(7)}.json`,
+    );
+    const completedBytes = readFileSync(completedPath);
+    assert.equal(Object.hasOwn(JSON.parse(completedBytes.toString()).binding.source.effect, 'configDigest'), false);
     const reused = await withIssueSourcePhase(input, async () => {
       entered += 1;
     });
     assert.equal(reused.recordId, receipt.recordId);
     assert.equal(entered, 1);
+    assert.deepEqual(readFileSync(completedPath), completedBytes);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function sourceConfigurationTransitionFixture() {
+  const result = await sourcePhaseFixture({ personalAuthor: true, custodianIdentity: 'historical-builder' });
+  const { root, row, outputRoot, input } = result;
+  const policy = join(row.path, 'policy.mjs');
+  const original = readFileSync(policy, 'utf8');
+  const revised = `${original}\n// Declared candidate policy revision.\n`;
+  writeFileSync(policy, revised);
+  const finalConfiguration = await loadDeliveryConfig(row.path);
+  const finalPolicyDigest = sha256(policy);
+  git(row.path, 'add', 'policy.mjs');
+  const tree = git(row.path, 'write-tree');
+  writeFileSync(policy, original);
+  git(row.path, 'add', 'policy.mjs');
+  assert.equal(git(row.path, 'write-tree'), input.source.indexTree);
+  assert.equal(git(row.path, 'status', '--porcelain'), '');
+  assert.equal((await loadDeliveryConfig(row.path)).configDigest, input.source.configDigest);
+  assert.notEqual(finalConfiguration.configDigest, input.source.configDigest);
+  assert.notEqual(finalConfiguration.configDigest, finalPolicyDigest);
+  const effect = {
+    kind: 'commitOnce' as const,
+    parent: input.source.head,
+    tree,
+    configDigest: finalConfiguration.configDigest,
+  };
+  input.source.effect = effect;
+  const hook = join(root, '.git', 'source-phase-hooks', 'pre-commit');
+  mkdirSync(dirname(hook));
+  writeFileSync(hook, `#!/bin/sh\nprintf 'enabled\\n' >> ${JSON.stringify(join(outputRoot, 'hook-count.txt'))}\n`, {
+    mode: 0o700,
+  });
+  const gitPath = realpathSync(execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim());
+  input.inputs = [hook, gitPath].map((path) => ({ path, digest: sha256(path) }));
+  const transition = `const fs=require('node:fs'),c=require('node:child_process');
+fs.writeFileSync(${JSON.stringify(policy)},${JSON.stringify(revised)});
+const git=(...args)=>c.execFileSync(${JSON.stringify(gitPath)},args,{stdio:'inherit'});
+git('add','policy.mjs');
+git('-c',${JSON.stringify(`core.hooksPath=${dirname(hook)}`)},'commit','-m','Reviewed candidate policy transition');`;
+  input.commands[1]!.argv = [realpathSync(process.execPath), '-e', transition];
+  input.commandGraphDigest = digestValue(input.commands);
+  return { ...result, policy, original, revised, effect, transition };
+}
+
+test('supported issue source phase binds initial and final resolved candidate configurations across one normal-hook commit', async () => {
+  const { root, row, outputRoot, input, effect } = await sourceConfigurationTransitionFixture();
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    let entered = 0;
+    const receipt = await withIssueSourcePhase(input, async (context) => {
+      entered += 1;
+      assert.equal(context.source.configDigest, input.source.configDigest);
+      mkdirSync(outputRoot);
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    assert.equal(receipt.source.configDigest, effect.configDigest);
+    assert.equal(receipt.source.indexTree, effect.tree);
+    assert.equal(
+      git(row.path, 'rev-list', '--parents', '-n', '1', 'HEAD'),
+      `${receipt.source.head} ${input.source.head}`,
+    );
+    assert.equal(git(row.path, 'status', '--porcelain'), '');
+    assert.equal(git(root, 'rev-parse', 'HEAD'), input.controller.head);
+    assert.equal((await loadDeliveryConfig(root)).configDigest, input.controller.configDigest);
+    assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    const completed = sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId);
+    assert.deepEqual((completed?.binding as { source?: { effect?: unknown } } | undefined)?.source?.effect, effect);
+    const reused = await withIssueSourcePhase(input, async () => {
+      entered += 1;
+    });
+    assert.equal(reused.recordId, receipt.recordId);
+    assert.deepEqual(
+      sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId),
+      completed,
+    );
+    assert.equal(entered, 1);
+    assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    for (const digest of ['initial', 'final'] as const) {
+      const changed = structuredClone(input);
+      if (digest === 'initial') changed.source.configDigest = digestValue('different initial configuration');
+      else changed.source.effect = { ...effect, configDigest: digestValue('different final configuration') };
+      await assert.rejects(
+        withIssueSourcePhase(changed, async () => assert.fail('changed binding cannot reuse completion or enter')),
+        /initial source|configuration|reconciliation/u,
+      );
+      assert.deepEqual(
+        sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId),
+        completed,
+      );
+      assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    }
+    writeFileSync(join(row.path, 'policy.mjs'), 'export const deliverySettings = {};\n');
+    await assert.rejects(withIssueSourcePhase(input, async () => assert.fail('changed final source cannot reuse')));
+    assert.deepEqual(
+      sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId),
+      completed,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['preserve', 'invalid digest', 'unknown field'] as const)(
+  'supported issue source phase strictly refuses a final configuration declaration with %s',
+  async (invalid) => {
+    const { root, input, effect } = await sourceConfigurationTransitionFixture();
+    const declaration =
+      invalid === 'preserve'
+        ? { kind: 'preserve', configDigest: effect.configDigest }
+        : invalid === 'invalid digest'
+          ? { ...effect, configDigest: 'invalid' }
+          : { ...effect, finalConfigDigest: effect.configDigest };
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      await assert.rejects(
+        withIssueSourcePhase(
+          { ...input, source: { ...input.source, effect: declaration } } as IssueSourcePhaseInput,
+          async () => assert.fail('invalid declaration cannot enter'),
+        ),
+      );
+      assert.equal(existsSync(join(gitCommonDir(root), 'ai-delivery', 'receipts', 'source-phase@1')), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('supported issue source phase refuses the final configuration at the initial head before work', async () => {
+  const { root, input, policy, revised } = await sourceConfigurationTransitionFixture();
+  writeFileSync(policy, revised);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('initial head requires initial configuration')),
+      /configuration/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  'omitted digest',
+  'wrong digest',
+  'wrong tree',
+  'wrong parent',
+  'second commit',
+  'dirty final',
+  'controller configuration',
+  'seal configuration',
+] as const)(
+  'supported issue source phase refuses a candidate configuration transition with %s without replay',
+  async (invalid) => {
+    const { root, row, outputRoot, input, effect, transition, policy, original } =
+      await sourceConfigurationTransitionFixture();
+    if (invalid === 'omitted digest') {
+      input.source.effect = { kind: 'commitOnce', parent: effect.parent, tree: effect.tree };
+    } else if (invalid === 'wrong digest') {
+      input.source.effect = { ...effect, configDigest: input.source.configDigest };
+    } else if (invalid === 'wrong tree') {
+      input.source.effect = { ...effect, tree: input.source.indexTree };
+    } else if (invalid === 'wrong parent') {
+      input.source.effect = { ...effect, parent: '1'.repeat(40) };
+    } else if (invalid === 'second commit') {
+      input.commands[1]!.argv[2] = `${transition}\ngit('commit','--allow-empty','-m','Undeclared second commit');`;
+    } else if (invalid === 'dirty final') {
+      input.commands[1]!.argv[2] = `${transition}\nfs.writeFileSync('artifact.txt','undeclared dirty final');`;
+    } else if (invalid === 'controller configuration') {
+      input.commands[1]!.argv[2] = `${transition}\nfs.appendFileSync(${JSON.stringify(join(root, 'policy.mjs'))},'\\n// Undeclared controller change.\\n');`;
+    } else {
+      input.commands[2]!.argv = [
+        realpathSync(process.execPath),
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(policy)},${JSON.stringify(original)});`,
+      ];
+    }
+    input.commandGraphDigest = digestValue(input.commands);
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      let entered = 0;
+      await assert.rejects(
+        withIssueSourcePhase(input, async (context) => {
+          entered += 1;
+          mkdirSync(outputRoot);
+          writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+          for (let index = 0; index < input.commands.length; index++) await context.run(index);
+        }),
+        invalid === 'controller configuration' ? /repository admission/u : /configuration|parent, tree/u,
+      );
+      assert.equal(entered, 1);
+      assert.notEqual(git(row.path, 'rev-parse', 'HEAD'), input.source.head);
+      assert.equal(sourcePhaseRecords(root)[0]?.status, 'unresolved');
+      const head = git(row.path, 'rev-parse', 'HEAD');
+      const hooks = readFileSync(join(outputRoot, 'hook-count.txt'));
+      await assert.rejects(withIssueSourcePhase(input, async () => assert.fail('failed commit cannot replay')));
+      assert.equal(git(row.path, 'rev-parse', 'HEAD'), head);
+      assert.deepEqual(readFileSync(join(outputRoot, 'hook-count.txt')), hooks);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('supported issue source phase never replays a commit followed by callback failure', async () => {
   const { root, row, input } = await sourcePhaseFixture();
