@@ -642,6 +642,10 @@ function scanOutputRoots(
       try {
         current = lstatSync(path);
       } catch (error) {
+        // A previously validated alias removed during this visit has no physical payload.
+        // Continue the complete current scan, publishing no identity for the vanished alias.
+        if (commandRunning && (error as NodeJS.ErrnoException).code === 'ENOENT' && previous?.identity === identity)
+          return;
         throw new OutputObservationError('Filesystem output alias identity readback failed.', path, error);
       }
       if (
