@@ -170,13 +170,14 @@ function sourceRootFor(name: AiDeliveryMcpToolName, input: Record<string, unknow
 export async function startTrackedIssue(
   context: Awaited<ReturnType<typeof loadDeliveryContext>>,
   input: Record<string, unknown>,
+  runtimeEntryPath?: string,
 ): Promise<Record<string, unknown>> {
   const knownIssue = input.issueNumber === undefined ? undefined : requiredNumber(input, 'issueNumber');
   if (input.resumeCreated === true && (knownIssue === undefined || input.develop !== true)) {
     throw new DeliveryError('Resume of a known created issue requires issueNumber and develop=true.');
   }
   if (knownIssue !== undefined && input.resumeCreated !== true) {
-    const row = await developIssue(context, knownIssue);
+    const row = await developIssue(context, knownIssue, runtimeEntryPath);
     const title = (await issueInfo(context, knownIssue)).title;
     return {
       issueNumber: knownIssue,
@@ -250,7 +251,7 @@ export async function startTrackedIssue(
   }
   if (input.develop === true) {
     try {
-      const row = await developIssue(context, created.number);
+      const row = await developIssue(context, created.number, runtimeEntryPath);
       return {
         schemaVersion: 'ai-delivery.issue-start-registration@1',
         status: 'started',
@@ -404,7 +405,11 @@ export async function executeTool(
   }
   if (MUTATING_TOOLS.has(name) && input.dryRun !== true) {
     if (name !== 'issue_worktree_transition_apply' && typeof input.issueNumber === 'number')
-      assertIssueWorktreeTransitionAdmission(input.issueNumber, primaryGitRoot(execution.repoRoot));
+      assertIssueWorktreeTransitionAdmission(
+        input.issueNumber,
+        primaryGitRoot(execution.repoRoot),
+        name === 'issue_develop' || (name === 'issue_start' && input.resumeCreated !== true),
+      );
     await assertDeliveryRuntimeAdmitted({
       ...execution,
       repoRoot: sourceRoot === undefined ? execution.repoRoot : primaryGitRoot(execution.repoRoot),
@@ -452,7 +457,7 @@ export async function executeTool(
         await preflightReviewRoute(context, undefined, undefined, 'development');
         return scratchStart(input, execution, identity, context.configuration?.remote);
       }
-      return startTrackedIssue(context, input);
+      return startTrackedIssue(context, input, execution.runtimeEntryPath);
     }
     case 'issue_update': {
       return updateIssue(context, input as unknown as UpdateIssueInput);
@@ -466,7 +471,7 @@ export async function executeTool(
     }
     case 'issue_develop': {
       const issueNumber = requiredNumber(input, 'issueNumber');
-      const result = await developIssue(context, issueNumber);
+      const result = await developIssue(context, issueNumber, execution.runtimeEntryPath);
       if (input.assignee !== undefined)
         await context.clients.rest.issues.addAssignees({
           ...context.repo,

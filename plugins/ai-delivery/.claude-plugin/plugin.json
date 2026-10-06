@@ -2,5 +2,5 @@
   "name": "ai-delivery",
   "description": "GitHub issue and pull request delivery tools for prepared worktrees and evidence-based handoff.",
   "deliveryCapabilityVersion": 2,
-  "packageVersion": "0.3.15"
+  "packageVersion": "0.3.16"
 }

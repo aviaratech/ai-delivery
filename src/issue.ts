@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import type { DeliveryConfig, LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
+import { assertPrivateFile, digestBytes, stableJson } from './delivery/common.js';
 import { digestValue } from './delivery/index.js';
 import { DeliveryError } from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
@@ -26,17 +27,26 @@ import {
   resolveNativeRelationshipTargets,
 } from './github/relationships.js';
 import { resolveDeliveryRepo, type RepoCoordinates } from './github/repo.js';
-import { assertClean, git, gitCommonDir, gitRoot, primaryGitRoot } from './git.js';
-import { mergePr, preflightReviewRoute } from './pr.js';
+import { assertClean, git, gitCommonDir, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
+import { mergePr, preflightReviewRoute, readMergedContinuationTerminal } from './pr.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
+import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
 import {
   addWorktreeEntry,
   assertNativeIssueTrackingAdmission,
   getIssueWorktreeStrict,
   getWorktreeByIssue,
   listWorktreesStrict,
+  committedContinuationPlanPath,
+  CommittedContinuationPlanSchema,
+  pendingCommittedContinuation,
+  withCommittedContinuationRegistry,
+  writeCommittedContinuationCheckpoint,
+  type CommittedContinuationPlan,
+  type WorktreeEntry,
 } from './services/worktreeRegistry.js';
-import { withRuntimeSetupWriter } from './verification.js';
+import { withRuntimeSetupWriter, withWorktreeTransitionWriterAbsent } from './verification.js';
+import { authenticatedWorktreeActors, assertNativeWorktreeAcceptance } from './worktreeTransition.js';
 import { assertIssueWorktreeLocation, prepareIssueWorktree } from './worktree.js';
 import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
@@ -461,9 +471,192 @@ export async function readyCheck(context: DeliveryContext, issueNumber: number):
   });
 }
 
+function continuationOperatorBody(plan: CommittedContinuationPlan): string {
+  return stableJson({
+    schemaVersion: 'ai-delivery.worktree-continuation-authority@1',
+    plan,
+    acceptedScope: 'the-complete-content-addressed-committed-descendant-plan-and-every-original',
+    operationalClosure: 'all-other-launchers-and-writers-are-quiescent-no-unknown-writers',
+    maintainedExclusion: 'all-other-launchers-and-writers-remain-excluded-through-apply-and-exact-plan-replay',
+    historicalAuthority: 'preservation-only-no-current-verification-review-retirement-or-hold-release',
+  });
+}
+function continuationReviewerBody(plan: CommittedContinuationPlan, authorityCommentId: number): string {
+  return stableJson({
+    schemaVersion: 'ai-delivery.worktree-continuation-acceptance@1',
+    plan,
+    authorityCommentId,
+    authorityDigest: digestBytes(Buffer.from(continuationOperatorBody(plan))),
+    acceptedScope: 'independent-acceptance-of-the-complete-plan-and-maintained-writer-exclusion',
+    result: 'approved',
+  });
+}
+
+async function continueCommittedDescendant(
+  context: DeliveryContext,
+  issueNumber: number,
+  selected: WorktreeEntry,
+  runtimeEntryPath?: string,
+): Promise<void> {
+  if (context.config.roles.author.authSource !== 'personal')
+    throw new DeliveryError('Committed continuation requires configured personal author authentication.');
+  await withWorktreeTransitionWriterAbsent(context.root, selected.path, () =>
+    withCommittedContinuationRegistry(context.root, issueNumber, async (registry) => {
+      const original = registry.pending?.plan.row ?? registry.current;
+      assertIssueWorktreeLocation(original, context.root);
+      assertClean(original.path);
+      const actors = await authenticatedWorktreeActors(context);
+      const historical = await readMergedContinuationTerminal(context, original, actors.operator);
+      const head = {
+        sha: git(original.path, 'rev-parse', 'HEAD'),
+        tree: git(original.path, 'rev-parse', 'HEAD^{tree}'),
+      };
+      if (
+        head.sha === historical.terminal.headSha ||
+        gitExitCode(original.path, 'merge-base', '--is-ancestor', historical.terminal.headSha, head.sha) !== 0
+      )
+        throw new DeliveryError(
+          'Committed continuation requires a strict committed descendant of its exact terminal head.',
+        );
+      if (!context.configuration)
+        throw new DeliveryError('Committed continuation requires discovered current configuration.');
+      const readRuntime = () =>
+        assertDeliveryRuntimeAdmitted({
+          repoRoot: context.root,
+          configuration: context.configuration!,
+          ...(runtimeEntryPath === undefined ? {} : { runtimeEntryPath }),
+        });
+      const currentRuntime = await readRuntime();
+      const path = committedContinuationPlanPath(context.root, issueNumber, head.sha);
+      const stored =
+        registry.pending?.plan ??
+        (existsSync(path)
+          ? CommittedContinuationPlanSchema.parse(
+              (JSON.parse(assertPrivateFile(path).toString('utf8')) as { plan: unknown }).plan,
+            )
+          : undefined);
+      const { prNumber: _priorPr, ...retained } = original;
+      const content = {
+        schemaVersion: 'ai-delivery.committed-continuation-plan@1' as const,
+        repository: context.config.repository,
+        repoRoot: context.root,
+        configDigest: context.configuration.configDigest,
+        currentRuntime,
+        row: original,
+        replacement: {
+          ...retained,
+          type: 'issue' as const,
+          issueNumber,
+          identity: context.config.roles.author.identity,
+          status: 'active' as const,
+          updatedAt: stored?.replacement.updatedAt ?? new Date().toISOString(),
+        },
+        head,
+        terminalHead: { sha: historical.terminal.headSha, tree: historical.terminal.headTree },
+        terminalMergeId: historical.terminal.mergeId,
+        operator: actors.operator,
+        reviewerActor: actors.reviewerActor,
+        preserved: [...historical.preserved, registry.ownerWitness],
+      };
+      const plan = CommittedContinuationPlanSchema.parse({ ...content, planId: digestValue(content) });
+      if (stored && stableJson(stored) !== stableJson(plan))
+        throw new DeliveryError('Committed continuation approved source, configuration or custody plan drifted.');
+      registry.prepare();
+      writeCommittedContinuationCheckpoint(path, {
+        plan,
+        operatorBody: continuationOperatorBody(plan),
+        reviewerBody: continuationReviewerBody(plan, 0),
+      });
+      let ids = registry.pending && {
+        authorityCommentId: registry.pending.authorityCommentId,
+        acceptanceCommentId: registry.pending.acceptanceCommentId,
+      };
+      if (!ids) {
+        const comments = [];
+        for (let page = 1; ; page += 1) {
+          const batch = (
+            await context.clients.rest.issues.listComments({
+              ...context.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+              page,
+            })
+          ).data;
+          comments.push(...batch);
+          if (batch.length < 100) break;
+        }
+        const authorities = comments.filter(
+          (comment) =>
+            comment.body === continuationOperatorBody(plan) &&
+            comment.user?.type === 'User' &&
+            comment.user.login.toLowerCase() === actors.operator.actorLogin.toLowerCase() &&
+            `user:${String(comment.user.id)}` === actors.operator.credentialIdentity,
+        );
+        const authority = authorities.length === 1 ? authorities[0] : undefined;
+        const acceptances = authority
+          ? comments.filter(
+              (comment) =>
+                comment.body === continuationReviewerBody(plan, authority.id) &&
+                comment.user?.type === 'Bot' &&
+                comment.user.login.toLowerCase() === actors.reviewerActor.toLowerCase(),
+            )
+          : [];
+        if (!authority || acceptances.length !== 1 || !acceptances[0])
+          throw new DeliveryError(
+            `Committed continuation requires exact native operator and configured reviewer-App acceptance. Saved plan: ${path}`,
+          );
+        ids = { authorityCommentId: authority.id, acceptanceCommentId: acceptances[0].id };
+      }
+      const assertAuthority = () =>
+        assertNativeWorktreeAcceptance(context, {
+          repository: plan.repository,
+          subject: issueNumber,
+          operator: plan.operator,
+          reviewerActor: plan.reviewerActor,
+          ...ids,
+          operatorBody: continuationOperatorBody(plan),
+          reviewerBody: continuationReviewerBody(plan, ids.authorityCommentId),
+          revokedBody: stableJson({
+            schemaVersion: 'ai-delivery.worktree-continuation-revocation@1',
+            planId: plan.planId,
+            authorityCommentId: ids.authorityCommentId,
+          }),
+        });
+      const assertPreservedSource = async () => {
+        const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
+        if (issue.state !== 'open' || !(await readyCheck(context, issueNumber)).ready)
+          throw new DeliveryError('Committed continuation requires an open, ready unfinished issue.');
+        assertIssueWorktreeLocation(original, context.root);
+        assertClean(original.path);
+        if (
+          git(original.path, 'rev-parse', 'HEAD') !== plan.head.sha ||
+          git(original.path, 'rev-parse', 'HEAD^{tree}') !== plan.head.tree
+        )
+          throw new DeliveryError('Committed continuation source changed during exact-plan recovery.');
+        const fresh = await readMergedContinuationTerminal(context, original, plan.operator);
+        if (
+          fresh.terminal.mergeId !== plan.terminalMergeId ||
+          stableJson([...fresh.preserved, registry.ownerWitness]) !== stableJson(plan.preserved)
+        )
+          throw new DeliveryError('Committed continuation original lineage changed.');
+        await assertAuthority();
+        if (stableJson(await readRuntime()) !== stableJson(plan.currentRuntime))
+          throw new DeliveryError('Committed continuation runtime admission changed during exact-plan recovery.');
+      };
+      await assertPreservedSource();
+      registry.begin(plan, ids);
+      await assertPreservedSource();
+      registry.commit();
+      await assertPreservedSource();
+      registry.complete();
+    }),
+  );
+}
+
 export async function developIssue(
   context: DeliveryContext,
   issueNumber: number,
+  runtimeEntryPath?: string,
 ): Promise<{ path: string; branch: string }> {
   await preflightReviewRoute(context, undefined, undefined, 'development');
   const initialIssue = (await context.clients.rest.issues.get({ issue_number: issueNumber, ...context.repo })).data;
@@ -478,7 +671,25 @@ export async function developIssue(
     (entry) => entry.type === 'issue' && entry.issueNumber === issueNumber,
   );
   if (registered.length > 1) throw new DeliveryError('Issue has duplicate worktree registry rows.');
-  if (registered[0]?.status === 'merged') {
+  const pending = pendingCommittedContinuation(issueNumber, context.root);
+  const selected = registered[0];
+  if (
+    pending ||
+    (selected?.status === 'merged' &&
+      context.clients.authSource === 'personal' &&
+      !existsSync(
+        join(
+          gitCommonDir(selected.path),
+          'ai-delivery',
+          'merges',
+          String(issueNumber),
+          `${git(selected.path, 'rev-parse', 'HEAD')}.json`,
+        ),
+      ))
+  ) {
+    if (!selected) throw new DeliveryError('Committed continuation canonical custody is missing.');
+    await continueCommittedDescendant(context, issueNumber, selected, runtimeEntryPath);
+  } else if (selected?.status === 'merged') {
     const previous = getIssueWorktreeStrict(issueNumber, context.root);
     if (previous.identity !== context.config.roles.author.identity || previous.prNumber === undefined)
       throw new DeliveryError('Merged continuation requires the same preparing owner and exact prior PR.');

@@ -875,7 +875,8 @@ export async function applyWorktreeTransition(
   return { planId: plan.planId, result, replayed: priorSteps.length > 0, receiptPath: completionPath };
 }
 
-async function transitionActors(context: DeliveryContext) {
+/** @internal Shared personal-operator and distinct configured App authority. */
+export async function authenticatedWorktreeActors(context: DeliveryContext) {
   if (
     context.clients.authSource !== 'personal' ||
     context.clients.role !== 'author' ||
@@ -970,40 +971,72 @@ export async function assertWorktreeTransitionNativeAuthority(
     acceptanceCommentId: number;
   },
 ): Promise<{ relinquishment: unknown; acceptance: unknown }> {
-  const actors = await transitionActors(context);
+  const actors = await authenticatedWorktreeActors(context);
   if (stableJson(actors.operator) !== stableJson(plan.operator) || actors.reviewerActor !== plan.reviewerActor)
     throw new DeliveryError('Configured transition authority identities drifted.');
   if (plan.lineage.some((pr) => pr.authorLogin.toLowerCase() === actors.reviewerActor.toLowerCase()))
     throw new DeliveryError('Configured transition reviewer App is also the native PR author.');
   const subject = plan.terminalPrNumber ?? plan.row.issueNumber;
-  const issueUrl = `https://api.github.com/repos/${plan.repository}/issues/${String(subject)}`;
+  return assertNativeWorktreeAcceptance(context, {
+    repository: plan.repository,
+    subject,
+    operator: plan.operator,
+    reviewerActor: plan.reviewerActor,
+    authorityCommentId: ids.relinquishmentCommentId,
+    acceptanceCommentId: ids.acceptanceCommentId,
+    operatorBody: worktreeRelinquishmentBody(plan),
+    reviewerBody: worktreeAcceptanceBody(plan, ids.relinquishmentCommentId),
+    revokedBody: stableJson({
+      schemaVersion: 'ai-delivery.worktree-relinquishment-revocation@1',
+      planId: plan.planId,
+      relinquishmentCommentId: ids.relinquishmentCommentId,
+    }),
+  });
+}
+
+/** @internal Whole native comments are checked afresh by both preservation transitions. */
+export async function assertNativeWorktreeAcceptance(
+  context: DeliveryContext,
+  input: {
+    repository: string;
+    subject: number;
+    operator: { actorLogin: string; credentialIdentity: string };
+    reviewerActor: string;
+    authorityCommentId: number;
+    acceptanceCommentId: number;
+    operatorBody: string;
+    reviewerBody: string;
+    revokedBody: string;
+  },
+): Promise<{ relinquishment: unknown; acceptance: unknown }> {
+  const actors = await authenticatedWorktreeActors(context);
+  if (stableJson(actors.operator) !== stableJson(input.operator) || actors.reviewerActor !== input.reviewerActor)
+    throw new DeliveryError('Configured transition authority identities drifted.');
+  const subject = input.subject;
+  const issueUrl = `https://api.github.com/repos/${input.repository}/issues/${String(subject)}`;
   const relinquishment = (
-    await context.clients.rest.issues.getComment({ ...context.repo, comment_id: ids.relinquishmentCommentId })
+    await context.clients.rest.issues.getComment({ ...context.repo, comment_id: input.authorityCommentId })
   ).data;
   const acceptance = (
-    await actors.reviewer.rest.issues.getComment({ ...context.repo, comment_id: ids.acceptanceCommentId })
+    await actors.reviewer.rest.issues.getComment({ ...context.repo, comment_id: input.acceptanceCommentId })
   ).data;
   if (
-    relinquishment.id !== ids.relinquishmentCommentId ||
+    relinquishment?.id !== input.authorityCommentId ||
     relinquishment.issue_url?.toLowerCase() !== issueUrl.toLowerCase() ||
+    relinquishment.user?.type !== 'User' ||
     relinquishment.user?.login.toLowerCase() !== actors.operator.actorLogin.toLowerCase() ||
     `user:${String(relinquishment.user?.id)}` !== actors.operator.credentialIdentity ||
-    relinquishment.body !== worktreeRelinquishmentBody(plan)
+    relinquishment.body !== input.operatorBody
   )
     throw new DeliveryError('Native operator relinquishment is missing, changed or belongs to another subject.');
   if (
-    acceptance.id !== ids.acceptanceCommentId ||
+    acceptance?.id !== input.acceptanceCommentId ||
     acceptance.issue_url?.toLowerCase() !== issueUrl.toLowerCase() ||
     acceptance.user?.type !== 'Bot' ||
     acceptance.user.login.toLowerCase() !== actors.reviewerActor.toLowerCase() ||
-    acceptance.body !== worktreeAcceptanceBody(plan, ids.relinquishmentCommentId)
+    acceptance.body !== input.reviewerBody
   )
     throw new DeliveryError('Native configured reviewer-App exact-plan acceptance is missing or changed.');
-  const revokedBody = stableJson({
-    schemaVersion: 'ai-delivery.worktree-relinquishment-revocation@1',
-    planId: plan.planId,
-    relinquishmentCommentId: ids.relinquishmentCommentId,
-  });
   for (let page = 1; ; page += 1) {
     const comments = (
       await context.clients.rest.issues.listComments({ ...context.repo, issue_number: subject, per_page: 100, page })
@@ -1011,7 +1044,7 @@ export async function assertWorktreeTransitionNativeAuthority(
     if (
       comments.some(
         (comment) =>
-          comment.body === revokedBody &&
+          comment.body === input.revokedBody &&
           comment.user?.login.toLowerCase() === actors.operator.actorLogin.toLowerCase() &&
           `user:${String(comment.user.id)}` === actors.operator.credentialIdentity,
       )
@@ -1022,7 +1055,8 @@ export async function assertWorktreeTransitionNativeAuthority(
   return { relinquishment, acceptance };
 }
 
-async function nativeLineage(context: DeliveryContext, issueNumber: number, prNumber: number) {
+/** @internal The native repository and closing-issue relationship must match historical custody. */
+export async function readNativeWorktreePrLineage(context: DeliveryContext, issueNumber: number, prNumber: number) {
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
   const result = await context.clients.graphql<{
     repository: {
@@ -1073,7 +1107,7 @@ async function readTransitionLineage(context: DeliveryContext, row: WorktreeEntr
       [row.prNumber, terminalPrNumber].filter((number): number is number => number !== undefined && number !== null),
     ),
   ];
-  return Promise.all(numbers.map((number) => nativeLineage(context, row.issueNumber!, number)));
+  return Promise.all(numbers.map((number) => readNativeWorktreePrLineage(context, row.issueNumber!, number)));
 }
 
 function assertTransitionPurpose(
@@ -1230,7 +1264,7 @@ export async function inspectWorktreeTransition(
     const lineage = await readTransitionLineage(context, row, terminalPrNumber);
     const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: row.issueNumber })).data;
     assertTransitionPurpose(root, row, input.purpose, terminalPrNumber, head, lineage, issue.state, inventory);
-    const actors = await transitionActors(context);
+    const actors = await authenticatedWorktreeActors(context);
     if (lineage.some((pr) => pr.authorLogin.toLowerCase() === actors.reviewerActor.toLowerCase()))
       throw new DeliveryError('Configured transition reviewer App is also the native PR author.');
     const remoteRefs =

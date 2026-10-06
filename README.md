@@ -314,6 +314,25 @@ before verification; the already-merged HEAD cannot produce replacement evidence
 A closed issue, different owner, stale lineage or pending/terminal transition is
 refused. Source holds and runtime admission remain in force.
 
+A clean committed descendant can also continue when the configured personal
+author is the authenticated native author of the prior merged PR. The historical
+preparing label remains evidence. `develop` first saves an exact private plan and
+refuses to change custody until the native issue contains the complete operator
+authority body and independent configured reviewer-App acceptance. The saved
+templates bind the current source, configuration, installed runtime admission,
+original row, historical receipts and new owner. Set the acceptance template's `authorityCommentId` to the operator
+comment's native ID. The operator attests that all other launchers and writers
+are quiescent and remain excluded through recovery. The existing writer slot
+must be absent; this flow never recovers or terminates an unknown writer.
+
+Repeat `develop` or existing-issue `start` after interruption. Recovery checks
+the same pinned native comments, revocation, original bytes and exact original
+or replacement row before completing. Other mutations, including metadata
+resume, remain fenced while intent is pending. Completion retains the old
+witness and receipts, creates a distinct owner witness when identity changes,
+and permits fresh verification of the descendant and later ordinary commits.
+Historical approval supplies no current verification, review or hold release.
+
 Native issue metadata updates may target a legacy registered issue without
 adopting its worktree. The authenticated author and admitted runtime still apply,
 and canonical registry/schema, duplicate-owner and complete transition checks
