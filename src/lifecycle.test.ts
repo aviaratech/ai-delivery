@@ -6949,7 +6949,8 @@ test.each([
         fs.symlinkSync('./other', ${JSON.stringify(intermediate)});
       }
       if (${JSON.stringify(mode)} === 'chain-cycle') {
-        fs.unlinkSync(${JSON.stringify(intermediate)}); fs.symlinkSync('./cli', ${JSON.stringify(intermediate)});
+        const replacement = ${JSON.stringify(join(output, 'next-intermediate'))};
+        fs.symlinkSync('./cli', replacement); fs.renameSync(replacement, ${JSON.stringify(intermediate)});
       }
       for (let unit = 0; unit < 32; unit++) {
         fs.appendFileSync(${JSON.stringify(join(second, 'work'))}, 'unit\\n');
@@ -6983,15 +6984,22 @@ test.each([
                   ? /unsupported file/u
                   : mode === 'permission'
                     ? /readdir failed.*EACCES/u
-                    : mode === 'cycle' || mode === 'chain-cycle'
+                    : mode === 'cycle'
                       ? /ELOOP/u
-                      : /identity changed/u,
+                      : mode === 'chain-cycle'
+                        ? /ELOOP|alias identity changed/u
+                        : /identity changed/u,
         );
         assert.match(message, /First filesystem observation:.*ENOENT.*Last filesystem observation:/u);
         assert.doesNotMatch(message, /cleanup failed/u);
         return true;
       },
     );
+    if (mode === 'cycle' || mode === 'chain-cycle')
+      assert.throws(
+        () => realpathSync(alias),
+        (error: unknown) => (error as NodeJS.ErrnoException).code === 'ELOOP',
+      );
     assert.ok(observations.some((line) => line.includes('ENOENT')));
     assert.equal(
       observations.some((line) => line.includes('"state":"completed"')),
