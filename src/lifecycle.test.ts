@@ -5802,6 +5802,100 @@ test.each(['pass', 'chain-pass', 'command-error', 'cancel', 'persistent', 'limit
   },
 );
 
+test.each(['pass', 'limit', 'command-error'] as const)(
+  'validated alias deletion during identity readback keeps fresh slow-scan %s evidence',
+  async (mode) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-readback-deletion-')));
+    const { root } = await fixture();
+    const alias = join(output, 'alias'),
+      target = join(output, 'target'),
+      release = join(output, 'release'),
+      fresh = join(output, 'z-new-output');
+    writeFileSync(target, 'target');
+    writeFileSync(join(output, 'unrelated'), 'preserved');
+    symlinkSync('./target', alias);
+    const fs = (await import('node:fs')).default;
+    const actualLstat = fs.lstatSync;
+    const now = Date.now.bind(Date);
+    let removedDuringVisit = false,
+      scannedFreshOutput = false,
+      offset = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now() + offset);
+    const scan = vi.spyOn(fs, 'lstatSync').mockImplementation((path, options) => {
+      if (path === fresh && removedDuringVisit && !scannedFreshOutput) {
+        scannedFreshOutput = true;
+        // Inject scan duration only; removal, physical inventory and byte accounting are real.
+        offset += 1500;
+      }
+      return actualLstat(path, options);
+    });
+    syncBuiltinESMExports();
+    const progress = vi.spyOn(process.stderr, 'write').mockImplementation((line) => {
+      if (!removedDuringVisit && String(line).includes('broken or cyclic symbolic link')) {
+        writeFileSync(release, 'remove owned alias');
+        const until = now() + 5000;
+        for (;;) {
+          try {
+            actualLstat(alias);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            removedDuringVisit = true;
+            break;
+          }
+          if (now() >= until) throw new Error('Owned alias deletion handshake failed.');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+      }
+      return true;
+    });
+    const script = `(async () => {
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(fresh)}, 'x'.repeat(${mode === 'limit' ? 8192 : 512}));
+      fs.unlinkSync(${JSON.stringify(target)});
+      while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 5));
+      fs.unlinkSync(${JSON.stringify(alias)});
+      ${mode === 'command-error' ? "console.error('synthetic deletion command failure'); process.exitCode = 7;" : ''}
+    })().catch(error => { console.error(error); process.exitCode = 1; });`;
+    try {
+      const { withRuntimeSetupWriter } = await import('./verification.js');
+      const run = withRuntimeSetupWriter(root, (runner) =>
+        runner.run([process.execPath, '-e', script], {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 4096,
+          outputRoots: [output],
+        }),
+      );
+      if (mode === 'pass') await run;
+      else
+        await assert.rejects(run, (error: unknown) => {
+          assert.match(
+            String(error),
+            mode === 'limit' ? /Positive new filesystem output 8192 exceeded limit 4096/u : /Command exit 7/u,
+          );
+          assert.match(String(error), /Command output sha256:/u);
+          assert.doesNotMatch(String(error), /observation remained unavailable|cleanup failed/u);
+          return true;
+        });
+      assert.ok(removedDuringVisit);
+      assert.ok(scannedFreshOutput);
+      assert.equal(readdirSync(output).includes('alias'), false);
+      assert.equal(readFileSync(fresh).length, mode === 'limit' ? 8192 : 512);
+      assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
+      await withRuntimeSetupWriter(root, async (runner) => {
+        runner.assertQuiescent();
+      });
+    } finally {
+      progress.mockRestore();
+      scan.mockRestore();
+      syncBuiltinESMExports();
+      clock.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
+
 test('injected first failed scan duration does not consume the subsequent observation stall window', async () => {
   const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-scan-duration-')));
   const { root } = await fixture();
