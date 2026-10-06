@@ -26,7 +26,13 @@ export { buildVelocityReport, getDeliveryRecords, recordMergedDelivery } from '.
 export type { DeliveryRecord, VelocityReport, PointBucketStatistics } from './services/deliveryRecordService.js';
 export { getIssueWorktreeStrict, listWorktreesStrict } from './services/worktreeRegistry.js';
 export { prepareIssueWorktree, prepareStandaloneWorktree } from './worktree.js';
-export { verifyIssue, createIssuePhaseEvidence, withVerificationFilesystemFixture } from './verification.js';
+export {
+  verifyIssue,
+  createIssuePhaseEvidence,
+  withVerificationFilesystemFixture,
+  withIssueSourcePhase,
+} from './verification.js';
+export type { IssueSourcePhaseInput, IssueSourcePhaseContext, IssueSourcePhaseReceipt } from './verification.js';
 
 export { discoverDeliveryRouting } from './github/discovery.js';
 export type { DeliveryRouting, DiscoveryClients } from './github/discovery.js';

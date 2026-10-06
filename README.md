@@ -427,6 +427,65 @@ proof. A stopped or failed publish/finish must be read back before retrying;
 never infer completion from a timed-out command. Task assignment and model
 routing belong to a separate orchestrator, not this CLI.
 
+## Bounded issue source phases
+
+The root and `@aviaratech/ai-delivery/agent` exports provide
+`withIssueSourcePhase(input, async context => { ... })` for an expressly
+authorized source graph in an existing registered issue worktree. The input
+binds its exact row and ownership witness, configured authenticated author,
+admitted executing SDK, primary controller HEAD/configuration, and separate
+candidate HEAD/index/dirty files/configuration. Declare frozen caller and input
+artifact digests, resolved command executables/argv/cwd, effective environment
+digest and overrides, completion artifacts, disjoint output roots and fixed
+RSS/output/disk bounds. Environment values stay in memory; records contain its
+digest. The selected SDK's producer commit and the consumer controller HEAD
+are separate identities.
+
+Inside the callback, prepare owned metadata and `await context.run(index)` for
+every command, in order, once. The context exposes read-only source,
+controller, authenticated actor and input identities. It permits one active
+command and expires when the callback settles. An unawaited command cancels
+the phase and triggers identity-bound descendant cleanup. This is a trusted
+cooperative callback: use its AbortSignal and issue all subprocesses through
+`run`. JavaScript is not sandboxed. Source must preserve the exact initial
+snapshot or produce the one declared commit with its exact parent/tree and
+clean postconditions. Normal commit hooks remain enabled.
+
+The existing writer fence is published before lengthy validation/scans. The
+same runner accounts for the controller and owned descendants, captured logs,
+callback output and SDK metadata under one original cumulative physical
+baseline. New command calls cannot replace the graph, environment, roots or
+allocation. Cancellation and lock compromise cancel owned work; process
+cleanup, output accounting, writer release and lock release failures remain
+distinct. Completion is sealed only after accounting and confirmed release.
+The shared writer admission check continues to exclude other worktree writers
+while this source-phase record is unsealed, including the release-to-seal interval.
+
+The finite private `ai-delivery.source-phase@1` record is stored beneath the
+Git common directory's `ai-delivery/receipts/source-phase@1`, keyed by worktree
+and complete input digests. A compatible completed record can be returned
+without entering the callback or replaying commands after validating source,
+producer, admission and artifacts. A terminal `failed-quiescent` or
+`rejected-before-work` attempt can be followed only by an expressly authorized
+new input naming its exact predecessor phaseId/recordId, original baselineId
+when present, and authorization digest in `reconciliation`. Retain original
+source/runtime/input and allocation bindings and all output/bootstrap charges;
+corrected rejected inputs supply no reusable proof. Intermediate command
+results are never replay checkpoints. A missing or mistyped predecessor can be
+corrected without discarding its rejected record: validated retention edges
+carry every rejected sibling's bootstrap charge, separately from the requested
+reconciliation and any reusable source/runtime proof. Every attempt inherits
+the retained original allocation and charges prior attempts before checking
+work authorization. Rejected requests cannot enlarge that allocation or change
+its roots. Exhaustion remains unresolved and refuses another record or writer
+claim. Interrupted intent, uncertain commits,
+changed frozen inputs or unconfirmed release remain unresolved and refuse a
+new attempt; the API supplies no previous-process recovery or force-unblock.
+
+Its receipt proves this bounded operation only. Canonical verification,
+independent acceptance, scientific holds and receiving runtime selection keep
+their existing owners and checks.
+
 ## Compatibility contract
 
 The MCP input and result contract is `ai-delivery.mcp@1`, exported as `AI_DELIVERY_MCP_CONTRACT_VERSION`. It retains the 13 `issue_*` tool names. Each tool rejects unknown fields at the request boundary. `issue_create` accepts a title with optional body, Issue Type, Points, Priority, taxonomy labels, milestone, parent and blockers; it returns `{body, created: {number, title, url}, routing}`. A linked parent is read back and cleared of Points. `issue_start({issueNumber})` always checks readiness and prepares that existing issue; `develop` gates only preparation of a newly created issue. New starts default to 2 Points. `resumeCreated` requires both `issueNumber` and `develop: true` and never creates a second issue. Immediate creation and development preflights readiness before creation and returns `ai-delivery.issue-start-registration@1` with `status: "started"` or a `created-not-started` failure and exact `safeResume` arguments. The CLI prints that recovery JSON and exits nonzero for `created-not-started`. Scratch starts derive safe names from the request or title and return the branch and worktree path. `repo` on create, start and ready check, or global CLI `--repo`, must match the repository selected by the checkout's validated Git remote; a mismatch fails before a GitHub call.

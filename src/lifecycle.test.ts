@@ -33,6 +33,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { loadDeliveryConfig, parseDeliveryConfig } from './config/deliveryConfig.js';
+import * as deliveryConfiguration from './config/deliveryConfig.js';
 import { digestValue, stableJson } from './delivery/index.js';
 import { contextFor, executeTool, resumedIssueUpdate, startTrackedIssue } from './dispatch.js';
 import { defaultBaseRef, gitCommonDir } from './git.js';
@@ -55,7 +56,12 @@ import {
   removeWorktreeEntry,
   updateIssueWorktreeDelivery,
 } from './services/worktreeRegistry.js';
-import { assertDeliveryRuntimeAdmitted, type RuntimeAdmission } from './services/deliveryAdmission.js';
+import {
+  assertDeliveryRuntimeAdmitted,
+  buildRuntimeAdmission,
+  type RuntimeAdmission,
+} from './services/deliveryAdmission.js';
+import type { IssueSourcePhaseInput } from './agent.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
 import { createIssuePhaseEvidence, loadVerifiedRun, verifyIssue } from './verification.js';
 import {
@@ -451,6 +457,1227 @@ export default {
     throw error;
   }
 }
+
+async function sourcePhaseFixture(options: { personalAuthor?: boolean } = {}) {
+  const fixtureResult = await fixture(options);
+  const { root } = fixtureResult;
+  const identity = (await loadDeliveryConfig(root)).config.roles.author.identity;
+  const sdkRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+  const runtimeEntryPath = join(sdkRoot, 'dist', 'cli.js');
+  const packageVersion = (JSON.parse(readFileSync(join(sdkRoot, 'package.json'), 'utf8')) as { version: string })
+    .version;
+  const selectedAdmission = buildRuntimeAdmission({
+    cliPath: runtimeEntryPath,
+    mcpLauncherPath: join(sdkRoot, 'plugins', 'ai-delivery', 'dist', 'mcp-launcher.js'),
+    pluginManifestPath: join(sdkRoot, 'plugins', 'ai-delivery', '.claude-plugin', 'plugin.json'),
+    packageVersion,
+    sourceArchiveSha256: digestValue('synthetic source-phase archive'),
+    sourceCommit: git(sdkRoot, 'rev-parse', 'HEAD'),
+    configuration: await loadDeliveryConfig(root),
+  });
+  writeFileSync(join(root, '.git', 'ai-delivery', 'runtime-admission.json'), JSON.stringify(selectedAdmission), {
+    mode: 0o600,
+  });
+  const row = await prepareIssueWorktree({ identity, issueNumber: 17, repoRoot: root });
+  const outputRoot = join(root, '.git', 'source-phase-output');
+  const callerPath = join(root, '.git', 'source-phase-caller.mjs');
+  const authorizationPath = join(root, '.git', 'source-phase-authorization.json');
+  writeFileSync(callerPath, '// frozen synthetic source caller\n', { mode: 0o600 });
+  writeFileSync(authorizationPath, '{"source":"synthetic reviewed source allocation"}\n', { mode: 0o600 });
+  const executable = realpathSync(process.execPath);
+  const stat = lstatSync(executable);
+  const commands = [0, 1, 2].map((index) => ({
+    argv: [executable, '-e', `console.log(process.env.SOURCE_PHASE_VALUE + ':${String(index)}')`],
+    cwd: row.path,
+    executable: {
+      path: executable,
+      digest: sha256(executable),
+      device: stat.dev,
+      inode: stat.ino,
+      uid: stat.uid,
+      mode: stat.mode,
+    },
+  }));
+  const overrides = { SOURCE_PHASE_VALUE: 'frozen' };
+  const environment: NodeJS.ProcessEnv = { ...process.env, ...overrides };
+  delete environment.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
+  const admission = await assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath });
+  const input: IssueSourcePhaseInput = {
+    repoRoot: root,
+    issueNumber: 17,
+    identity,
+    rowDigest: digestValue(row),
+    controller: {
+      head: git(root, 'rev-parse', 'HEAD'),
+      configDigest: (await loadDeliveryConfig(root)).configDigest,
+      admissionId: admission.admissionId,
+      runtimeEntryPath,
+      packageVersion: admission.packageVersion,
+      archiveDigest: admission.sourceArchiveSha256,
+    },
+    source: {
+      path: row.path,
+      branch: row.branch,
+      head: git(row.path, 'rev-parse', 'HEAD'),
+      indexTree: git(row.path, 'write-tree'),
+      configDigest: (await loadDeliveryConfig(row.path)).configDigest,
+      dirty: [] as Array<{ path: string; digest: string | null }>,
+      effect: { kind: 'preserve' as const },
+    },
+    caller: { path: callerPath, digest: sha256(callerPath) },
+    authorization: { path: authorizationPath, digest: sha256(authorizationPath) },
+    inputs: [],
+    commands,
+    commandGraphDigest: digestValue(commands),
+    environment: { digest: digestValue(environment), overrides },
+    bounds: {
+      maxAggregateRssBytes: 1024 ** 3,
+      maxNewOutputBytes: 4 * 1024 ** 2,
+      minFreeDiskBytes: 1,
+      outputRoots: [outputRoot, join(root, '.git', 'ai-delivery')],
+    },
+    completionArtifacts: [join(outputRoot, 'metadata.json')],
+  };
+  return { ...fixtureResult, runtimeEntryPath, row, outputRoot, input, selectedAdmission };
+}
+
+function sourcePhaseRecords(root: string): Array<Record<string, unknown>> {
+  const directory = join(gitCommonDir(root), 'ai-delivery', 'receipts', 'source-phase@1');
+  return readdirSync(directory).flatMap((subject) =>
+    readdirSync(join(directory, subject)).map(
+      (name) => JSON.parse(readFileSync(join(directory, subject, name), 'utf8')) as Record<string, unknown>,
+    ),
+  );
+}
+
+test('supported issue source phase freezes three ordered commands and reuses only the completed whole phase', async () => {
+  const { root, outputRoot, input, selectedAdmission } = await sourcePhaseFixture();
+  try {
+    const agent = await import('./agent.js');
+    assert.equal(typeof agent.withIssueSourcePhase, 'function', 'the source capability must be public');
+    assert.notEqual(
+      selectedAdmission.sourceCommit,
+      input.controller.head,
+      'producer and consumer are separate repositories',
+    );
+    let entered = 0;
+    const receipt = await agent.withIssueSourcePhase(input, async (context) => {
+      entered += 1;
+      mkdirSync(outputRoot, { mode: 0o700 });
+      writeFileSync(join(outputRoot, 'metadata.json'), '{"owned":true}\n');
+      const inherited = process.env.SOURCE_PHASE_VALUE;
+      process.env.SOURCE_PHASE_VALUE = 'changed-after-freeze';
+      try {
+        for (let index = 0; index < input.commands.length; index++) {
+          assert.equal((await context.run(index)).toString().trim(), `frozen:${String(index)}`);
+        }
+      } finally {
+        if (inherited === undefined) delete process.env.SOURCE_PHASE_VALUE;
+        else process.env.SOURCE_PHASE_VALUE = inherited;
+      }
+    });
+    assert.equal(receipt.status, 'complete');
+    assert.equal(receipt.source.head, input.source.head);
+    assert.equal(receipt.commands.length, 3);
+    assert.equal(sourcePhaseRecords(root)[0]?.status, 'complete');
+    const reused = await agent.withIssueSourcePhase(input, async () => {
+      entered += 1;
+    });
+    assert.equal(reused.recordId, receipt.recordId);
+    assert.equal(entered, 1);
+    assert.equal(
+      readdirSync(join(gitCommonDir(root), 'ai-delivery', 'writers@1')).some((name) => name.endsWith('.json')),
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase refuses a linked worktree as its primary controller', async () => {
+  const { root, row, input } = await sourcePhaseFixture();
+  input.repoRoot = row.path;
+  let entered = false;
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /canonical primary controller/u,
+    );
+    assert.equal(entered, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase authenticates its configured author before callback entry', async () => {
+  const { root, input } = await sourcePhaseFixture();
+  let entered = false;
+  const unavailable = vi
+    .spyOn(githubClient, 'createDeliveryGitHubClients')
+    .mockRejectedValueOnce(new Error('Missing selected author credentials'));
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /Missing selected author credentials/u,
+    );
+    assert.equal(entered, false);
+  } finally {
+    unavailable.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase refuses an admitted CLI from a different executing installation', async () => {
+  const { root, input, selectedAdmission } = await sourcePhaseFixture();
+  const selectedRoot = join(root, '.git', 'different-selected-runtime');
+  mkdirSync(selectedRoot);
+  const sdkRoot = dirname(dirname(input.controller.runtimeEntryPath));
+  cpSync(join(sdkRoot, 'dist'), join(selectedRoot, 'dist'), { recursive: true });
+  cpSync(join(sdkRoot, 'package.json'), join(selectedRoot, 'package.json'));
+  const admission = buildRuntimeAdmission({
+    ...selectedAdmission,
+    cliPath: join(selectedRoot, 'dist', 'cli.js'),
+    configuration: await loadDeliveryConfig(root),
+  });
+  writeFileSync(join(root, '.git', 'ai-delivery', 'runtime-admission.json'), JSON.stringify(admission), {
+    mode: 0o600,
+  });
+  input.controller.runtimeEntryPath = admission.cliPath;
+  input.controller.admissionId = admission.admissionId;
+  let entered = false;
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /executing.*installation/u,
+    );
+    assert.equal(entered, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase refuses a matching existing commit without completed phase proof', async () => {
+  const { root, row, outputRoot, input } = await sourcePhaseFixture();
+  input.source.effect = { kind: 'commitOnce', parent: input.source.head, tree: input.source.indexTree };
+  const committed = git(
+    row.path,
+    'commit-tree',
+    input.source.indexTree,
+    '-p',
+    input.source.head,
+    '-m',
+    'Previously published source',
+  );
+  git(row.path, 'update-ref', `refs/heads/${row.branch}`, committed);
+  let entered = false;
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        entered = true;
+        mkdirSync(outputRoot);
+        writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+      }),
+      /initial source/u,
+    );
+    assert.equal(entered, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase cannot replay a failed command even when its callback catches the error', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  const counter = join(outputRoot, 'attempts.txt');
+  input.commands[0]!.argv = [
+    realpathSync(process.execPath),
+    '-e',
+    `const fs=require('fs');fs.appendFileSync(${JSON.stringify(counter)},'x');if(fs.readFileSync(${JSON.stringify(counter)},'utf8').length===1)process.exit(7);`,
+  ];
+  input.commandGraphDigest = digestValue(input.commands);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        mkdirSync(outputRoot, { mode: 0o700 });
+        writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+        await context.run(0).catch(() => undefined);
+        await context.run(0);
+        await context.run(1);
+        await context.run(2);
+      }),
+      /ordered|single-use|failed|command/u,
+    );
+    assert.equal(readFileSync(counter, 'utf8'), 'x');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase retains complete rejected bootstrap metadata through corrected attempts', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  const originalGraph = input.commandGraphDigest;
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      input.commandGraphDigest = digestValue(`invalid graph ${String(attempt)}`);
+      await assert.rejects(
+        withIssueSourcePhase(input, async () => {
+          assert.fail('rejected inputs must not enter callback');
+        }),
+        /binding changed/u,
+      );
+      const records = sourcePhaseRecords(root);
+      const predecessor = records.find(
+        (record) =>
+          !records.some(
+            (later) => (later.reconciliation as { phaseId?: string } | undefined)?.phaseId === record.phaseId,
+          ),
+      )!;
+      assert.equal(predecessor.status, 'rejected-before-work');
+      assert.ok(
+        Number(predecessor.bootstrapBytes) >= Buffer.byteLength(`${JSON.stringify(predecessor, null, 2)}\n`),
+        'charge the complete retained rejection',
+      );
+      assert.ok(predecessor.binding, 'preserve rejected requested allocation and input bindings');
+      input.reconciliation = {
+        phaseId: String(predecessor.phaseId),
+        recordId: String(predecessor.recordId),
+        authorizationDigest: input.authorization.digest,
+      };
+    }
+    const rejected = sourcePhaseRecords(root);
+    const retainedBootstrap = rejected.reduce((sum, record) => sum + Number(record.bootstrapBytes), 0);
+    input.commandGraphDigest = originalGraph;
+    const completed = await withIssueSourcePhase(input, async (context) => {
+      mkdirSync(outputRoot);
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    const result = sourcePhaseRecords(root).find((record) => record.recordId === completed.recordId)!;
+    assert.ok(Number((result.result as { newOutputBytes: number }).newOutputBytes) >= retainedBootstrap);
+    assert.equal(sourcePhaseRecords(root).length, 4, 'retain every rejection');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase marks changed frozen inputs unresolved after callback failure', async () => {
+  const { root, input } = await sourcePhaseFixture();
+  const frozen = join(root, '.git', 'frozen-input.json');
+  writeFileSync(frozen, '{}');
+  input.inputs = [{ path: frozen, digest: sha256(frozen) }];
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        writeFileSync(frozen, '{"changed":true}');
+        throw new Error('callback failed');
+      }),
+      /unresolved/u,
+    );
+    assert.equal(sourcePhaseRecords(root)[0]?.status, 'unresolved');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase reconciliation cannot forget original frozen inputs', async () => {
+  const { root, input } = await sourcePhaseFixture();
+  const frozen = join(root, '.git', 'frozen-input.json');
+  writeFileSync(frozen, '{}');
+  input.inputs = [{ path: frozen, digest: sha256(frozen) }];
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        throw new Error('quiescent failure');
+      }),
+      /failed-quiescent/u,
+    );
+    const predecessor = sourcePhaseRecords(root)[0]!;
+    const baseline = predecessor.baseline as { baselineId: string };
+    input.reconciliation = {
+      phaseId: String(predecessor.phaseId),
+      recordId: String(predecessor.recordId),
+      baselineId: baseline.baselineId,
+      authorizationDigest: input.authorization.digest,
+    };
+    input.inputs = [];
+    let entered = false;
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /compatible|retained.*input/u,
+    );
+    assert.equal(entered, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase stops streaming capture at its remaining cumulative allowance', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  input.bounds.maxNewOutputBytes = 128 * 1024;
+  input.commands[0]!.argv = [
+    realpathSync(process.execPath),
+    '-e',
+    'process.stdout.write(Buffer.alloc(256*1024,120));setInterval(()=>{},1000)',
+  ];
+  input.commandGraphDigest = digestValue(input.commands);
+  input.completionArtifacts = [];
+  const cancellation = new AbortController();
+  input.signal = cancellation.signal;
+  const diagnosticDeadline = setTimeout(() => cancellation.abort(), 3_000);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        mkdirSync(outputRoot);
+        await context.run(0);
+      }),
+      /captured.*allowance/u,
+    );
+    assert.equal(
+      cancellation.signal.aborted,
+      false,
+      'streaming bound stops the waiting command before diagnostic cancellation',
+    );
+    assert.equal(
+      readdirSync(join(gitCommonDir(root), 'ai-delivery', 'writers@1')).some((name) => name.endsWith('.json')),
+      false,
+    );
+  } finally {
+    clearTimeout(diagnosticDeadline);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase controls stale-lock compromise while a real competing writer is excluded', async () => {
+  const { root, row, outputRoot, input } = await sourcePhaseFixture();
+  const paused = join(root, '.git', 'source-phase-validation-paused');
+  const originalLoad = deliveryConfiguration.loadDeliveryConfig;
+  let pauseOnce = true;
+  const slowValidation = vi.spyOn(deliveryConfiguration, 'loadDeliveryConfig').mockImplementation(async (...args) => {
+    if (pauseOnce && args[0] === root) {
+      pauseOnce = false;
+      writeFileSync(paused, 'writer fence is live');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 12_500);
+    }
+    return originalLoad(...args);
+  });
+  const contender = spawn(
+    process.execPath,
+    [
+      '-e',
+      `(async()=>{
+    const fs=await import('node:fs');
+    while(!fs.existsSync(${JSON.stringify(paused)}))await new Promise(r=>setTimeout(r,20));
+    await new Promise(r=>setTimeout(r,11_000));
+    const {withRuntimeSetupWriter}=await import(${JSON.stringify(new URL('./verification.js', import.meta.url).href)});
+    await withRuntimeSetupWriter(${JSON.stringify(row.path)},async()=>{console.log('COMPETING_CALLBACK_ENTERED')});
+  })().catch(e=>{console.log(e.message);process.exitCode=1});`,
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let contenderOutput = '';
+  let entered = false;
+  contender.stdout.on('data', (bytes: Buffer) => {
+    contenderOutput += bytes.toString();
+  });
+  contender.stderr.on('data', (bytes: Buffer) => {
+    contenderOutput += bytes.toString();
+  });
+  const closed = new Promise<void>((resolve) => contender.once('close', () => resolve()));
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        entered = true;
+        mkdirSync(outputRoot);
+        writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+      }),
+      /unresolved/u,
+    );
+    await closed;
+    assert.match(contenderOutput, /unsealed source phase/u);
+    assert.equal(entered, false, 'compromise cancels before callback entry');
+    assert.doesNotMatch(contenderOutput, /COMPETING_CALLBACK_ENTERED/u);
+    const record = sourcePhaseRecords(root)[0]!;
+    assert.equal(record.status, 'unresolved');
+    assert.ok((record.failure as { lockRelease?: string }).lockRelease);
+    const writers = join(gitCommonDir(root), 'ai-delivery', 'writers@1');
+    assert.equal(readdirSync(writers).length, 0, 'writer and reclaimed lock are absent after controlled failure');
+  } finally {
+    slowValidation.mockRestore();
+    if (contender.exitCode === null && contender.signalCode === null) contender.kill('SIGKILL');
+    await closed;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test('supported issue source phase runs fixture tests, an enabled-hook commit and classification with separate controller source', async () => {
+  const { root, row, outputRoot, input } = await sourcePhaseFixture();
+  const hook = join(root, '.git', 'source-phase-hooks', 'pre-commit');
+  mkdirSync(dirname(hook));
+  writeFileSync(hook, `#!/bin/sh\nprintf 'enabled\\n' >> ${JSON.stringify(join(outputRoot, 'hook-count.txt'))}\n`, {
+    mode: 0o700,
+  });
+  writeFileSync(join(row.path, 'artifact.txt'), 'frozen staged source change\n');
+  git(row.path, 'add', 'artifact.txt');
+  input.source.indexTree = git(row.path, 'write-tree');
+  input.source.dirty = [{ path: 'artifact.txt', digest: sha256(join(row.path, 'artifact.txt')) }];
+  input.source.effect = { kind: 'commitOnce', parent: input.source.head, tree: input.source.indexTree };
+  input.inputs = [{ path: hook, digest: sha256(hook) }];
+  const gitPath = realpathSync(execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim());
+  const stat = lstatSync(gitPath);
+  input.commands[0]!.argv = [
+    realpathSync(process.execPath),
+    '-e',
+    "for(let i=0;i<18;i++)console.log('fixture '+i+' passed')",
+  ];
+  input.commands[1] = {
+    cwd: row.path,
+    argv: [gitPath, '-c', `core.hooksPath=${dirname(hook)}`, 'commit', '-m', 'Reviewed source phase'],
+    executable: {
+      path: gitPath,
+      digest: sha256(gitPath),
+      device: stat.dev,
+      inode: stat.ino,
+      uid: stat.uid,
+      mode: stat.mode,
+    },
+  };
+  input.commands[2]!.argv = [
+    realpathSync(process.execPath),
+    '-e',
+    "const c=require('child_process');if(c.execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim())process.exit(8);console.log('source classification passed')",
+  ];
+  input.commandGraphDigest = digestValue(input.commands);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    let entered = 0;
+    const receipt = await withIssueSourcePhase(input, async (context) => {
+      entered += 1;
+      mkdirSync(outputRoot);
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      assert.equal((await context.run(0)).toString().trim().split('\n').length, 18);
+      await context.run(1);
+      await context.run(2);
+    });
+    assert.notEqual(receipt.source.head, input.source.head);
+    assert.equal(git(root, 'rev-parse', 'HEAD'), input.controller.head);
+    assert.equal(git(row.path, 'rev-parse', 'HEAD^'), input.source.head);
+    assert.equal(receipt.source.indexTree, input.source.indexTree);
+    assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    const reused = await withIssueSourcePhase(input, async () => {
+      entered += 1;
+    });
+    assert.equal(reused.recordId, receipt.recordId);
+    assert.equal(entered, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase never replays a commit followed by callback failure', async () => {
+  const { root, row, input } = await sourcePhaseFixture();
+  input.source.effect = { kind: 'commitOnce', parent: input.source.head, tree: input.source.indexTree };
+  input.completionArtifacts = [];
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        const committed = git(
+          row.path,
+          'commit-tree',
+          input.source.indexTree,
+          '-p',
+          input.source.head,
+          '-m',
+          'Uncertain commit',
+        );
+        git(row.path, 'update-ref', `refs/heads/${row.branch}`, committed);
+        throw new Error('failure after commit');
+      }),
+      /unresolved/u,
+    );
+    const old = sourcePhaseRecords(root)[0]!;
+    assert.equal(old.status, 'unresolved');
+    let entered = false;
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /incomplete|Unresolved/u,
+    );
+    assert.equal(entered, false);
+    assert.deepEqual(sourcePhaseRecords(root)[0], old, 'uncertain evidence is immutable');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase rejects skipped and concurrent commands and expires escaped capabilities', async () => {
+  for (const mode of ['skipped', 'concurrent', 'escaped'] as const) {
+    const { root, outputRoot, input } = await sourcePhaseFixture();
+    let escaped: ((index: number) => Promise<Buffer>) | undefined;
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      const operation = withIssueSourcePhase(input, async (context) => {
+        escaped = context.run;
+        mkdirSync(outputRoot);
+        writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+        if (mode === 'skipped') await context.run(1);
+        else if (mode === 'concurrent') await Promise.all([context.run(0), context.run(1)]);
+        else for (let index = 0; index < input.commands.length; index++) await context.run(index);
+      });
+      if (mode === 'escaped') await operation;
+      else await assert.rejects(operation, /ordered|single-use|cancelled|unawaited/u);
+      await assert.rejects(escaped!(0), /expired/u);
+      assert.equal(
+        readdirSync(join(gitCommonDir(root), 'ai-delivery', 'writers@1')).some((name) => name.endsWith('.json')),
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('supported issue source phase cancels unawaited commands and preserves unrelated output', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  const unrelated = join(root, '.git', 'unrelated-preserved.txt');
+  writeFileSync(unrelated, 'another run');
+  input.commands[0]!.argv = [realpathSync(process.execPath), '-e', 'setInterval(()=>{},1000)'];
+  input.commandGraphDigest = digestValue(input.commands);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        mkdirSync(outputRoot);
+        void context.run(0).catch(() => undefined);
+      }),
+      /unawaited/u,
+    );
+    assert.equal(readFileSync(unrelated, 'utf8'), 'another run');
+    const record = sourcePhaseRecords(root)[0]!;
+    assert.equal(record.status, 'failed-quiescent');
+    assert.equal((record.failure as { cleanup?: string }).cleanup, undefined);
+    assert.equal(readdirSync(join(gitCommonDir(root), 'ai-delivery', 'writers@1')).length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase refuses interrupted intent without replay or changing its retained checkpoint', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture({ personalAuthor: true });
+  input.environment.overrides.AUTHOR_TOKEN = 'synthetic-selected-author';
+  const environment: NodeJS.ProcessEnv = { ...process.env };
+  delete environment.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
+  for (const [name, value] of Object.entries(input.environment.overrides)) {
+    if (value === null) delete environment[name];
+    else environment[name] = value;
+  }
+  input.environment.digest = digestValue(environment);
+  const completedUnit = join(outputRoot, 'completed-unit.json');
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      `(async()=>{
+    const {syntheticDiscoveryClients}=await import(${JSON.stringify(new URL('./fixtures/discovery.js', import.meta.url).href)});
+    globalThis.fetch=async(url,request)=>{
+      const address=String(url);
+      if(address.endsWith('/graphql')){
+        const body=JSON.parse(request.body);const data=await syntheticDiscoveryClients().graphql(body.query,body.variables);
+        return new Response(JSON.stringify({data}),{status:200,headers:{'content-type':'application/json'}});
+      }
+      if(address.endsWith('/user'))return new Response(JSON.stringify({login:'host-user',id:37}),{status:200,headers:{'content-type':'application/json'}});
+      throw new Error('Unexpected synthetic native request: '+address);
+    };
+    const {withIssueSourcePhase}=await import(${JSON.stringify(new URL('./agent.js', import.meta.url).href)});
+    const fs=await import('node:fs');
+    await withIssueSourcePhase(${JSON.stringify(input)},async context=>{
+      fs.mkdirSync(${JSON.stringify(outputRoot)});
+      await context.run(0);
+      fs.writeFileSync(${JSON.stringify(completedUnit)},JSON.stringify({unit:0,output:'frozen:0'}));
+      await new Promise(()=>setInterval(()=>{},1000));
+    });
+  })().catch(e=>{console.error(e.message);process.exitCode=1});`,
+    ],
+    { env: environment, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let output = '';
+  const capture = (bytes: Buffer): void => {
+    output += bytes.toString();
+    if (output.length > 64 * 1024) child.kill('SIGKILL');
+  };
+  child.stdout.on('data', capture);
+  child.stderr.on('data', capture);
+  const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+  try {
+    for (let attempt = 0; attempt < 500 && !existsSync(completedUnit) && child.exitCode === null; attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(completedUnit), output);
+    child.kill('SIGKILL');
+    await closed;
+    assert.equal(child.signalCode, 'SIGKILL');
+    const record = sourcePhaseRecords(root)[0]!;
+    assert.equal(record.status, 'intent');
+    assert.equal((record.commands as unknown[]).length, 1);
+    const writer = join(
+      gitCommonDir(root),
+      'ai-delivery',
+      'writers@1',
+      `${digestValue(input.source.path).slice(7)}.json`,
+    );
+    const beforeWriter = readFileSync(writer);
+    const stale = new Date(Date.now() - 20_000);
+    utimesSync(`${writer}.lock`, stale, stale);
+    const { withIssueSourcePhase } = await import('./agent.js');
+    let entered = false;
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /unsealed source phase/u,
+    );
+    assert.equal(entered, false);
+    assert.deepEqual(sourcePhaseRecords(root)[0], record);
+    assert.ok(readFileSync(writer).equals(beforeWriter));
+    assert.equal(readFileSync(completedUnit, 'utf8'), '{"unit":0,"output":"frozen:0"}');
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await closed;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test('supported issue source phase charges output before, between and after its frozen commands', async () => {
+  for (const timing of ['before', 'between', 'after'] as const) {
+    const { root, outputRoot, input } = await sourcePhaseFixture();
+    const counter = join(outputRoot, 'started.txt');
+    input.bounds.maxNewOutputBytes = 64 * 1024;
+    for (let index = 0; index < input.commands.length; index++)
+      input.commands[index]!.argv = [
+        realpathSync(process.execPath),
+        '-e',
+        `require('fs').appendFileSync(${JSON.stringify(counter)},${JSON.stringify(String(index))})`,
+      ];
+    input.commandGraphDigest = digestValue(input.commands);
+    input.completionArtifacts = [];
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      await assert.rejects(
+        withIssueSourcePhase(input, async (context) => {
+          mkdirSync(outputRoot);
+          if (timing === 'before') writeFileSync(join(outputRoot, 'before.bin'), Buffer.alloc(80 * 1024));
+          if (timing === 'between') writeFileSync(join(outputRoot, 'first.bin'), Buffer.alloc(30 * 1024));
+          await context.run(0);
+          if (timing === 'between') writeFileSync(join(outputRoot, 'second.bin'), Buffer.alloc(40 * 1024));
+          await context.run(1);
+          await context.run(2);
+          if (timing === 'after') writeFileSync(join(outputRoot, 'after.bin'), Buffer.alloc(80 * 1024));
+        }),
+        /output|allowance/u,
+      );
+      assert.equal(
+        existsSync(counter) ? readFileSync(counter, 'utf8') : '',
+        timing === 'before' ? '' : timing === 'between' ? '0' : '012',
+      );
+      assert.notEqual(sourcePhaseRecords(root)[0]?.status, 'complete');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('supported issue source phase resumes a quiescent failure with its original baseline and ends the predecessor chain', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  input.bounds.maxNewOutputBytes = 256 * 1024;
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        mkdirSync(outputRoot);
+        writeFileSync(join(outputRoot, 'retained.bin'), Buffer.alloc(40 * 1024, 1));
+        throw new Error('bounded preparation failure');
+      }),
+      /failed-quiescent/u,
+    );
+    const original = sourcePhaseRecords(root)[0]!;
+    const baseline = original.baseline as { baselineId: string };
+    input.reconciliation = {
+      phaseId: String(original.phaseId),
+      recordId: String(original.recordId),
+      baselineId: baseline.baselineId,
+      authorizationDigest: input.authorization.digest,
+    };
+    const nextCaller = join(root, '.git', 'next-source-caller.mjs');
+    writeFileSync(nextCaller, '// expressly authorized corrected caller\n');
+    input.caller = { path: nextCaller, digest: sha256(nextCaller) };
+    const receipt = await withIssueSourcePhase(input, async (context) => {
+      writeFileSync(join(outputRoot, 'new.bin'), Buffer.alloc(80 * 1024, 2));
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    const completed = sourcePhaseRecords(root).find((record) => record.recordId === receipt.recordId)!;
+    assert.equal((completed.baseline as { baselineId: string }).baselineId, baseline.baselineId);
+    assert.ok((completed.result as { newOutputBytes: number }).newOutputBytes >= 120 * 1024);
+    assert.deepEqual(
+      sourcePhaseRecords(root).find((record) => record.recordId === original.recordId),
+      original,
+    );
+    const futureCaller = join(root, '.git', 'future-source-caller.mjs');
+    writeFileSync(futureCaller, '// independent later authorized phase\n');
+    input.caller = { path: futureCaller, digest: sha256(futureCaller) };
+    delete input.reconciliation;
+    const future = await withIssueSourcePhase(input, async (context) => {
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    assert.equal(future.status, 'complete', 'terminal success consumes its failed predecessor chain');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase refuses changed retained output on an expressly authorized retry', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  const retained = join(outputRoot, 'retained.json');
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        mkdirSync(outputRoot);
+        writeFileSync(retained, '{"unit":1}');
+        throw new Error('quiescent failure');
+      }),
+      /failed-quiescent/u,
+    );
+    const original = sourcePhaseRecords(root)[0]!;
+    input.reconciliation = {
+      phaseId: String(original.phaseId),
+      recordId: String(original.recordId),
+      baselineId: (original.baseline as { baselineId: string }).baselineId,
+      authorizationDigest: input.authorization.digest,
+    };
+    const graph = input.commandGraphDigest;
+    input.commandGraphDigest = digestValue('invalid intermediate retry graph');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('invalid intermediate graph cannot enter callback')),
+      /binding changed/u,
+    );
+    const intermediate = sourcePhaseRecords(root).find((record) => record.phaseId !== original.phaseId)!;
+    input.commandGraphDigest = graph;
+    input.reconciliation = {
+      ...input.reconciliation,
+      phaseId: String(intermediate.phaseId),
+      recordId: String(intermediate.recordId),
+    };
+    writeFileSync(retained, '{"unit":2}');
+    let entered = false;
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => {
+        entered = true;
+      }),
+      /retained output artifact identity/u,
+    );
+    assert.equal(entered, false);
+    assert.deepEqual(
+      sourcePhaseRecords(root).find((record) => record.recordId === original.recordId),
+      original,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase cancellation cleans the observed command and descendant identities', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  const pidsPath = join(outputRoot, 'pids.json');
+  input.commands[0]!.argv = [
+    realpathSync(process.execPath),
+    '-e',
+    `const fs=require('fs'),cp=require('child_process');const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidsPath)},JSON.stringify({root:process.pid,descendant:child.pid}));setInterval(()=>{},1000);`,
+  ];
+  input.commandGraphDigest = digestValue(input.commands);
+  input.completionArtifacts = [];
+  const cancellation = new AbortController();
+  input.signal = cancellation.signal;
+  const { withIssueSourcePhase } = await import('./agent.js');
+  const operation = withIssueSourcePhase(input, async (context) => {
+    mkdirSync(outputRoot);
+    await context.run(0);
+  }).catch((error: unknown) => error);
+  try {
+    for (let attempt = 0; attempt < 500 && !existsSync(pidsPath); attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(existsSync(pidsPath));
+    const pids = JSON.parse(readFileSync(pidsPath, 'utf8')) as { root: number; descendant: number };
+    const writer = join(
+      gitCommonDir(root),
+      'ai-delivery',
+      'writers@1',
+      `${digestValue(input.source.path).slice(7)}.json`,
+    );
+    const observed = (): boolean =>
+      (JSON.parse(readFileSync(writer, 'utf8')) as { command: { tracked?: { pid: number }[] } }).command.tracked?.some(
+        (member) => member.pid === pids.descendant,
+      ) === true;
+    for (let attempt = 0; attempt < 500 && !observed(); attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(observed(), 'record actual descendant birth identity before cancellation');
+    cancellation.abort();
+    assert.match(String(await operation), /cancelled/u);
+    for (const pid of [pids.root, pids.descendant]) {
+      const status = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' }).stdout.trim();
+      assert.ok(status === '' || status.startsWith('Z'), 'owned identity is no longer running');
+    }
+    const record = sourcePhaseRecords(root)[0]!;
+    assert.equal((record.failure as { cleanup?: string }).cleanup, undefined);
+    assert.equal(readdirSync(join(gitCommonDir(root), 'ai-delivery', 'writers@1')).length, 0);
+  } finally {
+    cancellation.abort();
+    await operation;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test('supported issue source phase reports writer and lock release failures separately from process cleanup', async () => {
+  for (const released of ['writer', 'lock'] as const) {
+    const { root, outputRoot, input } = await sourcePhaseFixture();
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      await assert.rejects(
+        withIssueSourcePhase(input, async (context) => {
+          mkdirSync(outputRoot);
+          writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+          for (let index = 0; index < input.commands.length; index++) await context.run(index);
+          const writer = join(
+            gitCommonDir(root),
+            'ai-delivery',
+            'writers@1',
+            `${digestValue(input.source.path).slice(7)}.json`,
+          );
+          const state = JSON.parse(readFileSync(writer, 'utf8')) as { owner: { pid: number } };
+          assert.equal(state.owner.pid, process.pid, 'fixture only alters its own writer');
+          if (released === 'writer') unlinkSync(writer);
+          else writeFileSync(join(`${writer}.lock`, 'owned-release-obstruction'), 'fixture-owned release failure');
+        }),
+        /unresolved/u,
+      );
+      const record = sourcePhaseRecords(root)[0]!;
+      const failure = record.failure as { cleanup?: string; writerRelease?: string; lockRelease?: string };
+      assert.equal(failure.cleanup, undefined);
+      if (released === 'writer') assert.ok(failure.writerRelease);
+      else {
+        assert.ok(failure.lockRelease);
+        assert.equal(failure.writerRelease, undefined);
+      }
+      assert.equal(record.status, 'unresolved');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('supported issue source phase retains exclusion through terminal sealing against a real writer', async () => {
+  for (const outcome of ['complete', 'failed-quiescent'] as const) {
+    const { root, row, outputRoot, input } = await sourcePhaseFixture();
+    const writer = join(gitCommonDir(root), 'ai-delivery', 'writers@1', `${digestValue(row.path).slice(7)}.json`);
+    const metadata = join(outputRoot, 'metadata.json');
+    const originalLoad = deliveryConfiguration.loadDeliveryConfig;
+    let contender: ReturnType<typeof spawnSync> | undefined;
+    const inspectRelease = vi.spyOn(deliveryConfiguration, 'loadDeliveryConfig').mockImplementation(async (...args) => {
+      if (
+        args[0] === root &&
+        contender === undefined &&
+        !existsSync(writer) &&
+        sourcePhaseRecords(root).some((record) => record.status === 'intent')
+      ) {
+        contender = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `import {writeFileSync} from 'node:fs';
+             import {withRuntimeSetupWriter} from ${JSON.stringify(new URL('./verification.js', import.meta.url).href)};
+             await withRuntimeSetupWriter(${JSON.stringify(row.path)},async()=>{
+               writeFileSync(${JSON.stringify(metadata)},'competing writer changed completion bytes');
+             });`,
+          ],
+          { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
+        );
+      }
+      return originalLoad(...args);
+    });
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      const phase = withIssueSourcePhase(input, async (context) => {
+        mkdirSync(outputRoot);
+        writeFileSync(metadata, '{}');
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+        if (outcome === 'failed-quiescent') throw new Error('quiescent callback failure');
+      });
+      if (outcome === 'complete') await phase;
+      else await assert.rejects(phase, /failed-quiescent/u);
+      assert.ok(contender, 'competing process attempted entry after writer release and before terminal seal');
+      assert.equal(contender.error, undefined);
+      assert.equal(contender.status, 1);
+      assert.match(String(contender.stderr), /unsealed source phase/u);
+      assert.equal(readFileSync(metadata, 'utf8'), '{}');
+      assert.equal(sourcePhaseRecords(root)[0]?.status, outcome);
+      const afterSeal = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `import {withRuntimeSetupWriter} from ${JSON.stringify(new URL('./verification.js', import.meta.url).href)};
+           await withRuntimeSetupWriter(${JSON.stringify(row.path)},async()=>console.log('writer entered after seal'));`,
+        ],
+        { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
+      );
+      assert.equal(afterSeal.error, undefined);
+      assert.equal(afterSeal.status, 0, String(afterSeal.stderr));
+      assert.match(String(afterSeal.stdout), /writer entered after seal/u);
+    } finally {
+      inspectRelease.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
+
+test('supported issue source phase corrects invalid reconciliation while retaining every rejected charge', async () => {
+  for (const initial of ['rejected-before-work', 'failed-quiescent'] as const) {
+    const { root, outputRoot, input } = await sourcePhaseFixture();
+    const graph = input.commandGraphDigest;
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      if (initial === 'rejected-before-work') input.commandGraphDigest = digestValue('initial invalid graph');
+      await assert.rejects(
+        withIssueSourcePhase(input, async () => {
+          if (initial === 'rejected-before-work') assert.fail('invalid graph cannot enter callback');
+          mkdirSync(outputRoot);
+          writeFileSync(join(outputRoot, 'retained.bin'), Buffer.alloc(40 * 1024));
+          throw new Error('original quiescent failure');
+        }),
+        initial === 'rejected-before-work' ? /binding changed/u : /failed-quiescent/u,
+      );
+      const original = sourcePhaseRecords(root)[0]!;
+      input.commandGraphDigest = graph;
+      const reconciliation = {
+        phaseId: String(original.phaseId),
+        recordId: String(original.recordId),
+        authorizationDigest: input.authorization.digest,
+        ...(original.baseline === undefined
+          ? {}
+          : { baselineId: (original.baseline as { baselineId: string }).baselineId }),
+      };
+      for (const invalid of ['missing', 'phase', 'record', 'authorization'] as const) {
+        const caller = join(root, '.git', `source-phase-invalid-${invalid}.mjs`);
+        writeFileSync(caller, `// frozen ${invalid} retry caller\n`);
+        input.caller = { path: caller, digest: sha256(caller) };
+        if (invalid === 'missing') delete input.reconciliation;
+        else
+          input.reconciliation = {
+            ...reconciliation,
+            ...(invalid === 'phase' ? { phaseId: digestValue('wrong predecessor phase') } : {}),
+            ...(invalid === 'record' ? { recordId: digestValue('wrong predecessor record') } : {}),
+            ...(invalid === 'authorization' ? { authorizationDigest: digestValue('wrong retry authorization') } : {}),
+          };
+        await assert.rejects(
+          withIssueSourcePhase(input, async () => assert.fail('invalid reconciliation cannot enter callback')),
+          /reconciliation|predecessor/u,
+        );
+      }
+      const retained = sourcePhaseRecords(root);
+      assert.equal(retained.length, 5);
+      assert.equal(
+        retained.filter((record) => record.status === 'rejected-before-work').length,
+        initial === 'rejected-before-work' ? 5 : 4,
+      );
+      input.reconciliation = reconciliation;
+      const completed = await withIssueSourcePhase(input, async (context) => {
+        mkdirSync(outputRoot, { recursive: true });
+        writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+      });
+      const finalRecords = sourcePhaseRecords(root);
+      const complete = finalRecords.find((record) => record.recordId === completed.recordId)!;
+      const bootstrap = retained.reduce((sum, record) => sum + Number(record.bootstrapBytes), 0);
+      assert.ok(
+        Number((complete.result as { newOutputBytes: number }).newOutputBytes) >=
+          bootstrap + (initial === 'failed-quiescent' ? 40 * 1024 : 0),
+      );
+      for (const record of retained)
+        assert.deepEqual(
+          finalRecords.find((current) => current.phaseId === record.phaseId),
+          record,
+          'rejected and failed evidence stays immutable',
+        );
+      delete input.reconciliation;
+      const nextCaller = join(root, '.git', 'source-phase-independent-next.mjs');
+      writeFileSync(nextCaller, '// independent later authorized graph\n');
+      input.caller = { path: nextCaller, digest: sha256(nextCaller) };
+      await withIssueSourcePhase(input, async (context) => {
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}, 40_000);
+
+test('supported issue source phase cannot derive a larger allocation or changed roots from rejected siblings', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  input.bounds.maxNewOutputBytes = 64 * 1024;
+  input.bounds.minFreeDiskBytes = 2;
+  const originalBounds = structuredClone(input.bounds);
+  const graph = input.commandGraphDigest;
+  const replacementRoot = join(root, '.git', 'replacement-source-output');
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    input.commandGraphDigest = digestValue('initial rejected graph with original allocation');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('invalid graph')),
+      /binding changed/u,
+    );
+    const original = sourcePhaseRecords(root)[0]!;
+    input.commandGraphDigest = graph;
+    const caller = join(root, '.git', 'source-phase-increased-request.mjs');
+    writeFileSync(caller, '// rejected request cannot grant larger bounds\n');
+    input.caller = { path: caller, digest: sha256(caller) };
+    input.bounds = {
+      maxAggregateRssBytes: 2 * originalBounds.maxAggregateRssBytes,
+      maxNewOutputBytes: 1024 * 1024,
+      minFreeDiskBytes: 1,
+      outputRoots: [replacementRoot, join(root, '.git', 'ai-delivery')],
+    };
+    input.completionArtifacts = [join(replacementRoot, 'metadata.json')];
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('missing reconciliation cannot enter')),
+      /reconciliation|original.*allowance/u,
+    );
+    const sibling = sourcePhaseRecords(root).find((record) => record.phaseId !== original.phaseId)!;
+    input.reconciliation = {
+      phaseId: String(sibling.phaseId),
+      recordId: String(sibling.recordId),
+      authorizationDigest: input.authorization.digest,
+    };
+    let entered = false;
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        entered = true;
+        mkdirSync(replacementRoot);
+        writeFileSync(join(replacementRoot, 'metadata.json'), '{}');
+        writeFileSync(join(replacementRoot, 'beyond-original-allowance.bin'), Buffer.alloc(96 * 1024));
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+      }),
+      /original.*allowance|original output baseline/u,
+    );
+    assert.equal(entered, false, 'a rejected sibling cannot authorize original-bound increases or new roots');
+    input.bounds = structuredClone(originalBounds);
+    input.completionArtifacts = [join(outputRoot, 'metadata.json')];
+    const completed = await withIssueSourcePhase(input, async (context) => {
+      mkdirSync(outputRoot);
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    const records = sourcePhaseRecords(root);
+    for (const record of records) assert.deepEqual(record.allocation, originalBounds);
+    assert.equal(records.find((record) => record.recordId === completed.recordId)?.status, 'complete');
+    assert.deepEqual(
+      records.find((record) => record.recordId === original.recordId),
+      original,
+    );
+    assert.equal(existsSync(replacementRoot), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase charges invalid attempts against the original cumulative allowance', async () => {
+  const { root, input } = await sourcePhaseFixture();
+  input.bounds.maxNewOutputBytes = 32 * 1024;
+  const originalBounds = structuredClone(input.bounds);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    input.commandGraphDigest = digestValue('invalid frozen graph');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('invalid graph')),
+      /binding changed/u,
+    );
+    input.bounds.maxNewOutputBytes = 1024 * 1024;
+    let exhausted: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const caller = join(root, '.git', `source-phase-missing-predecessor-${String(attempt)}.mjs`);
+      writeFileSync(caller, `// immutable invalid retry ${String(attempt)}\n`);
+      input.caller = { path: caller, digest: sha256(caller) };
+      await assert.rejects(
+        withIssueSourcePhase(input, async () => assert.fail('invalid retry cannot enter callback')),
+        /reconciliation|unresolved|original.*allowance/u,
+      );
+      const record = sourcePhaseRecords(root).find(
+        (value) => (value.binding as { caller?: { path: string } } | undefined)?.caller?.path === caller,
+      )!;
+      if (record.status === 'unresolved') {
+        exhausted = record;
+        break;
+      }
+    }
+    assert.ok(exhausted, 'cumulative rejected bootstrap must exhaust the original allocation before twelve resets');
+    assert.deepEqual(exhausted.allocation, originalBounds);
+    assert.match((exhausted.failure as { accounting: string }).accounting, /original output allowance/u);
+    assert.equal(exhausted.result, undefined);
+    const count = sourcePhaseRecords(root).length;
+    const caller = join(root, '.git', 'source-phase-after-exhaustion.mjs');
+    writeFileSync(caller, '// no new persistent phase metadata after unresolved exhaustion\n');
+    input.caller = { path: caller, digest: sha256(caller) };
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('unresolved allowance cannot admit more work')),
+      /[Uu]nresolved source phase/u,
+    );
+    assert.equal(sourcePhaseRecords(root).length, count);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supported issue source phase refuses undefined callback rejection after successful commands', async () => {
+  const { root, outputRoot, input } = await sourcePhaseFixture();
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async (context) => {
+        mkdirSync(outputRoot);
+        writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+        for (let index = 0; index < input.commands.length; index++) await context.run(index);
+        await Promise.reject<void>(undefined);
+      }),
+      /failed-quiescent/u,
+    );
+    const record = sourcePhaseRecords(root)[0]!;
+    assert.equal(record.status, 'failed-quiescent');
+    assert.equal((record.commands as unknown[]).length, 3);
+    assert.equal((record.failure as { operation?: string }).operation, 'undefined');
+    assert.equal(record.result, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('published package and bundled plugin agree on the admission version', () => {
   const packageManifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
@@ -1656,6 +2883,124 @@ test('cancelling verification stops its owned descendant and preserves an unrela
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test.skipIf(process.platform !== 'darwin').each(['exited group', 'live root', 'live group member'] as const)(
+  'owned process cleanup rechecks EPERM for %s',
+  async (disposition) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ad-group-exit-')));
+    const marker = join(output, 'processes'),
+      release = join(output, 'release');
+    const { root } = await fixture({
+      firstStageScript: `const fs=require('node:fs');const {spawn}=require('node:child_process');
+        const descendant=${JSON.stringify(disposition)}==='live group member'?spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}):undefined;
+        fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify([process.pid,...(descendant?[descendant.pid]:[])]));
+        setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)}))process.exit(0);},10);`,
+    });
+    const originalKill = process.kill.bind(process);
+    const owned = new Map<number, string>();
+    const unrelated = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    const identity = (pid: number): string =>
+      spawnSync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim();
+    const unrelatedIdentity = identity(unrelated.pid!);
+    let restoreKill: (() => void) | undefined;
+    let permissionExit: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    let run: Promise<unknown> | undefined;
+    try {
+      const row = await prepareIssueWorktree({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      writeFileSync(join(row.path, 'change.txt'), 'group exit\n');
+      git(row.path, 'add', 'change.txt');
+      git(row.path, 'commit', '-qm', 'synthetic group exit');
+      run = verifyIssue({ issueNumber: 17, repoRoot: row.path, signal: controller.signal });
+      const rejection = assert.rejects(run, (error: unknown) => {
+        assert.match(String(error), /cancelled/u);
+        if (disposition === 'exited group') assert.doesNotMatch(String(error), /cleanup failed/u);
+        else assert.match(String(error), /Owned process cleanup failed \(synthetic live EPERM\)/u);
+        return true;
+      });
+      const readyDeadline = Date.now() + 2_000;
+      while (!existsSync(marker) && Date.now() < readyDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(existsSync(marker), true);
+      const pids = JSON.parse(readFileSync(marker, 'utf8')) as number[];
+      for (const pid of pids) {
+        const birth = identity(pid);
+        assert.ok(birth);
+        owned.set(pid, birth);
+      }
+      const leader = pids[0]!;
+      let observedEperm = false;
+      const kill = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        assert.notEqual(pid, unrelated.pid);
+        if (pid !== -leader || signal !== 'SIGKILL') return originalKill(pid, signal);
+        if (disposition !== 'live root') {
+          writeFileSync(release, 'exit');
+          const exitDeadline = Date.now() + 2_000;
+          for (;;) {
+            assert.equal(identity(leader), owned.get(leader));
+            const state = spawnSync('/bin/ps', ['-p', String(leader), '-o', 'stat='], {
+              encoding: 'utf8',
+            }).stdout.trim();
+            if (state.startsWith('Z')) break;
+            assert.ok(Date.now() < exitDeadline, 'owned leader did not exit at the signal boundary');
+          }
+        }
+        if (disposition === 'exited group') {
+          try {
+            return originalKill(pid, signal);
+          } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, 'EPERM');
+            observedEperm = true;
+            throw error;
+          }
+        }
+        if (disposition === 'live group member') {
+          const member = pids[1]!;
+          assert.equal(identity(member), owned.get(member));
+          assert.doesNotMatch(
+            spawnSync('/bin/ps', ['-p', String(member), '-o', 'stat='], { encoding: 'utf8' }).stdout,
+            /^\s*Z/u,
+          );
+        }
+        observedEperm = true;
+        if (disposition === 'live root') permissionExit = setTimeout(() => writeFileSync(release, 'exit'), 500);
+        throw Object.assign(new Error('synthetic live EPERM'), { code: 'EPERM' });
+      });
+      restoreKill = () => kill.mockRestore();
+      controller.abort();
+      await rejection;
+      assert.equal(observedEperm, true);
+      assert.equal(identity(unrelated.pid!), unrelatedIdentity);
+      assert.equal(existsSync(join(root, '.git', 'ai-delivery', 'verification@1', 'stages', 'check')), false);
+    } finally {
+      restoreKill?.();
+      clearTimeout(permissionExit);
+      controller.abort();
+      for (const [pid, birth] of owned) {
+        if (identity(pid) === birth) {
+          try {
+            originalKill(pid, 'SIGKILL');
+          } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH');
+          }
+        }
+      }
+      if (unrelated.pid !== undefined && identity(unrelated.pid) === unrelatedIdentity)
+        originalKill(unrelated.pid, 'SIGKILL');
+      await run?.catch(() => undefined);
+      await new Promise<void>((resolve) => {
+        if (unrelated.exitCode !== null || unrelated.signalCode !== null) resolve();
+        else unrelated.once('close', () => resolve());
+      });
+      rmSync(root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);
 
 test.each([
   { name: 'nonzero exit', terminate: 'process.exit(7)', expected: /exit 7/u },
@@ -5604,7 +6949,8 @@ test.each([
         fs.symlinkSync('./other', ${JSON.stringify(intermediate)});
       }
       if (${JSON.stringify(mode)} === 'chain-cycle') {
-        fs.unlinkSync(${JSON.stringify(intermediate)}); fs.symlinkSync('./cli', ${JSON.stringify(intermediate)});
+        const replacement = ${JSON.stringify(join(output, 'next-intermediate'))};
+        fs.symlinkSync('./cli', replacement); fs.renameSync(replacement, ${JSON.stringify(intermediate)});
       }
       for (let unit = 0; unit < 32; unit++) {
         fs.appendFileSync(${JSON.stringify(join(second, 'work'))}, 'unit\\n');
@@ -5638,15 +6984,22 @@ test.each([
                   ? /unsupported file/u
                   : mode === 'permission'
                     ? /readdir failed.*EACCES/u
-                    : mode === 'cycle' || mode === 'chain-cycle'
+                    : mode === 'cycle'
                       ? /ELOOP/u
-                      : /identity changed/u,
+                      : mode === 'chain-cycle'
+                        ? /ELOOP|alias identity changed/u
+                        : /identity changed/u,
         );
         assert.match(message, /First filesystem observation:.*ENOENT.*Last filesystem observation:/u);
         assert.doesNotMatch(message, /cleanup failed/u);
         return true;
       },
     );
+    if (mode === 'cycle' || mode === 'chain-cycle')
+      assert.throws(
+        () => realpathSync(alias),
+        (error: unknown) => (error as NodeJS.ErrnoException).code === 'ELOOP',
+      );
     assert.ok(observations.some((line) => line.includes('ENOENT')));
     assert.equal(
       observations.some((line) => line.includes('"state":"completed"')),
