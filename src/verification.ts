@@ -2572,6 +2572,7 @@ export async function withIssueSourcePhase(
   const row = getIssueWorktreeStrict(input.issueNumber, root);
   assertAiDeliveryWorktreeOwner(row, root);
   if (
+    !row.identity ||
     row.path !== input.source.path ||
     row.branch !== input.source.branch ||
     !['active', 'pr-published'].includes(row.status) ||
@@ -2702,7 +2703,7 @@ export async function withIssueSourcePhase(
       throw new DeliveryError('Source-phase executing SDK installation is not the selected admitted runtime.');
     if (
       digestValue(currentRow) !== input.rowDigest ||
-      currentRow.identity !== input.identity ||
+      currentRow.identity !== row.identity ||
       configuration.config.roles.author.identity !== input.identity ||
       git(root, 'rev-parse', 'HEAD') !== input.controller.head ||
       configuration.configDigest !== input.controller.configDigest ||
