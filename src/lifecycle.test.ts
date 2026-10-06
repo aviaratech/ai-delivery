@@ -6,6 +6,8 @@ import {
   cpSync,
   chmodSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -53,7 +55,7 @@ import {
   removeWorktreeEntry,
   updateIssueWorktreeDelivery,
 } from './services/worktreeRegistry.js';
-import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
+import { assertDeliveryRuntimeAdmitted, type RuntimeAdmission } from './services/deliveryAdmission.js';
 import { getDeliveryRecords } from './services/deliveryRecordService.js';
 import { createIssuePhaseEvidence, loadVerifiedRun, verifyIssue } from './verification.js';
 import {
@@ -3595,13 +3597,23 @@ async function syntheticLifecycle(routing: {
   divergentOrigin: boolean;
   producerOnboarding?: boolean;
   mergedContinuation?: boolean;
+  committedDescendantContinuation?: boolean;
+  appAuthorContinuation?: boolean;
+  crashCheckpoints?: boolean;
+  interruptContinuation?: boolean;
+  continuationResult?: { value?: unknown };
   legacyNativeMetadata?: boolean;
 }): Promise<void> {
-  const created = await fixture({ ...routing, omitRuntimeAdmission: routing.producerOnboarding === true });
+  const created = await fixture({
+    ...routing,
+    personalAuthor: routing.committedDescendantContinuation === true,
+    omitRuntimeAdmission: routing.producerOnboarding === true,
+  });
   const root = created.root;
   let runtimeEntryPath = created.runtimeEntryPath;
   const originalPath = process.env.PATH;
   let restoreTransport: (() => void) | undefined;
+  let restoreCheckpointWrites: (() => void) | undefined;
   const remoteName = routing.remote;
   assert.equal(defaultBaseRef(root, remoteName), `refs/remotes/${remoteName}/main`);
   const remote = join(root, '.git', 'remote.git');
@@ -3643,6 +3655,11 @@ async function syntheticLifecycle(routing: {
   let review: Record<string, unknown> | null = null;
   let reviewDecision: 'APPROVED' | 'REVIEW_REQUIRED' = 'REVIEW_REQUIRED';
   const calls: string[] = [];
+  const historicalActor = routing.committedDescendantContinuation ? 'host-user' : 'synthetic-author[bot]';
+  let nativePrAuthor = historicalActor;
+  let nativeClosingIssue = issueNumber;
+  let nativePrRepository: string | undefined;
+  const continuationComments: Record<string, unknown>[] = [];
   const createPayloads: Record<string, unknown>[] = [];
   const statuses = { Queued: 'STATUS-0', Active: 'STATUS-1', Waiting: 'STATUS-2', Shipped: 'STATUS-3' };
   const statusName = (option: string) => Object.entries(statuses).find(([, id]) => id === option)?.[0];
@@ -3670,14 +3687,26 @@ async function syntheticLifecycle(routing: {
     state: stale ? 'open' : prState,
     draft: prDraft,
     merged_at: !stale && prState === 'closed' ? mergedAt : null,
+    merged: !stale && prState === 'closed',
     merge_commit_sha: mergeSha || null,
     mergeable: true,
     mergeable_state: 'clean',
-    user: { login: 'synthetic-author[bot]' },
-    head: { sha: headSha, ref: 'issue/17' },
-    base: { sha: baseSha, ref: 'main' },
+    user: { login: nativePrAuthor, id: 37, type: routing.committedDescendantContinuation ? 'User' : 'Bot' },
+    head: { sha: headSha, ref: 'issue/17', ...(nativePrRepository ? { repo: { full_name: nativePrRepository } } : {}) },
+    base: { sha: baseSha, ref: 'main', ...(nativePrRepository ? { repo: { full_name: nativePrRepository } } : {}) },
   });
   const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
+    if (query.includes('WorktreeTransitionLineage'))
+      return {
+        repository: {
+          pullRequest: {
+            closingIssuesReferences: {
+              nodes: [{ number: nativeClosingIssue, repository: { nameWithOwner: nativePrRepository } }],
+              pageInfo,
+            },
+          },
+        },
+      };
     if (query.includes('DeliveryReviewDecision'))
       return { repository: { pullRequest: { headRefOid: headSha, reviewDecision } } };
     if (query.includes('ProjectDeliveryConfiguration'))
@@ -3874,6 +3903,10 @@ async function syntheticLifecycle(routing: {
       throw new Error(`Unexpected REST route: ${route}`);
     },
     issues: {
+      listComments: async () => ({ data: continuationComments }),
+      getComment: async (input: { comment_id: number }) => ({
+        data: continuationComments.find((comment) => comment.id === input.comment_id),
+      }),
       create: async (input: Record<string, unknown>) => {
         calls.push('issue:create');
         createPayloads.push(input);
@@ -3981,20 +4014,21 @@ async function syntheticLifecycle(routing: {
       getCombinedStatusForRef: async () => ({ data: { statuses: [], state: 'success' } }),
     },
   };
-  let authenticatedAuthor = 'synthetic-author[bot]';
+  let authenticatedAuthor = historicalActor;
+  let authenticatedCredential = routing.committedDescendantContinuation ? 'user:37' : 'app:201:installation:301';
   const context = {
     root,
     repo: { owner: 'example', repo: 'widget' },
     config,
     configuration,
     clients: {
-      authSource: 'app',
+      authSource: routing.committedDescendantContinuation ? 'personal' : 'app',
       role: 'author',
       graphql,
       rest,
       authenticatedAuthor: async () => ({
         actorLogin: authenticatedAuthor,
-        credentialIdentity: 'app:201:installation:301',
+        credentialIdentity: authenticatedCredential,
       }),
     },
   } as unknown as DeliveryContext;
@@ -4005,6 +4039,7 @@ async function syntheticLifecycle(routing: {
       ...(input.role === 'reviewer'
         ? {
             role: 'reviewer' as const,
+            authSource: 'app' as const,
             appActorLogin: async () => 'synthetic-reviewer[bot]',
           }
         : {}),
@@ -4018,7 +4053,12 @@ async function syntheticLifecycle(routing: {
     restoreDispatchClient = () => dispatchClient.mockRestore();
     return dispatchClient;
   };
-  const execution = { repoRoot: root, runtimeEntryPath, identity: 'synthetic-author' };
+  const execution = {
+    repoRoot: root,
+    runtimeEntryPath,
+    identity: config.roles.author.identity,
+    ...(routing.appAuthorContinuation ? { personalAuth: true } : {}),
+  };
   try {
     if (routing.legacyNativeMetadata) {
       enableDispatch();
@@ -4208,6 +4248,8 @@ async function syntheticLifecycle(routing: {
     await assert.rejects(developIssue(context, issueNumber), /closed/u);
     issue.state = 'open';
     assert.equal((await readyCheck(context, issueNumber)).ready, true);
+    if (routing.committedDescendantContinuation)
+      await prepareIssueWorktree({ identity: 'synthetic-preparer', issueNumber, repoRoot: root });
     const started = await startTrackedIssue(context, { issueNumber });
     assert.equal(started.mode, 'existing-issue');
     assert.equal(started.issueNumber, issueNumber);
@@ -4357,14 +4399,14 @@ exec "${realGit}" "$@"
       });
     }
     assert.equal((await listPrs(context)).pullRequests[0]?.number, prNumber);
-    assert.equal((await prInfo(context, { prNumber })).authorLogin, 'synthetic-author[bot]');
+    assert.equal((await prInfo(context, { prNumber })).authorLogin, historicalActor);
     assert.equal((await prChecks(context, prNumber)).combinedStatus, 'success');
     assert.equal((await prChecks(context, prNumber)).reviewState.status, 'still-required');
     await assert.rejects(checkoutPr(context, prNumber), /open in-repository branch/u);
     assert.equal(git(remote, 'rev-parse', 'refs/heads/issue/17'), headSha);
     await assert.rejects(mergePr(context, { issueNumber, prNumber }), /submitted independent review/);
     const artifactContent = {
-      authorIdentity: 'synthetic-author',
+      authorIdentity: config.roles.author.identity,
       checks: ['verified exact diff'],
       diffScopeHash: digestValue(run.classification.changedPaths),
       elapsedMs: 100,
@@ -4385,7 +4427,12 @@ exec "${realGit}" "$@"
     const artifact = JSON.stringify({ ...artifactContent, artifactId: digestValue(artifactContent) });
     const reviewer = {
       ...context,
-      clients: { ...context.clients, role: 'reviewer', appActorLogin: async () => 'synthetic-reviewer' },
+      clients: {
+        ...context.clients,
+        authSource: 'app',
+        role: 'reviewer',
+        appActorLogin: async () => 'synthetic-reviewer',
+      },
     } as DeliveryContext;
     const personalReviewer = {
       ...reviewer,
@@ -4423,14 +4470,14 @@ exec "${realGit}" "$@"
     );
     const attempt = JSON.parse(readFileSync(attemptPath, 'utf8')) as Record<string, unknown>;
     assert.equal(attempt.operation, 'updateRefs');
-    assert.equal(attempt.actor, 'synthetic-author');
-    assert.equal(attempt.actorLogin, 'synthetic-author[bot]');
+    assert.equal(attempt.actor, config.roles.author.identity);
+    assert.equal(attempt.actorLogin, historicalActor);
     authenticatedAuthor = 'different-author[bot]';
     await assert.rejects(
       finishIssue(context, { issueNumber, prNumber, strategy: 'merge' }),
       /Merge attempt disagrees with its exact source, operation or author/u,
     );
-    authenticatedAuthor = 'synthetic-author[bot]';
+    authenticatedAuthor = historicalActor;
     assert.equal(calls.filter((call) => call === 'git:createCommit').length, 1);
     await assert.rejects(finishIssue(context, { issueNumber, prNumber, strategy: 'merge' }), /readback is unresolved/u);
     assert.equal(calls.filter((call) => call === 'git:createCommit').length, 1);
@@ -4455,7 +4502,7 @@ exec "${realGit}" "$@"
     );
     headSha = reviewedHead;
     assert.equal(calls.filter((call) => call === 'git:createCommit').length, 1);
-    if (routing.mergedContinuation) {
+    if (routing.mergedContinuation || routing.committedDescendantContinuation) {
       enableDispatch();
       const terminal = await executeTool('issue_pr_merge', { issueNumber, prNumber, strategy: 'merge' }, execution);
       assert.equal((terminal as { mergeSha: string }).mergeSha, mergeSha);
@@ -4485,6 +4532,673 @@ exec "${realGit}" "$@"
       for (const name of custody) saveReceipts(join(gitCommonDir(root), 'ai-delivery', name));
       const ownerPath = join(gitCommonDir(root), 'ai-delivery/worktree-owners');
       const ownerHash = directoryHash(ownerPath);
+      if (routing.committedDescendantContinuation) {
+        const ownerFiles = readdirSync(ownerPath).map((name) => ({
+          path: join(ownerPath, name),
+          bytes: readFileSync(join(ownerPath, name)),
+        }));
+        writeFileSync(join(row.path, 'change.txt'), 'already committed continuation\n');
+        git(row.path, 'add', 'change.txt');
+        git(row.path, 'commit', '-qm', 'commit the unfinished continuation');
+        const descendant = git(row.path, 'rev-parse', 'HEAD');
+        const descendantTree = git(row.path, 'rev-parse', 'HEAD^{tree}');
+        nativePrRepository = 'example/widget';
+        const refuse = async (pattern: RegExp) => {
+          await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), pattern);
+          const currentRegistry = JSON.parse(readFileSync(registryPath, 'utf8')) as { worktrees: unknown[] };
+          assert.deepEqual(
+            currentRegistry.worktrees.filter(
+              (entry) => (entry as { issueNumber?: number }).issueNumber === issueNumber,
+            ),
+            [previous],
+          );
+          assert.equal(git(row.path, 'rev-parse', 'HEAD'), descendant);
+        };
+        if (routing.appAuthorContinuation) {
+          const policyPath = join(root, 'policy.mjs');
+          writeFileSync(
+            policyPath,
+            readFileSync(policyPath, 'utf8').replace(
+              /export const deliverySettings = .*;/u,
+              `export const deliverySettings = ${JSON.stringify({
+                commandPolicy: config.commandPolicy,
+                roles: {
+                  ...config.roles,
+                  author: {
+                    authSource: 'app',
+                    credentialEnv: {
+                      appId: 'AUTHOR_APP_ID',
+                      installationId: 'AUTHOR_INSTALLATION_ID',
+                      privateKeyPath: 'AUTHOR_KEY_PATH',
+                    },
+                    identity: config.roles.author.identity,
+                  },
+                },
+              })};`,
+            ),
+          );
+          const admissionPath = join(gitCommonDir(root), 'ai-delivery/runtime-admission.json');
+          const { admissionId: _id, ...admission } = JSON.parse(
+            readFileSync(admissionPath, 'utf8'),
+          ) as RuntimeAdmission;
+          admission.configDigest = (await loadDeliveryConfig(root, { personalAuth: true })).configDigest;
+          execution.identity = 'personal';
+          writeFileSync(admissionPath, JSON.stringify({ ...admission, admissionId: digestValue(admission) }));
+          await refuse(/requires configured personal author/u);
+          for (const savedReceipt of [...oldReceipts, ...ownerFiles])
+            assert.deepEqual(readFileSync(savedReceipt.path), savedReceipt.bytes);
+          return;
+        }
+        authenticatedAuthor = 'different-user';
+        await refuse(/authenticated host author/u);
+        authenticatedAuthor = historicalActor;
+        authenticatedCredential = 'user:99';
+        await refuse(/authenticated host author/u);
+        authenticatedCredential = 'unattested';
+        await refuse(/user identity.*unavailable/u);
+        authenticatedCredential = 'user:37';
+        nativePrAuthor = 'different-user';
+        await refuse(/authenticated host author/u);
+        nativePrAuthor = historicalActor;
+        nativeClosingIssue = 18;
+        await refuse(/Native PR lineage/u);
+        nativeClosingIssue = issueNumber;
+        nativePrRepository = 'other/widget';
+        await refuse(/Native PR lineage/u);
+        nativePrRepository = 'example/widget';
+        for (const directory of custody) {
+          const file = oldReceipts.find(
+            (file) => file.path.includes(`/${directory}/`) && file.path.endsWith(`/${headSha}.json`),
+          );
+          assert.ok(file, `historical ${directory} fixture`);
+          unlinkSync(file.path);
+          try {
+            await refuse(/(?:ENOENT|missing|lacks|manifest|publication|terminal|review|intent|custody)/u);
+          } finally {
+            writeFileSync(file.path, file.bytes, { mode: 0o600 });
+          }
+          const forged = JSON.parse(file.bytes.toString()) as Record<string, unknown>;
+          const seal = Object.keys(forged).find((key) =>
+            /^(?:manifest|publication|receipt|intent|attempt|result|merge)Id$/u.test(key),
+          );
+          assert.ok(seal);
+          forged[seal] = `sha256:${'f'.repeat(64)}`;
+          writeFileSync(file.path, JSON.stringify(forged));
+          try {
+            await refuse(/(?:identity|invalid|disagrees|not bound|corrupt)/iu);
+          } finally {
+            writeFileSync(file.path, file.bytes);
+          }
+        }
+        const witness = ownerFiles.find(
+          (file) => (JSON.parse(file.bytes.toString()) as { identity?: string }).identity === 'synthetic-preparer',
+        );
+        assert.ok(witness);
+        unlinkSync(witness.path);
+        try {
+          await refuse(/ownership witness/u);
+        } finally {
+          writeFileSync(witness.path, witness.bytes, { mode: 0o600 });
+        }
+        writeFileSync(join(row.path, 'change.txt'), 'dirty continuation\n');
+        await refuse(/clean|uncommitted|dirty/iu);
+        git(row.path, 'restore', 'change.txt');
+        const unrelatedHead = git(row.path, 'commit-tree', descendantTree, '-m', 'unrelated root');
+        git(row.path, 'reset', '--hard', unrelatedHead);
+        try {
+          await assert.rejects(
+            executeTool('issue_develop', { issueNumber }, execution),
+            /strict committed descendant/u,
+          );
+        } finally {
+          git(row.path, 'reset', '--hard', descendant);
+        }
+        const registryData = JSON.parse(registryBytes.toString()) as { worktrees: (typeof previous)[] };
+        for (const conflicting of [previous, { ...previous, type: 'standalone' as const, issueNumber: 18 }]) {
+          writeFileSync(registryPath, JSON.stringify({ worktrees: [...registryData.worktrees, conflicting] }));
+          try {
+            await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /duplicate|overlaps/u);
+          } finally {
+            writeFileSync(registryPath, registryBytes);
+          }
+        }
+        const writerPath = join(gitCommonDir(root), 'ai-delivery/writers@1', `${digestValue(row.path).slice(7)}.json`);
+        atomicJson.writePrivateJsonFileAtomically(writerPath, { unknown: 'writer-custody' });
+        const writerBytes = readFileSync(writerPath);
+        try {
+          await refuse(/writer absence/u);
+          assert.deepEqual(readFileSync(writerPath), writerBytes);
+        } finally {
+          unlinkSync(writerPath);
+        }
+        const legacyIntentPath = join(ownerPath, 'issue-17.transition.json');
+        atomicJson.writePrivateJsonFileAtomically(legacyIntentPath, { unknown: 'legacy-transition' });
+        try {
+          await refuse(/transition.*incomplete/u);
+        } finally {
+          unlinkSync(legacyIntentPath);
+        }
+        let crashIndex = 0;
+        const publishedCheckpoints: { path: string; bytes: Buffer }[] = [];
+        const withDirectorySyncProbe = async (
+          directory: string,
+          failure: string,
+          operation: (probe: { attempts: number; fail: boolean }) => Promise<void>,
+        ) => {
+          const fs = (await import('node:fs')).default;
+          const originalOpen = fs.openSync;
+          const originalSync = fs.fsyncSync;
+          const originalClose = fs.closeSync;
+          const directories = new Set<number>();
+          const probe = { attempts: 0, fail: true };
+          const opened = vi.spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
+            const descriptor = originalOpen(path, flags, mode);
+            if (path === directory) directories.add(descriptor);
+            return descriptor;
+          });
+          const synced = vi.spyOn(fs, 'fsyncSync').mockImplementation((descriptor) => {
+            if (directories.has(descriptor)) {
+              probe.attempts += 1;
+              if (probe.fail) throw new Error(failure);
+            }
+            originalSync(descriptor);
+          });
+          const closed = vi.spyOn(fs, 'closeSync').mockImplementation((descriptor) => {
+            directories.delete(descriptor);
+            originalClose(descriptor);
+          });
+          syncBuiltinESMExports();
+          try {
+            await operation(probe);
+          } finally {
+            closed.mockRestore();
+            synced.mockRestore();
+            opened.mockRestore();
+            syncBuiltinESMExports();
+          }
+        };
+        const crashAfterDirectoryCreation = (directory: string, marker: string) => {
+          assert.equal(existsSync(directory), false);
+          const directoryChild = spawnSync(
+            process.execPath,
+            [
+              '--input-type=module',
+              '-e',
+              `
+          import fs from 'node:fs';
+          import { syncBuiltinESMExports } from 'node:module';
+          const mkdir = fs.mkdirSync;
+          fs.mkdirSync = (path, options) => {
+            const result = mkdir(path, options);
+            if (path === ${JSON.stringify(directory)}) {
+              const stat = fs.lstatSync(path);
+              fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({
+                path, pid: process.pid, dev: stat.dev, ino: stat.ino, uid: stat.uid, mode: stat.mode,
+              }), { mode: 0o600 });
+              process.kill(process.pid, 'SIGKILL');
+            }
+            return result;
+          };
+          syncBuiltinESMExports();
+          const { ensurePrivateDirectoryDurably } = await import(${JSON.stringify(new URL('./utils/atomicJson.js', import.meta.url).href)});
+          ensurePrivateDirectoryDurably(${JSON.stringify(directory)});
+        `,
+            ],
+            { encoding: 'utf8', maxBuffer: 1024 * 1024 },
+          );
+          assert.equal(directoryChild.signal, 'SIGKILL', directoryChild.stderr);
+          const directoryProof = JSON.parse(readFileSync(marker, 'utf8')) as {
+            path: string;
+            pid: number;
+            dev: number;
+            ino: number;
+            uid: number;
+            mode: number;
+          };
+          assert.equal(directoryProof.path, directory);
+          assert.equal(directoryProof.pid, directoryChild.pid);
+          assert.throws(() => process.kill(directoryProof.pid, 0), /ESRCH/u);
+          const directoryStat = lstatSync(directory);
+          assert.ok(directoryStat.isDirectory() && !directoryStat.isSymbolicLink());
+          assert.equal(directoryStat.dev, directoryProof.dev);
+          assert.equal(directoryStat.ino, directoryProof.ino);
+          assert.equal(directoryStat.uid, directoryProof.uid);
+          assert.equal(directoryStat.mode & 0o077, 0);
+          console.info('continuation directory crash evidence', JSON.stringify(directoryProof));
+        };
+        if (routing.crashCheckpoints) {
+          const continuationRoot = join(gitCommonDir(root), 'ai-delivery/continuations');
+          assert.equal(existsSync(continuationRoot), false);
+          crashAfterDirectoryCreation(continuationRoot, join(gitCommonDir(root), 'continuation-root-crash.json'));
+          const kinds = ['plan', 'intent', 'witness', 'completion'];
+          const originalWrite = atomicJson.writePrivateJsonFileAtomically;
+          const crashing = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+            const kind = path.includes('/worktree-owners/') ? 'witness' : path.split('.').at(-2);
+            if (kind !== kinds[Math.floor(crashIndex / 2)]) return originalWrite(path, value);
+            const after = crashIndex % 2 === 1;
+            const marker = join(gitCommonDir(root), `continuation-crash-${String(crashIndex)}.json`);
+            const child = spawnSync(
+              process.execPath,
+              [
+                '--input-type=module',
+                '-e',
+                `
+              import fs from 'node:fs';
+              import { createHash } from 'node:crypto';
+              import { syncBuiltinESMExports } from 'node:module';
+              const path = ${JSON.stringify(path)};
+              for (const method of ['renameSync', 'linkSync']) {
+                const publish = fs[method];
+                fs[method] = (temporary, destination) => {
+                  if (destination !== path) return publish(temporary, destination);
+                  const stat = fs.lstatSync(temporary);
+                  const digest = createHash('sha256').update(fs.readFileSync(temporary)).digest('hex');
+                  if (${String(after)}) publish(temporary, destination);
+                  fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({
+                    path, temporary, pid: process.pid, dev: stat.dev, ino: stat.ino,
+                    uid: stat.uid, mode: stat.mode, digest,
+                  }), { mode: 0o600 });
+                  process.kill(process.pid, 'SIGKILL');
+                  throw new Error('SIGKILL did not terminate checkpoint publisher');
+                };
+              }
+              syncBuiltinESMExports();
+              const { writeCommittedContinuationCheckpoint } = await import(${JSON.stringify(new URL('./services/worktreeRegistry.js', import.meta.url).href)});
+              writeCommittedContinuationCheckpoint(path, ${JSON.stringify(value)});
+            `,
+              ],
+              { encoding: 'utf8', maxBuffer: 1024 * 1024 },
+            );
+            assert.equal(child.signal, 'SIGKILL', child.stderr);
+            const proof = JSON.parse(readFileSync(marker, 'utf8')) as {
+              path: string;
+              temporary: string;
+              pid: number;
+              dev: number;
+              ino: number;
+              uid: number;
+              mode: number;
+              digest: string;
+            };
+            assert.equal(proof.pid, child.pid);
+            assert.equal(proof.path, path);
+            assert.throws(() => process.kill(proof.pid, 0), /ESRCH/u);
+            if (after) {
+              const stat = lstatSync(path);
+              assert.ok(stat.isFile() && !stat.isSymbolicLink());
+              assert.equal(stat.nlink, 1, `${kind} publication must retain a single link after process death`);
+              assert.equal(stat.mode & 0o077, 0);
+              assert.equal(stat.dev, proof.dev);
+              assert.equal(stat.ino, proof.ino);
+              assert.equal(stableJson(JSON.parse(readFileSync(path, 'utf8')) as unknown), stableJson(value));
+              assert.equal(existsSync(proof.temporary), false);
+              publishedCheckpoints.push({ path, bytes: readFileSync(path) });
+            } else {
+              assert.equal(existsSync(path), false);
+              const stat = lstatSync(proof.temporary);
+              assert.ok(stat.isFile() && !stat.isSymbolicLink());
+              assert.equal(stat.nlink, 1);
+              assert.equal(stat.uid, proof.uid);
+              assert.equal(stat.mode, proof.mode);
+              assert.equal(stat.dev, proof.dev);
+              assert.equal(stat.ino, proof.ino);
+              assert.equal(createHash('sha256').update(readFileSync(proof.temporary)).digest('hex'), proof.digest);
+              unlinkSync(proof.temporary);
+            }
+            console.info(
+              'continuation checkpoint crash recovered',
+              JSON.stringify({
+                kind,
+                after,
+                signal: child.signal,
+                proof,
+                temporaryRemoved: !existsSync(proof.temporary),
+                targetExists: existsSync(path),
+              }),
+            );
+            crashIndex += 1;
+            throw new Error('synthetic SIGKILL checkpoint publication');
+          });
+          restoreCheckpointWrites = () => crashing.mockRestore();
+          for (const directory of [dirname(continuationRoot), gitCommonDir(root)])
+            await withDirectorySyncProbe(
+              directory,
+              'synthetic continuation namespace parent sync failure',
+              async (probe) => {
+                await refuse(/synthetic continuation namespace parent sync failure/u);
+                assert.ok(probe.attempts > 0);
+                assert.deepEqual(readdirSync(continuationRoot), [String(issueNumber)]);
+                assert.equal(readdirSync(join(continuationRoot, String(issueNumber))).length, 0);
+                probe.fail = false;
+                const beforeRetry = probe.attempts;
+                await refuse(/synthetic SIGKILL checkpoint publication/u);
+                assert.ok(probe.attempts > beforeRetry, 'supported replay must sync the existing namespace parent');
+              },
+            );
+          assert.equal(crashIndex, 2);
+        }
+        const first = await executeTool('issue_develop', { issueNumber }, execution).catch((error: Error) => error);
+        assert.ok(first instanceof Error);
+        assert.match(first.message, /exact native.*acceptance/u);
+        const planPath = first.message.split('Saved plan: ')[1]!;
+        const saved = JSON.parse(readFileSync(planPath, 'utf8')) as {
+          plan: { planId: string };
+          operatorBody: string;
+          reviewerBody: string;
+        };
+        if (routing.crashCheckpoints) {
+          const foreignLink = join(gitCommonDir(root), 'foreign-continuation-plan-link.json');
+          linkSync(planPath, foreignLink);
+          try {
+            await refuse(/private regular file/u);
+            assert.equal(lstatSync(planPath).ino, lstatSync(foreignLink).ino);
+          } finally {
+            unlinkSync(foreignLink);
+          }
+        }
+        assert.deepEqual(readFileSync(registryPath), registryBytes);
+        const unrelated = {
+          branch: 'unrelated/retained',
+          createdAt: previous.createdAt,
+          identity: 'separate-worker',
+          path: join(root, '.worktrees/unrelated-retained'),
+          status: 'active',
+          type: 'standalone',
+          updatedAt: previous.updatedAt,
+        };
+        writeFileSync(registryPath, JSON.stringify({ worktrees: [...registryData.worktrees, unrelated] }));
+        const subject = 'https://api.github.com/repos/example/widget/issues/17';
+        continuationComments.push({
+          id: 101,
+          issue_url: subject,
+          user: { login: 'host-user', id: 37, type: 'User' },
+          body: saved.operatorBody,
+        });
+        const acceptance = { ...(JSON.parse(saved.reviewerBody) as Record<string, unknown>), authorityCommentId: 101 };
+        continuationComments.push({
+          id: 102,
+          issue_url: subject,
+          user: { login: 'synthetic-reviewer[bot]', id: 38, type: 'Bot' },
+          body: stableJson(acceptance),
+        });
+        for (const [index, patch] of [
+          [0, { issue_url: 'https://api.github.com/repos/example/widget/issues/18' }],
+          [0, { user: { login: 'host-user', id: 99, type: 'User' } }],
+          [0, { body: '{}' }],
+          [1, { user: { login: 'different-reviewer[bot]', id: 38, type: 'Bot' } }],
+          [1, { user: { login: 'synthetic-reviewer[bot]', id: 38, type: 'User' } }],
+          [1, { body: '{}' }],
+        ] as const) {
+          const original = continuationComments[index]!;
+          continuationComments[index] = { ...original, ...patch };
+          try {
+            await refuse(/(?:exact native.*acceptance|Native.*(?:missing|changed))/u);
+          } finally {
+            continuationComments[index] = original;
+          }
+        }
+        continuationComments.push({
+          id: 103,
+          issue_url: subject,
+          user: { login: 'host-user', id: 37, type: 'User' },
+          body: stableJson({
+            schemaVersion: 'ai-delivery.worktree-continuation-revocation@1',
+            planId: saved.plan.planId,
+            authorityCommentId: 101,
+          }),
+        });
+        try {
+          await refuse(/revoked/u);
+          assert.equal(existsSync(planPath.replace(/\.plan\.json$/u, '.intent.json')), false);
+        } finally {
+          continuationComments.pop();
+        }
+        const refuseDifferentRuntime = async () => {
+          const admissionPath = join(gitCommonDir(root), 'ai-delivery/runtime-admission.json');
+          const originalAdmission = readFileSync(admissionPath);
+          const { admissionId: _id, ...content } = JSON.parse(originalAdmission.toString()) as RuntimeAdmission;
+          const changed = { ...content, sourceArchiveSha256: digestValue('another valid admitted archive') };
+          const before = readFileSync(registryPath);
+          writeFileSync(admissionPath, JSON.stringify({ ...changed, admissionId: digestValue(changed) }));
+          try {
+            const admitted = await assertDeliveryRuntimeAdmitted({ repoRoot: root, runtimeEntryPath });
+            assert.equal(admitted.sourceArchiveSha256, changed.sourceArchiveSha256);
+            await assert.rejects(
+              executeTool('issue_develop', { issueNumber }, execution),
+              /runtime admission.*(?:changed|drifted)|plan drifted/u,
+            );
+            assert.deepEqual(readFileSync(registryPath), before);
+            for (const savedReceipt of [...oldReceipts, ...ownerFiles])
+              assert.deepEqual(readFileSync(savedReceipt.path), savedReceipt.bytes);
+          } finally {
+            writeFileSync(admissionPath, originalAdmission);
+          }
+        };
+        await refuseDifferentRuntime();
+        if (routing.crashCheckpoints) {
+          const evidenceDirectory = join(gitCommonDir(root), 'ai-delivery/continuations/evidence');
+          crashAfterDirectoryCreation(evidenceDirectory, join(gitCommonDir(root), 'continuation-directory-crash.json'));
+          const retainedDirectory = join(gitCommonDir(root), 'retained-continuation-evidence');
+          const fs = (await import('node:fs')).default;
+          fs.renameSync(evidenceDirectory, retainedDirectory);
+          symlinkSync(retainedDirectory, evidenceDirectory, 'dir');
+          try {
+            await refuse(/evidence requires a private directory/u);
+            assert.equal(readdirSync(retainedDirectory).length, 0);
+          } finally {
+            unlinkSync(evidenceDirectory);
+            fs.renameSync(retainedDirectory, evidenceDirectory);
+          }
+          await withDirectorySyncProbe(
+            dirname(evidenceDirectory),
+            'synthetic evidence directory sync failure',
+            async (probe) => {
+              await refuse(/synthetic evidence directory sync failure/u);
+              assert.ok(probe.attempts > 0);
+              assert.equal(existsSync(planPath.replace(/\.plan\.json$/u, '.intent.json')), false);
+              assert.equal(readdirSync(evidenceDirectory).length, 0);
+              probe.fail = false;
+              const beforeRetry = probe.attempts;
+              for (let attempt = 0; attempt < 6; attempt += 1) {
+                await assert.rejects(
+                  executeTool('issue_develop', { issueNumber }, execution),
+                  /synthetic SIGKILL checkpoint publication/u,
+                );
+                assert.equal(git(row.path, 'rev-parse', 'HEAD'), descendant);
+                assert.equal(git(row.path, 'rev-parse', 'HEAD^{tree}'), descendantTree);
+                for (const savedReceipt of [...oldReceipts, ...ownerFiles])
+                  assert.deepEqual(readFileSync(savedReceipt.path), savedReceipt.bytes);
+                if (attempt < 5 && existsSync(planPath.replace(/\.plan\.json$/u, '.intent.json')))
+                  await assert.rejects(
+                    executeTool('issue_verify', { issueNumber }, execution),
+                    /continuation.*(?:pending|incomplete)/u,
+                  );
+              }
+              assert.ok(probe.attempts > beforeRetry, 'retry must durably publish the existing evidence directory');
+            },
+          );
+          assert.equal(crashIndex, 8);
+          for (const checkpoint of publishedCheckpoints)
+            assert.deepEqual(readFileSync(checkpoint.path), checkpoint.bytes);
+          restoreCheckpointWrites?.();
+          restoreCheckpointWrites = undefined;
+          const before = readFileSync(registryPath);
+          fs.renameSync(evidenceDirectory, retainedDirectory);
+          symlinkSync(retainedDirectory, evidenceDirectory, 'dir');
+          try {
+            for (const tool of ['issue_develop', 'issue_verify'] as const)
+              await assert.rejects(
+                executeTool(tool, { issueNumber }, execution),
+                /evidence requires a private directory/u,
+              );
+            assert.deepEqual(readFileSync(registryPath), before);
+            for (const checkpoint of publishedCheckpoints)
+              assert.deepEqual(readFileSync(checkpoint.path), checkpoint.bytes);
+          } finally {
+            unlinkSync(evidenceDirectory);
+            fs.renameSync(retainedDirectory, evidenceDirectory);
+          }
+          for (const directory of [
+            gitCommonDir(root),
+            join(gitCommonDir(root), 'ai-delivery'),
+            dirname(dirname(planPath)),
+            dirname(planPath),
+          ])
+            await withDirectorySyncProbe(directory, 'synthetic completion directory sync failure', async (probe) => {
+              for (const tool of ['issue_develop', 'issue_verify'] as const)
+                await assert.rejects(
+                  executeTool(tool, { issueNumber }, execution),
+                  /synthetic completion directory sync failure/u,
+                );
+              assert.ok(probe.attempts > 0);
+              assert.deepEqual(readFileSync(registryPath), before);
+              for (const checkpoint of publishedCheckpoints)
+                assert.deepEqual(readFileSync(checkpoint.path), checkpoint.bytes);
+              for (const savedReceipt of [...oldReceipts, ...ownerFiles])
+                assert.deepEqual(readFileSync(savedReceipt.path), savedReceipt.bytes);
+              probe.fail = false;
+              const beforeRetry = probe.attempts;
+              await executeTool('issue_develop', { issueNumber }, execution);
+              assert.ok(probe.attempts > beforeRetry, 'supported replay must sync the existing completion directory');
+            });
+        }
+        if (routing.interruptContinuation !== false) {
+          const originalWrite = atomicJson.writeJsonFileAtomically;
+          for (const afterWrite of [false, true]) {
+            const interrupted = vi.spyOn(atomicJson, 'writeJsonFileAtomically').mockImplementation((...args) => {
+              if (args[0] === registryPath) {
+                if (afterWrite) originalWrite(...args);
+                throw new Error('synthetic continuation registry interruption');
+              }
+              return originalWrite(...args);
+            });
+            try {
+              await assert.rejects(
+                executeTool('issue_develop', { issueNumber }, execution),
+                /synthetic continuation registry interruption/u,
+              );
+            } finally {
+              interrupted.mockRestore();
+            }
+            await assert.rejects(
+              executeTool('issue_verify', { issueNumber }, execution),
+              /continuation.*(?:pending|incomplete)/u,
+            );
+            await assert.rejects(
+              executeTool('issue_update', { issueNumber, body: issue.body }, execution),
+              /continuation.*(?:pending|incomplete)/u,
+            );
+            await assert.rejects(
+              executeTool('issue_start', { issueNumber, resumeCreated: true, develop: true }, execution),
+              /continuation.*(?:pending|incomplete)/u,
+            );
+            assert.equal(git(row.path, 'rev-parse', 'HEAD'), descendant);
+            assert.equal(git(row.path, 'rev-parse', 'HEAD^{tree}'), descendantTree);
+            for (const savedReceipt of [...oldReceipts, ...ownerFiles])
+              assert.deepEqual(readFileSync(savedReceipt.path), savedReceipt.bytes);
+          }
+          const intentPath = planPath.replace(/\.plan\.json$/u, '.intent.json');
+          await refuseDifferentRuntime();
+          const intentBytes = readFileSync(intentPath);
+          writeFileSync(intentPath, '{}');
+          try {
+            await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /invalid|expected/iu);
+          } finally {
+            writeFileSync(intentPath, intentBytes);
+          }
+          const beforeimageDirectory = join(gitCommonDir(root), 'ai-delivery/continuations/evidence');
+          const beforeimage = join(beforeimageDirectory, readdirSync(beforeimageDirectory)[0]!);
+          const beforeimageBytes = readFileSync(beforeimage);
+          writeFileSync(beforeimage, 'corrupt original');
+          try {
+            await assert.rejects(
+              executeTool('issue_develop', { issueNumber }, execution),
+              /(?:evidence|beforeimage).*changed/u,
+            );
+          } finally {
+            writeFileSync(beforeimage, beforeimageBytes);
+          }
+          writeFileSync(join(row.path, 'change.txt'), 'incompatible replay source\n');
+          git(row.path, 'add', 'change.txt');
+          git(row.path, 'commit', '-qm', 'incompatible replay');
+          try {
+            await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /plan drifted/u);
+          } finally {
+            git(row.path, 'reset', '--hard', descendant);
+          }
+          const authorityUser = continuationComments[0]!.user;
+          continuationComments[0]!.user = { login: 'host-user', id: 99, type: 'User' };
+          try {
+            await assert.rejects(
+              executeTool('issue_develop', { issueNumber }, execution),
+              /operator.*(?:missing|changed)/u,
+            );
+          } finally {
+            continuationComments[0]!.user = authorityUser;
+          }
+          const reviewBody = continuationComments[1]!.body;
+          continuationComments[1]!.body = '{}';
+          await assert.rejects(
+            executeTool('issue_develop', { issueNumber }, execution),
+            /acceptance.*(?:missing|changed)/u,
+          );
+          continuationComments[1]!.body = reviewBody;
+          continuationComments.push({
+            id: 103,
+            issue_url: subject,
+            user: { login: 'host-user', id: 37, type: 'User' },
+            body: stableJson({
+              schemaVersion: 'ai-delivery.worktree-continuation-revocation@1',
+              planId: saved.plan.planId,
+              authorityCommentId: 101,
+            }),
+          });
+          await assert.rejects(executeTool('issue_develop', { issueNumber }, execution), /revoked/u);
+          continuationComments.pop();
+        }
+        projectStatus = null;
+        failNextProjectSync = true;
+        await assert.rejects(executeTool('issue_start', { issueNumber }, execution), /synthetic Project interruption/u);
+        const resumed = await executeTool('issue_develop', { issueNumber }, execution);
+        assert.deepEqual(resumed, { path: previous.path, branch: previous.branch });
+        const current = getIssueWorktreeStrict(issueNumber, root);
+        assert.equal(current.identity, 'host-author');
+        assert.equal(current.status, 'active');
+        assert.equal(current.prNumber, undefined);
+        assert.equal(current.createdAt, previous.createdAt);
+        assert.equal(git(row.path, 'rev-parse', 'HEAD'), descendant);
+        assert.equal(git(row.path, 'status', '--porcelain'), '');
+        assert.equal(existsSync(join(gitCommonDir(root), 'ai-delivery/merges', '17', `${descendant}.json`)), false);
+        const continued = await verifyIssue({ issueNumber, repoRoot: row.path });
+        assert.equal(continued.classification.head.sha, descendant);
+        writeFileSync(join(row.path, 'change.txt'), 'later ordinary commit\n');
+        git(row.path, 'add', 'change.txt');
+        git(row.path, 'commit', '-qm', 'ordinary work after completed continuation');
+        const futureHead = git(row.path, 'rev-parse', 'HEAD');
+        await executeTool('issue_verify', { issueNumber }, execution);
+        assert.equal(loadVerifiedRun(row.path, issueNumber).classification.head.sha, futureHead);
+        for (const savedReceipt of [...oldReceipts, ...ownerFiles])
+          assert.deepEqual(readFileSync(savedReceipt.path), savedReceipt.bytes);
+        const finalRegistry = JSON.parse(readFileSync(registryPath, 'utf8')) as { worktrees: { branch: string }[] };
+        assert.deepEqual(
+          finalRegistry.worktrees.find((entry) => entry.branch === unrelated.branch),
+          unrelated,
+        );
+        assert.equal(calls.filter((call) => call === 'git:createCommit').length, 1);
+        if (routing.continuationResult)
+          routing.continuationResult.value = {
+            identity: current.identity,
+            status: current.status,
+            prNumber: current.prNumber,
+            createdAtPreserved: current.createdAt === previous.createdAt,
+            issueRows: finalRegistry.worktrees.filter((entry) => entry.branch === previous.branch).length,
+            unrelatedPreserved: true,
+            originalBytesPreserved: true,
+            descendantVerified: continued.classification.head.sha === descendant,
+            futureVerified: loadVerifiedRun(row.path, issueNumber).classification.head.sha === futureHead,
+          };
+        return;
+      }
       const publicationPath = join(
         gitCommonDir(root),
         'ai-delivery/publications',
@@ -4661,6 +5375,7 @@ exec "${realGit}" "$@"
     assert.equal(resumedTracking.status, 'started');
     assert.equal(calls.filter((call) => call === 'issue:create').length, beforeTracking + 1);
   } finally {
+    restoreCheckpointWrites?.();
     restoreTransport?.();
     process.env.PATH = originalPath;
     restoreDispatchClient?.();
@@ -4682,6 +5397,46 @@ test(
   'supported develop resumes an open merged issue under the same owner and preserves prior receipts',
   { timeout: 0 },
   async () => syntheticLifecycle({ remote: 'origin', divergentOrigin: false, mergedContinuation: true }),
+);
+
+test(
+  'supported develop reconciles authenticated host custody for an already committed descendant',
+  { timeout: 0 },
+  async () => {
+    const input = { remote: 'origin', divergentOrigin: false, committedDescendantContinuation: true };
+    const recovered: { value?: unknown } = {};
+    const uninterrupted: { value?: unknown } = {};
+    await syntheticLifecycle({ ...input, continuationResult: recovered });
+    await syntheticLifecycle({ ...input, interruptContinuation: false, continuationResult: uninterrupted });
+    assert.ok(recovered.value);
+    assert.ok(uninterrupted.value);
+    assert.deepEqual(recovered.value, uninterrupted.value);
+  },
+);
+
+test(
+  'committed descendant checkpoint publication recovers from SIGKILL before and after every rename',
+  { timeout: 0 },
+  async () =>
+    syntheticLifecycle({
+      remote: 'origin',
+      divergentOrigin: false,
+      committedDescendantContinuation: true,
+      interruptContinuation: false,
+      crashCheckpoints: true,
+    }),
+);
+
+test(
+  'committed descendant continuation refuses configured App authors using a personal override',
+  { timeout: 0 },
+  async () =>
+    syntheticLifecycle({
+      remote: 'origin',
+      divergentOrigin: false,
+      committedDescendantContinuation: true,
+      appAuthorContinuation: true,
+    }),
 );
 
 test(

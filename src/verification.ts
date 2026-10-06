@@ -2162,6 +2162,21 @@ export function loadVerifiedRun(repoRoot: string, issueNumber: number): Verifica
   return loadRun(gitCommonDir(root), coordinate(root).sha, root, historical);
 }
 
+/** @internal Preservation-only read; the continuation owner validates custody and terminal lineage. */
+export function loadHistoricalMergedRun(
+  repoRoot: string,
+  headSha: string,
+): {
+  run: VerificationRun;
+  path: string;
+} {
+  const root = gitRoot(repoRoot);
+  const common = gitCommonDir(root);
+  const run = loadRun(common, headSha, root, true);
+  const current = manifestPath(common, headSha, root);
+  return { run, path: existsSync(current) ? current : manifestPath(common, headSha) };
+}
+
 /** Recover an exact merged run after worktree removal interrupted terminal recording. */
 export function loadRemovedMergedRun(primaryRepoRoot: string, issueNumber: number): VerificationRun {
   const root = gitRoot(primaryRepoRoot);

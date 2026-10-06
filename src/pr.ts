@@ -5,7 +5,7 @@ import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
-import { assertPrivateFile } from './delivery/common.js';
+import { assertPrivateFile, digestBytes } from './delivery/common.js';
 import {
   digestValue,
   loadSelectedRepositoryPolicy,
@@ -40,10 +40,18 @@ import {
   getIssueWorktreeStrict,
   listWorktreesStrict,
   updateIssueWorktreeDelivery,
+  type WorktreeEntry,
 } from './services/worktreeRegistry.js';
 import { getDeliveryRecords, recordMergedDelivery, type DeliveryRecord } from './services/deliveryRecordService.js';
-import { createIssuePhaseEvidence, loadRemovedMergedRun, loadVerifiedRun } from './verification.js';
+import {
+  createIssuePhaseEvidence,
+  loadHistoricalMergedRun,
+  loadRemovedMergedRun,
+  loadVerifiedRun,
+  type VerificationRun,
+} from './verification.js';
 import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
+import { readNativeWorktreePrLineage } from './worktreeTransition.js';
 import { cleanupMergedIssueWorktree, preparePrWorktree } from './worktree.js';
 
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
@@ -954,6 +962,115 @@ export async function persistMergedResult(
   return merged;
 }
 
+async function validateTerminalMerge(
+  context: DeliveryContext,
+  row: WorktreeEntry,
+  run: VerificationRun,
+  publication: Publication,
+  existing: MergeReceipt,
+): Promise<void> {
+  const head = run.classification.head;
+  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: existing.prNumber })).data;
+  if (
+    existing.prNumber !== row.prNumber ||
+    existing.issueNumber !== row.issueNumber ||
+    existing.headSha !== head.sha ||
+    publication.prNumber !== existing.prNumber ||
+    publication.issueNumber !== existing.issueNumber ||
+    publication.headSha !== head.sha ||
+    publication.baseSha !== run.classification.base.sha ||
+    pr.state !== 'closed' ||
+    !pr.merged_at ||
+    pr.head.sha !== head.sha ||
+    pr.head.ref !== row.branch ||
+    pr.merge_commit_sha !== existing.mergeSha
+  )
+    throw new DeliveryError('Merged PR readback or publication disagrees with terminal receipt.');
+  const intent = readOptionalPrivate(mergeIntentPath(row.path, existing.issueNumber, head.sha), (value) =>
+    MergeIntentSchema.parse(value),
+  );
+  if (
+    !intent ||
+    intent.intentId !== existing.intentId ||
+    intent.baseSha !== run.classification.base.sha ||
+    intent.headSha !== head.sha ||
+    intent.headTree !== head.tree
+  )
+    throw new DeliveryError('Terminal merge lacks its exact verified intent.');
+  const historicalReview = loadSubmittedReview(row.path, existing.issueNumber, head.sha);
+  if (
+    !historicalReview ||
+    historicalReview.prNumber !== existing.prNumber ||
+    historicalReview.headSha !== head.sha ||
+    historicalReview.artifact.issueNumber !== existing.issueNumber ||
+    historicalReview.artifact.head.tree !== head.tree ||
+    historicalReview.artifact.diffScopeHash !== digestValue(run.classification.changedPaths) ||
+    historicalReview.artifact.verdict !== 'approve' ||
+    historicalReview.publicationEvidenceId !== publication.evidenceId ||
+    historicalReview.receiptId !== intent.reviewReceiptId
+  )
+    throw new DeliveryError('Terminal merge publication lacks its exact historical approved review.');
+  const result = await readMergedResult(context, intent, existing.mergeSha);
+  if (result.mergeTree !== existing.mergeTree) throw new DeliveryError('Terminal merge tree changed.');
+  const { schemaVersion: _version, ...intentContent } = intent;
+  const expected = { ...intentContent, ...result, schemaVersion: 'ai-delivery.merge@3' as const };
+  if (existing.mergeId !== digestValue(expected))
+    throw new DeliveryError('Terminal merge receipt disagrees with its intent.');
+}
+
+/** @internal Read-only ancestor validation for the locked committed-descendant continuation. */
+export async function readMergedContinuationTerminal(
+  context: DeliveryContext,
+  row: WorktreeEntry,
+  operator: { actorLogin: string; credentialIdentity: string },
+): Promise<{ terminal: MergeReceipt; preserved: { path: string; digest: string }[] }> {
+  if (row.status !== 'merged' || row.prNumber === undefined || row.issueNumber === undefined)
+    throw new DeliveryError('Committed continuation requires exact merged issue custody.');
+  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: row.prNumber })).data;
+  const historical = loadHistoricalMergedRun(row.path, Sha.parse(pr.head.sha));
+  const head = historical.run.classification.head.sha;
+  const publication = loadPublication(row.path, row.issueNumber, head);
+  const path = mergePath(row.path, row.issueNumber, head);
+  const terminal = readOptionalPrivate(path, (value) => MergeSchema.parse(value));
+  if (!terminal || !historical.run.writer || historical.run.classification.repository !== context.config.repository)
+    throw new DeliveryError('Committed continuation lacks supported exact historical terminal provenance.');
+  await validateTerminalMerge(context, row, historical.run, publication, terminal);
+  await readNativeWorktreePrLineage(context, row.issueNumber, row.prNumber);
+  const attemptPath = mergeAttemptPath(row.path, row.issueNumber, head);
+  const resultPath = mergeResultPath(row.path, row.issueNumber, head);
+  const attempt = readOptionalPrivate(attemptPath, (value) => MergeAttemptSchema.parse(value));
+  const result = readOptionalPrivate(resultPath, (value) => MergeResultSchema.parse(value));
+  if (
+    pr.number !== row.prNumber ||
+    pr.user?.type !== 'User' ||
+    pr.user.login.toLowerCase() !== operator.actorLogin.toLowerCase() ||
+    `user:${String(pr.user.id)}` !== operator.credentialIdentity ||
+    !attempt ||
+    attempt.authSource !== 'personal' ||
+    attempt.actorLogin.toLowerCase() !== operator.actorLogin.toLowerCase() ||
+    attempt.credentialIdentity !== operator.credentialIdentity ||
+    attempt.intentId !== terminal.intentId ||
+    !result ||
+    result.attemptId !== attempt.attemptId ||
+    result.mergeSha !== terminal.mergeSha
+  )
+    throw new DeliveryError(
+      'Committed continuation authenticated host author disagrees with native historical custody.',
+    );
+  return {
+    terminal,
+    preserved: [
+      historical.path,
+      publicationPath(row.path, row.issueNumber, head),
+      join(gitCommonDir(row.path), 'ai-delivery', 'reviews', String(row.issueNumber), `${head}.json`),
+      mergeIntentPath(row.path, row.issueNumber, head),
+      attemptPath,
+      resultPath,
+      path,
+    ].map((file) => ({ path: file, digest: digestBytes(assertPrivateFile(file)) })),
+  };
+}
+
 export async function mergePr(
   context: DeliveryContext,
   input: {
@@ -980,49 +1097,13 @@ export async function mergePr(
   const existingPath = mergePath(receiptRoot, input.issueNumber, head.sha);
   const existing = readOptionalPrivate(existingPath, (value) => MergeSchema.parse(value));
   if (existing) {
-    const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: input.prNumber })).data;
-    if (
-      existing.prNumber !== input.prNumber ||
-      existing.issueNumber !== input.issueNumber ||
-      existing.headSha !== head.sha ||
-      pr.state !== 'closed' ||
-      !pr.merged_at ||
-      pr.head.sha !== head.sha ||
-      pr.head.ref !== row.branch ||
-      pr.merge_commit_sha !== existing.mergeSha
-    ) {
-      throw new DeliveryError('Merged PR readback disagrees with terminal receipt.');
-    }
-    const intent = readOptionalPrivate(mergeIntentPath(receiptRoot, input.issueNumber, head.sha), (value) =>
-      MergeIntentSchema.parse(value),
+    await validateTerminalMerge(
+      context,
+      { ...row, path: receiptRoot, prNumber: input.prNumber },
+      run,
+      publication,
+      existing,
     );
-    if (
-      !intent ||
-      intent.intentId !== existing.intentId ||
-      intent.baseSha !== run.classification.base.sha ||
-      intent.headSha !== head.sha ||
-      intent.headTree !== head.tree
-    )
-      throw new DeliveryError('Terminal merge lacks its exact verified intent.');
-    const historicalReview = loadSubmittedReview(receiptRoot, input.issueNumber, head.sha);
-    if (
-      !historicalReview ||
-      historicalReview.prNumber !== input.prNumber ||
-      historicalReview.headSha !== head.sha ||
-      historicalReview.artifact.issueNumber !== input.issueNumber ||
-      historicalReview.artifact.head.tree !== head.tree ||
-      historicalReview.artifact.diffScopeHash !== digestValue(run.classification.changedPaths) ||
-      historicalReview.artifact.verdict !== 'approve' ||
-      historicalReview.publicationEvidenceId !== publication.evidenceId ||
-      historicalReview.receiptId !== intent.reviewReceiptId
-    )
-      throw new DeliveryError('Terminal merge publication lacks its exact historical approved review.');
-    const result = await readMergedResult(context, intent, existing.mergeSha);
-    if (result.mergeTree !== existing.mergeTree) throw new DeliveryError('Terminal merge tree changed.');
-    const { schemaVersion: _version, ...intentContent } = intent;
-    const expected = { ...intentContent, ...result, schemaVersion: 'ai-delivery.merge@3' as const };
-    if (existing.mergeId !== digestValue(expected))
-      throw new DeliveryError('Terminal merge receipt disagrees with its intent.');
     await updateIssueWorktreeDelivery({
       branch: row.branch,
       issueNumber: input.issueNumber,

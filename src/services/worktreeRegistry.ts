@@ -1,13 +1,26 @@
-import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { z } from 'zod';
 
-import { assertPrivateFile, stableJson, writeCreateOnly } from '../delivery/common.js';
+import {
+  assertPrivateFile,
+  CoordinateSchema,
+  DigestSchema,
+  digestBytes,
+  stableJson,
+  writeCreateOnly,
+} from '../delivery/common.js';
 import { digestValue } from '../delivery/index.js';
 import { gitCommonDir } from '../git.js';
+import { RuntimeAdmissionSchema } from './deliveryAdmission.js';
 import type { WorktreeTransitionPlan } from '../worktreeTransition.js';
 import { logInfo, logWarn } from '../logger.js';
 import { ensureDataDirectory, ISSUE_CLI_DATA_DIR } from '../utils/filesystem.js';
-import { writeJsonFileAtomically } from '../utils/atomicJson.js';
+import {
+  ensurePrivateDirectoryDurably,
+  writeJsonFileAtomically,
+  writePrivateJsonFileAtomically,
+} from '../utils/atomicJson.js';
 import { withLock } from '../utils/lockfile.js';
 
 export interface WorktreeEntry {
@@ -31,6 +44,163 @@ interface WorktreeRegistry {
 
 const REGISTRY_PATH = `${ISSUE_CLI_DATA_DIR}/worktrees.json`;
 const LOCK_RETRY_MESSAGE = 'Worktree registry locked by another process. Retrying...';
+
+const ContinuationRowSchema = z
+  .strictObject({
+    branch: z.string().min(1),
+    createdAt: z.string().min(1),
+    identity: z.string().min(1),
+    issueNumber: z.number().int().positive(),
+    path: z.string().min(1),
+    prNumber: z.number().int().positive().optional(),
+    status: z.enum(['active', 'error', 'merged', 'pr-published', 'stale']),
+    type: z.literal('issue'),
+    updatedAt: z.string().min(1),
+  })
+  .transform(({ prNumber, ...row }) => ({ ...row, ...(prNumber === undefined ? {} : { prNumber }) }));
+/** @internal Private exact-plan checkpoint; it is not a public transition purpose. */
+export const CommittedContinuationPlanSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.committed-continuation-plan@1'),
+    planId: DigestSchema,
+    repository: z.string().min(1),
+    repoRoot: z.string().min(1),
+    configDigest: DigestSchema,
+    currentRuntime: RuntimeAdmissionSchema,
+    row: ContinuationRowSchema,
+    replacement: ContinuationRowSchema,
+    head: CoordinateSchema,
+    terminalHead: CoordinateSchema,
+    terminalMergeId: DigestSchema,
+    operator: z.strictObject({
+      actorLogin: z.string().min(1),
+      credentialIdentity: z.string().regex(/^user:[1-9]\d*$/u),
+    }),
+    reviewerActor: z.string().min(1),
+    preserved: z.array(z.strictObject({ path: z.string().min(1), digest: DigestSchema })).min(1),
+  })
+  .superRefine((plan, ctx) => {
+    const { planId, ...content } = plan;
+    const { prNumber: _pr, identity: _identity, status: _status, updatedAt: _updated, ...original } = plan.row;
+    const { identity: _newIdentity, status: _newStatus, updatedAt: _newUpdated, ...replacement } = plan.replacement;
+    if (
+      planId !== digestValue(content) ||
+      plan.row.status !== 'merged' ||
+      !plan.row.prNumber ||
+      plan.replacement.status !== 'active' ||
+      plan.replacement.prNumber !== undefined ||
+      stableJson(original) !== stableJson(replacement) ||
+      plan.head.sha === plan.terminalHead.sha ||
+      new Set(plan.preserved.map((file) => file.path)).size !== plan.preserved.length
+    )
+      ctx.addIssue({ code: 'custom', message: 'Committed continuation plan identity or disposition is invalid.' });
+  });
+export type CommittedContinuationPlan = z.infer<typeof CommittedContinuationPlanSchema>;
+const ContinuationIntentSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.committed-continuation-intent@1'),
+    intentId: DigestSchema,
+    plan: CommittedContinuationPlanSchema,
+    authorityCommentId: z.number().int().positive(),
+    acceptanceCommentId: z.number().int().positive(),
+  })
+  .superRefine(({ intentId, ...content }, ctx) => {
+    if (intentId !== digestValue(content))
+      ctx.addIssue({ code: 'custom', message: 'Continuation intent identity is invalid.' });
+  });
+type ContinuationIntent = z.infer<typeof ContinuationIntentSchema>;
+const ContinuationCompletionSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.committed-continuation-completion@1'),
+    completionId: DigestSchema,
+    intentId: DigestSchema,
+    planId: DigestSchema,
+    row: ContinuationRowSchema,
+    head: CoordinateSchema,
+    completed: z.literal(true),
+  })
+  .superRefine(({ completionId, ...content }, ctx) => {
+    if (completionId !== digestValue(content))
+      ctx.addIssue({ code: 'custom', message: 'Continuation completion identity is invalid.' });
+  });
+
+export function committedContinuationPlanPath(root: string, issueNumber: number, head: string): string {
+  return join(gitCommonDir(root), 'ai-delivery', 'continuations', String(issueNumber), `${head}.plan.json`);
+}
+function continuationIntentPath(plan: CommittedContinuationPlan): string {
+  return committedContinuationPlanPath(plan.repoRoot, plan.row.issueNumber, plan.head.sha).replace(
+    /\.plan\.json$/u,
+    '.intent.json',
+  );
+}
+function continuationCompletionPath(plan: CommittedContinuationPlan): string {
+  return continuationIntentPath(plan).replace(/\.intent\.json$/u, '.completion.json');
+}
+function continuationBeforeimagePath(plan: CommittedContinuationPlan, digest: string): string {
+  return join(gitCommonDir(plan.repoRoot), 'ai-delivery', 'continuations', 'evidence', `${digest.slice(7)}.bin`);
+}
+function assertContinuationPreserved(plan: CommittedContinuationPlan, beforeimages = false): void {
+  for (const file of plan.preserved) {
+    if (
+      digestBytes(assertPrivateFile(file.path)) !== file.digest ||
+      (beforeimages && digestBytes(assertPrivateFile(continuationBeforeimagePath(plan, file.digest))) !== file.digest)
+    )
+      throw new Error('Committed continuation original evidence changed.');
+  }
+  if (beforeimages) {
+    const bytes = Buffer.from(stableJson(plan.row));
+    if (!assertPrivateFile(continuationBeforeimagePath(plan, digestBytes(bytes))).equals(bytes))
+      throw new Error('Committed continuation original row beforeimage changed.');
+  }
+}
+
+/** @internal Pending intents are recoverable only by the same supported develop boundary. */
+export function pendingCommittedContinuation(issueNumber: number, root: string): ContinuationIntent | undefined {
+  const directory = join(gitCommonDir(root), 'ai-delivery', 'continuations', String(issueNumber));
+  if (!existsSync(directory)) return undefined;
+  let pending: ContinuationIntent | undefined;
+  for (const name of readdirSync(directory)
+    .filter((name) => name.endsWith('.intent.json'))
+    .sort()) {
+    const intent = ContinuationIntentSchema.parse(
+      JSON.parse(assertPrivateFile(join(directory, name)).toString('utf8')),
+    );
+    const plan = intent.plan;
+    if (
+      plan.repoRoot !== resolve(root) ||
+      plan.row.issueNumber !== issueNumber ||
+      join(directory, name) !== continuationIntentPath(plan)
+    )
+      throw new Error('Committed continuation checkpoint identity disagrees.');
+    assertContinuationPreserved(plan, true);
+    const completionPath = continuationCompletionPath(plan);
+    if (existsSync(completionPath)) {
+      const completion = ContinuationCompletionSchema.parse(
+        JSON.parse(assertPrivateFile(completionPath).toString('utf8')),
+      );
+      if (
+        completion.intentId !== intent.intentId ||
+        completion.planId !== plan.planId ||
+        stableJson(completion.row) !== stableJson(plan.replacement) ||
+        stableJson(completion.head) !== stableJson(plan.head)
+      )
+        throw new Error('Committed continuation completion disagrees with its intent.');
+      assertOwnerWitness(plan.replacement, root);
+      // Terminal recovery validates existing ancestors and repairs their directory durability.
+      prepareCommittedContinuationDirectory(root, directory, false);
+      prepareCommittedContinuationDirectory(
+        root,
+        dirname(continuationBeforeimagePath(plan, plan.preserved[0]!.digest)),
+        false,
+      );
+      syncCommittedContinuationDirectory(completionPath);
+    } else {
+      if (pending) throw new Error('Issue has multiple incomplete committed continuations.');
+      pending = intent;
+    }
+  }
+  return pending;
+}
 
 function ownerContent(entry: WorktreeEntry): Record<string, unknown> {
   if (!entry.identity) throw new Error('ai-delivery worktree ownership requires the preparing identity.');
@@ -110,6 +280,12 @@ function assertNoIncompleteWorktreeTransition(entry: WorktreeEntry, root: string
 /** An immutable witness separates new rows from legacy rows in the same canonical registry. */
 export function assertAiDeliveryWorktreeOwner(entry: WorktreeEntry, root: string): void {
   assertNoIncompleteWorktreeTransition(entry, root);
+  if (entry.issueNumber !== undefined && pendingCommittedContinuation(entry.issueNumber, root))
+    throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
+  assertOwnerWitness(entry, root);
+}
+
+function assertOwnerWitness(entry: WorktreeEntry, root: string): void {
   const content = ownerContent(entry);
   const path = ownerPath(root, entry);
   let stored: unknown;
@@ -124,7 +300,13 @@ export function assertAiDeliveryWorktreeOwner(entry: WorktreeEntry, root: string
 }
 
 /** Ordinary source mutations also refuse terminal/pending issue intent after the row was removed. */
-export function assertIssueWorktreeTransitionAdmission(issueNumber: number, root: string): void {
+export function assertIssueWorktreeTransitionAdmission(
+  issueNumber: number,
+  root: string,
+  committedRecovery = false,
+): void {
+  if (pendingCommittedContinuation(issueNumber, root) && !committedRecovery)
+    throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
   const path = join(
     gitCommonDir(root),
     'ai-delivery',
@@ -154,6 +336,179 @@ function writeWorktreeOwner(entry: WorktreeEntry, root: string, transition = fal
   if (!transition) assertAiDeliveryWorktreeOwner(entry, root);
 }
 
+/** @internal New continuation checkpoints are published only while both owning locks are held. */
+export function writeCommittedContinuationCheckpoint(path: string, value: unknown): void {
+  const assertEqual = () => {
+    const stored: unknown = JSON.parse(assertPrivateFile(path).toString('utf8')) as unknown;
+    if (stableJson(stored) !== stableJson(value)) throw new Error('Committed continuation checkpoint changed.');
+  };
+  try {
+    assertEqual();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    writePrivateJsonFileAtomically(path, value);
+    assertEqual();
+  }
+  // Retry completes durability if the prior publisher died after rename but before directory sync.
+  syncCommittedContinuationDirectory(path);
+}
+
+function syncCommittedContinuationDirectory(path: string): void {
+  const directory = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
+}
+
+/** Repair only this new namespace, anchored at the existing Git common directory. */
+function prepareCommittedContinuationDirectory(root: string, directory: string, create = true): void {
+  const deliveryDirectory = join(gitCommonDir(root), 'ai-delivery');
+  const continuationRoot = join(deliveryDirectory, 'continuations');
+  const paths = [deliveryDirectory, continuationRoot, directory];
+  const validate = (path: string, missing: boolean) => {
+    let metadata;
+    try {
+      metadata = lstatSync(path);
+    } catch (error) {
+      if (missing && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (
+      !metadata.isDirectory() ||
+      metadata.isSymbolicLink() ||
+      (path !== deliveryDirectory && (metadata.mode & 0o077) !== 0)
+    )
+      throw new Error('Committed continuation evidence requires a private directory.');
+  };
+  for (const path of paths) validate(path, create && path !== deliveryDirectory);
+  if (create) ensurePrivateDirectoryDurably(directory);
+  for (const path of paths) {
+    validate(path, false);
+    // Existing mkdir state can be recovery from death before its parent was synced.
+    syncCommittedContinuationDirectory(path);
+  }
+}
+
+/** @internal One canonical row, its immutable witnesses, and the existing registry lock own this recovery. */
+export async function withCommittedContinuationRegistry<T>(
+  root: string,
+  issueNumber: number,
+  operation: (input: {
+    current: WorktreeEntry;
+    pending: ContinuationIntent | undefined;
+    ownerWitness: { path: string; digest: string };
+    prepare(this: void): void;
+    begin(
+      this: void,
+      plan: CommittedContinuationPlan,
+      ids: { authorityCommentId: number; acceptanceCommentId: number },
+    ): void;
+    commit(this: void): void;
+    complete(this: void): void;
+  }) => Promise<T>,
+): Promise<T> {
+  ensureRegistryDirectory(root);
+  return withLock(REGISTRY_PATH, {
+    projectRoot: root,
+    timeout: 5000,
+    operation: async () => {
+      const pending = pendingCommittedContinuation(issueNumber, root);
+      let intent = pending;
+      let current: WorktreeEntry;
+      const readCurrent = () => {
+        const registry = loadRegistryStrict(root);
+        const matches = registry.worktrees.filter((row) => row.type === 'issue' && row.issueNumber === issueNumber);
+        const row = matches[0];
+        if (matches.length !== 1 || !row)
+          throw new Error('Committed continuation requires one exact canonical issue row.');
+        if (registry.worktrees.some((other) => other !== row && registryIdentitiesOverlap(other, row)))
+          throw new Error('Committed continuation overlaps another canonical owner.');
+        assertNoIncompleteWorktreeTransition(row, root);
+        assertOwnerWitness(row, root);
+        return { registry, row };
+      };
+      current = readCurrent().row;
+      if (
+        pending &&
+        ![pending.plan.row, pending.plan.replacement].some((row) => stableJson(row) === stableJson(current))
+      )
+        throw new Error('Committed continuation canonical row drifted.');
+      const original = pending?.plan.row ?? current;
+      assertOwnerWitness(original, root);
+      const witnessPath = ownerPath(root, original);
+      const ownerWitness = { path: witnessPath, digest: digestBytes(assertPrivateFile(witnessPath)) };
+      return operation({
+        current,
+        pending,
+        ownerWitness,
+        prepare: () =>
+          prepareCommittedContinuationDirectory(
+            root,
+            join(gitCommonDir(root), 'ai-delivery', 'continuations', String(issueNumber)),
+          ),
+        begin: (raw, ids) => {
+          const plan = CommittedContinuationPlanSchema.parse(raw);
+          if (
+            plan.repoRoot !== resolve(root) ||
+            plan.row.issueNumber !== issueNumber ||
+            stableJson(plan.row) !== stableJson(original) ||
+            !plan.preserved.some((file) => stableJson(file) === stableJson(ownerWitness))
+          )
+            throw new Error('Committed continuation lacks exact original custody.');
+          const content = { schemaVersion: 'ai-delivery.committed-continuation-intent@1' as const, plan, ...ids };
+          const next = ContinuationIntentSchema.parse({ ...content, intentId: digestValue(content) });
+          if (intent && stableJson(next) !== stableJson(intent))
+            throw new Error('Committed continuation intent drifted.');
+          assertContinuationPreserved(plan);
+          const evidenceDirectory = dirname(continuationBeforeimagePath(plan, plan.preserved[0]!.digest));
+          prepareCommittedContinuationDirectory(root, evidenceDirectory);
+          for (const file of plan.preserved)
+            writeCreateOnly(continuationBeforeimagePath(plan, file.digest), assertPrivateFile(file.path), file.digest);
+          const rowBytes = Buffer.from(stableJson(plan.row));
+          writeCreateOnly(continuationBeforeimagePath(plan, digestBytes(rowBytes)), rowBytes, digestBytes(rowBytes));
+          writeCommittedContinuationCheckpoint(continuationIntentPath(plan), next);
+          intent = next;
+        },
+        commit: () => {
+          if (!intent) throw new Error('Committed continuation lacks its durable intent.');
+          const { registry, row } = readCurrent();
+          if (stableJson(row) !== stableJson(current))
+            throw new Error('Committed continuation canonical row changed before commit.');
+          assertContinuationPreserved(intent.plan, true);
+          const replacementOwner = ownerContent(intent.plan.replacement);
+          writeCommittedContinuationCheckpoint(ownerPath(root, intent.plan.replacement), {
+            ...replacementOwner,
+            ownerId: digestValue(replacementOwner),
+          });
+          registry.worktrees.splice(registry.worktrees.indexOf(row), 1, intent.plan.replacement);
+          saveRegistryStrict(root, registry);
+          current = intent.plan.replacement;
+        },
+        complete: () => {
+          if (!intent || stableJson(readCurrent().row) !== stableJson(intent.plan.replacement))
+            throw new Error('Committed continuation replacement row is incomplete.');
+          assertContinuationPreserved(intent.plan, true);
+          assertOwnerWitness(intent.plan.replacement, root);
+          const content = {
+            schemaVersion: 'ai-delivery.committed-continuation-completion@1' as const,
+            intentId: intent.intentId,
+            planId: intent.plan.planId,
+            row: intent.plan.replacement,
+            head: intent.plan.head,
+            completed: true as const,
+          };
+          writeCommittedContinuationCheckpoint(continuationCompletionPath(intent.plan), {
+            ...content,
+            completionId: digestValue(content),
+          });
+        },
+      });
+    },
+  });
+}
+
 /** @internal The explicit transition owner holds the existing registry lock through its exact planned mutation. */
 export async function withWorktreeTransitionRegistry<T>(
   plan: WorktreeTransitionPlan,
@@ -165,6 +520,8 @@ export async function withWorktreeTransitionRegistry<T>(
   }) => Promise<T>,
 ): Promise<T> {
   const root = plan.repoRoot;
+  if (pendingCommittedContinuation(plan.row.issueNumber, root))
+    throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
   ensureRegistryDirectory(root);
   return withLock(REGISTRY_PATH, {
     projectRoot: root,
