@@ -441,6 +441,12 @@ RSS/output/disk bounds. Environment values stay in memory; records contain its
 digest. The selected SDK's producer commit and the consumer controller HEAD
 are separate identities.
 
+`identity` selects the configured authenticated author. Historical worktree
+custody may name a different principal: the exact canonical row digest and
+ownership witness remain bound and unchanged throughout the phase. The receipt
+binds that row separately from its authenticated actor; entering a source phase
+does not transfer custody or alias those principals.
+
 Inside the callback, prepare owned metadata and `await context.run(index)` for
 every command, in order, once. The context exposes read-only source,
 controller, authenticated actor and input identities. It permits one active

@@ -458,7 +458,7 @@ export default {
   }
 }
 
-async function sourcePhaseFixture(options: { personalAuthor?: boolean } = {}) {
+async function sourcePhaseFixture(options: { personalAuthor?: boolean; custodianIdentity?: string } = {}) {
   const fixtureResult = await fixture(options);
   const { root } = fixtureResult;
   const identity = (await loadDeliveryConfig(root)).config.roles.author.identity;
@@ -478,7 +478,11 @@ async function sourcePhaseFixture(options: { personalAuthor?: boolean } = {}) {
   writeFileSync(join(root, '.git', 'ai-delivery', 'runtime-admission.json'), JSON.stringify(selectedAdmission), {
     mode: 0o600,
   });
-  const row = await prepareIssueWorktree({ identity, issueNumber: 17, repoRoot: root });
+  const row = await prepareIssueWorktree({
+    identity: options.custodianIdentity ?? identity,
+    issueNumber: 17,
+    repoRoot: root,
+  });
   const outputRoot = join(root, '.git', 'source-phase-output');
   const callerPath = join(root, '.git', 'source-phase-caller.mjs');
   const authorizationPath = join(root, '.git', 'source-phase-authorization.json');
@@ -593,6 +597,97 @@ test('supported issue source phase freezes three ordered commands and reuses onl
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('supported issue source phase preserves historical custody under the configured authenticated author', async () => {
+  const { root, row, outputRoot, input } = await sourcePhaseFixture({
+    personalAuthor: true,
+    custodianIdentity: 'historical-builder',
+  });
+  const owners = join(gitCommonDir(root), 'ai-delivery', 'worktree-owners');
+  const witnessNames = readdirSync(owners);
+  const witnesses = witnessNames.map((name) => ({ path: join(owners, name), bytes: readFileSync(join(owners, name)) }));
+  const registryPath = join(root, '.issue-cli', 'worktrees.json');
+  const registryBytes = readFileSync(registryPath);
+  const registered = getIssueWorktreeStrict(input.issueNumber, root);
+  let entered = 0;
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    assert.equal(row.identity, 'historical-builder');
+    assert.equal(input.identity, 'host-author');
+    const receipt = await withIssueSourcePhase(input, async (context) => {
+      entered += 1;
+      assert.equal(context.actor.identity, input.identity);
+      mkdirSync(outputRoot);
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    assert.equal(receipt.status, 'complete');
+    assert.equal(receipt.commands.length, input.commands.length);
+    const record = sourcePhaseRecords(root).find((value) => value.recordId === receipt.recordId)!;
+    assert.equal((record.actor as { identity: string }).identity, 'host-author');
+    assert.equal((record.binding as { rowDigest: string }).rowDigest, digestValue(registered));
+    assert.deepEqual(getIssueWorktreeStrict(input.issueNumber, root), registered);
+    assert.ok(readFileSync(registryPath).equals(registryBytes));
+    assert.deepEqual(readdirSync(owners), witnessNames);
+    for (const witness of witnesses) assert.ok(readFileSync(witness.path).equals(witness.bytes));
+    const reused = await withIssueSourcePhase(input, async () => {
+      entered += 1;
+    });
+    assert.equal(reused.recordId, receipt.recordId);
+    assert.equal(entered, 1);
+    assert.deepEqual(getIssueWorktreeStrict(input.issueNumber, root), registered);
+    assert.ok(readFileSync(registryPath).equals(registryBytes));
+    for (const witness of witnesses) assert.ok(readFileSync(witness.path).equals(witness.bytes));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['author', 'issue', 'worktree', 'row', 'missing-witness', 'changed-witness'] as const)(
+  'supported issue source phase preserves historical custody fences for wrong %s',
+  async (mode) => {
+    const { root, row, outputRoot, input } = await sourcePhaseFixture({
+      personalAuthor: true,
+      custodianIdentity: 'historical-builder',
+    });
+    let entered = false;
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      if (mode === 'author') input.identity = 'historical-builder';
+      if (mode === 'issue') input.issueNumber += 1;
+      if (mode === 'worktree') input.source.path = root;
+      if (mode === 'row') input.rowDigest = digestValue({ ...row, identity: input.identity });
+      if (mode === 'missing-witness' || mode === 'changed-witness') {
+        const owners = join(gitCommonDir(root), 'ai-delivery', 'worktree-owners');
+        const names = readdirSync(owners);
+        assert.equal(names.length, 1);
+        const witness = join(owners, names[0]!);
+        if (mode === 'missing-witness') unlinkSync(witness);
+        else {
+          const stored = JSON.parse(readFileSync(witness, 'utf8')) as { ownerId: string };
+          stored.ownerId = digestValue('tampered witness');
+          writeFileSync(witness, JSON.stringify(stored));
+        }
+      }
+      await assert.rejects(
+        withIssueSourcePhase(input, async () => {
+          entered = true;
+        }),
+        mode === 'author'
+          ? /actor.*binding changed/u
+          : mode === 'issue'
+            ? /canonical registry row/u
+            : mode === 'worktree' || mode === 'row'
+              ? /exact registered issue owner/u
+              : /ownership witness/u,
+      );
+      assert.equal(entered, false);
+      assert.equal(existsSync(outputRoot), false, 'no source command or callback output was created');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('supported issue source phase refuses a linked worktree as its primary controller', async () => {
   const { root, row, input } = await sourcePhaseFixture();
@@ -865,7 +960,10 @@ test('supported issue source phase stops streaming capture at its remaining cumu
 });
 
 test('supported issue source phase controls stale-lock compromise while a real competing writer is excluded', async () => {
-  const { root, row, outputRoot, input } = await sourcePhaseFixture();
+  const { root, row, outputRoot, input } = await sourcePhaseFixture({
+    personalAuthor: true,
+    custodianIdentity: 'historical-builder',
+  });
   const paused = join(root, '.git', 'source-phase-validation-paused');
   const originalLoad = deliveryConfiguration.loadDeliveryConfig;
   let pauseOnce = true;
@@ -929,7 +1027,10 @@ test('supported issue source phase controls stale-lock compromise while a real c
 }, 30_000);
 
 test('supported issue source phase runs fixture tests, an enabled-hook commit and classification with separate controller source', async () => {
-  const { root, row, outputRoot, input } = await sourcePhaseFixture();
+  const { root, row, outputRoot, input } = await sourcePhaseFixture({
+    personalAuthor: true,
+    custodianIdentity: 'historical-builder',
+  });
   const hook = join(root, '.git', 'source-phase-hooks', 'pre-commit');
   mkdirSync(dirname(hook));
   writeFileSync(hook, `#!/bin/sh\nprintf 'enabled\\n' >> ${JSON.stringify(join(outputRoot, 'hook-count.txt'))}\n`, {
