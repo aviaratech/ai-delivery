@@ -325,6 +325,13 @@ comment's native ID. The operator attests that all other launchers and writers
 are quiescent and remain excluded through recovery. The existing writer slot
 must be absent; this flow never recovers or terminates an unknown writer.
 
+For this committed-descendant case only, a complete empty native closing-issue
+connection may instead bind an explicit `Refs #<issue>` reference, with optional
+explanatory text, to complete native issue-timeline cross-reference evidence for
+the same PR, repository and authenticated historical author before the merge. The PR body alone is
+insufficient. Missing, incomplete or mismatched native evidence is refused;
+other worktree transition purposes retain their closing-issue requirement.
+
 Repeat `develop` or existing-issue `start` after interruption. Recovery checks
 the same pinned native comments, revocation, original bytes and exact original
 or replacement row before completing. Other mutations, including metadata

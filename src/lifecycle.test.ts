@@ -1095,7 +1095,8 @@ test('supported issue source phase runs fixture tests, an enabled-hook commit an
       `${receipt.phaseId.slice(7)}.json`,
     );
     const completedBytes = readFileSync(completedPath);
-    assert.equal(Object.hasOwn(JSON.parse(completedBytes.toString()).binding.source.effect, 'configDigest'), false);
+    const completed = JSON.parse(completedBytes.toString()) as { binding: Pick<IssueSourcePhaseInput, 'source'> };
+    assert.equal(Object.hasOwn(completed.binding.source.effect, 'configDigest'), false);
     const reused = await withIssueSourcePhase(input, async () => {
       entered += 1;
     });
@@ -5260,6 +5261,7 @@ async function syntheticLifecycle(routing: {
   producerOnboarding?: boolean;
   mergedContinuation?: boolean;
   committedDescendantContinuation?: boolean;
+  nativeRefsContinuation?: boolean;
   appAuthorContinuation?: boolean;
   crashCheckpoints?: boolean;
   interruptContinuation?: boolean;
@@ -5320,6 +5322,13 @@ async function syntheticLifecycle(routing: {
   const historicalActor = routing.committedDescendantContinuation ? 'host-user' : 'synthetic-author[bot]';
   let nativePrAuthor = historicalActor;
   let nativeClosingIssue = issueNumber;
+  let nativeClosingConnectionEmpty = false;
+  let nativeClosingHasNextPage = false;
+  let nativeRefsBody = `Refs #${String(issueNumber)}`;
+  let nativeTimelinePages: Record<string, unknown>[][] | undefined;
+  let nativeTimelineFailurePage: number | undefined;
+  let nativeTimelineNextLink = false;
+  let nativeTimelineCalls = 0;
   let nativePrRepository: string | undefined;
   const continuationComments: Record<string, unknown>[] = [];
   const createPayloads: Record<string, unknown>[] = [];
@@ -5346,6 +5355,8 @@ async function syntheticLifecycle(routing: {
     node_id: 'PR-23',
     title: 'Synthetic change',
     html_url: 'https://example.test/pulls/23',
+    url: 'https://api.example.test/repos/example/widget/pulls/23',
+    body: nativeRefsBody,
     state: stale ? 'open' : prState,
     draft: prDraft,
     merged_at: !stale && prState === 'closed' ? mergedAt : null,
@@ -5355,16 +5366,39 @@ async function syntheticLifecycle(routing: {
     mergeable_state: 'clean',
     user: { login: nativePrAuthor, id: 37, type: routing.committedDescendantContinuation ? 'User' : 'Bot' },
     head: { sha: headSha, ref: 'issue/17', ...(nativePrRepository ? { repo: { full_name: nativePrRepository } } : {}) },
-    base: { sha: baseSha, ref: 'main', ...(nativePrRepository ? { repo: { full_name: nativePrRepository } } : {}) },
+    base: {
+      sha: baseSha,
+      ref: 'main',
+      ...(nativePrRepository
+        ? { repo: { full_name: nativePrRepository, url: `https://api.example.test/repos/${nativePrRepository}` } }
+        : {}),
+    },
+  });
+  const nativeReference = () => ({
+    event: 'cross-referenced',
+    actor: { login: historicalActor, id: 37, type: 'User' },
+    created_at: new Date(Date.parse(mergedAt) - 60_000).toISOString(),
+    source: {
+      type: 'issue',
+      issue: {
+        number: prNumber,
+        user: { login: historicalActor, id: 37, type: 'User' },
+        repository_url: 'https://api.example.test/repos/example/widget',
+        html_url: 'https://example.test/pulls/23',
+        pull_request: { url: 'https://api.example.test/repos/example/widget/pulls/23' },
+      },
+    },
   });
   const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
-    if (query.includes('WorktreeTransitionLineage'))
+    if (query.includes('WorktreeTransitionLineage') || query.includes('CommittedContinuationLineage'))
       return {
         repository: {
           pullRequest: {
             closingIssuesReferences: {
-              nodes: [{ number: nativeClosingIssue, repository: { nameWithOwner: nativePrRepository } }],
-              pageInfo,
+              nodes: nativeClosingConnectionEmpty
+                ? []
+                : [{ number: nativeClosingIssue, repository: { nameWithOwner: nativePrRepository } }],
+              pageInfo: { ...pageInfo, hasNextPage: nativeClosingHasNextPage },
             },
           },
         },
@@ -5565,6 +5599,18 @@ async function syntheticLifecycle(routing: {
       throw new Error(`Unexpected REST route: ${route}`);
     },
     issues: {
+      listEventsForTimeline: async (input: { issue_number: number; page: number }) => {
+        assert.equal(input.issue_number, issueNumber);
+        nativeTimelineCalls += 1;
+        if (input.page === nativeTimelineFailurePage) throw new Error('Synthetic native timeline unavailable');
+        return {
+          headers:
+            nativeTimelineNextLink && input.page === 1
+              ? { link: '<https://api.example.test/repos/example/widget/issues/17/timeline?page=2>; rel="next"' }
+              : {},
+          data: nativeTimelinePages?.[input.page - 1] ?? (input.page === 1 ? [nativeReference()] : []),
+        };
+      },
       listComments: async () => ({ data: continuationComments }),
       getComment: async (input: { comment_id: number }) => ({
         data: continuationComments.find((comment) => comment.id === input.comment_id),
@@ -6539,6 +6585,77 @@ exec "${realGit}" "$@"
             );
           assert.equal(crashIndex, 2);
         }
+        if (routing.nativeRefsContinuation) {
+          nativeClosingConnectionEmpty = true;
+          nativeClosingHasNextPage = true;
+          await refuse(/Native PR lineage/u);
+          nativeClosingHasNextPage = false;
+          nativeClosingConnectionEmpty = false;
+          nativeClosingIssue = 18;
+          await refuse(/Native PR lineage/u);
+          nativeClosingIssue = issueNumber;
+          nativeClosingConnectionEmpty = true;
+          for (const body of ['', 'Refs #18', 'Refs #170', 'Refs #17letters', 'Refs #17_extra', 'Mention #17']) {
+            nativeRefsBody = body;
+            await refuse(/Native PR lineage/u);
+          }
+          nativeRefsBody = `Refs #${String(issueNumber)}`;
+          const event = nativeReference();
+          const source = event.source;
+          const sourceIssue = source.issue;
+          for (const invalid of [
+            undefined,
+            { ...event, actor: { ...event.actor, id: 99 } },
+            { ...event, actor: { ...event.actor, login: 'different-user' } },
+            { ...event, actor: { ...event.actor, type: 'Bot' } },
+            { ...event, created_at: mergedAt },
+            { ...event, created_at: new Date(Date.parse(mergedAt) + 1000).toISOString() },
+            { ...event, created_at: 'unknown' },
+            { ...event, source: { ...source, type: 'pull_request' } },
+            { ...event, source: { ...source, issue: { ...sourceIssue, number: 24 } } },
+            {
+              ...event,
+              source: {
+                ...source,
+                issue: { ...sourceIssue, repository_url: 'https://api.example.test/repos/other/widget' },
+              },
+            },
+            { ...event, source: { ...source, issue: { ...sourceIssue, html_url: 'https://example.test/pulls/24' } } },
+            {
+              ...event,
+              source: {
+                ...source,
+                issue: {
+                  ...sourceIssue,
+                  pull_request: { url: 'https://api.example.test/repos/example/widget/pulls/24' },
+                },
+              },
+            },
+            { ...event, source: { ...source, issue: { ...sourceIssue, pull_request: undefined } } },
+            { ...event, source: { ...source, issue: { ...sourceIssue, user: { ...sourceIssue.user, id: 99 } } } },
+          ]) {
+            nativeTimelinePages = [invalid === undefined ? [] : [invalid]];
+            await refuse(/Native PR lineage/u);
+          }
+          nativeTimelinePages = [[event]];
+          nativeTimelineFailurePage = 1;
+          await refuse(/Synthetic native timeline unavailable/u);
+          nativeTimelineFailurePage = 2;
+          nativeTimelineNextLink = true;
+          const before = nativeTimelineCalls;
+          await refuse(/Synthetic native timeline unavailable/u);
+          assert.equal(nativeTimelineCalls - before, 2, 'matching first page cannot hide a missing next page');
+          nativeTimelineFailurePage = undefined;
+          nativeTimelineNextLink = false;
+          nativeTimelinePages = [Array.from({ length: 100 }, () => ({ event: 'commented' })), [event]];
+          unlinkSync(witness.path);
+          try {
+            await refuse(/ownership witness/u);
+          } finally {
+            writeFileSync(witness.path, witness.bytes, { mode: 0o600 });
+          }
+          nativeRefsBody = `Refs #${String(issueNumber)}. Keep the issue open for retirement and supported consumer cutover.`;
+        }
         const first = await executeTool('issue_develop', { issueNumber }, execution).catch((error: Error) => error);
         assert.ok(first instanceof Error);
         assert.match(first.message, /exact native.*acceptance/u);
@@ -7074,6 +7191,16 @@ test(
     assert.ok(uninterrupted.value);
     assert.deepEqual(recovered.value, uninterrupted.value);
   },
+);
+
+test('supported develop preserves native Refs lineage for a committed descendant', { timeout: 0 }, async () =>
+  syntheticLifecycle({
+    remote: 'origin',
+    divergentOrigin: false,
+    committedDescendantContinuation: true,
+    nativeRefsContinuation: true,
+    interruptContinuation: false,
+  }),
 );
 
 test(

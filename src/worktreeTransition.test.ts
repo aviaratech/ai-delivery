@@ -773,6 +773,22 @@ test(
       f.nativePr.head.repo.full_name = 'example/widget';
       f.nativePr.user.login = 'changed-original-author';
       await assert.rejects(applyWorktreeTransition(f.context, input), /native PR lineage.*drifted/iu);
+      f.nativePr.user.login = 'synthetic-original-author';
+      Object.assign(f.nativePr, { body: 'Refs #17' });
+      f.context.clients.graphql = (async () => ({
+        repository: { pullRequest: { closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: false } } } },
+      })) as unknown as typeof f.context.clients.graphql;
+      let timelineReads = 0;
+      f.context.clients.rest.issues.listEventsForTimeline = (async () => {
+        timelineReads += 1;
+        return { data: [] };
+      }) as unknown as typeof f.context.clients.rest.issues.listEventsForTimeline;
+      assert.match(
+        (await inspectWorktreeTransition(f.context, f.inspectInput)).blockers.join('; '),
+        /repository.*closing issue/iu,
+      );
+      await assert.rejects(applyWorktreeTransition(f.context, input), /repository.*closing issue/iu);
+      assert.equal(timelineReads, 0, 'legacy transition purposes never use the continuation-specific Refs alternative');
     } finally {
       rmSync(f.root, { force: true, recursive: true });
     }
