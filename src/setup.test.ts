@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -47,11 +48,16 @@ const actors = vi.hoisted(() => ({
   reviewer: 'reviewer[bot]',
   access: true,
   projectId: 'PROJECT-1',
+  authorCalls: 0,
+  reviewerCalls: 0,
+  authorStarted: false,
+  authorAborted: false,
+  pauseAuthor: false,
 }));
 // Only GitHub HTTP/authentication is synthetic. Resolver, process ownership and file operations are real.
 vi.mock('./github/client.js', async (original) => ({
   ...(await original<typeof import('./github/client.js')>()),
-  createDeliveryGitHubClients: async (input: { role: string }) => ({
+  createDeliveryGitHubClients: async (input: { role: string; signal?: AbortSignal }) => ({
     ...syntheticDiscoveryClients(),
     graphql: async (query: string, variables: Record<string, unknown>) => {
       const result = await syntheticDiscoveryClients().graphql(query, variables);
@@ -62,8 +68,29 @@ vi.mock('./github/client.js', async (original) => ({
     authSource: input.role === 'author' ? 'personal' : 'app',
     credentialSource: input.role === 'author' ? 'env:AUTHOR_TOKEN' : 'app:reviewer',
     role: input.role,
-    authenticatedAuthor: async () => ({ actorLogin: actors.author, credentialIdentity: 'user:37' }),
-    appActorLogin: async () => actors.reviewer,
+    authenticatedAuthor: async (signal?: AbortSignal) => {
+      actors.authorCalls++;
+      actors.authorStarted = true;
+      if (actors.pauseAuthor) {
+        await new Promise<void>((resolve, reject) => {
+          // A delayed HTTP response bounds this fixture's request, not the stage's elapsed duration.
+          const response = setTimeout(resolve, 4_000);
+          const abort = () => {
+            clearTimeout(response);
+            actors.authorAborted = true;
+            reject(new Error('Synthetic author HTTP request aborted'));
+          };
+          const requestSignal = signal ?? input.signal;
+          if (requestSignal?.aborted) abort();
+          else requestSignal?.addEventListener('abort', abort, { once: true });
+        });
+      }
+      return { actorLogin: actors.author, credentialIdentity: 'user:37' };
+    },
+    appActorLogin: async () => {
+      actors.reviewerCalls++;
+      return actors.reviewer;
+    },
     rest: {
       repos: {
         get: async () => {
@@ -89,7 +116,12 @@ type SetupInput = {
   expectedConfigDigest: string;
   runtimeDirectory: string;
   signal?: AbortSignal;
-  resourceBounds?: { maxAggregateRssBytes: number; minFreeDiskBytes: number; maxNewOutputBytes: number };
+  resourceBounds?: {
+    maxAggregateRssBytes: number;
+    minFreeDiskBytes: number;
+    maxNewOutputBytes: number;
+    maxCapturedOutputBytes?: number;
+  };
 };
 type Stage = { stageId: string; admission: RuntimeAdmission; reused: boolean };
 type Producer = {
@@ -116,6 +148,11 @@ async function fixture() {
   actors.reviewer = 'reviewer[bot]';
   actors.access = true;
   actors.projectId = 'PROJECT-1';
+  actors.authorCalls = 0;
+  actors.reviewerCalls = 0;
+  actors.authorStarted = false;
+  actors.authorAborted = false;
+  actors.pauseAuthor = false;
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-setup-')));
   const root = join(base, 'consumer');
   mkdirSync(root);
@@ -173,7 +210,7 @@ async function fixture() {
   // Synthetic installer boundary: the real owned command copies fixture bytes; no process manager is mocked.
   writeFileSync(
     join(bin, 'npm'),
-    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nif(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{},1000);\n`,
+    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-settings'))},JSON.stringify({args,cwd:process.cwd(),TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP}));\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nconst logs=${JSON.stringify(join(base, 'log-bytes'))};\nif(fs.existsSync(logs))process.stdout.write(Buffer.alloc(Number(fs.readFileSync(logs,'utf8')),65),()=>{if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);});\nelse if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nconst memory=${JSON.stringify(join(base, 'memory-bytes'))};\nif(fs.existsSync(memory)){globalThis.fixtureAllocation=Buffer.alloc(Number(fs.readFileSync(memory,'utf8')),1);setInterval(()=>{},1000);}\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{},1000);\n`,
   );
   chmodSync(join(bin, 'npm'), 0o755);
   const previousPath = process.env.PATH;
@@ -205,6 +242,349 @@ function admitInput(input: SetupInput, stageId: string, prior: string | null = n
   const { archivePath: _archive, expectedArchiveSha256: _digest, packageVersion: _version, ...rest } = input;
   return { ...rest, authority: 'runtime:admit', stageId, expectedPriorAdmissionSha256: prior };
 }
+
+test('runtime-stage controller memory is bounded before authenticated preflight', async () => {
+  const api = await producer();
+  const f = await fixture();
+  try {
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: { maxAggregateRssBytes: 1, minFreeDiskBytes: 1, maxNewOutputBytes: 128 * 1024 ** 2 },
+      }),
+      /RSS.*limit|RSS.*bound/u,
+    );
+    assert.equal(actors.authorCalls, 0, 'over-budget controller must not start authenticated preflight');
+    assert.equal(existsSync(f.counter), false);
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('runtime-stage controller growth during preflight fails before installing', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const memoryUsage = process.memoryUsage.bind(process);
+  const memory = vi.spyOn(process, 'memoryUsage').mockImplementation(() => ({
+    ...memoryUsage(),
+    rss: actors.authorCalls === 0 ? 64 * 1024 ** 2 : 1024 ** 3,
+  }));
+  try {
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+        },
+      }),
+      /RSS.*limit|RSS.*bound/u,
+    );
+    assert.ok(actors.authorCalls > 0);
+    assert.equal(existsSync(f.counter), false, 'preflight failure must not release the npm command');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    memory.mockRestore();
+    f.cleanup();
+  }
+});
+
+for (const interruption of ['resource breach', 'caller cancellation'] as const) {
+  test(`runtime-stage ${interruption} aborts a delayed preflight request and releases ownership before continuation`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    const cancellation = new AbortController();
+    const actualMemory = process.memoryUsage.bind(process);
+    const memory = vi.spyOn(process, 'memoryUsage').mockImplementation(() => ({
+      ...actualMemory(),
+      rss: interruption === 'resource breach' && actors.authorStarted ? 1024 ** 3 : 64 * 1024 ** 2,
+    }));
+    actors.pauseAuthor = true;
+    try {
+      const rejected = assert.rejects(
+        api.stageRuntime({
+          ...f.input,
+          signal: cancellation.signal,
+          resourceBounds: {
+            maxAggregateRssBytes: 512 * 1024 ** 2,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: 128 * 1024 ** 2,
+            maxCapturedOutputBytes: 1024 ** 2,
+          },
+        }),
+        interruption === 'resource breach' ? /aggregate RSS .* exceeded limit/u : /cancelled/u,
+      );
+      if (interruption === 'caller cancellation') {
+        while (!actors.authorStarted) await new Promise((resolve) => setTimeout(resolve, 10));
+        cancellation.abort();
+      }
+      await rejected;
+      assert.equal(actors.authorAborted, true, 'in-flight author request must receive scope cancellation');
+      assert.equal(actors.reviewerCalls, 0, 'reviewer preflight must not continue after detection');
+      assert.equal(existsSync(f.counter), false);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+      memory.mockRestore();
+      actors.pauseAuthor = false;
+      const retry = await api.stageRuntime(f.input);
+      assert.equal(retry.reused, false, 'cancelled preflight must release writer ownership for a clean retry');
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+    } finally {
+      memory.mockRestore();
+      f.cleanup();
+    }
+  });
+}
+
+test('runtime-stage failure logs honor the caller retained-output cap outside the stage', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const logLimit = 1024 ** 2;
+  try {
+    writeFileSync(join(f.base, 'log-bytes'), String(2 * logLimit));
+    writeFileSync(join(f.base, 'fail'), 'go');
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+          maxCapturedOutputBytes: logLimit,
+        },
+      }),
+      /captured output exceeded/u,
+    );
+    const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+    const logs = readdirSync(outputDirectory);
+    assert.equal(logs.length, 1);
+    assert.ok(lstatSync(join(outputDirectory, logs[0]!)).size <= logLimit);
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('runtime-stage explicitly isolates npm cache, logs, configuration and temporary destinations', async () => {
+  const api = await producer();
+  const f = await fixture();
+  try {
+    await api.stageRuntime(f.input);
+    const settings = JSON.parse(readFileSync(join(f.base, 'installer-settings'), 'utf8')) as {
+      args: string[];
+      cwd: string;
+      TMPDIR: string;
+      TMP: string;
+      TEMP: string;
+    };
+    const stage = f.input.runtimeDirectory;
+    for (const option of ['--cache', '--logs-dir', '--userconfig', '--globalconfig']) {
+      assert.ok(settings.args.includes(option), `missing explicit npm ${option}`);
+      const value = settings.args[settings.args.indexOf(option) + 1]!;
+      assert.ok(value.startsWith(`${stage}/`), `npm ${option} must stay inside the owned stage`);
+      assert.ok(existsSync(value));
+    }
+    assert.equal(settings.cwd, stage);
+    for (const key of ['TMPDIR', 'TMP', 'TEMP'] as const) {
+      assert.ok(settings[key].startsWith(`${stage}/`), `${key} must stay inside the owned stage`);
+      assert.ok(existsSync(settings[key]));
+    }
+    assert.equal((await api.stageRuntime(f.input)).reused, true);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('runtime-stage post-install preflight growth cannot publish completion', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const memoryUsage = process.memoryUsage.bind(process);
+  const memory = vi.spyOn(process, 'memoryUsage').mockImplementation(() => ({
+    ...memoryUsage(),
+    rss: actors.authorCalls < 2 ? 64 * 1024 ** 2 : 1024 ** 3,
+  }));
+  try {
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+        },
+      }),
+      /RSS.*limit|RSS.*bound/u,
+    );
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x', 'installation must finish before the failing final preflight');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+  } finally {
+    memory.mockRestore();
+    f.cleanup();
+  }
+});
+
+test('runtime-stage bounds actual controller and npm memory and preserves an unrelated live peer', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const closed = new Promise<void>((resolve) => peer.once('close', () => resolve()));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      peer.once('spawn', () => resolve());
+      peer.once('error', reject);
+    });
+    writeFileSync(join(f.base, 'memory-bytes'), String(512 * 1024 ** 2));
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+          maxCapturedOutputBytes: 1024 ** 2,
+        },
+      }),
+      /aggregate RSS .* exceeded limit/u,
+    );
+    const ownedPid = Number(readFileSync(f.marker, 'utf8'));
+    assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
+    assert.equal(peer.exitCode, null);
+    process.kill(peer.pid!, 0);
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+  } finally {
+    peer.kill('SIGKILL');
+    await closed;
+    f.cleanup();
+  }
+});
+
+test('runtime-stage changed resource intent preserves compatible completed bytes without reinstalling', async () => {
+  const api = await producer();
+  const f = await fixture();
+  try {
+    const stage = await api.stageRuntime(f.input);
+    const path = join(f.input.runtimeDirectory, 'runtime-stage.json');
+    const completion = readFileSync(path);
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+          maxCapturedOutputBytes: 512 * 1024,
+        },
+      }),
+      /incompatible setup intent/u,
+    );
+    assert.deepEqual(readFileSync(path), completion);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    assert.equal((await api.stageRuntime(f.input)).stageId, stage.stageId);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('real npm isolation retains cache and logs inside the stage and preserves unrelated host destinations', async () => {
+  const api = await producer();
+  const realPath = process.env.PATH;
+  const f = await fixture();
+  const previous = {
+    cache: process.env.npm_config_cache,
+    logs: process.env.npm_config_logs_dir,
+    userconfig: process.env.npm_config_userconfig,
+  };
+  try {
+    process.env.PATH = realPath;
+    const outside = join(f.base, 'unrelated-host');
+    mkdirSync(outside);
+    const cache = join(outside, 'cache');
+    const logs = join(outside, 'logs');
+    for (const path of [cache, logs]) {
+      mkdirSync(path);
+      writeFileSync(join(path, 'keep'), 'unrelated');
+    }
+    const userconfig = join(outside, 'user.npmrc');
+    const config = `cache=${cache}\nlogs-dir=${logs}\n`;
+    writeFileSync(userconfig, config);
+    const nativeBin = join(f.base, 'native-bin');
+    mkdirSync(nativeBin);
+    const probe = join(f.input.runtimeDirectory, 'native-npm-observation.json');
+    const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
+    writeFileSync(
+      join(nativeBin, 'npm'),
+      `#!${process.execPath}\nconst fs=require('node:fs'),os=require('node:os');\nfs.writeFileSync(${JSON.stringify(probe)},JSON.stringify({args:process.argv.slice(2),cwd:process.cwd(),tmpdir:os.tmpdir(),npmVersion:require(${JSON.stringify(join(npmRoot, 'package.json'))}).version}),{mode:0o600});\nrequire(${JSON.stringify(join(npmRoot, 'bin/npm-cli.js'))});\n`,
+    );
+    chmodSync(join(nativeBin, 'npm'), 0o755);
+    process.env.PATH = `${nativeBin}:${realPath ?? ''}`;
+    process.env.npm_config_cache = cache;
+    process.env.npm_config_logs_dir = logs;
+    process.env.npm_config_userconfig = userconfig;
+    const stage = await api.stageRuntime({
+      ...f.input,
+      resourceBounds: {
+        maxAggregateRssBytes: 512 * 1024 ** 2,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 128 * 1024 ** 2,
+        maxCapturedOutputBytes: 1024 ** 2,
+      },
+    });
+    assert.equal(existsSync(f.counter), false, 'synthetic npm must not execute');
+    assert.equal(
+      execFileSync(process.execPath, [stage.admission.cliPath, '--version'], { encoding: 'utf8' }).trim(),
+      '0.3.5',
+    );
+    assert.ok(readdirSync(join(f.input.runtimeDirectory, '.npm/cache')).length > 0);
+    assert.ok(readdirSync(join(f.input.runtimeDirectory, '.npm/logs')).length > 0);
+    const native = JSON.parse(readFileSync(probe, 'utf8')) as {
+      args: string[];
+      cwd: string;
+      tmpdir: string;
+      npmVersion: string;
+    };
+    assert.equal(native.npmVersion, '11.19.0');
+    assert.equal(native.cwd, f.input.runtimeDirectory);
+    assert.equal(native.tmpdir, join(f.input.runtimeDirectory, '.npm/tmp'));
+    for (const option of ['--cache', '--logs-dir', '--userconfig', '--globalconfig']) {
+      assert.ok(native.args.includes(option));
+      assert.ok(native.args[native.args.indexOf(option) + 1]!.startsWith(`${f.input.runtimeDirectory}/`));
+    }
+    assert.deepEqual(readdirSync(cache), ['keep']);
+    assert.deepEqual(readdirSync(logs), ['keep']);
+    assert.equal(readFileSync(userconfig, 'utf8'), config);
+    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+    console.log(
+      'REAL_NPM_ISOLATION_RECEIPT',
+      JSON.stringify({
+        cacheAndLogsInsideStage: true,
+        temporaryAndConfigInsideStage: true,
+        unrelatedHostPreserved: true,
+        controllerInclusiveMemoryBytes: 512 * 1024 ** 2,
+        retainedLogCapBytes: 1024 ** 2,
+        hostActivated: false,
+        sharedAdmissionWritten: false,
+      }),
+    );
+  } finally {
+    for (const [name, value] of [
+      ['npm_config_cache', previous.cache],
+      ['npm_config_logs_dir', previous.logs],
+      ['npm_config_userconfig', previous.userconfig],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    f.cleanup();
+  }
+});
 
 test('public producer stages exact bytes, explicitly admits and reuses completed work without installing again', async () => {
   const api = await producer();

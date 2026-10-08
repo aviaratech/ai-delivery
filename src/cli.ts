@@ -70,6 +70,10 @@ program
   .requiredOption('--source-commit <sha>')
   .requiredOption('--config-digest <digest>')
   .requiredOption('--runtime-directory <path>')
+  .option('--max-aggregate-rss-bytes <bytes>', 'Sampled controller plus children RSS limit')
+  .option('--max-new-output-bytes <bytes>', 'Owned stage and metadata output limit')
+  .option('--min-free-disk-bytes <bytes>', 'Required free disk headroom')
+  .option('--max-captured-output-bytes <bytes>', 'Retained command log cap; defaults to 1 MiB')
   .option('--authorize-stage', 'Explicit authority to stage this reviewed archive')
   .action(async (o: Record<string, string | boolean>) =>
     run('runtime_stage', {
@@ -80,6 +84,18 @@ program
       expectedSourceCommit: o.sourceCommit,
       expectedConfigDigest: o.configDigest,
       runtimeDirectory: o.runtimeDirectory,
+      ...(['maxAggregateRssBytes', 'maxNewOutputBytes', 'minFreeDiskBytes', 'maxCapturedOutputBytes'].some(
+        (key) => o[key] !== undefined,
+      )
+        ? {
+            resourceBounds: {
+              maxAggregateRssBytes: Number(o.maxAggregateRssBytes ?? 1024 ** 3),
+              minFreeDiskBytes: Number(o.minFreeDiskBytes ?? 256 * 1024 ** 2),
+              maxNewOutputBytes: Number(o.maxNewOutputBytes ?? 512 * 1024 ** 2),
+              maxCapturedOutputBytes: Number(o.maxCapturedOutputBytes ?? 1024 ** 2),
+            },
+          }
+        : {}),
     }),
   );
 

@@ -20,6 +20,17 @@ import { withLock } from './utils/lockfile.js';
 import { withRuntimeSetupWriter } from './verification.js';
 
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
+const StageBounds = z.strictObject({
+  maxAggregateRssBytes: z.number().int().positive().safe(),
+  minFreeDiskBytes: z.number().int().positive().safe(),
+  maxNewOutputBytes: z.number().int().positive().safe(),
+  maxCapturedOutputBytes: z
+    .number()
+    .int()
+    .positive()
+    .safe()
+    .max(8 * 1024 ** 2),
+});
 const IntentSchema = z.strictObject({
   archivePath: z.string().min(1),
   archiveSha256: Digest,
@@ -30,6 +41,7 @@ const IntentSchema = z.strictObject({
   reviewRouteDigest: Digest,
   runtimeDirectory: z.string().min(1),
   sourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
+  resourceBounds: StageBounds.optional(),
 });
 const StageSchema = z
   .strictObject({
@@ -84,7 +96,12 @@ export interface StageRuntimeInput extends SetupControllerInput {
   expectedArchiveSha256: string;
   packageVersion: string;
   signal?: AbortSignal;
-  resourceBounds?: { maxAggregateRssBytes: number; minFreeDiskBytes: number; maxNewOutputBytes: number };
+  resourceBounds?: {
+    maxAggregateRssBytes: number;
+    minFreeDiskBytes: number;
+    maxNewOutputBytes: number;
+    maxCapturedOutputBytes?: number;
+  };
 }
 export interface AdmitRuntimeInput extends SetupControllerInput {
   authority: 'runtime:admit';
@@ -132,7 +149,13 @@ function assertArchiveSnapshot(intent: StageRecord['intent']): string {
     throw new DeliveryError('Runtime stage archive snapshot bytes changed.');
   return path;
 }
-async function controller(input: SetupControllerInput, command: 'runtime:stage' | 'runtime:admit') {
+async function controller(
+  input: SetupControllerInput,
+  command: 'runtime:stage' | 'runtime:admit',
+  checkResources?: () => Promise<void>,
+  signal?: AbortSignal,
+) {
+  await checkResources?.();
   if (typeof input.identity !== 'string' || !input.identity.trim())
     throw new DeliveryError('Runtime setup requires an explicit configured author identity.');
   const root = gitRoot(input.repoRoot);
@@ -146,8 +169,10 @@ async function controller(input: SetupControllerInput, command: 'runtime:stage' 
     identity: input.identity,
     repoRoot: root,
     role: 'author',
+    ...(signal === undefined ? {} : { signal }),
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
   });
+  await checkResources?.();
   const policy = evaluateCommandIdentityPolicy({
     commandName: command,
     deliveryConfig: context.config,
@@ -157,7 +182,14 @@ async function controller(input: SetupControllerInput, command: 'runtime:stage' 
   if (policy.error) throw new DeliveryError(policy.error);
   if (!context.configuration || context.configuration.configDigest !== input.expectedConfigDigest)
     throw new DeliveryError('Primary controller resolver config digest changed.');
-  const reviewRoute = await preflightReviewRoute(context);
+  const reviewRoute = await preflightReviewRoute(
+    context,
+    undefined,
+    undefined,
+    'publication',
+    checkResources === undefined || signal === undefined ? undefined : { signal, checkResources },
+  );
+  await checkResources?.();
   // Publication preflight requires the actual configured author credential, not a development override.
   assertClean(root);
   if (coordinate(root).sha !== input.expectedSourceCommit)
@@ -247,133 +279,169 @@ function assertStageController(
 /** Stage one reviewed local archive without activating host references or issuing admission. */
 export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeStageResult> {
   if (input.authority !== 'runtime:stage') throw new DeliveryError('Explicit runtime:stage authority is required.');
-  const current = await controller(input, 'runtime:stage');
-  assertArchive(input.archivePath, input.expectedArchiveSha256);
-  const intent = IntentSchema.parse({
-    archivePath: input.archivePath,
-    archiveSha256: input.expectedArchiveSha256,
-    configDigest: input.expectedConfigDigest,
-    sourceCommit: input.expectedSourceCommit,
-    packageVersion: input.packageVersion,
-    repoRoot: current.root,
-    repository: current.configuration.config.repository,
-    reviewRouteDigest: digestValue(current.reviewRoute),
-    runtimeDirectory: input.runtimeDirectory,
+  const bounds = StageBounds.parse({
+    maxAggregateRssBytes: 1024 ** 3,
+    minFreeDiskBytes: 256 * 1024 ** 2,
+    maxNewOutputBytes: 512 * 1024 ** 2,
+    maxCapturedOutputBytes: 1024 ** 2,
+    ...input.resourceBounds,
   });
-  const stageId = digestValue(intent);
-  return withRuntimeSetupWriter(current.root, async (runner) => {
-    if (existsSync(input.runtimeDirectory)) {
-      const prior = readStage(input.runtimeDirectory);
-      if (prior.stageId !== stageId) throw new DeliveryError('Runtime stage belongs to an incompatible setup intent.');
-      if (prior.status === 'complete') {
-        const reread = await controller(input, 'runtime:stage');
-        assertStageController(prior, reread, input);
-        assertArchive(intent.archivePath, intent.archiveSha256);
-        durability(join(input.runtimeDirectory, 'reviewed-archive.tgz'));
-        assertArchiveSnapshot(intent);
-        validateRuntimeAdmission(prior.admission!, reread.configuration, prior.admission!.cliPath);
-        durability(join(input.runtimeDirectory, 'runtime-stage.json'));
-        syncDirectory(dirname(input.runtimeDirectory));
-        return stageResult(prior, reread.reviewRoute, true);
-      }
-      runner.assertQuiescent();
-      rmSync(input.runtimeDirectory, { recursive: true });
-    }
-    ensurePrivateDirectoryDurably(dirname(input.runtimeDirectory));
-    mkdirSync(input.runtimeDirectory, { mode: 0o700 });
-    const directory = lstatSync(input.runtimeDirectory);
-    const content: Omit<StageRecord, 'recordId'> = {
-      schemaVersion: 'ai-delivery.runtime-stage@1',
-      stageId,
-      intent,
-      directory: { device: directory.dev, inode: directory.ino },
-      status: 'incomplete',
-    };
-    let owned = false;
-    try {
-      syncDirectory(dirname(input.runtimeDirectory));
-      writeStage(input.runtimeDirectory, content);
-      owned = true;
-      if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
-      const bounds = input.resourceBounds ?? {
-        maxAggregateRssBytes: 1024 ** 3,
-        minFreeDiskBytes: 256 * 1024 ** 2,
-        maxNewOutputBytes: 512 * 1024 ** 2,
-      };
-      // Hash and persist the same captured bytes. npm must never reopen the mutable transport pathname.
-      const archiveBytes = assertArchive(input.archivePath, input.expectedArchiveSha256);
-      if (!Number.isSafeInteger(bounds.maxNewOutputBytes) || archiveBytes.length >= bounds.maxNewOutputBytes)
-        throw new DeliveryError('Reviewed archive snapshot exceeds the stage output limit.');
-      writeCreateOnly(join(input.runtimeDirectory, 'reviewed-archive.tgz'), archiveBytes);
-      const snapshot = assertArchiveSnapshot(intent);
-      await runner.run(
-        [
-          'npm',
-          'install',
-          '--prefix',
-          input.runtimeDirectory,
-          '--omit=dev',
-          '--ignore-scripts',
-          '--no-audit',
-          '--no-fund',
-          '--package-lock=false',
-          snapshot,
-        ],
-        {
-          ...bounds,
-          maxNewOutputBytes: bounds.maxNewOutputBytes - archiveBytes.length,
-          outputRoots: [input.runtimeDirectory],
-        },
-        input.signal,
-      );
-      const reread = await controller(input, 'runtime:stage');
-      assertStageController({ ...content, recordId: digestValue(content) }, reread, input);
+  canonicalPath(input.runtimeDirectory);
+  return withRuntimeSetupWriter(
+    input.repoRoot,
+    async (runner) => {
+      const current = await controller(input, 'runtime:stage', runner.checkResources, runner.signal);
       assertArchive(input.archivePath, input.expectedArchiveSha256);
-      assertArchiveSnapshot(intent);
-      const packageRoot = join(input.runtimeDirectory, 'node_modules', '@aviaratech', 'ai-delivery');
-      const plugin = join(packageRoot, 'plugins', 'ai-delivery');
-      const admission = buildRuntimeAdmission({
-        cliPath: join(packageRoot, 'dist', 'cli.js'),
-        mcpLauncherPath: join(plugin, 'dist', 'mcp-launcher.js'),
-        pluginManifestPath: join(plugin, '.claude-plugin', 'plugin.json'),
-        packageVersion: input.packageVersion,
-        sourceArchiveSha256: input.expectedArchiveSha256,
+      const intent = IntentSchema.parse({
+        archivePath: input.archivePath,
+        archiveSha256: input.expectedArchiveSha256,
+        configDigest: input.expectedConfigDigest,
         sourceCommit: input.expectedSourceCommit,
-        configuration: reread.configuration,
+        packageVersion: input.packageVersion,
+        repoRoot: current.root,
+        repository: current.configuration.config.repository,
+        reviewRouteDigest: digestValue(current.reviewRoute),
+        runtimeDirectory: input.runtimeDirectory,
+        resourceBounds: bounds,
       });
-      if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
-      runner.assertQuiescent();
-      const complete = writeStage(input.runtimeDirectory, { ...content, status: 'complete', admission });
-      validateRuntimeAdmission(complete.admission!, reread.configuration, complete.admission!.cliPath);
-      return stageResult(complete, reread.reviewRoute, false);
-    } catch (error) {
-      // Completion is a durable unit. Never prune it after a lost write response.
-      if (!owned) {
-        runner.assertQuiescent();
-        const retained = lstatSync(input.runtimeDirectory);
-        if (retained.dev !== directory.dev || retained.ino !== directory.ino || retained.isSymbolicLink())
-          throw new DeliveryError('Runtime stage cleanup ownership changed.');
-        rmSync(input.runtimeDirectory, { recursive: true });
-      } else {
-        runner.assertQuiescent();
-        const retained = readStage(input.runtimeDirectory);
-        if (retained.stageId !== stageId) throw new DeliveryError('Runtime stage cleanup ownership changed.');
-        if (retained.status === 'incomplete') rmSync(input.runtimeDirectory, { recursive: true });
-        else {
-          const final = await controller(input, 'runtime:stage');
-          assertStageController(retained, final, input);
+      const stageId = digestValue(intent);
+      if (existsSync(input.runtimeDirectory)) {
+        const prior = readStage(input.runtimeDirectory);
+        if (prior.stageId !== stageId)
+          throw new DeliveryError('Runtime stage belongs to an incompatible setup intent.');
+        if (prior.status === 'complete') {
+          const reread = await controller(input, 'runtime:stage', runner.checkResources, runner.signal);
+          assertStageController(prior, reread, input);
           assertArchive(intent.archivePath, intent.archiveSha256);
           durability(join(input.runtimeDirectory, 'reviewed-archive.tgz'));
           assertArchiveSnapshot(intent);
-          validateRuntimeAdmission(retained.admission!, final.configuration, retained.admission!.cliPath);
+          validateRuntimeAdmission(prior.admission!, reread.configuration, prior.admission!.cliPath);
           durability(join(input.runtimeDirectory, 'runtime-stage.json'));
           syncDirectory(dirname(input.runtimeDirectory));
-          return stageResult(retained, final.reviewRoute, true);
+          await runner.checkResources();
+          return stageResult(prior, reread.reviewRoute, true);
         }
+        runner.assertQuiescent();
+        rmSync(input.runtimeDirectory, { recursive: true });
       }
-      throw error;
-    }
-  });
+      ensurePrivateDirectoryDurably(dirname(input.runtimeDirectory));
+      mkdirSync(input.runtimeDirectory, { mode: 0o700 });
+      const directory = lstatSync(input.runtimeDirectory);
+      const content: Omit<StageRecord, 'recordId'> = {
+        schemaVersion: 'ai-delivery.runtime-stage@1',
+        stageId,
+        intent,
+        directory: { device: directory.dev, inode: directory.ino },
+        status: 'incomplete',
+      };
+      let owned = false;
+      try {
+        syncDirectory(dirname(input.runtimeDirectory));
+        writeStage(input.runtimeDirectory, content);
+        owned = true;
+        if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
+        // Hash and persist the same captured bytes. npm must never reopen the mutable transport pathname.
+        const archiveBytes = assertArchive(input.archivePath, input.expectedArchiveSha256);
+        if (!Number.isSafeInteger(bounds.maxNewOutputBytes) || archiveBytes.length >= bounds.maxNewOutputBytes)
+          throw new DeliveryError('Reviewed archive snapshot exceeds the stage output limit.');
+        writeCreateOnly(join(input.runtimeDirectory, 'reviewed-archive.tgz'), archiveBytes);
+        const snapshot = assertArchiveSnapshot(intent);
+        const npmRoot = join(input.runtimeDirectory, '.npm');
+        const cache = join(npmRoot, 'cache');
+        const logs = join(npmRoot, 'logs');
+        const temporary = join(npmRoot, 'tmp');
+        for (const path of [cache, logs, temporary]) ensurePrivateDirectoryDurably(path);
+        const userconfig = join(npmRoot, 'user.npmrc');
+        const globalconfig = join(npmRoot, 'global.npmrc');
+        writeCreateOnly(userconfig, Buffer.alloc(0));
+        writeCreateOnly(globalconfig, Buffer.alloc(0));
+        await runner.checkResources();
+        await runner.run(
+          [
+            'npm',
+            'install',
+            '--prefix',
+            input.runtimeDirectory,
+            '--omit=dev',
+            '--ignore-scripts',
+            '--no-audit',
+            '--no-fund',
+            '--package-lock=false',
+            '--cache',
+            cache,
+            '--logs-dir',
+            logs,
+            '--userconfig',
+            userconfig,
+            '--globalconfig',
+            globalconfig,
+            snapshot,
+          ],
+          {
+            ...bounds,
+            maxNewOutputBytes: bounds.maxNewOutputBytes - archiveBytes.length,
+            outputRoots: [input.runtimeDirectory],
+          },
+          input.signal,
+          { ...process.env, TMPDIR: temporary, TMP: temporary, TEMP: temporary },
+          input.runtimeDirectory,
+        );
+        const reread = await controller(input, 'runtime:stage', runner.checkResources, runner.signal);
+        assertStageController({ ...content, recordId: digestValue(content) }, reread, input);
+        assertArchive(input.archivePath, input.expectedArchiveSha256);
+        assertArchiveSnapshot(intent);
+        const packageRoot = join(input.runtimeDirectory, 'node_modules', '@aviaratech', 'ai-delivery');
+        const plugin = join(packageRoot, 'plugins', 'ai-delivery');
+        const admission = buildRuntimeAdmission({
+          cliPath: join(packageRoot, 'dist', 'cli.js'),
+          mcpLauncherPath: join(plugin, 'dist', 'mcp-launcher.js'),
+          pluginManifestPath: join(plugin, '.claude-plugin', 'plugin.json'),
+          packageVersion: input.packageVersion,
+          sourceArchiveSha256: input.expectedArchiveSha256,
+          sourceCommit: input.expectedSourceCommit,
+          configuration: reread.configuration,
+        });
+        if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
+        runner.assertQuiescent();
+        validateRuntimeAdmission(admission, reread.configuration, admission.cliPath);
+        await runner.checkResources();
+        const complete = writeStage(input.runtimeDirectory, { ...content, status: 'complete', admission });
+        validateRuntimeAdmission(complete.admission!, reread.configuration, complete.admission!.cliPath);
+        return stageResult(complete, reread.reviewRoute, false);
+      } catch (error) {
+        // Completion is a durable unit. Never prune it after a lost write response.
+        if (!owned) {
+          runner.assertQuiescent();
+          const retained = lstatSync(input.runtimeDirectory);
+          if (retained.dev !== directory.dev || retained.ino !== directory.ino || retained.isSymbolicLink())
+            throw new DeliveryError('Runtime stage cleanup ownership changed.');
+          rmSync(input.runtimeDirectory, { recursive: true });
+        } else {
+          runner.assertQuiescent();
+          const retained = readStage(input.runtimeDirectory);
+          if (retained.stageId !== stageId) throw new DeliveryError('Runtime stage cleanup ownership changed.');
+          if (retained.status === 'incomplete') rmSync(input.runtimeDirectory, { recursive: true });
+          else {
+            const final = await controller(input, 'runtime:stage', runner.checkResources, runner.signal);
+            assertStageController(retained, final, input);
+            assertArchive(intent.archivePath, intent.archiveSha256);
+            durability(join(input.runtimeDirectory, 'reviewed-archive.tgz'));
+            assertArchiveSnapshot(intent);
+            validateRuntimeAdmission(retained.admission!, final.configuration, retained.admission!.cliPath);
+            durability(join(input.runtimeDirectory, 'runtime-stage.json'));
+            syncDirectory(dirname(input.runtimeDirectory));
+            return stageResult(retained, final.reviewRoute, true);
+          }
+        }
+        throw error;
+      }
+    },
+    {
+      bounds: { ...bounds, outputRoots: [input.runtimeDirectory] },
+      maxCapturedOutputBytes: bounds.maxCapturedOutputBytes,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    },
+  );
 }
 
 export class RuntimeAdmissionCommitUnknownError extends DeliveryError {

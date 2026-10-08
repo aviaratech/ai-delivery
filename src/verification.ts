@@ -966,9 +966,14 @@ function sampleOwnedTree(
   baseline?: OutputBaseline,
   newOutputBytes?: number,
   controllerRssBytes = 0,
+  includeControllerTree = false,
 ): ResourceSample {
-  const owned = observeOwnedProcesses(state, processSnapshot());
-  const rssBytes = owned.reduce((total, member) => total + member.rssBytes, controllerRssBytes);
+  const snapshot = processSnapshot();
+  const owned = observeOwnedProcesses(state, snapshot);
+  const controller = includeControllerTree
+    ? controllerTreeRssBytes(snapshot, new Set(owned.map((member) => member.pid)))
+    : controllerRssBytes;
+  const rssBytes = owned.reduce((total, member) => total + member.rssBytes, controller);
   if (!Number.isSafeInteger(rssBytes))
     throw new DeliveryError('Owned aggregate RSS is outside the safe integer range.');
   if (rssBytes > bounds.maxAggregateRssBytes) {
@@ -993,6 +998,23 @@ function sampleOwnedTree(
     ...(newOutputBytes === undefined ? {} : { newOutputBytes }),
     ownedProcessCount: owned.length,
   };
+}
+
+/** Accounting includes the caller's tree; containment remains restricted to the recorded command. */
+function controllerTreeRssBytes(snapshot = processSnapshot(), excluded = new Set<number>()): number {
+  const controller = snapshot.get(process.pid);
+  if (controller === undefined || controller.status.startsWith('Z'))
+    throw new DeliveryError('Runtime setup controller resource observation is unavailable.');
+  const selected = new Set([process.pid]);
+  let bytes = process.memoryUsage().rss;
+  for (const pid of selected)
+    for (const member of snapshot.values())
+      if (member.ppid === pid && !member.status.startsWith('Z') && !selected.has(member.pid)) {
+        selected.add(member.pid);
+        if (!excluded.has(member.pid)) bytes += member.rssBytes;
+      }
+  if (!Number.isSafeInteger(bytes)) throw new DeliveryError('Controller aggregate RSS observation overflowed.');
+  return bytes;
 }
 
 async function confirmOwnedCleanup(state: OwnedProcessState): Promise<void> {
@@ -1565,6 +1587,9 @@ function runStageCommand(
   writer?: VerificationWriter,
   execution?: {
     environment: NodeJS.ProcessEnv;
+    cwd?: string;
+    maxCapturedOutputBytes?: number;
+    includeControllerTree?: boolean;
     onCaptured?(bytes: number): void;
     onCleanupFailure?(reason: string): void;
   },
@@ -1585,7 +1610,7 @@ function runStageCommand(
         ...args,
       ],
       {
-        cwd: repoRoot,
+        cwd: execution?.cwd ?? repoRoot,
         detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'pipe'],
         ...(baseline?.gate === undefined && execution === undefined
@@ -1605,6 +1630,8 @@ function runStageCommand(
         ? undefined
         : { rootPid: child.pid, sampled: false, tracked: new Map() };
     let outputBytes = 0;
+    let retainedOutputBytes = 0;
+    const outputLimit = execution?.maxCapturedOutputBytes ?? 8 * 1024 * 1024;
     let sampledOutputBytes = 0;
     let failure: string | undefined;
     let cleanupFailure: string | undefined;
@@ -1702,11 +1729,21 @@ function runStageCommand(
         stop('source-phase captured output exceeded remaining cumulative allowance');
         return;
       }
-      if (outputBytes > 8 * 1024 * 1024) {
-        stop('captured output exceeded 8 MiB');
+      if (outputBytes > outputLimit) {
+        const remaining = outputLimit - retainedOutputBytes;
+        if (remaining > 0) {
+          chunks.push(Buffer.from(chunk.subarray(0, remaining)));
+          retainedOutputBytes += Math.min(remaining, chunk.length);
+        }
+        stop(
+          execution?.maxCapturedOutputBytes === undefined
+            ? 'captured output exceeded 8 MiB'
+            : `captured output exceeded ${outputLimit} bytes`,
+        );
         return;
       }
       chunks.push(chunk);
+      retainedOutputBytes += chunk.length;
     };
     child.stdout.on('data', (chunk: Buffer) => capture(stdout, chunk));
     child.stderr.on('data', (chunk: Buffer) => capture(stderr, chunk));
@@ -1740,6 +1777,7 @@ function runStageCommand(
               baseline,
               undefined,
               execution === undefined ? 0 : process.memoryUsage().rss,
+              execution?.includeControllerTree,
             );
             onResourceSample?.(result);
             onRunning?.(outputBytes, result);
@@ -1766,6 +1804,7 @@ function runStageCommand(
                 baseline,
                 bytes + (execution === undefined ? 0 : outputBytes),
                 execution === undefined ? 0 : process.memoryUsage().rss,
+                execution?.includeControllerTree,
               );
               onResourceSample?.(result);
               onRunning?.(outputBytes, result);
@@ -1813,6 +1852,7 @@ function runStageCommand(
                 : (await positiveNewOutputBytes(baseline, scanCancellation.signal)) +
                     (execution === undefined ? 0 : outputBytes),
               execution === undefined ? 0 : process.memoryUsage().rss,
+              execution?.includeControllerTree,
             );
             onResourceSample?.(sample);
             onRunning?.(outputBytes, sample);
@@ -3313,77 +3353,200 @@ export async function withRuntimeSetupWriter<T>(
   root: string,
   operation: (runner: {
     assertQuiescent(): void;
-    run(argv: readonly string[], bounds: VerificationResourceBounds, signal?: AbortSignal): Promise<Buffer>;
+    checkResources: () => Promise<void>;
+    signal: AbortSignal;
+    run(
+      argv: readonly string[],
+      bounds: VerificationResourceBounds,
+      signal?: AbortSignal,
+      environment?: NodeJS.ProcessEnv,
+      cwd?: string,
+    ): Promise<Buffer>;
   }) => Promise<T>,
+  scope?: { bounds: VerificationResourceBounds; maxCapturedOutputBytes: number; signal?: AbortSignal },
 ): Promise<T> {
+  const cancellation = new AbortController();
+  const signal =
+    scope?.signal === undefined ? cancellation.signal : AbortSignal.any([scope.signal, cancellation.signal]);
+  let failure: Error | undefined;
+  let baseline: OutputBaseline | undefined;
+  let captured = 0;
+  const started = Date.now();
+  const guard = (): number => {
+    if (failure !== undefined) throw failure;
+    if (signal.aborted) throw new DeliveryError('Runtime setup cancelled.');
+    const rss = scope === undefined ? 0 : controllerTreeRssBytes();
+    if (scope !== undefined) {
+      if (rss > scope.bounds.maxAggregateRssBytes)
+        throw new DeliveryError(`Controller aggregate RSS ${rss} exceeded limit ${scope.bounds.maxAggregateRssBytes}.`);
+      assertDiskHeadroom(root, scope.bounds, baseline);
+    }
+    return rss;
+  };
+  if (scope !== undefined) {
+    assertResourceBounds(scope.bounds);
+    if (
+      !Number.isSafeInteger(scope.maxCapturedOutputBytes) ||
+      scope.maxCapturedOutputBytes <= 0 ||
+      scope.maxCapturedOutputBytes > 8 * 1024 ** 2
+    )
+      throw new DeliveryError('Invalid runtime setup captured-output bound; maximum is 8 MiB.');
+    guard();
+  }
+  root = gitRoot(root);
   return withVerificationWriter(root, async (writer) =>
-    operation({
-      assertQuiescent: () => writer.assertQuiescent(),
-      run: async (argv, bounds, signal) => {
-        assertResourceBounds(bounds);
-        const roots = bounds.outputRoots?.map((path) => resolve(root, path)).sort();
-        if (roots !== undefined) {
-          for (let i = 1; i < roots.length; i++)
-            if (roots[i] === roots[i - 1] || roots[i]!.startsWith(`${roots[i - 1]}${sep}`))
-              throw new DeliveryError('Filesystem output roots must not overlap.');
-        }
-        return withOutputObservationGate(root, roots !== undefined, async (gate) => {
-          const links: OutputBaseline['links'] = new Map();
-          const files =
-            roots === undefined
-              ? undefined
-              : await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots, links), signal);
-          const baseline =
-            roots === undefined || files === undefined
-              ? undefined
-              : {
-                  roots,
-                  files,
-                  links,
-                  baselineId: digestValue([...files]),
-                  ...(gate === undefined ? {} : { gate }),
-                };
-          assertDiskHeadroom(root, bounds, baseline);
-          const started = Date.now();
-          const output = await runStageCommand(
-            root,
-            argv,
-            signal,
-            (capturedOutputBytes, sample, reason) =>
-              reportVerificationProgress({
-                state: 'running',
-                stageId: 'runtime-setup',
-                completedStages: 0,
-                reusedStages: 0,
-                remainingStages: 1,
-                elapsedMs: Date.now() - started,
-                capturedOutputBytes,
-                ...(reason === undefined ? {} : { reason }),
-                ...(sample === undefined
-                  ? {}
-                  : {
-                      sampledAggregateRssBytes: sample.aggregateRssBytes,
-                      sampledFreeDiskBytes: sample.freeDiskBytes,
-                      sampledNewOutputBytes: sample.newOutputBytes,
-                    }),
-              }),
-            bounds,
-            baseline,
-            undefined,
-            writer,
+    withOutputObservationGate(root, scope !== undefined, async (scopeGate) => {
+      if (scope !== undefined) {
+        const paths = [...(scope.bounds.outputRoots ?? []), join(gitCommonDir(root), 'ai-delivery')]
+          .map((path) => resolve(root, path))
+          .sort();
+        const roots = paths.filter(
+          (path, index) => !paths.slice(0, index).some((prior) => path === prior || path.startsWith(`${prior}${sep}`)),
+        );
+        const links: OutputBaseline['links'] = new Map();
+        const files = await withOutputGateLock(scopeGate, 'scan', () => scanOutputRoots(roots, links), signal);
+        baseline = {
+          roots,
+          links,
+          files,
+          baselineId: digestValue([...files]),
+          ...(scopeGate === undefined ? {} : { gate: scopeGate }),
+        };
+      }
+      const checkResources = async (): Promise<void> => {
+        const rss = guard();
+        if (scope === undefined || baseline === undefined) return;
+        const newOutputBytes = captured + (await positiveNewOutputBytes(baseline, signal));
+        guard();
+        if (newOutputBytes > scope.bounds.maxNewOutputBytes!)
+          throw new DeliveryError(
+            `Runtime setup output ${newOutputBytes} exceeded limit ${scope.bounds.maxNewOutputBytes!}.`,
           );
-          if (signal?.aborted) throw new DeliveryError('Runtime setup cancelled.');
-          reportVerificationProgress({
-            state: 'completed',
-            stageId: 'runtime-setup',
-            completedStages: 1,
-            reusedStages: 0,
-            remainingStages: 0,
-            elapsedMs: Date.now() - started,
-          });
-          return output;
+        reportVerificationProgress({
+          state: 'running',
+          stageId: 'runtime-setup',
+          completedStages: 0,
+          reusedStages: 0,
+          remainingStages: 1,
+          elapsedMs: Date.now() - started,
+          capturedOutputBytes: captured,
+          sampledAggregateRssBytes: rss,
+          sampledFreeDiskBytes: freeDiskBytes(root, baseline),
+          sampledNewOutputBytes: newOutputBytes,
         });
-      },
+      };
+      await checkResources();
+      const timer =
+        scope === undefined
+          ? undefined
+          : setInterval(() => {
+              try {
+                guard();
+              } catch (error) {
+                failure ??= error instanceof Error ? error : new DeliveryError(String(error));
+                cancellation.abort();
+              }
+            }, 1_000);
+      timer?.unref();
+      try {
+        const result = await operation({
+          assertQuiescent: () => writer.assertQuiescent(),
+          checkResources,
+          signal,
+          run: async (argv, bounds, commandSignal, environment, cwd) => {
+            await checkResources();
+            assertResourceBounds(bounds);
+            const roots = bounds.outputRoots?.map((path) => resolve(root, path)).sort();
+            if (roots !== undefined) {
+              for (let i = 1; i < roots.length; i++)
+                if (roots[i] === roots[i - 1] || roots[i]!.startsWith(`${roots[i - 1]}${sep}`))
+                  throw new DeliveryError('Filesystem output roots must not overlap.');
+            }
+            const run = async (gate: OutputGate | undefined): Promise<Buffer> => {
+              const links: OutputBaseline['links'] = new Map();
+              const files =
+                roots === undefined
+                  ? undefined
+                  : await withOutputGateLock(gate, 'scan', () => scanOutputRoots(roots, links), signal);
+              const commandBaseline =
+                roots === undefined || files === undefined
+                  ? undefined
+                  : {
+                      roots,
+                      files,
+                      links,
+                      baselineId: digestValue([...files]),
+                      ...(gate === undefined ? {} : { gate }),
+                    };
+              assertDiskHeadroom(root, bounds, commandBaseline);
+              let commandCaptured = 0;
+              const output = await runStageCommand(
+                root,
+                argv,
+                commandSignal === undefined ? signal : AbortSignal.any([signal, commandSignal]),
+                (capturedOutputBytes, sample, reason) =>
+                  reportVerificationProgress({
+                    state: 'running',
+                    stageId: 'runtime-setup:install',
+                    completedStages: 0,
+                    reusedStages: 0,
+                    remainingStages: 1,
+                    elapsedMs: Date.now() - started,
+                    capturedOutputBytes,
+                    ...(reason === undefined ? {} : { reason }),
+                    ...(sample === undefined
+                      ? {}
+                      : {
+                          sampledAggregateRssBytes: sample.aggregateRssBytes,
+                          sampledFreeDiskBytes: sample.freeDiskBytes,
+                          sampledNewOutputBytes: sample.newOutputBytes,
+                        }),
+                  }),
+                bounds,
+                commandBaseline,
+                undefined,
+                writer,
+                scope === undefined && environment === undefined && cwd === undefined
+                  ? undefined
+                  : {
+                      environment: environment ?? process.env,
+                      ...(cwd === undefined ? {} : { cwd }),
+                      ...(scope === undefined
+                        ? {}
+                        : { maxCapturedOutputBytes: scope.maxCapturedOutputBytes, includeControllerTree: true }),
+                      onCaptured: (bytes) => {
+                        captured += bytes - commandCaptured;
+                        commandCaptured = bytes;
+                      },
+                    },
+              );
+              await checkResources();
+              return output;
+            };
+            return scope === undefined ? withOutputObservationGate(root, roots !== undefined, run) : run(scopeGate);
+          },
+        });
+        await checkResources();
+        reportVerificationProgress({
+          state: 'completed',
+          stageId: 'runtime-setup',
+          completedStages: 1,
+          reusedStages: 0,
+          remainingStages: 0,
+          elapsedMs: Date.now() - started,
+        });
+        return result;
+      } catch (error) {
+        if (failure !== undefined)
+          throw new DeliveryError(
+            `${failure.message} Runtime setup operation failed (${error instanceof Error ? error.message : String(error)}).`,
+          );
+        if (signal.aborted)
+          throw new DeliveryError(`Runtime setup cancelled. ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      } finally {
+        if (timer !== undefined) clearInterval(timer);
+      }
     }),
   );
 }

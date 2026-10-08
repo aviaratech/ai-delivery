@@ -445,7 +445,13 @@ export async function preflightReviewRoute(
   base = baseBranch(context.root, context.configuration?.remote),
   selectedReviewer?: GitHubClients,
   purpose: 'development' | 'publication' = 'publication',
+  control?: { signal: AbortSignal; checkResources: () => Promise<void> },
 ): Promise<ReviewRoutePreflight> {
+  const check = async (): Promise<void> => {
+    await control?.checkResources();
+    control?.signal.throwIfAborted();
+  };
+  await check();
   const configuredAuthorSource = context.config.roles.author.authSource ?? 'app';
   const personalDevelopmentOverride =
     purpose === 'development' && configuredAuthorSource === 'app' && context.clients.authSource === 'personal';
@@ -459,7 +465,8 @@ export async function preflightReviewRoute(
   if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor) {
     throw new DeliveryError('Delivery access preflight requires authenticated author identity readback.');
   }
-  const author = await context.clients.authenticatedAuthor();
+  const author = await context.clients.authenticatedAuthor(control?.signal);
+  await check();
   if (!author.actorLogin || !author.credentialIdentity) {
     throw new DeliveryError('Author GitHub identity readback is incomplete.');
   }
@@ -470,11 +477,14 @@ export async function preflightReviewRoute(
       identity: context.config.roles.reviewer.identity,
       role: 'reviewer',
       selectedAuthor: context.clients,
+      ...(control === undefined ? {} : { signal: control.signal }),
     }));
+  await check();
   if (reviewer.role !== 'reviewer' || reviewer.authSource !== 'app' || !reviewer.appActorLogin) {
     throw new DeliveryError('Configured reviewer GitHub App identity is unavailable.');
   }
-  const reviewerActor = await reviewer.appActorLogin();
+  const reviewerActor = await reviewer.appActorLogin(control?.signal);
+  await check();
   if (!reviewerActor) throw new DeliveryError('Reviewer GitHub App actor lookup is incomplete.');
   if (author.actorLogin.toLowerCase() === reviewerActor.toLowerCase()) {
     throw new DeliveryError(
@@ -482,7 +492,13 @@ export async function preflightReviewRoute(
     );
   }
   try {
-    const repository = (await reviewer.rest.repos.get({ ...context.repo })).data;
+    const repository = (
+      await reviewer.rest.repos.get({
+        ...context.repo,
+        ...(control === undefined ? {} : { request: { signal: control.signal } }),
+      })
+    ).data;
+    await check();
     if (repository.full_name.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()) {
       throw new DeliveryError('Reviewer GitHub App repository readback disagrees with the selected checkout.');
     }
@@ -496,12 +512,15 @@ export async function preflightReviewRoute(
     context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
       ...context.repo,
       branch: base,
+      ...(control === undefined ? {} : { request: { signal: control.signal } }),
     }),
     context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
       ...context.repo,
       branch: base,
+      ...(control === undefined ? {} : { request: { signal: control.signal } }),
     }),
   ]);
+  await check();
   const counts: number[] = [];
   if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
     for (const rule of rulesetResult.value.data) {

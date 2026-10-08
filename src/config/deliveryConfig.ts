@@ -331,9 +331,12 @@ export async function loadDeliveryConfig(
   options: {
     clients?: DiscoveryClients;
     personalAuth?: boolean;
+    signal?: AbortSignal;
   } = {},
 ): Promise<LoadedDeliveryConfig> {
+  options.signal?.throwIfAborted();
   const settings = await loadDeliverySettings(repositoryRoot);
+  options.signal?.throwIfAborted();
   const legacyPersonalAuth = options.personalAuth === true && settings.roles.author.authSource !== 'personal';
   const clients =
     options.clients ??
@@ -342,6 +345,7 @@ export async function loadDeliveryConfig(
       identity: legacyPersonalAuth ? 'personal' : settings.roles.author.identity,
       ...(legacyPersonalAuth ? { personalAuth: { enabled: true as const } } : {}),
       role: 'author',
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
     }));
   let routing: DeliveryRouting;
   try {
