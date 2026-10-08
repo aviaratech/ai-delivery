@@ -68,6 +68,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       archivePath: z.string().min(1),
       expectedArchiveSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
       packageVersion: z.string().regex(/^\d+\.\d+\.\d+$/u),
+      nativePluginRoot: z.string().min(1).optional(),
       resourceBounds: z
         .strictObject({
           maxAggregateRssBytes: z.number().int().positive().safe(),

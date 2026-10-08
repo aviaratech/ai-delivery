@@ -16,6 +16,7 @@ import { buildVelocityReport, getDeliveryRecords } from './services/deliveryReco
 import { listWorktreesStrict } from './services/worktreeRegistry.js';
 import { cleanupNonIssueWorktree } from './worktree.js';
 import { PACKAGE_VERSION } from './version.js';
+import { managePlugin } from './pluginInstaller.js';
 
 const program = new Command();
 program
@@ -26,6 +27,19 @@ program
   .option('--personal-auth', 'Explicit legacy personal-token author override')
   .option('--repo <owner/name>', 'Repository selector; must match the configured checkout')
   .option('--repo-root <path>', 'Target Git repository root', process.cwd());
+
+// Only the plugin command group owns a local --version input. Skip global option
+// values when selecting its parser so an unrelated argument named plugin has no effect.
+for (let index = 2; index < process.argv.length; index++) {
+  const argument = process.argv[index]!;
+  const option = program.options.find((value) => value.long === argument.split('=')[0] || value.short === argument);
+  if (option) {
+    if (option.required && !argument.includes('=')) index++;
+    continue;
+  }
+  if (argument === 'plugin') program.enablePositionalOptions();
+  break;
+}
 
 function execution(): ExecutionContext {
   const options = program.opts<{ identity?: string; personalAuth?: boolean; repo?: string; repoRoot: string }>();
@@ -62,6 +76,43 @@ function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+const plugin = program.command('plugin').description('Manage the ai-delivery native plugin');
+for (const action of ['install', 'doctor', 'update', 'rollback', 'remove'] as const) {
+  const command = plugin
+    .command(action)
+    .requiredOption('--host <host>', 'Native host: codex or claude-code')
+    .option('--scope <scope>', 'Native scope: user, project, or local; Codex supports user', 'user')
+    .option('--dry-run', 'Describe the selected target without changing files or contacting native tools')
+    .option('--json', 'Print the result as JSON');
+  if (action === 'install' || action === 'update')
+    command.requiredOption('--version <version>', 'Explicit published package version');
+  command.action(
+    async (options: { host: string; scope: string; version?: string; dryRun?: boolean; json?: boolean }) => {
+      const result = await managePlugin({
+        action,
+        host: options.host,
+        scope: options.scope,
+        ...(options.version === undefined ? {} : { version: options.version }),
+        dryRun: options.dryRun === true,
+        repoRoot: execution().repoRoot,
+      });
+      if (options.json) {
+        print(result);
+        return;
+      }
+      process.stdout.write(
+        `${result.dryRun ? 'Dry run: ' : ''}${result.host} ${result.scope}: ${action}; version ${result.version ?? 'none'}; installed ${result.installed}; changed ${result.changed}\n`,
+      );
+      if (result.mcp)
+        process.stdout.write(
+          `Bundled MCP startup: ${result.mcp.startup}${result.mcp.error ? ` (${result.mcp.error})` : ''}\n`,
+        );
+      if (result.recoveryRequired)
+        process.stdout.write('Resume the interrupted original plugin command to recover this target.\n');
+    },
+  );
+}
+
 program
   .command('runtime:stage')
   .description('Stage a reviewed archive in a private directory; does not activate or admit it')
@@ -71,6 +122,7 @@ program
   .requiredOption('--source-commit <sha>')
   .requiredOption('--config-digest <digest>')
   .requiredOption('--runtime-directory <path>')
+  .option('--native-plugin-root <path>', 'Bind the exact reviewed native plugin root')
   .option('--max-aggregate-rss-bytes <bytes>', 'Sampled controller plus children RSS limit')
   .option('--max-new-output-bytes <bytes>', 'Owned stage and metadata output limit')
   .option('--min-free-disk-bytes <bytes>', 'Required free disk headroom')
@@ -85,6 +137,7 @@ program
       expectedSourceCommit: o.sourceCommit,
       expectedConfigDigest: o.configDigest,
       runtimeDirectory: o.runtimeDirectory,
+      ...(o.nativePluginRoot === undefined ? {} : { nativePluginRoot: o.nativePluginRoot }),
       ...(['maxAggregateRssBytes', 'maxNewOutputBytes', 'minFreeDiskBytes', 'maxCapturedOutputBytes'].some(
         (key) => o[key] !== undefined,
       )

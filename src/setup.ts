@@ -1,4 +1,14 @@
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from 'node:fs';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { z } from 'zod';
 
@@ -40,6 +50,7 @@ const IntentSchema = z.strictObject({
   repository: z.string().min(1),
   reviewRouteDigest: Digest,
   runtimeDirectory: z.string().min(1),
+  nativePluginRoot: z.string().min(1).optional(),
   sourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
   resourceBounds: StageBounds.optional(),
 });
@@ -66,17 +77,11 @@ const StageSchema = z
           value.admission.configDigest !== value.intent.configDigest ||
           value.admission.repository !== value.intent.repository ||
           value.admission.cliPath !==
-            join(value.intent.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/dist/cli.js') ||
+            runtimePaths(value.intent.runtimeDirectory, value.intent.nativePluginRoot).cliPath ||
           value.admission.mcpLauncherPath !==
-            join(
-              value.intent.runtimeDirectory,
-              'node_modules/@aviaratech/ai-delivery/plugins/ai-delivery/dist/mcp-launcher.js',
-            ) ||
+            runtimePaths(value.intent.runtimeDirectory, value.intent.nativePluginRoot).mcpLauncherPath ||
           value.admission.pluginManifestPath !==
-            join(
-              value.intent.runtimeDirectory,
-              'node_modules/@aviaratech/ai-delivery/plugins/ai-delivery/.claude-plugin/plugin.json',
-            )))
+            runtimePaths(value.intent.runtimeDirectory, value.intent.nativePluginRoot).pluginManifestPath))
     )
       context.addIssue({ code: 'custom', message: 'Runtime stage identity or completion is corrupt.' });
   });
@@ -95,6 +100,7 @@ export interface StageRuntimeInput extends SetupControllerInput {
   archivePath: string;
   expectedArchiveSha256: string;
   packageVersion: string;
+  nativePluginRoot?: string;
   signal?: AbortSignal;
   resourceBounds?: {
     maxAggregateRssBytes: number;
@@ -131,6 +137,60 @@ function canonicalPath(path: string): string {
     }
   }
   return path;
+}
+function runtimePaths(directory: string, nativePluginRoot?: string) {
+  const packageRoot = join(directory, 'node_modules', '@aviaratech', 'ai-delivery');
+  const pluginRoot = nativePluginRoot ?? join(packageRoot, 'plugins', 'ai-delivery');
+  return {
+    cliPath: nativePluginRoot ? join(pluginRoot, 'runtime', 'dist', 'cli.js') : join(packageRoot, 'dist', 'cli.js'),
+    mcpLauncherPath: join(pluginRoot, 'dist', 'mcp-launcher.js'),
+    pluginManifestPath: join(pluginRoot, '.claude-plugin', 'plugin.json'),
+  };
+}
+function assertNativeLocation(directory: string, nativePluginRoot?: string): void {
+  if (nativePluginRoot === undefined) return;
+  canonicalPath(nativePluginRoot);
+  if (
+    nativePluginRoot === directory ||
+    nativePluginRoot.startsWith(`${directory}${sep}`) ||
+    directory.startsWith(`${nativePluginRoot}${sep}`)
+  )
+    throw new DeliveryError('Native plugin cache and owned runtime stage paths must not overlap.');
+}
+/** A cache is read-only: every built file must match the reviewed archive's installed plugin. */
+function assertNativePlugin(intent: StageRecord['intent']): void {
+  if (intent.nativePluginRoot === undefined) return;
+  assertNativeLocation(intent.runtimeDirectory, intent.nativePluginRoot);
+  const source = canonicalPath(
+    join(intent.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/plugins/ai-delivery'),
+  );
+  let entries = 0;
+  const compare = (reviewed: string, selected: string, depth: number): void => {
+    if (depth > 16 || ++entries > 4096)
+      throw new DeliveryError('Native plugin inventory exceeds the reviewed layout bound.');
+    const expected = lstatSync(reviewed);
+    const actual = lstatSync(selected);
+    if (expected.isDirectory() && actual.isDirectory()) {
+      const names = readdirSync(reviewed).sort();
+      if (JSON.stringify(names) !== JSON.stringify(readdirSync(selected).sort()))
+        throw new DeliveryError('Selected native plugin inventory disagrees with reviewed archive bytes.');
+      for (const name of names) compare(join(reviewed, name), join(selected, name), depth + 1);
+    } else if (
+      !expected.isFile() ||
+      !actual.isFile() ||
+      expected.nlink !== 1 ||
+      actual.nlink !== 1 ||
+      expected.size !== actual.size ||
+      !readFileSync(reviewed).equals(readFileSync(selected))
+    )
+      throw new DeliveryError('Selected native plugin files disagree with reviewed archive bytes.');
+  };
+  try {
+    compare(source, intent.nativePluginRoot, 0);
+  } catch (error) {
+    if (error instanceof DeliveryError) throw error;
+    throw new DeliveryError('Selected native plugin cannot be matched to reviewed archive bytes.');
+  }
 }
 function assertArchive(path: string, expected: string): Buffer {
   canonicalPath(path);
@@ -213,7 +273,10 @@ function readStage(directory: string): StageRecord {
     metadata.ino !== record.directory.inode
   )
     throw new DeliveryError('Runtime stage directory ownership changed.');
-  if (record.status === 'complete') assertArchiveSnapshot(record.intent);
+  if (record.status === 'complete') {
+    assertArchiveSnapshot(record.intent);
+    assertNativePlugin(record.intent);
+  }
   return record;
 }
 function writeStage(directory: string, content: Omit<StageRecord, 'recordId'>): StageRecord {
@@ -287,6 +350,7 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
     ...input.resourceBounds,
   });
   canonicalPath(input.runtimeDirectory);
+  assertNativeLocation(input.runtimeDirectory, input.nativePluginRoot);
   return withRuntimeSetupWriter(
     input.repoRoot,
     async (runner) => {
@@ -303,8 +367,10 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
         reviewRouteDigest: digestValue(current.reviewRoute),
         runtimeDirectory: input.runtimeDirectory,
         resourceBounds: bounds,
+        ...(input.nativePluginRoot === undefined ? {} : { nativePluginRoot: input.nativePluginRoot }),
       });
       const stageId = digestValue(intent);
+      runner.bindCapturedOutput(stageId);
       if (existsSync(input.runtimeDirectory)) {
         const prior = readStage(input.runtimeDirectory);
         if (prior.stageId !== stageId)
@@ -371,6 +437,9 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
             cache,
             '--logs-dir',
             logs,
+            // Command capture owns the entire retained-log allowance.
+            '--logs-max',
+            '0',
             '--userconfig',
             userconfig,
             '--globalconfig',
@@ -390,17 +459,15 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
         assertStageController({ ...content, recordId: digestValue(content) }, reread, input);
         assertArchive(input.archivePath, input.expectedArchiveSha256);
         assertArchiveSnapshot(intent);
-        const packageRoot = join(input.runtimeDirectory, 'node_modules', '@aviaratech', 'ai-delivery');
-        const plugin = join(packageRoot, 'plugins', 'ai-delivery');
+        assertNativePlugin(intent);
         const admission = buildRuntimeAdmission({
-          cliPath: join(packageRoot, 'dist', 'cli.js'),
-          mcpLauncherPath: join(plugin, 'dist', 'mcp-launcher.js'),
-          pluginManifestPath: join(plugin, '.claude-plugin', 'plugin.json'),
+          ...runtimePaths(input.runtimeDirectory, input.nativePluginRoot),
           packageVersion: input.packageVersion,
           sourceArchiveSha256: input.expectedArchiveSha256,
           sourceCommit: input.expectedSourceCommit,
           configuration: reread.configuration,
         });
+        assertNativePlugin(intent);
         if (input.signal?.aborted) throw new DeliveryError('Runtime stage cancelled.');
         runner.assertQuiescent();
         validateRuntimeAdmission(admission, reread.configuration, admission.cliPath);

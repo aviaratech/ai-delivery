@@ -1,11 +1,10 @@
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "ai-delivery",
   "version": "0.3.23",
   "description": "GitHub issue and pull request delivery tools for prepared worktrees and evidence-based handoff.",
   "author": { "name": "AviaraTech", "url": "https://github.com/aviaratech" },
   "homepage": "https://github.com/aviaratech/ai-delivery#readme",
   "repository": "https://github.com/aviaratech/ai-delivery",
-  "license": "MIT",
-  "deliveryCapabilityVersion": 2,
-  "packageVersion": "0.3.23"
+  "license": "MIT"
 }
