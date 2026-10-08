@@ -1083,15 +1083,232 @@ test('supported issue source phase runs fixture tests, an enabled-hook commit an
     assert.equal(git(row.path, 'rev-parse', 'HEAD^'), input.source.head);
     assert.equal(receipt.source.indexTree, input.source.indexTree);
     assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    const { environment, ...legacyBinding } = input;
+    assert.equal(receipt.phaseId, digestValue({ ...legacyBinding, environmentDigest: environment.digest }));
+    assert.equal(Object.hasOwn(input.source.effect, 'configDigest'), false);
+    const completedPath = join(
+      gitCommonDir(root),
+      'ai-delivery',
+      'receipts',
+      'source-phase@1',
+      digestValue(row.path).slice(7),
+      `${receipt.phaseId.slice(7)}.json`,
+    );
+    const completedBytes = readFileSync(completedPath);
+    const completed = JSON.parse(completedBytes.toString()) as { binding: Pick<IssueSourcePhaseInput, 'source'> };
+    assert.equal(Object.hasOwn(completed.binding.source.effect, 'configDigest'), false);
     const reused = await withIssueSourcePhase(input, async () => {
       entered += 1;
     });
     assert.equal(reused.recordId, receipt.recordId);
     assert.equal(entered, 1);
+    assert.deepEqual(readFileSync(completedPath), completedBytes);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function sourceConfigurationTransitionFixture() {
+  const result = await sourcePhaseFixture({ personalAuthor: true, custodianIdentity: 'historical-builder' });
+  const { root, row, outputRoot, input } = result;
+  const policy = join(row.path, 'policy.mjs');
+  const original = readFileSync(policy, 'utf8');
+  const revised = `${original}\n// Declared candidate policy revision.\n`;
+  writeFileSync(policy, revised);
+  const finalConfiguration = await loadDeliveryConfig(row.path);
+  const finalPolicyDigest = sha256(policy);
+  git(row.path, 'add', 'policy.mjs');
+  const tree = git(row.path, 'write-tree');
+  writeFileSync(policy, original);
+  git(row.path, 'add', 'policy.mjs');
+  assert.equal(git(row.path, 'write-tree'), input.source.indexTree);
+  assert.equal(git(row.path, 'status', '--porcelain'), '');
+  assert.equal((await loadDeliveryConfig(row.path)).configDigest, input.source.configDigest);
+  assert.notEqual(finalConfiguration.configDigest, input.source.configDigest);
+  assert.notEqual(finalConfiguration.configDigest, finalPolicyDigest);
+  const effect = {
+    kind: 'commitOnce' as const,
+    parent: input.source.head,
+    tree,
+    configDigest: finalConfiguration.configDigest,
+  };
+  input.source.effect = effect;
+  const hook = join(root, '.git', 'source-phase-hooks', 'pre-commit');
+  mkdirSync(dirname(hook));
+  writeFileSync(hook, `#!/bin/sh\nprintf 'enabled\\n' >> ${JSON.stringify(join(outputRoot, 'hook-count.txt'))}\n`, {
+    mode: 0o700,
+  });
+  const gitPath = realpathSync(execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim());
+  input.inputs = [hook, gitPath].map((path) => ({ path, digest: sha256(path) }));
+  const transition = `const fs=require('node:fs'),c=require('node:child_process');
+fs.writeFileSync(${JSON.stringify(policy)},${JSON.stringify(revised)});
+const git=(...args)=>c.execFileSync(${JSON.stringify(gitPath)},args,{stdio:'inherit'});
+git('add','policy.mjs');
+git('-c',${JSON.stringify(`core.hooksPath=${dirname(hook)}`)},'commit','-m','Reviewed candidate policy transition');`;
+  input.commands[1]!.argv = [realpathSync(process.execPath), '-e', transition];
+  input.commandGraphDigest = digestValue(input.commands);
+  return { ...result, policy, original, revised, effect, transition };
+}
+
+test('supported issue source phase binds initial and final resolved candidate configurations across one normal-hook commit', async () => {
+  const { root, row, outputRoot, input, effect } = await sourceConfigurationTransitionFixture();
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    let entered = 0;
+    const receipt = await withIssueSourcePhase(input, async (context) => {
+      entered += 1;
+      assert.equal(context.source.configDigest, input.source.configDigest);
+      mkdirSync(outputRoot);
+      writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+      for (let index = 0; index < input.commands.length; index++) await context.run(index);
+    });
+    assert.equal(receipt.source.configDigest, effect.configDigest);
+    assert.equal(receipt.source.indexTree, effect.tree);
+    assert.equal(
+      git(row.path, 'rev-list', '--parents', '-n', '1', 'HEAD'),
+      `${receipt.source.head} ${input.source.head}`,
+    );
+    assert.equal(git(row.path, 'status', '--porcelain'), '');
+    assert.equal(git(root, 'rev-parse', 'HEAD'), input.controller.head);
+    assert.equal((await loadDeliveryConfig(root)).configDigest, input.controller.configDigest);
+    assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    const completed = sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId);
+    assert.deepEqual((completed?.binding as { source?: { effect?: unknown } } | undefined)?.source?.effect, effect);
+    const reused = await withIssueSourcePhase(input, async () => {
+      entered += 1;
+    });
+    assert.equal(reused.recordId, receipt.recordId);
+    assert.deepEqual(
+      sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId),
+      completed,
+    );
+    assert.equal(entered, 1);
+    assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    for (const digest of ['initial', 'final'] as const) {
+      const changed = structuredClone(input);
+      if (digest === 'initial') changed.source.configDigest = digestValue('different initial configuration');
+      else changed.source.effect = { ...effect, configDigest: digestValue('different final configuration') };
+      await assert.rejects(
+        withIssueSourcePhase(changed, async () => assert.fail('changed binding cannot reuse completion or enter')),
+        /initial source|configuration|reconciliation/u,
+      );
+      assert.deepEqual(
+        sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId),
+        completed,
+      );
+      assert.equal(readFileSync(join(outputRoot, 'hook-count.txt'), 'utf8'), 'enabled\n');
+    }
+    writeFileSync(join(row.path, 'policy.mjs'), 'export const deliverySettings = {};\n');
+    await assert.rejects(withIssueSourcePhase(input, async () => assert.fail('changed final source cannot reuse')));
+    assert.deepEqual(
+      sourcePhaseRecords(root).find((record) => record.phaseId === receipt.phaseId),
+      completed,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['preserve', 'invalid digest', 'unknown field'] as const)(
+  'supported issue source phase strictly refuses a final configuration declaration with %s',
+  async (invalid) => {
+    const { root, input, effect } = await sourceConfigurationTransitionFixture();
+    const declaration =
+      invalid === 'preserve'
+        ? { kind: 'preserve', configDigest: effect.configDigest }
+        : invalid === 'invalid digest'
+          ? { ...effect, configDigest: 'invalid' }
+          : { ...effect, finalConfigDigest: effect.configDigest };
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      await assert.rejects(
+        withIssueSourcePhase(
+          { ...input, source: { ...input.source, effect: declaration } } as IssueSourcePhaseInput,
+          async () => assert.fail('invalid declaration cannot enter'),
+        ),
+      );
+      assert.equal(existsSync(join(gitCommonDir(root), 'ai-delivery', 'receipts', 'source-phase@1')), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('supported issue source phase refuses the final configuration at the initial head before work', async () => {
+  const { root, input, policy, revised } = await sourceConfigurationTransitionFixture();
+  writeFileSync(policy, revised);
+  try {
+    const { withIssueSourcePhase } = await import('./agent.js');
+    await assert.rejects(
+      withIssueSourcePhase(input, async () => assert.fail('initial head requires initial configuration')),
+      /configuration/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  'omitted digest',
+  'wrong digest',
+  'wrong tree',
+  'wrong parent',
+  'second commit',
+  'dirty final',
+  'controller configuration',
+  'seal configuration',
+] as const)(
+  'supported issue source phase refuses a candidate configuration transition with %s without replay',
+  async (invalid) => {
+    const { root, row, outputRoot, input, effect, transition, policy, original } =
+      await sourceConfigurationTransitionFixture();
+    if (invalid === 'omitted digest') {
+      input.source.effect = { kind: 'commitOnce', parent: effect.parent, tree: effect.tree };
+    } else if (invalid === 'wrong digest') {
+      input.source.effect = { ...effect, configDigest: input.source.configDigest };
+    } else if (invalid === 'wrong tree') {
+      input.source.effect = { ...effect, tree: input.source.indexTree };
+    } else if (invalid === 'wrong parent') {
+      input.source.effect = { ...effect, parent: '1'.repeat(40) };
+    } else if (invalid === 'second commit') {
+      input.commands[1]!.argv[2] = `${transition}\ngit('commit','--allow-empty','-m','Undeclared second commit');`;
+    } else if (invalid === 'dirty final') {
+      input.commands[1]!.argv[2] = `${transition}\nfs.writeFileSync('artifact.txt','undeclared dirty final');`;
+    } else if (invalid === 'controller configuration') {
+      input.commands[1]!.argv[2] = `${transition}\nfs.appendFileSync(${JSON.stringify(join(root, 'policy.mjs'))},'\\n// Undeclared controller change.\\n');`;
+    } else {
+      input.commands[2]!.argv = [
+        realpathSync(process.execPath),
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(policy)},${JSON.stringify(original)});`,
+      ];
+    }
+    input.commandGraphDigest = digestValue(input.commands);
+    try {
+      const { withIssueSourcePhase } = await import('./agent.js');
+      let entered = 0;
+      await assert.rejects(
+        withIssueSourcePhase(input, async (context) => {
+          entered += 1;
+          mkdirSync(outputRoot);
+          writeFileSync(join(outputRoot, 'metadata.json'), '{}');
+          for (let index = 0; index < input.commands.length; index++) await context.run(index);
+        }),
+        invalid === 'controller configuration' ? /repository admission/u : /configuration|parent, tree/u,
+      );
+      assert.equal(entered, 1);
+      assert.notEqual(git(row.path, 'rev-parse', 'HEAD'), input.source.head);
+      assert.equal(sourcePhaseRecords(root)[0]?.status, 'unresolved');
+      const head = git(row.path, 'rev-parse', 'HEAD');
+      const hooks = readFileSync(join(outputRoot, 'hook-count.txt'));
+      await assert.rejects(withIssueSourcePhase(input, async () => assert.fail('failed commit cannot replay')));
+      assert.equal(git(row.path, 'rev-parse', 'HEAD'), head);
+      assert.deepEqual(readFileSync(join(outputRoot, 'hook-count.txt')), hooks);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('supported issue source phase never replays a commit followed by callback failure', async () => {
   const { root, row, input } = await sourcePhaseFixture();
@@ -5044,6 +5261,7 @@ async function syntheticLifecycle(routing: {
   producerOnboarding?: boolean;
   mergedContinuation?: boolean;
   committedDescendantContinuation?: boolean;
+  nativeRefsContinuation?: boolean;
   appAuthorContinuation?: boolean;
   crashCheckpoints?: boolean;
   interruptContinuation?: boolean;
@@ -5104,6 +5322,13 @@ async function syntheticLifecycle(routing: {
   const historicalActor = routing.committedDescendantContinuation ? 'host-user' : 'synthetic-author[bot]';
   let nativePrAuthor = historicalActor;
   let nativeClosingIssue = issueNumber;
+  let nativeClosingConnectionEmpty = false;
+  let nativeClosingHasNextPage = false;
+  let nativeRefsBody = `Refs #${String(issueNumber)}`;
+  let nativeTimelinePages: Record<string, unknown>[][] | undefined;
+  let nativeTimelineFailurePage: number | undefined;
+  let nativeTimelineNextLink = false;
+  let nativeTimelineCalls = 0;
   let nativePrRepository: string | undefined;
   const continuationComments: Record<string, unknown>[] = [];
   const createPayloads: Record<string, unknown>[] = [];
@@ -5130,6 +5355,8 @@ async function syntheticLifecycle(routing: {
     node_id: 'PR-23',
     title: 'Synthetic change',
     html_url: 'https://example.test/pulls/23',
+    url: 'https://api.example.test/repos/example/widget/pulls/23',
+    body: nativeRefsBody,
     state: stale ? 'open' : prState,
     draft: prDraft,
     merged_at: !stale && prState === 'closed' ? mergedAt : null,
@@ -5139,16 +5366,39 @@ async function syntheticLifecycle(routing: {
     mergeable_state: 'clean',
     user: { login: nativePrAuthor, id: 37, type: routing.committedDescendantContinuation ? 'User' : 'Bot' },
     head: { sha: headSha, ref: 'issue/17', ...(nativePrRepository ? { repo: { full_name: nativePrRepository } } : {}) },
-    base: { sha: baseSha, ref: 'main', ...(nativePrRepository ? { repo: { full_name: nativePrRepository } } : {}) },
+    base: {
+      sha: baseSha,
+      ref: 'main',
+      ...(nativePrRepository
+        ? { repo: { full_name: nativePrRepository, url: `https://api.example.test/repos/${nativePrRepository}` } }
+        : {}),
+    },
+  });
+  const nativeReference = () => ({
+    event: 'cross-referenced',
+    actor: { login: historicalActor, id: 37, type: 'User' },
+    created_at: new Date(Date.parse(mergedAt) - 60_000).toISOString(),
+    source: {
+      type: 'issue',
+      issue: {
+        number: prNumber,
+        user: { login: historicalActor, id: 37, type: 'User' },
+        repository_url: 'https://api.example.test/repos/example/widget',
+        html_url: 'https://example.test/pulls/23',
+        pull_request: { url: 'https://api.example.test/repos/example/widget/pulls/23' },
+      },
+    },
   });
   const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
-    if (query.includes('WorktreeTransitionLineage'))
+    if (query.includes('WorktreeTransitionLineage') || query.includes('CommittedContinuationLineage'))
       return {
         repository: {
           pullRequest: {
             closingIssuesReferences: {
-              nodes: [{ number: nativeClosingIssue, repository: { nameWithOwner: nativePrRepository } }],
-              pageInfo,
+              nodes: nativeClosingConnectionEmpty
+                ? []
+                : [{ number: nativeClosingIssue, repository: { nameWithOwner: nativePrRepository } }],
+              pageInfo: { ...pageInfo, hasNextPage: nativeClosingHasNextPage },
             },
           },
         },
@@ -5349,6 +5599,18 @@ async function syntheticLifecycle(routing: {
       throw new Error(`Unexpected REST route: ${route}`);
     },
     issues: {
+      listEventsForTimeline: async (input: { issue_number: number; page: number }) => {
+        assert.equal(input.issue_number, issueNumber);
+        nativeTimelineCalls += 1;
+        if (input.page === nativeTimelineFailurePage) throw new Error('Synthetic native timeline unavailable');
+        return {
+          headers:
+            nativeTimelineNextLink && input.page === 1
+              ? { link: '<https://api.example.test/repos/example/widget/issues/17/timeline?page=2>; rel="next"' }
+              : {},
+          data: nativeTimelinePages?.[input.page - 1] ?? (input.page === 1 ? [nativeReference()] : []),
+        };
+      },
       listComments: async () => ({ data: continuationComments }),
       getComment: async (input: { comment_id: number }) => ({
         data: continuationComments.find((comment) => comment.id === input.comment_id),
@@ -6323,6 +6585,77 @@ exec "${realGit}" "$@"
             );
           assert.equal(crashIndex, 2);
         }
+        if (routing.nativeRefsContinuation) {
+          nativeClosingConnectionEmpty = true;
+          nativeClosingHasNextPage = true;
+          await refuse(/Native PR lineage/u);
+          nativeClosingHasNextPage = false;
+          nativeClosingConnectionEmpty = false;
+          nativeClosingIssue = 18;
+          await refuse(/Native PR lineage/u);
+          nativeClosingIssue = issueNumber;
+          nativeClosingConnectionEmpty = true;
+          for (const body of ['', 'Refs #18', 'Refs #170', 'Refs #17letters', 'Refs #17_extra', 'Mention #17']) {
+            nativeRefsBody = body;
+            await refuse(/Native PR lineage/u);
+          }
+          nativeRefsBody = `Refs #${String(issueNumber)}`;
+          const event = nativeReference();
+          const source = event.source;
+          const sourceIssue = source.issue;
+          for (const invalid of [
+            undefined,
+            { ...event, actor: { ...event.actor, id: 99 } },
+            { ...event, actor: { ...event.actor, login: 'different-user' } },
+            { ...event, actor: { ...event.actor, type: 'Bot' } },
+            { ...event, created_at: mergedAt },
+            { ...event, created_at: new Date(Date.parse(mergedAt) + 1000).toISOString() },
+            { ...event, created_at: 'unknown' },
+            { ...event, source: { ...source, type: 'pull_request' } },
+            { ...event, source: { ...source, issue: { ...sourceIssue, number: 24 } } },
+            {
+              ...event,
+              source: {
+                ...source,
+                issue: { ...sourceIssue, repository_url: 'https://api.example.test/repos/other/widget' },
+              },
+            },
+            { ...event, source: { ...source, issue: { ...sourceIssue, html_url: 'https://example.test/pulls/24' } } },
+            {
+              ...event,
+              source: {
+                ...source,
+                issue: {
+                  ...sourceIssue,
+                  pull_request: { url: 'https://api.example.test/repos/example/widget/pulls/24' },
+                },
+              },
+            },
+            { ...event, source: { ...source, issue: { ...sourceIssue, pull_request: undefined } } },
+            { ...event, source: { ...source, issue: { ...sourceIssue, user: { ...sourceIssue.user, id: 99 } } } },
+          ]) {
+            nativeTimelinePages = [invalid === undefined ? [] : [invalid]];
+            await refuse(/Native PR lineage/u);
+          }
+          nativeTimelinePages = [[event]];
+          nativeTimelineFailurePage = 1;
+          await refuse(/Synthetic native timeline unavailable/u);
+          nativeTimelineFailurePage = 2;
+          nativeTimelineNextLink = true;
+          const before = nativeTimelineCalls;
+          await refuse(/Synthetic native timeline unavailable/u);
+          assert.equal(nativeTimelineCalls - before, 2, 'matching first page cannot hide a missing next page');
+          nativeTimelineFailurePage = undefined;
+          nativeTimelineNextLink = false;
+          nativeTimelinePages = [Array.from({ length: 100 }, () => ({ event: 'commented' })), [event]];
+          unlinkSync(witness.path);
+          try {
+            await refuse(/ownership witness/u);
+          } finally {
+            writeFileSync(witness.path, witness.bytes, { mode: 0o600 });
+          }
+          nativeRefsBody = `Refs #${String(issueNumber)}. Keep the issue open for retirement and supported consumer cutover.`;
+        }
         const first = await executeTool('issue_develop', { issueNumber }, execution).catch((error: Error) => error);
         assert.ok(first instanceof Error);
         assert.match(first.message, /exact native.*acceptance/u);
@@ -6858,6 +7191,16 @@ test(
     assert.ok(uninterrupted.value);
     assert.deepEqual(recovered.value, uninterrupted.value);
   },
+);
+
+test('supported develop preserves native Refs lineage for a committed descendant', { timeout: 0 }, async () =>
+  syntheticLifecycle({
+    remote: 'origin',
+    divergentOrigin: false,
+    committedDescendantContinuation: true,
+    nativeRefsContinuation: true,
+    interruptContinuation: false,
+  }),
 );
 
 test(

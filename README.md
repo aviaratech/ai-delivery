@@ -325,6 +325,13 @@ comment's native ID. The operator attests that all other launchers and writers
 are quiescent and remain excluded through recovery. The existing writer slot
 must be absent; this flow never recovers or terminates an unknown writer.
 
+For this committed-descendant case only, a complete empty native closing-issue
+connection may instead bind an explicit `Refs #<issue>` reference, with optional
+explanatory text, to complete native issue-timeline cross-reference evidence for
+the same PR, repository and authenticated historical author before the merge. The PR body alone is
+insufficient. Missing, incomplete or mismatched native evidence is refused;
+other worktree transition purposes retain their closing-issue requirement.
+
 Repeat `develop` or existing-issue `start` after interruption. Recovery checks
 the same pinned native comments, revocation, original bytes and exact original
 or replacement row before completing. Other mutations, including metadata
@@ -456,6 +463,15 @@ cooperative callback: use its AbortSignal and issue all subprocesses through
 `run`. JavaScript is not sandboxed. Source must preserve the exact initial
 snapshot or produce the one declared commit with its exact parent/tree and
 clean postconditions. Normal commit hooks remain enabled.
+
+For a declared candidate policy change, set the optional
+`source.effect.configDigest` on `commitOnce` to the final resolved candidate
+configuration digest. `source.configDigest` binds the initial configuration;
+the final digest applies only to the exact declared clean child commit. Resolve
+both digests through the SDK's configuration loader; a policy file hash is not
+a resolved configuration digest. Omitting the final digest requires the initial
+configuration throughout and preserves existing record identities. `preserve`
+does not accept a final digest. The controller configuration remains fixed.
 
 The existing writer fence is published before lengthy validation/scans. The
 same runner accounts for the controller and owned descendants, captured logs,

@@ -1035,7 +1035,100 @@ export async function readMergedContinuationTerminal(
   if (!terminal || !historical.run.writer || historical.run.classification.repository !== context.config.repository)
     throw new DeliveryError('Committed continuation lacks supported exact historical terminal provenance.');
   await validateTerminalMerge(context, row, historical.run, publication, terminal);
-  await readNativeWorktreePrLineage(context, row.issueNumber, row.prNumber);
+  const lineage = await context.clients.graphql<{
+    repository: { pullRequest: { closingIssuesReferences: unknown } | null } | null;
+  }>(
+    `query CommittedContinuationLineage($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+      closingIssuesReferences(first: 100) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage } }
+    } }
+  }`,
+    { ...context.repo, number: row.prNumber },
+  );
+  const closing = z
+    .object({
+      nodes: z.array(
+        z.object({ number: z.number().int().positive(), repository: z.object({ nameWithOwner: z.string().min(1) }) }),
+      ),
+      pageInfo: z.object({ hasNextPage: z.literal(false) }),
+    })
+    .safeParse(lineage.repository?.pullRequest?.closingIssuesReferences);
+  if (
+    !closing.success ||
+    pr.head.repo?.full_name.toLowerCase() !== context.config.repository.toLowerCase() ||
+    pr.base.repo.full_name.toLowerCase() !== context.config.repository.toLowerCase()
+  )
+    throw new DeliveryError(
+      'Native PR lineage does not establish the exact repository and complete closing connection.',
+    );
+  if (
+    closing.data.nodes.some(
+      (issue) =>
+        issue.number === row.issueNumber &&
+        issue.repository.nameWithOwner.toLowerCase() === context.config.repository.toLowerCase(),
+    )
+  ) {
+    await readNativeWorktreePrLineage(context, row.issueNumber, row.prNumber);
+  } else {
+    const mergedAt = Date.parse(pr.merged_at ?? '');
+    if (
+      closing.data.nodes.length !== 0 ||
+      !new RegExp(`^Refs[ \\t]+#${String(row.issueNumber)}(?=$|[ \\t.,;:!?])`, 'imu').test(pr.body ?? '') ||
+      !Number.isFinite(mergedAt) ||
+      !pr.merged ||
+      pr.head.ref !== row.branch ||
+      !pr.base.ref ||
+      !Sha.safeParse(pr.base.sha).success ||
+      pr.merge_commit_sha !== terminal.mergeSha
+    )
+      throw new DeliveryError('Native PR lineage lacks the exact unfinished Refs relationship.');
+    const reference = z.object({
+      event: z.literal('cross-referenced'),
+      actor: z.object({ login: z.string(), id: z.number().int().positive(), type: z.literal('User') }),
+      created_at: z.string(),
+      source: z.object({
+        type: z.literal('issue'),
+        issue: z.object({
+          number: z.number().int().positive(),
+          user: z.object({ login: z.string(), id: z.number().int().positive(), type: z.literal('User') }),
+          repository_url: z.string(),
+          html_url: z.string(),
+          pull_request: z.object({ url: z.string() }),
+        }),
+      }),
+    });
+    let matched = false;
+    // Read every page before accepting even a matching first-page reference.
+    for (let page = 1; ; page += 1) {
+      const events = await context.clients.rest.issues.listEventsForTimeline({
+        ...context.repo,
+        issue_number: row.issueNumber,
+        per_page: 100,
+        page,
+      });
+      if (!Array.isArray(events.data)) throw new DeliveryError('Native PR lineage timeline is incomplete.');
+      for (const event of events.data) {
+        const parsed = reference.safeParse(event);
+        if (!parsed.success) continue;
+        const native = parsed.data;
+        const at = Date.parse(native.created_at);
+        matched ||=
+          Number.isFinite(at) &&
+          at < mergedAt &&
+          native.actor.login.toLowerCase() === operator.actorLogin.toLowerCase() &&
+          `user:${String(native.actor.id)}` === operator.credentialIdentity &&
+          native.source.issue.number === row.prNumber &&
+          native.source.issue.user.login.toLowerCase() === operator.actorLogin.toLowerCase() &&
+          `user:${String(native.source.issue.user.id)}` === operator.credentialIdentity &&
+          native.source.issue.repository_url === pr.base.repo.url &&
+          native.source.issue.html_url === pr.html_url &&
+          native.source.issue.pull_request.url === pr.url;
+      }
+      if (events.data.length < 100 && !/;\s*rel="next"/u.test(events.headers.link ?? '')) break;
+    }
+    if (!matched)
+      throw new DeliveryError('Native PR lineage lacks complete authenticated before-merge cross-reference evidence.');
+  }
   const attemptPath = mergeAttemptPath(row.path, row.issueNumber, head);
   const resultPath = mergeResultPath(row.path, row.issueNumber, head);
   const attempt = readOptionalPrivate(attemptPath, (value) => MergeAttemptSchema.parse(value));
