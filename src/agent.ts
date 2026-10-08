@@ -11,7 +11,18 @@ export { resolveDeliveryRepo } from './github/repo.js';
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS, createAiDeliveryMcpServer } from './mcp/index.js';
 export { executeTool } from './dispatch.js';
 export { evaluateAgentReadiness } from './services/agentReadinessService.js';
-export { createIssue, updateIssue, issueInfo, readyCheck, developIssue, listIssueSubissues } from './issue.js';
+export {
+  createIssue,
+  updateIssue,
+  issueInfo,
+  readyCheck,
+  developIssue,
+  listIssueSubissues,
+  commentIssue,
+} from './issue.js';
+export { ISSUE_COMMENT_BODY_LIMIT } from './issue.js';
+export type { IssueCommentInput, IssueCommentReadback } from './issue.js';
+export type { JournalInput } from './issueJournal.js';
 export { prInfo, listPrs, prChecks, checkoutPr, publishPr, submitFormalReview, mergePr, finishIssue } from './pr.js';
 export { preparePrWorktree, cleanupNonIssueWorktree } from './worktree.js';
 export {

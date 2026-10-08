@@ -527,11 +527,87 @@ their existing owners and checks.
 
 ## Compatibility contract
 
-The MCP input and result contract is `ai-delivery.mcp@1`, exported as `AI_DELIVERY_MCP_CONTRACT_VERSION`. It retains the 13 `issue_*` tool names. Each tool rejects unknown fields at the request boundary. `issue_create` accepts a title with optional body, Issue Type, Points, Priority, taxonomy labels, milestone, parent and blockers; it returns `{body, created: {number, title, url}, routing}`. A linked parent is read back and cleared of Points. `issue_start({issueNumber})` always checks readiness and prepares that existing issue; `develop` gates only preparation of a newly created issue. New starts default to 2 Points. `resumeCreated` requires both `issueNumber` and `develop: true` and never creates a second issue. Immediate creation and development preflights readiness before creation and returns `ai-delivery.issue-start-registration@1` with `status: "started"` or a `created-not-started` failure and exact `safeResume` arguments. The CLI prints that recovery JSON and exits nonzero for `created-not-started`. Scratch starts derive safe names from the request or title and return the branch and worktree path. `repo` on create, start and ready check, or global CLI `--repo`, must match the repository selected by the checkout's validated Git remote; a mismatch fails before a GitHub call.
+The MCP input and result contract is `ai-delivery.mcp@1`, exported as `AI_DELIVERY_MCP_CONTRACT_VERSION`. It retains the existing 13 `issue_*` tools and adds typed `issue_comment`. Each tool rejects unknown fields at the request boundary. `issue_create` accepts a title with optional body, Issue Type, Points, Priority, taxonomy labels, milestone, parent and blockers; it returns `{body, created: {number, title, url}, routing}`. A linked parent is read back and cleared of Points. `issue_start({issueNumber})` always checks readiness and prepares that existing issue; `develop` gates only preparation of a newly created issue. New starts default to 2 Points. `resumeCreated` requires `issueNumber` and an explicit `develop` boolean and never creates a second issue; `develop: false` recovers creation-only registration and journaling. Immediate creation and development preflights readiness before creation and returns `ai-delivery.issue-start-registration@1` with `status: "started"` or a `created-not-started` failure and exact `safeResume` arguments. The CLI prints that recovery JSON and exits nonzero for `created-not-started`. Scratch starts derive safe names from the request or title and return the branch and worktree path. `repo` on create, start and ready check, or global CLI `--repo`, must match the repository selected by the checkout's validated Git remote; a mismatch fails before a GitHub call.
 
 `issue_update` returns authoritative issue readback and synchronizes configured Project status from live native blockers. Closed issues and Done items remain Done; removing the last unresolved blocker returns to Todo. To park execution while retaining a worktree, use `ai-delivery update --issue 17 --park` or `issue_update({issueNumber: 17, park: true})`; status becomes Todo, or Blocked while native blockers remain. Unrelated metadata edits preserve parked presentation. Resume explicitly with `develop`/`issue_develop` or an existing-issue start, which still requires readiness; worktree presence never establishes active execution. `issue_info` returns current native metadata, parent, blockers, Project state and registered worktree; `issue_ready_check` returns deterministic admission and reasons; `issue_develop` and `issue_worktree_create` return registered worktree rows. `issue_verify` returns classification, aggregate, manifest and publication evidence IDs, plus the sampled resource summary when limits were supplied. `issue_pr_create` returns the PR number, URL and bound publication evidence ID, plus route evidence or the live review state on ready promotion; `issue_pr_info` returns number, state, exact head/base, draft flag, author login and URL. `issue_pr_review` returns an exact-head submitted review receipt and live required-review state, `issue_pr_merge` a durable merge receipt, and `issue_finish` returns the merge SHA and successful issue/cleanup readback. CLI and MCP call the same owners for these tools.
 
 The CLI also exposes native relationship reads (`parent`, `subissues`, `blockers`), registry reads and clean registered PR/standalone cleanup (`worktrees:list`, `worktrees:status`, `worktrees:cleanup`), and PR reads and exact-head selected-author checkout (`pr:list`, `pr:checks`, `pr:checkout`). `pr:checks` includes GitHub's current review decision. A cleaned PR worktree can be reopened when its retained branch still matches the remote head. `migrate:legacy-issues --input-file` produces an offline `ai-delivery.legacy-issue-migration@1` plan without live writes. `metrics velocity --json` reads completed local delivery records and returns `ai-delivery.velocity-report@1` with buckets for configured Points; unknown blocker and review measurements remain null. `finish` can confirm completion after a lost response by matching the exact merge receipts, delivery record and live issue/Project state. Installing the package never migrates active runtime state automatically.
+
+## Typed issue journals
+
+`issue_comment` posts a typed journal through the configured author role. The public
+`commentIssue(context, input)` API uses the same implementation. The returned
+`commentId`, `url`, `body` and `reused` come from a fresh GitHub comment readback;
+the author, issue target and body must agree. This comment-tool slice is part of
+the journal feature; list/search, historical rewrites and reasoned issue closure
+are separate work.
+
+The public agent API also accepts `commentIssue(context, {issueNumber, body})`
+for exact raw comments, such as an already-rendered history snapshot. It preserves
+leading/trailing whitespace, line endings and content beyond the journal template
+limits, and appends no wrapper or marker. Exact authored-body retries reuse the
+existing comment and still require fresh readback. Blank bodies and complete
+payloads exceeding `ISSUE_COMMENT_BODY_LIMIT` (65,536 UTF-16 code units, matching
+[GitHub's first-party JavaScript validation](https://github.com/github/gh-aw/blob/3ead8042c7b1edc2128ba1b28b1b80d00b7f4c22/actions/setup/js/comment_limit_helpers.cjs))
+fail before authentication or mutation. This supported client bound also applies
+after typed-journal rendering; it does not truncate content. The MCP
+`issue_comment` input remains the typed journal contract below. History rendering
+and ordering of later issue rewrites belong to the caller.
+
+Every kind requires `issueNumber`, a one-line `summary`, `status`, `keyNumbers`
+(an array, empty when no numbers are known), `evidence` (HTTPS links), `nextStep`
+and `nextDate` (`YYYY-MM-DD`, or `null` when unscheduled). The summary is the first
+visible line, numbers stay inline, and evidence should be reachable outside the
+operator's machine. Validation requires HTTPS with a DNS hostname; it rejects
+file paths, credential-bearing URLs, IP literals, localhost and `.local` names.
+It does not probe remote reachability. Each kind also requires these fields:
+
+| Kind | Required fields |
+| --- | --- |
+| `start` | `outcome` |
+| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link |
+| `decision` | `decision`, `rationale` |
+| `blocker` | `blocker`, `resolution` |
+| `closeout` | `acceptance` (nonempty `{criterion, evidence}` list), `followUps` (list; empty when none) |
+
+Optional `details` adds supporting prose. `lengthCap` (600–10,000 characters,
+default 1,800) limits the expanded journal: excess fields move into one collapsed
+details section, without truncating acceptance evidence. Keep bulky inventories
+in linked evidence instead of the summary.
+
+```json
+{
+  "issueNumber": 17,
+  "kind": "progress",
+  "summary": "Input validation is implemented and ready for review.",
+  "status": "In progress",
+  "done": ["Added malformed-input handling and regression coverage"],
+  "keyNumbers": ["7 focused tests passed"],
+  "decisionNeeded": "None",
+  "evidence": ["https://github.com/example/widget/pull/23"],
+  "nextStep": "Complete independent review",
+  "nextDate": "2026-10-09"
+}
+```
+
+Successful tracked `issue_start` and `issue_develop` calls publish one start
+journal. Scratch work, failed readiness and failed development do not claim a
+start. `issue_finish` publishes closeout only after its existing merge, closure,
+Project and cleanup contracts succeed, with each checkbox acceptance criterion
+linked to the merged PR and a follow-up field. The PR carries the verification
+and review evidence; the comment does not create another acceptance gate.
+
+Exact manual retries reuse the same authored comment. Automatic retries find the
+original start or exact-merge closeout even after a lost response or worktree
+cleanup. Markers from another author never establish reuse. Operations from the
+same local controller serialize their comment writes; independently configured
+controllers still require one issue owner. A failed journal write/readback is
+reported and the same lifecycle call can recover it. Creation-only start failures
+return the created issue identity and `safeResume.arguments` with
+`resumeCreated: true` and `develop: false`, so recovery never creates another
+issue or starts development. Historical comments are
+preserved. Generated issue Status blocks and general readability warnings are
+owned by the separate issue-contract work.
 
 ## Contributor checks and release
 

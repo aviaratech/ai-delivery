@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { JournalInputSchema } from '../issueJournal.js';
 
 const Positive = z.number().int().positive();
 const Labels = z.array(z.string().regex(/^(?:area|risk):[^\s:]+$/u));
@@ -27,6 +28,12 @@ const RuntimeController = {
 };
 
 export const AI_DELIVERY_MCP_TOOLS = [
+  {
+    name: 'issue_comment',
+    commandName: 'comment',
+    description: 'Post a typed issue journal with authoritative comment readback',
+    inputSchema: JournalInputSchema,
+  },
   {
     name: 'runtime_stage',
     commandName: 'runtime:stage',

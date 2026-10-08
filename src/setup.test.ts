@@ -957,108 +957,106 @@ test('setup interruption child', { skip: !process.env.AI_DELIVERY_SETUP_INTERRUP
   await api.stageRuntime(JSON.parse(process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT!) as SetupInput);
 });
 
-test(
-  'stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-  { timeout: 30_000 },
-  async () => {
-    const api = await producer();
-    const f = await fixture();
-    let child: ReturnType<typeof spawn> | undefined;
-    let ownedPid: number | undefined;
-    let ownedIdentity: string | undefined;
-    let ownerPid: number | undefined;
-    const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
-    try {
-      writeFileSync(join(f.base, 'wait'), 'go');
-      child = spawn(
-        process.execPath,
-        [
-          join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
-          'run',
-          'dist/setup.test.js',
-          '-t',
-          '^setup interruption child$',
-        ],
-        {
-          cwd: process.cwd(),
-          stdio: 'ignore',
-          env: { ...process.env, AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(f.input) },
-        },
-      );
-      const closed = new Promise((resolve) => child!.once('close', resolve));
-      const writerPath = join(
-        f.root,
-        '.git/ai-delivery/writers@1',
-        `${(await import('./delivery/index.js')).digestValue(f.root).slice(7)}.json`,
-      );
-      let record:
-        | { owner: { pid: number }; command: { phase: string; root?: { pid: number; identity: string } } }
-        | undefined;
-      for (let i = 0; i < 200; i++) {
-        if (existsSync(writerPath)) record = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof record;
-        if (record?.command.phase === 'running' && existsSync(f.marker)) break;
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      assert.equal(record?.command.phase, 'running');
-      const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
-      assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
-      ownerPid = record!.owner.pid;
-      ownedPid = record!.command.root!.pid;
-      ownedIdentity = record!.command.root!.identity;
-      process.kill(ownerPid, 'SIGSTOP');
-      const stale = new Date(Date.now() - 20_000);
-      utimesSync(`${writerPath}.lock`, stale, stale);
-      await assert.rejects(api.stageRuntime(f.input), /live verification writer/u);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      process.kill(ownerPid, 'SIGKILL');
-      ownerPid = undefined;
-      await closed;
-      process.kill(ownedPid, 0);
-      writeFileSync(snapshot, 'interrupted incomplete snapshot');
-      rmSync(join(f.base, 'wait'));
-      const recovered = await api.stageRuntime(f.input);
-      assert.equal(recovered.reused, false);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-      assert.equal(existsSync(writerPath), false);
-      assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
-      const completedSnapshot = lstatSync(snapshot);
-      process.kill(peer.pid!, 0);
-      const state = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
-      assert.ok(state.status === 1 || state.stdout.trim().startsWith('Z'));
-      ownedPid = undefined;
-      assert.equal((await api.stageRuntime(f.input)).reused, true);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-      assert.equal(lstatSync(snapshot).ino, completedSnapshot.ino);
-      console.log(
-        'SETUP_INTERRUPTION_RECEIPT',
-        JSON.stringify({
-          completedStageId: recovered.stageId,
-          installerExecutions: 2,
-          peerPreserved: true,
-          ownedCleanupConfirmed: true,
-          completedRetrySkipped: true,
-          incompleteSnapshotRebuilt: true,
-          completedSnapshotReused: true,
-          archiveSha256: f.input.expectedArchiveSha256,
-        }),
-      );
-    } finally {
-      if (ownerPid !== undefined) {
-        process.kill(ownerPid, 'SIGCONT');
-        process.kill(ownerPid, 'SIGKILL');
-      }
-      if (
-        ownedPid !== undefined &&
-        spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim() ===
-          ownedIdentity
-      )
-        process.kill(ownedPid, 'SIGKILL');
-      if (peer.exitCode === null && peer.signalCode === null) peer.kill('SIGKILL');
-      if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      f.cleanup();
+test('stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install', async () => {
+  const api = await producer();
+  const f = await fixture();
+  let child: ReturnType<typeof spawn> | undefined;
+  let ownedPid: number | undefined;
+  let ownedIdentity: string | undefined;
+  let ownerPid: number | undefined;
+  const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+  try {
+    writeFileSync(join(f.base, 'wait'), 'go');
+    child = spawn(
+      process.execPath,
+      [
+        join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+        'run',
+        'dist/setup.test.js',
+        '-t',
+        '^setup interruption child$',
+      ],
+      {
+        cwd: process.cwd(),
+        stdio: 'ignore',
+        env: { ...process.env, AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(f.input) },
+      },
+    );
+    const closed = new Promise((resolve) => child!.once('close', resolve));
+    const writerPath = join(
+      f.root,
+      '.git/ai-delivery/writers@1',
+      `${(await import('./delivery/index.js')).digestValue(f.root).slice(7)}.json`,
+    );
+    let record:
+      | { owner: { pid: number }; command: { phase: string; root?: { pid: number; identity: string } } }
+      | undefined;
+    // Bound this cold installer-start observation, not the recovery run.
+    for (let i = 0; i < 1000; i++) {
+      if (existsSync(writerPath)) record = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof record;
+      if (record?.command.phase === 'running' && existsSync(f.marker)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
-  },
-);
+    assert.equal(record?.command.phase, 'running');
+    assert.equal(existsSync(f.marker), true, 'interrupt only after the owned installer actually starts');
+    const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
+    assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
+    ownerPid = record!.owner.pid;
+    ownedPid = record!.command.root!.pid;
+    ownedIdentity = record!.command.root!.identity;
+    process.kill(ownerPid, 'SIGSTOP');
+    const stale = new Date(Date.now() - 20_000);
+    utimesSync(`${writerPath}.lock`, stale, stale);
+    await assert.rejects(api.stageRuntime(f.input), /live verification writer/u);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    process.kill(ownerPid, 'SIGKILL');
+    ownerPid = undefined;
+    await closed;
+    process.kill(ownedPid, 0);
+    writeFileSync(snapshot, 'interrupted incomplete snapshot');
+    rmSync(join(f.base, 'wait'));
+    const recovered = await api.stageRuntime(f.input);
+    assert.equal(recovered.reused, false);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+    assert.equal(existsSync(writerPath), false);
+    assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
+    const completedSnapshot = lstatSync(snapshot);
+    process.kill(peer.pid!, 0);
+    const state = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
+    assert.ok(state.status === 1 || state.stdout.trim().startsWith('Z'));
+    ownedPid = undefined;
+    assert.equal((await api.stageRuntime(f.input)).reused, true);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+    assert.equal(lstatSync(snapshot).ino, completedSnapshot.ino);
+    console.log(
+      'SETUP_INTERRUPTION_RECEIPT',
+      JSON.stringify({
+        completedStageId: recovered.stageId,
+        installerExecutions: 2,
+        peerPreserved: true,
+        ownedCleanupConfirmed: true,
+        completedRetrySkipped: true,
+        incompleteSnapshotRebuilt: true,
+        completedSnapshotReused: true,
+        archiveSha256: f.input.expectedArchiveSha256,
+      }),
+    );
+  } finally {
+    if (ownerPid !== undefined) {
+      process.kill(ownerPid, 'SIGCONT');
+      process.kill(ownerPid, 'SIGKILL');
+    }
+    if (
+      ownedPid !== undefined &&
+      spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim() ===
+        ownedIdentity
+    )
+      process.kill(ownedPid, 'SIGKILL');
+    if (peer.exitCode === null && peer.signalCode === null) peer.kill('SIGKILL');
+    if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    f.cleanup();
+  }
+});
 
 test('CLI stage and admit execute the same public producer with explicit authority and prior absence', async () => {
   const f = await fixture();
