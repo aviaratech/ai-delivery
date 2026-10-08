@@ -680,12 +680,25 @@ export interface UpdateIssueInput {
   title?: string;
 }
 
-export async function updateIssue(
-  context: DeliveryContext,
-  input: UpdateIssueInput,
-): Promise<Awaited<ReturnType<typeof issueInfo>>> {
+export interface UpdateIssueResult extends IssueInfo {
+  historyComment?: IssueCommentReadback;
+  closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
+}
+
+export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
+  if (
+    (input.closeReason !== undefined && !['completed', 'not_planned', 'duplicate'].includes(input.closeReason)) ||
+    ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
+  )
+    throw new DeliveryError('Closure details require state closed and a supported close reason.');
+  if (
+    input.supersededBy !== undefined &&
+    (!Number.isSafeInteger(input.supersededBy) || input.supersededBy <= 0 || input.supersededBy === input.issueNumber)
+  )
+    throw new DeliveryError('A superseding issue must be a different positive issue number.');
   assertNativeIssueTrackingAdmission(input.issueNumber, context.root);
   const { clients, config, repo } = context;
+  const acceptedLabels = input.labels === undefined ? undefined : labels(input.labels);
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
     throw new DeliveryError('Unsupported configured Issue Type.');
   }
@@ -717,17 +730,99 @@ export async function updateIssue(
       rest: clients.rest,
     });
   }
+  const closeReason = input.closeReason ?? (input.supersededBy === undefined ? undefined : 'completed');
+  let supersedingIssueId: number | undefined;
+  if (input.supersededBy !== undefined) {
+    const target = (await clients.rest.issues.get({ ...repo, issue_number: input.supersededBy })).data;
+    if (
+      target.number !== input.supersededBy ||
+      'pull_request' in target ||
+      !Number.isSafeInteger(target.id) ||
+      target.id <= 0 ||
+      new URL(target.html_url).pathname.toLowerCase() !==
+        `/${repo.owner}/${repo.repo}/issues/${String(input.supersededBy)}`.toLowerCase()
+    )
+      throw new DeliveryError('Superseding issue readback is not the requested repository issue.');
+    supersedingIssueId = target.id;
+  }
+  const assertClosure = (closure: IssueClosureReadback): void => {
+    if (
+      closure.state !== 'closed' ||
+      closure.closeReason !== closeReason ||
+      (closeReason === 'duplicate' &&
+        input.supersededBy !== undefined &&
+        (closure.duplicateOf?.number !== input.supersededBy ||
+          closure.duplicateOf.repository.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()))
+    )
+      throw new DeliveryError('Native closure readback disagrees with the requested reason or superseding issue.');
+  };
+  if (closeReason !== undefined) {
+    const current = await readIssueClosure(context, input.issueNumber);
+    if (current.state === 'closed') {
+      try {
+        assertClosure(current);
+      } catch {
+        throw new DeliveryError('Issue is already closed with different closure evidence; reopen it explicitly first.');
+      }
+    }
+  }
+  let historyComment: IssueCommentReadback | undefined;
+  let priorContent: { title: string; body: string } | undefined;
+  if (input.preserveHistory === true && (input.title !== undefined || input.body !== undefined)) {
+    const current = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
+    if (current.number !== input.issueNumber || 'pull_request' in current)
+      throw new DeliveryError('History target is not the requested issue.');
+    const prior = { title: current.title, body: current.body ?? '' };
+    if (
+      (input.title !== undefined && input.title !== prior.title) ||
+      (input.body !== undefined && input.body !== prior.body)
+    ) {
+      const body = renderIssueHistory(prior.title, prior.body);
+      if (body.length > ISSUE_COMMENT_BODY_LIMIT)
+        throw new DeliveryError(
+          'Complete issue history exceeds the supported comment body limit; issue was not rewritten.',
+        );
+      priorContent = prior;
+      historyComment = await commentIssue(context, { issueNumber: input.issueNumber, body });
+    }
+  }
+  let closureComment: IssueCommentReadback | undefined;
+  if (closeReason !== undefined)
+    closureComment = await commentIssue(context, {
+      issueNumber: input.issueNumber,
+      body: `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`,
+    });
+  if (priorContent !== undefined) {
+    const current = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
+    if (
+      current.number !== input.issueNumber ||
+      'pull_request' in current ||
+      current.title !== priorContent.title ||
+      (current.body ?? '') !== priorContent.body
+    )
+      throw new DeliveryError(
+        'Issue content changed after history readback; retry against the current title and body.',
+      );
+  }
   await clients.rest.issues.update({
     issue_number: input.issueNumber,
     owner: repo.owner,
     repo: repo.repo,
     ...(input.body === undefined ? {} : { body: input.body }),
     ...(input.issueType === undefined ? {} : { type: input.issueType }),
-    ...(input.labels === undefined ? {} : { labels: labels(input.labels) }),
+    ...(acceptedLabels === undefined ? {} : { labels: acceptedLabels }),
     ...(input.milestone === undefined ? {} : { milestone: input.milestone }),
     ...(input.state === undefined ? {} : { state: input.state }),
+    ...(closeReason === undefined
+      ? {}
+      : { state_reason: closeReason, headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION } }),
+    ...(closeReason !== 'duplicate' || supersedingIssueId === undefined
+      ? {}
+      : { duplicate_issue_id: supersedingIssueId }),
     ...(input.title === undefined ? {} : { title: input.title }),
   });
+  const closure = closeReason === undefined ? undefined : await readIssueClosure(context, input.issueNumber);
+  if (closure !== undefined) assertClosure(closure);
   if (input.points !== undefined || input.priority !== undefined)
     await setConfiguredNativeIssueMetadata({
       issueNumber: input.issueNumber,
@@ -786,7 +881,21 @@ export async function updateIssue(
     settings: projectSettingsFromDeliveryConfig(config),
     status,
   });
-  return issueInfo(context, input.issueNumber);
+  const readback = await issueInfo(context, input.issueNumber);
+  if (
+    (input.preserveHistory === true || closeReason !== undefined) &&
+    ((input.title !== undefined && readback.title !== input.title) ||
+      (input.body !== undefined && readback.body !== input.body) ||
+      (input.state !== undefined && readback.state !== input.state))
+  )
+    throw new DeliveryError('Issue update readback disagrees with the requested content or state.');
+  return {
+    ...readback,
+    ...(historyComment === undefined ? {} : { historyComment }),
+    ...(closure === undefined || closureComment === undefined
+      ? {}
+      : { closure: { ...closure, supersededBy: input.supersededBy ?? null, comment: closureComment } }),
+  };
 }
 
 /** Complete the native tracking and Project state of an issue created before an interrupted response. */
