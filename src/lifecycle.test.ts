@@ -4807,7 +4807,7 @@ exec "${realGit}" "$@"
       rmSync(root, { recursive: true, force: true });
     }
   },
-  15_000,
+  0,
 );
 
 test.each(['runtime', 'primary-policy', 'witness', 'sibling', 'foreign-repository', 'missing-source'])(
@@ -5177,6 +5177,7 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
   assert.deepEqual(
     AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name),
     [
+      'issue_comment',
       'runtime_stage',
       'runtime_admit',
       'issue_create',
@@ -5197,6 +5198,17 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
     ],
   );
   const validInputs = {
+    issue_comment: {
+      issueNumber: 17,
+      kind: 'start',
+      summary: 'Implementation started.',
+      status: 'In progress',
+      outcome: 'Deliver validation',
+      keyNumbers: [],
+      evidence: [],
+      nextStep: 'Run checks',
+      nextDate: '2026-10-09',
+    },
     issue_create: { title: 'Synthetic tracking parent' },
     issue_update: { issueNumber: 17, park: true },
     issue_ready_check: { issueNumber: 17 },
@@ -5294,6 +5306,7 @@ async function syntheticLifecycle(routing: {
     body: `## Outcome\nDeliver a verified synthetic change to the local repository.\n\n## Scope\n- \`artifact.txt\`\n\n## Acceptance Criteria\n- [ ] Change is verified\n- [ ] Review and merge are recorded\n\n## Verification\nRun \`node --version\`.`,
     state: 'open',
     html_url: 'https://example.test/issues/17',
+    created_at: '2026-10-01T00:00:00Z',
     type: { name: 'Task' },
   };
   let issuePoints: number | undefined;
@@ -5331,7 +5344,10 @@ async function syntheticLifecycle(routing: {
   let nativeTimelineCalls = 0;
   let nativePrRepository: string | undefined;
   const continuationComments: Record<string, unknown>[] = [];
+  const journalComments: { id: number; body: string; html_url: string; issue_url: string; user: { login: string } }[] =
+    [];
   const createPayloads: Record<string, unknown>[] = [];
+  let loseNextJournalResponse = false;
   const statuses = { Queued: 'STATUS-0', Active: 'STATUS-1', Waiting: 'STATUS-2', Shipped: 'STATUS-3' };
   const statusName = (option: string) => Object.entries(statuses).find(([, id]) => id === option)?.[0];
   const pageInfo = { endCursor: null, hasNextPage: false };
@@ -5611,9 +5627,24 @@ async function syntheticLifecycle(routing: {
           data: nativeTimelinePages?.[input.page - 1] ?? (input.page === 1 ? [nativeReference()] : []),
         };
       },
-      listComments: async () => ({ data: continuationComments }),
+      listComments: async () => ({ data: [...continuationComments, ...journalComments] }),
+      createComment: async (input: { body: string }) => {
+        const data = {
+          id: 1000 + journalComments.length,
+          body: input.body,
+          html_url: `https://example.test/issues/17#issuecomment-${String(1000 + journalComments.length)}`,
+          issue_url: 'https://api.example.test/repos/example/widget/issues/17',
+          user: { login: authenticatedAuthor },
+        };
+        journalComments.push(data);
+        if (loseNextJournalResponse) {
+          loseNextJournalResponse = false;
+          throw new Error('Synthetic journal response lost');
+        }
+        return { data };
+      },
       getComment: async (input: { comment_id: number }) => ({
-        data: continuationComments.find((comment) => comment.id === input.comment_id),
+        data: [...continuationComments, ...journalComments].find((comment) => comment.id === input.comment_id),
       }),
       create: async (input: Record<string, unknown>) => {
         calls.push('issue:create');
@@ -5913,7 +5944,7 @@ async function syntheticLifecycle(routing: {
     calls.length = 0;
     await assert.rejects(
       startTrackedIssue(context, { issueNumber, resumeCreated: true }),
-      /requires issueNumber and develop=true/u,
+      /requires issueNumber and an explicit develop boolean/u,
     );
     await assert.rejects(
       createIssue(context, {
@@ -5954,14 +5985,19 @@ async function syntheticLifecycle(routing: {
     trackingParent = false;
     issue.state = 'closed';
     await assert.rejects(developIssue(context, issueNumber), /closed/u);
+    assert.equal(journalComments.length, 0, 'failed readiness must not publish a start journal');
     issue.state = 'open';
     assert.equal((await readyCheck(context, issueNumber)).ready, true);
     if (routing.committedDescendantContinuation)
       await prepareIssueWorktree({ identity: 'synthetic-preparer', issueNumber, repoRoot: root });
+    loseNextJournalResponse = true;
+    await assert.rejects(startTrackedIssue(context, { issueNumber }), /journal response lost/u);
     const started = await startTrackedIssue(context, { issueNumber });
     assert.equal(started.mode, 'existing-issue');
     assert.equal(started.issueNumber, issueNumber);
     assert.equal(started.title, issue.title);
+    assert.equal(journalComments.length, 1, 'successful start publishes one journal');
+    assert.match(journalComments[0]!.body, /\*\*Kind:\*\* start/u);
     const row = started as unknown as { path: string; branch: string };
     assert.equal(projectStatus, 'Active');
     const parked = await updateIssue(context, { issueNumber, park: true });
@@ -5969,6 +6005,7 @@ async function syntheticLifecycle(routing: {
     assert.equal(existsSync(row.path), true);
     assert.equal((await updateIssue(context, { issueNumber, title: issue.title })).projectStatus, 'Todo');
     await developIssue(context, issueNumber);
+    assert.equal(journalComments.length, 1, 'repeat develop reuses the start journal');
     assert.equal(projectStatus, 'Active');
     const blockedUpdate = await updateIssue(context, { issueNumber, blockedBy: [9] });
     assert.deepEqual(blockedUpdate.blockedBy, [9]);
@@ -7085,6 +7122,11 @@ exec "${realGit}" "$@"
       finishIssue(context, { issueNumber, prNumber, strategy: 'merge' }),
       /Delivery record store is invalid/u,
     );
+    assert.equal(
+      journalComments.filter((comment) => comment.body.includes('**Kind:** closeout')).length,
+      0,
+      'failed finish must not claim closeout',
+    );
     assert.equal(existsSync(row.path), false);
     rmSync(blockedRecordPath, { recursive: true });
     const dispatchClient = enableDispatch();
@@ -7095,6 +7137,11 @@ exec "${realGit}" "$@"
       execution,
     )) as { mergeSha: string };
     assert.equal(terminalMerge.mergeSha, git(remote, 'rev-parse', 'refs/heads/main'));
+    loseNextJournalResponse = true;
+    await assert.rejects(
+      executeTool('issue_finish', { issueNumber, prNumber, strategy: 'merge' }, execution),
+      /journal response lost/u,
+    );
     const finished = (await executeTool('issue_finish', { issueNumber, prNumber, strategy: 'merge' }, execution)) as {
       mergeSha: string;
       issueClosed: true;
@@ -7102,6 +7149,11 @@ exec "${realGit}" "$@"
     };
     assert.equal(finished.issueClosed, true);
     assert.equal(finished.cleaned, true);
+    const closeouts = journalComments.filter((comment) => comment.body.includes('**Kind:** closeout'));
+    assert.equal(closeouts.length, 1);
+    assert.match(closeouts[0]!.body, /Change is verified/u);
+    assert.match(closeouts[0]!.body, /Review and merge are recorded/u);
+    assert.match(closeouts[0]!.body, /https:\/\/example.test\/pulls\/23/u);
     assert.equal(projectStatus, 'Shipped');
     assert.equal(git(remote, 'rev-parse', 'refs/heads/main'), finished.mergeSha);
     assert.equal(existsSync(row.path), false);
@@ -7112,6 +7164,11 @@ exec "${realGit}" "$@"
       await executeTool('issue_finish', { issueNumber, prNumber, strategy: 'merge' }, execution),
       finished,
     );
+    assert.equal(
+      journalComments.filter((comment) => comment.body.includes('**Kind:** closeout')).length,
+      1,
+      'repeated finish reuses closeout',
+    );
     await assert.rejects(
       executeTool('issue_finish', { issueNumber, prNumber: 24 }, execution),
       /exact terminal merge receipts/u,
@@ -7119,11 +7176,31 @@ exec "${realGit}" "$@"
     dispatchClient.mockRestore();
     assert.equal(getDeliveryRecords(root).length, 1);
     await assert.rejects(finishIssue(context, { issueNumber, prNumber: 24 }), /exact terminal merge receipts/u);
-    const newlyStarted = await startTrackedIssue(context, { request: 'New synthetic task' });
+    const readyBody = issue.body;
+    issue.created_at = '2026-10-08T00:00:00Z';
+    issue.state = 'open';
+    const beforeCreationOnly = calls.filter((call) => call === 'issue:create').length;
+    const beforeCreationJournal = journalComments.length;
+    loseNextJournalResponse = true;
+    const creationOnlyFailure = (await startTrackedIssue(context, { request: 'New synthetic task' })) as {
+      status: string;
+      createdIssue: { number: number };
+      failure: { phase: string };
+      safeResume: { arguments: Record<string, unknown> };
+    };
+    assert.equal(creationOnlyFailure.status, 'created-not-started');
+    assert.equal(creationOnlyFailure.createdIssue.number, issueNumber);
+    assert.equal(creationOnlyFailure.failure.phase, 'journal');
+    assert.equal(creationOnlyFailure.safeResume.arguments.develop, false);
+    const newlyStarted = await startTrackedIssue(context, creationOnlyFailure.safeResume.arguments);
     assert.equal(newlyStarted.mode, 'created-issue');
     assert.equal(newlyStarted.issueNumber, issueNumber);
+    assert.equal(calls.filter((call) => call === 'issue:create').length, beforeCreationOnly + 1);
+    assert.equal(journalComments.length, beforeCreationJournal + 1);
+    assert.equal(existsSync(row.path), false, 'creation-only journal recovery must not develop the issue');
     assert.equal(createPayloads.at(-1)?.body, 'New synthetic task');
     assert.equal(issuePoints, 2);
+    issue.body = readyBody;
     issue.state = 'closed';
     const beforeDevelopment = calls.filter((call) => call === 'issue:create').length;
     const developmentFailure = (await startTrackedIssue(context, {
@@ -7166,11 +7243,7 @@ test.each([
   { remote: 'origin', divergentOrigin: false },
   { remote: 'upstream', divergentOrigin: false },
   { remote: 'upstream', divergentOrigin: true },
-])(
-  'synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin',
-  syntheticLifecycle,
-  15_000,
-);
+])('synthetic lifecycle finishes with remote $remote and divergent origin $divergentOrigin', syntheticLifecycle, 0);
 
 test(
   'supported develop resumes an open merged issue under the same owner and preserves prior receipts',

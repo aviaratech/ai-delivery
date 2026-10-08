@@ -12,8 +12,10 @@ import {
   cachedIssueInfo,
   CreatedTrackingIssueError,
   createIssue,
+  commentIssue,
   developIssue,
   issueInfo,
+  journalIssueStart,
   loadDeliveryContext,
   readyCheck,
   resumeCreatedIssue,
@@ -21,6 +23,7 @@ import {
   type CreateIssueInput,
   type UpdateIssueInput,
 } from './issue.js';
+import type { JournalInput } from './issueJournal.js';
 import { finishIssue, mergePr, preflightReviewRoute, prInfo, publishPr, submitFormalReview } from './pr.js';
 import { parseReviewArtifact, reviewArtifactApproval, savePrepublicationArtifact } from './review.js';
 import { evaluateAgentReadiness } from './services/agentReadinessService.js';
@@ -55,6 +58,7 @@ export interface ExecutionContext {
 }
 
 const MUTATING_TOOLS = new Set<AiDeliveryMcpToolName>([
+  'issue_comment',
   'issue_create',
   'issue_start',
   'issue_update',
@@ -173,8 +177,8 @@ export async function startTrackedIssue(
   runtimeEntryPath?: string,
 ): Promise<Record<string, unknown>> {
   const knownIssue = input.issueNumber === undefined ? undefined : requiredNumber(input, 'issueNumber');
-  if (input.resumeCreated === true && (knownIssue === undefined || input.develop !== true)) {
-    throw new DeliveryError('Resume of a known created issue requires issueNumber and develop=true.');
+  if (input.resumeCreated === true && (knownIssue === undefined || typeof input.develop !== 'boolean')) {
+    throw new DeliveryError('Resume of a known created issue requires issueNumber and an explicit develop boolean.');
   }
   if (knownIssue !== undefined && input.resumeCreated !== true) {
     const row = await developIssue(context, knownIssue, runtimeEntryPath);
@@ -206,7 +210,7 @@ export async function startTrackedIssue(
   const repository = `${context.repo.owner}/${context.repo.repo}`;
   const createdNotStarted = (
     createdIssue: { number: number; title: string; url: string },
-    phase: 'tracking' | 'development',
+    phase: 'tracking' | 'development' | 'journal',
     error: unknown,
   ) => ({
     schemaVersion: 'ai-delivery.issue-start-registration@1',
@@ -222,7 +226,7 @@ export async function startTrackedIssue(
         ...tracking,
         ...(input.repo === undefined ? {} : { repo: input.repo }),
         issueNumber: createdIssue.number,
-        develop: true,
+        develop: input.develop === true,
         resumeCreated: true,
       },
     },
@@ -265,6 +269,11 @@ export async function startTrackedIssue(
     } catch (error) {
       return createdNotStarted(created, 'development', error);
     }
+  }
+  try {
+    await journalIssueStart(context, created.number);
+  } catch (error) {
+    return createdNotStarted(created, 'journal', error);
   }
   return { issueNumber: created.number, issueUrl: created.url, mode: 'created-issue', title: created.title };
 }
@@ -357,6 +366,7 @@ export async function executeTool(
   if (name === 'issue_info' && input.cached === true)
     return cachedIssueInfo(execution.repoRoot, requiredNumber(input, 'issueNumber'));
   const commands: Record<AiDeliveryMcpToolName, string> = {
+    issue_comment: 'comment',
     runtime_stage: 'runtime:stage',
     runtime_admit: 'runtime:admit',
     issue_create: 'create',
@@ -428,6 +438,8 @@ export async function executeTool(
     });
   }
   switch (name) {
+    case 'issue_comment':
+      return commentIssue(context, input as JournalInput);
     case 'issue_worktree_transition_inspect':
       return inspectWorktreeTransition(context, {
         ...input,
@@ -447,8 +459,10 @@ export async function executeTool(
     }
     case 'issue_start': {
       const identity = await identityFor(execution, 'start');
-      if (input.resumeCreated === true && (input.issueNumber === undefined || input.develop !== true)) {
-        throw new DeliveryError('Resume of a known created issue requires issueNumber and develop=true.');
+      if (input.resumeCreated === true && (input.issueNumber === undefined || typeof input.develop !== 'boolean')) {
+        throw new DeliveryError(
+          'Resume of a known created issue requires issueNumber and an explicit develop boolean.',
+        );
       }
       if (input.scratch === true) {
         if (input.issueNumber !== undefined || input.develop === true || input.resumeCreated === true) {

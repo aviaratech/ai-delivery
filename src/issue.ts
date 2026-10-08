@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { z } from 'zod';
 
 import type { DeliveryConfig, LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
@@ -48,7 +49,116 @@ import {
 import { withRuntimeSetupWriter, withWorktreeTransitionWriterAbsent } from './verification.js';
 import { authenticatedWorktreeActors, assertNativeWorktreeAcceptance } from './worktreeTransition.js';
 import { assertIssueWorktreeLocation, prepareIssueWorktree } from './worktree.js';
-import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
+import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
+import { withLock } from './utils/lockfile.js';
+import { JournalInputSchema, renderJournal, type JournalInput } from './issueJournal.js';
+
+export interface IssueCommentReadback {
+  commentId: number;
+  url: string;
+  body: string;
+  reused: boolean;
+}
+
+// Matches GitHub's first-party JavaScript comment-length validation:
+// https://github.com/github/gh-aw/blob/3ead8042c7b1edc2128ba1b28b1b80d00b7f4c22/actions/setup/js/comment_limit_helpers.cjs
+export const ISSUE_COMMENT_BODY_LIMIT = 65_536;
+export type IssueCommentInput = JournalInput | { issueNumber: number; body: string };
+const RawIssueCommentSchema = z.strictObject({ issueNumber: z.number().int().positive(), body: z.string() });
+
+/** One canonical exact-body operation shared by direct calls, MCP, and lifecycle journals. */
+export async function commentIssue(
+  context: DeliveryContext,
+  input: IssueCommentInput,
+  lifecycleKey?: string,
+): Promise<IssueCommentReadback> {
+  const accepted =
+    'body' in input ? RawIssueCommentSchema.parse(input) : (JournalInputSchema.parse(input) as JournalInput);
+  const rawBody = 'body' in accepted ? accepted.body : undefined;
+  if (rawBody !== undefined && lifecycleKey !== undefined)
+    throw new DeliveryError('Raw issue comments do not accept a lifecycle journal key.');
+  const marker =
+    rawBody === undefined
+      ? `<!-- ai-delivery:journal@1:${digestValue({ issueNumber: accepted.issueNumber, key: lifecycleKey ?? accepted })} -->`
+      : undefined;
+  const body = rawBody ?? renderJournal(accepted as JournalInput, marker);
+  if (body.length > ISSUE_COMMENT_BODY_LIMIT || !body.trim())
+    throw new DeliveryError(
+      `Issue comment body must contain text and fit ${String(ISSUE_COMMENT_BODY_LIMIT)} UTF-16 code units.`,
+    );
+  if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor)
+    throw new DeliveryError('Issue comments require the authenticated author role.');
+  const actor = (await context.clients.authenticatedAuthor()).actorLogin;
+  if (!actor) throw new DeliveryError('Issue comment author identity is missing.');
+  const directory = join(gitCommonDir(context.root), 'ai-delivery', 'journals');
+  ensurePrivateDirectoryDurably(directory);
+  return withLock(join(directory, String(input.issueNumber)), {
+    operation: async () => {
+      const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: input.issueNumber })).data;
+      if ('pull_request' in issue || issue.number !== input.issueNumber)
+        throw new DeliveryError('Issue comment target is not the requested issue.');
+      const matches = [];
+      for (let page = 1; ; page += 1) {
+        const batch = (
+          await context.clients.rest.issues.listComments({
+            ...context.repo,
+            issue_number: input.issueNumber,
+            page,
+            per_page: 100,
+          })
+        ).data;
+        matches.push(
+          ...batch.filter(
+            (comment) =>
+              (marker === undefined ? comment.body === body : comment.body?.endsWith(marker)) &&
+              comment.user?.login.toLowerCase() === actor.toLowerCase(),
+          ),
+        );
+        if (batch.length < 100) break;
+      }
+      if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
+      const existing = matches[0];
+      const created =
+        existing ??
+        (await context.clients.rest.issues.createComment({ ...context.repo, issue_number: input.issueNumber, body }))
+          .data;
+      const readback = (await context.clients.rest.issues.getComment({ ...context.repo, comment_id: created.id })).data;
+      const expectedIssuePath = `/repos/${context.repo.owner}/${context.repo.repo}/issues/${String(input.issueNumber)}`;
+      if (
+        !Number.isSafeInteger(readback.id) ||
+        readback.id <= 0 ||
+        readback.id !== created.id ||
+        readback.html_url !== created.html_url ||
+        readback.body !== (existing?.body ?? body) ||
+        (lifecycleKey === undefined && readback.body !== body) ||
+        readback.user?.login.toLowerCase() !== actor.toLowerCase() ||
+        new URL(readback.issue_url).pathname.toLowerCase() !== expectedIssuePath.toLowerCase() ||
+        !readback.html_url.startsWith('https://')
+      )
+        throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
+      return { commentId: readback.id, url: readback.html_url, body: readback.body!, reused: existing !== undefined };
+    },
+  });
+}
+
+export async function journalIssueStart(context: DeliveryContext, issueNumber: number): Promise<IssueCommentReadback> {
+  const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
+  return commentIssue(
+    context,
+    {
+      issueNumber,
+      kind: 'start',
+      summary: `Work started on ${issue.title}.`,
+      status: 'Started',
+      outcome: issue.title,
+      keyNumbers: [`Issue #${String(issueNumber)}`],
+      evidence: [issue.html_url],
+      nextStep: 'Implement the issue acceptance criteria and run its verification',
+      nextDate: null,
+    },
+    `start:${issue.created_at}`,
+  );
+}
 
 export interface DeliveryContext {
   clients: GitHubClients;
@@ -731,5 +841,6 @@ export async function developIssue(
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: 'In Progress',
   });
+  await journalIssueStart(context, issueNumber);
   return { branch: row.branch, path: row.path };
 }

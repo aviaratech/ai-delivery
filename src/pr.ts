@@ -26,7 +26,8 @@ import {
   projectSettingsFromDeliveryConfig,
   syncIssueProjectStatus,
 } from './github/projectDelivery.js';
-import type { DeliveryContext } from './issue.js';
+import { commentIssue, type DeliveryContext } from './issue.js';
+import { acceptanceCriteria, issueFollowUps } from './issueJournal.js';
 import {
   loadPrepublicationArtifact,
   loadSubmittedReview,
@@ -1529,7 +1530,35 @@ export async function finishIssue(
       );
     },
   });
+  await journalIssueCloseout(context, input, merge.mergeSha);
   return { mergeSha: merge.mergeSha, issueClosed: true, cleaned: true };
+}
+
+async function journalIssueCloseout(
+  context: DeliveryContext,
+  input: { issueNumber: number; prNumber: number },
+  mergeSha: string,
+): Promise<void> {
+  const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: input.issueNumber })).data;
+  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: input.prNumber })).data;
+  const criteria = acceptanceCriteria(issue.body ?? '');
+  if (!criteria.length) throw new DeliveryError('Closeout requires acceptance criteria with public delivery evidence.');
+  await commentIssue(
+    context,
+    {
+      issueNumber: input.issueNumber,
+      kind: 'closeout',
+      summary: `Merged delivery completed for ${issue.title}.`,
+      status: 'Closed; merged and cleaned',
+      acceptance: criteria.map((criterion) => ({ criterion, evidence: pr.html_url })),
+      followUps: issueFollowUps(issue.body ?? ''),
+      keyNumbers: [`${String(criteria.length)} acceptance criteria`, `PR #${String(input.prNumber)}`],
+      evidence: [pr.html_url],
+      nextStep: 'No further delivery action; see the merged PR for verification and follow-ups',
+      nextDate: null,
+    },
+    `closeout:${mergeSha}`,
+  );
 }
 
 async function readCompletedIssue(
@@ -1584,5 +1613,6 @@ async function readCompletedIssue(
     settings: projectSettingsFromDeliveryConfig(context.config),
   });
   if (project?.status !== 'Done') throw new DeliveryError('Completed issue Project status is not Done.');
+  await journalIssueCloseout(context, input, receipt.mergeSha);
   return { mergeSha: receipt.mergeSha, issueClosed: true, cleaned: true };
 }
