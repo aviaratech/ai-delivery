@@ -20,6 +20,30 @@ const Tracking = {
   title: z.string().trim().min(1).max(256),
 };
 
+const IssueListing = {
+  state: z.enum(['open', 'closed', 'all']).optional(),
+  labels: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .regex(/^[^"\\\r\n]+$/u),
+    )
+    .optional(),
+  parentIssueNumber: Positive.nullable().optional(),
+  issueType: z.string().min(1).optional(),
+  projectStatus: z.enum(['Todo', 'In Progress', 'Blocked', 'Done']).nullable().optional(),
+  updatedSince: z.iso.datetime({ offset: true }).optional(),
+  page: Positive.optional(),
+  perPage: Positive.max(100).optional(),
+};
+const SearchText = z
+  .string()
+  .trim()
+  .min(1)
+  .max(256)
+  .regex(/^[^"\\\r\n]+$/u);
+
 const RuntimeController = {
   identity: z.string().min(1).optional(),
   expectedSourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -100,23 +124,43 @@ export const AI_DELIVERY_MCP_TOOLS = [
     }),
   },
   {
+    name: 'issue_list',
+    commandName: 'list',
+    description: 'List repository issues with native filters, named organization fields and pagination',
+    inputSchema: z.strictObject({ ...IssueListing, query: SearchText.optional() }),
+  },
+  {
+    name: 'issue_search',
+    commandName: 'search',
+    description: 'Search literal issue text in the selected repository with native filters and pagination',
+    inputSchema: z.strictObject({ ...IssueListing, query: SearchText }),
+  },
+  {
     name: 'issue_update',
     commandName: 'update',
     description: 'Update native issue fields and exact relationship sets with readback',
-    inputSchema: z.strictObject({
-      blockedBy: z.array(Positive).optional(),
-      body: z.string().optional(),
-      issueNumber: Positive,
-      issueType: z.string().min(1).optional(),
-      labels: Labels.optional(),
-      milestone: Positive.nullable().optional(),
-      parentIssueNumber: Positive.nullable().optional(),
-      park: z.literal(true).optional(),
-      points: Positive.optional(),
-      priority: z.string().min(1).optional(),
-      state: z.enum(['open', 'closed']).optional(),
-      title: z.string().trim().min(1).max(256).optional(),
-    }),
+    inputSchema: z
+      .strictObject({
+        blockedBy: z.array(Positive).optional(),
+        body: z.string().optional(),
+        issueNumber: Positive,
+        issueType: z.string().min(1).optional(),
+        labels: Labels.optional(),
+        milestone: Positive.nullable().optional(),
+        parentIssueNumber: Positive.nullable().optional(),
+        park: z.literal(true).optional(),
+        points: Positive.optional(),
+        priority: z.string().min(1).optional(),
+        state: z.enum(['open', 'closed']).optional(),
+        preserveHistory: z.boolean().optional(),
+        closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
+        supersededBy: Positive.optional(),
+        title: z.string().trim().min(1).max(256).optional(),
+      })
+      .refine(
+        (input) => (input.closeReason === undefined && input.supersededBy === undefined) || input.state === 'closed',
+        'Closure details require state closed',
+      ),
   },
   {
     name: 'issue_info',

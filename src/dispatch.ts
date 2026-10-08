@@ -16,6 +16,8 @@ import {
   developIssue,
   issueInfo,
   journalIssueStart,
+  listIssues,
+  type ListIssuesInput,
   loadDeliveryContext,
   readyCheck,
   resumeCreatedIssue,
@@ -373,6 +375,8 @@ export async function executeTool(
     issue_start: 'start',
     issue_update: 'update',
     issue_info: 'info',
+    issue_list: 'list',
+    issue_search: 'search',
     issue_ready_check: 'ready:check',
     issue_develop: 'develop',
     issue_verify: 'verify',
@@ -476,6 +480,9 @@ export async function executeTool(
     case 'issue_update': {
       return updateIssue(context, input as unknown as UpdateIssueInput);
     }
+    case 'issue_list':
+    case 'issue_search':
+      return listIssues(context, input as ListIssuesInput);
     case 'issue_info': {
       if (input.cached === true) return cachedIssueInfo(execution.repoRoot, requiredNumber(input, 'issueNumber'));
       return issueInfo(context, requiredNumber(input, 'issueNumber'));
