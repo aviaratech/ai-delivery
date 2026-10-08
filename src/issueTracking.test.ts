@@ -91,7 +91,9 @@ function updateFixture() {
             if (!controls.ignoreClosure && typeof input.state === 'string') {
               live.state = input.state;
               controls.reason =
-                input.state === 'closed' ? String(input.state_reason ?? 'completed').toUpperCase() : 'REOPENED';
+                input.state === 'closed'
+                  ? (typeof input.state_reason === 'string' ? input.state_reason : 'completed').toUpperCase()
+                  : 'REOPENED';
               if (input.duplicate_issue_id !== undefined) controls.duplicate = 18;
             }
             return { data: { ...live } };
