@@ -1,5 +1,6 @@
 import { syntheticDiscoveryClients, syntheticOverrides } from '../fixtures/discovery.js';
 import assert from 'node:assert/strict';
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -186,6 +187,120 @@ describe('portable delivery configuration', () => {
       await assert.rejects(expired.authenticatedAuthor(), /personal author token is invalid or expired/u);
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('cancels actual Octokit identity, REST and GraphQL requests through the selected scope signal', async () => {
+    const base = syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' });
+    const config = parseDeliveryConfig({
+      ...base,
+      roles: {
+        author: { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' },
+        reviewer: base.roles.reviewer,
+      },
+    });
+    const originalFetch = globalThis.fetch;
+    try {
+      for (const operation of ['identity', 'rest', 'graphql'] as const) {
+        const cancellation = new AbortController();
+        let observedAbort = false;
+        let started!: () => void;
+        const requestStarted = new Promise<void>((resolve) => {
+          started = resolve;
+        });
+        globalThis.fetch = async (_url, init) => {
+          started();
+          assert.equal(new Headers(init?.headers).get('authorization'), 'token selected-token');
+          assert.equal(init?.signal, cancellation.signal);
+          return new Promise<Response>((_resolve, reject) => {
+            init!.signal!.addEventListener(
+              'abort',
+              () => {
+                observedAbort = true;
+                reject(cancellation.signal.reason);
+              },
+              { once: true },
+            );
+          });
+        };
+        const clients = await createDeliveryGitHubClients({
+          config,
+          env: { AUTHOR_TOKEN: 'selected-token', GH_TOKEN: 'ambient-token' },
+          identity: 'host-author',
+          role: 'author',
+          signal: cancellation.signal,
+        });
+        assert.ok(clients.authenticatedAuthor);
+        const request =
+          operation === 'identity'
+            ? clients.authenticatedAuthor()
+            : operation === 'rest'
+              ? clients.rest.repos.get({ owner: 'sample', repo: 'widget' })
+              : clients.graphql('query { viewer { login } }');
+        const rejected = assert.rejects(request);
+        await requestStarted;
+        cancellation.abort();
+        await rejected;
+        assert.equal(observedAbort, true, `${operation} HTTP request must be cancelled`);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('cancels App installation authentication before either configured role can continue', async () => {
+    const config = parseDeliveryConfig(syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' }));
+    const temp = mkdtempSync(join(tmpdir(), 'delivery-cancel-app-'));
+    const originalFetch = globalThis.fetch;
+    try {
+      const env: NodeJS.ProcessEnv = {};
+      for (const [index, role] of (['author', 'reviewer'] as const).entries()) {
+        const path = join(temp, `${role}.pem`);
+        const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+        writeFileSync(path, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+        const names = config.roles[role].credentialEnv;
+        assert.ok('appId' in names, 'Synthetic role must use App credentials');
+        env[names.appId] = String(42 + index);
+        env[names.installationId] = String(52 + index);
+        env[names.privateKeyPath] = path;
+      }
+      for (const role of ['author', 'reviewer'] as const) {
+        const cancellation = new AbortController();
+        let observedAbort = false;
+        let started!: () => void;
+        const requestStarted = new Promise<void>((resolve) => {
+          started = resolve;
+        });
+        globalThis.fetch = async (_url, init) => {
+          started();
+          assert.equal(init?.signal, cancellation.signal);
+          return new Promise<Response>((_resolve, reject) => {
+            init!.signal!.addEventListener(
+              'abort',
+              () => {
+                observedAbort = true;
+                reject(cancellation.signal.reason);
+              },
+              { once: true },
+            );
+          });
+        };
+        const request = createDeliveryGitHubClients({
+          config,
+          env,
+          identity: config.roles[role].identity,
+          role,
+          signal: cancellation.signal,
+        });
+        const rejected = assert.rejects(request, /GitHub App authentication failed/u);
+        await requestStarted;
+        cancellation.abort();
+        await rejected;
+        assert.equal(observedAbort, true, `${role} installation request must be cancelled`);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(temp, { recursive: true, force: true });
     }
   });
 

@@ -209,7 +209,9 @@ ai-delivery --repo-root /absolute/consumer --identity configured-author runtime:
   --authorize-stage --archive /absolute/reviewed-package.tgz \
   --archive-sha256 sha256:<reviewed-archive-digest> --package-version 0.3.5 \
   --source-commit <clean-primary-consumer-head> --config-digest sha256:<resolver-digest> \
-  --runtime-directory /absolute/private-runtimes/ai-delivery-0.3.5
+  --runtime-directory /absolute/private-runtimes/ai-delivery-0.3.5 \
+  --max-aggregate-rss-bytes 536870912 --max-new-output-bytes 1073741824 \
+  --min-free-disk-bytes 68719476736 --max-captured-output-bytes 1048576
 ```
 
 Stage captures and hashes the exact reviewed archive bytes, durably retains a
@@ -217,6 +219,21 @@ private copy in its owned directory, and gives that copy to npm. The snapshot
 counts toward the stage output allowance and is revalidated on completion,
 reuse and admission. Stage installs production dependencies with scripts, audit
 and funding disabled.
+The existing setup writer samples controller-plus-children RSS throughout
+preflight, installation and final validation, with checks at each awaited
+preflight boundary and cancellation passed to in-flight GitHub requests.
+These are sampled stop thresholds, not OS-enforced hard
+ceilings. npm runs from the owned stage with explicit cache, log, user/global
+configuration and temporary destinations there; lifecycle scripts cannot write
+elsewhere because they are disabled. Filesystem accounting also covers the
+consumer's delivery metadata and retained command evidence. The archive and
+captured command output consume the output allowance. Retained command logs
+default to 1 MiB; `maxCapturedOutputBytes` in the existing MCP/API resource
+bounds, or the CLI flag above, selects a positive cap up to the evidence store's
+8 MiB maximum. A failed command retains at most that cap. Default memory,
+output and free-disk bounds remain 1 GiB, 512 MiB and 256 MiB.
+Normalized bounds are part of the stage intent: changing them requires a fresh
+stage directory and never replaces a completed stage silently.
 It validates actual CLI, full distribution, package manifest, bundled MCP launcher
 and plugin bytes and capability 2. Its private completion record binds these
 bytes to the reviewed archive and primary controller; `sourceCommit` means the

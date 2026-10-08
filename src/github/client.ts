@@ -14,8 +14,8 @@ export interface GitHubClients {
   credentialSource?: string;
   effectiveContentsPermission?: DeliveryPermission | 'admin';
   role: DeliveryRole;
-  appActorLogin?: () => Promise<string>;
-  authenticatedAuthor?: () => Promise<{ actorLogin: string; credentialIdentity: string }>;
+  appActorLogin?: (signal?: AbortSignal) => Promise<string>;
+  authenticatedAuthor?: (signal?: AbortSignal) => Promise<{ actorLogin: string; credentialIdentity: string }>;
   graphql: typeof GraphQLType;
   rest: Octokit;
 }
@@ -64,7 +64,9 @@ export async function createDeliveryGitHubClients(input: {
   selectedAuthor?: GitHubClients;
   additionalPermissions?: Readonly<Record<string, DeliveryPermission>>;
   role: DeliveryRole;
+  signal?: AbortSignal;
 }): Promise<GitHubClients> {
+  input.signal?.throwIfAborted();
   const env = input.env ?? process.env;
   const selected = input.config.roles[input.role];
   if (selected.authSource === 'personal') {
@@ -75,7 +77,7 @@ export async function createDeliveryGitHubClients(input: {
     if (!token) {
       throw new DeliveryError(`Missing personal author token in ${selected.credentialEnv.token}.`);
     }
-    return personalClients(token, `env:${selected.credentialEnv.token}`);
+    return personalClients(token, `env:${selected.credentialEnv.token}`, input.signal);
   }
   if (input.personalAuth !== undefined) {
     if (
@@ -92,7 +94,7 @@ export async function createDeliveryGitHubClients(input: {
       : env.GH_TOKEN?.trim()
         ? 'env:GH_TOKEN'
         : 'env:GITHUB_TOKEN';
-    return personalClients(token, source);
+    return personalClients(token, source, input.signal);
   }
 
   if (input.identity.trim().toLowerCase() !== selected.identity.toLowerCase()) {
@@ -121,7 +123,11 @@ export async function createDeliveryGitHubClients(input: {
     throw new DeliveryError(`GitHub App private key for ${input.role} role is unavailable.`);
   }
   try {
-    const auth = createAppAuth({ appId: credentials.appId, privateKey });
+    const auth = createAppAuth({
+      appId: credentials.appId,
+      privateKey,
+      ...(input.signal === undefined ? {} : { request: new Octokit({ request: { signal: input.signal } }).request }),
+    });
     const result = await auth({ installationId: credentials.installationId, type: 'installation' });
     if (typeof result.token !== 'string' || !result.token.startsWith('ghs_')) {
       throw new DeliveryError(`GitHub ${input.role} role did not receive an App installation token.`);
@@ -133,9 +139,13 @@ export async function createDeliveryGitHubClients(input: {
     });
     const appActorLogin =
       input.role === 'reviewer'
-        ? async () => {
+        ? async (signal?: AbortSignal) => {
+            const requestSignal = signal ?? input.signal;
             try {
-              const app = await new Octokit({ auth: (await auth({ type: 'app' })).token }).rest.apps.getAuthenticated();
+              const app = await new Octokit({
+                auth: (await auth({ type: 'app' })).token,
+                ...(requestSignal === undefined ? {} : { request: { signal: requestSignal } }),
+              }).rest.apps.getAuthenticated();
               if (!app.data || app.data.id !== Number(credentials.appId) || !app.data.slug) {
                 throw new DeliveryError('Reviewer GitHub App identity did not match its configured App ID.');
               }
@@ -148,9 +158,13 @@ export async function createDeliveryGitHubClients(input: {
         : undefined;
     const authenticatedAuthor =
       input.role === 'author'
-        ? async () => {
+        ? async (signal?: AbortSignal) => {
+            const requestSignal = signal ?? input.signal;
             try {
-              const app = await new Octokit({ auth: (await auth({ type: 'app' })).token }).rest.apps.getAuthenticated();
+              const app = await new Octokit({
+                auth: (await auth({ type: 'app' })).token,
+                ...(requestSignal === undefined ? {} : { request: { signal: requestSignal } }),
+              }).rest.apps.getAuthenticated();
               if (!app.data || app.data.id !== Number(credentials.appId) || !app.data.slug) {
                 throw new DeliveryError('Author GitHub App identity did not match its configured App ID.');
               }
@@ -172,6 +186,7 @@ export async function createDeliveryGitHubClients(input: {
       appActorLogin,
       authenticatedAuthor,
       (result.permissions as Record<string, DeliveryPermission | 'admin'>).contents,
+      input.signal,
     );
   } catch (error) {
     if (error instanceof DeliveryError) throw error;
@@ -179,22 +194,39 @@ export async function createDeliveryGitHubClients(input: {
   }
 }
 
-function personalClients(token: string, credentialSource: string): GitHubClients {
-  return buildClients(token, 'personal', 'author', credentialSource, undefined, async () => {
-    try {
-      const user = (await new Octokit({ auth: token }).rest.users.getAuthenticated()).data;
-      if (!Number.isSafeInteger(user.id) || user.id <= 0 || !user.login) {
-        throw new DeliveryError('Personal author identity readback is incomplete.');
+function personalClients(token: string, credentialSource: string, signal?: AbortSignal): GitHubClients {
+  return buildClients(
+    token,
+    'personal',
+    'author',
+    credentialSource,
+    undefined,
+    async (requestSignal?: AbortSignal) => {
+      const selectedSignal = requestSignal ?? signal;
+      try {
+        const user = (
+          await new Octokit({
+            auth: token,
+            ...(selectedSignal === undefined ? {} : { request: { signal: selectedSignal } }),
+          }).rest.users.getAuthenticated()
+        ).data;
+        if (!Number.isSafeInteger(user.id) || user.id <= 0 || !user.login) {
+          throw new DeliveryError('Personal author identity readback is incomplete.');
+        }
+        return { actorLogin: user.login, credentialIdentity: `user:${String(user.id)}` };
+      } catch (error) {
+        if (error instanceof DeliveryError) throw error;
+        if ((error as { status?: number }).status === 401) {
+          throw new DeliveryError(
+            'Configured personal author token is invalid or expired; refresh the selected token.',
+          );
+        }
+        throw new DeliveryError('Personal author identity readback failed.');
       }
-      return { actorLogin: user.login, credentialIdentity: `user:${String(user.id)}` };
-    } catch (error) {
-      if (error instanceof DeliveryError) throw error;
-      if ((error as { status?: number }).status === 401) {
-        throw new DeliveryError('Configured personal author token is invalid or expired; refresh the selected token.');
-      }
-      throw new DeliveryError('Personal author identity readback failed.');
-    }
-  });
+    },
+    undefined,
+    signal,
+  );
 }
 
 function buildClients(
@@ -202,9 +234,10 @@ function buildClients(
   authSource: GitHubClients['authSource'],
   role: DeliveryRole,
   credentialSource: string,
-  appActorLogin?: () => Promise<string>,
+  appActorLogin?: GitHubClients['appActorLogin'],
   authenticatedAuthor?: GitHubClients['authenticatedAuthor'],
   effectiveContentsPermission?: GitHubClients['effectiveContentsPermission'],
+  signal?: AbortSignal,
 ): GitHubClients {
   const clients: GitHubClients = {
     authSource,
@@ -213,8 +246,11 @@ function buildClients(
     role,
     ...(appActorLogin ? { appActorLogin } : {}),
     ...(authenticatedAuthor ? { authenticatedAuthor } : {}),
-    graphql: graphql.defaults({ headers: { authorization: `token ${token}` } }),
-    rest: new Octokit({ auth: token }),
+    graphql: graphql.defaults({
+      headers: { authorization: `token ${token}` },
+      ...(signal === undefined ? {} : { request: { signal } }),
+    }),
+    rest: new Octokit({ auth: token, ...(signal === undefined ? {} : { request: { signal } }) }),
   };
   if (role === 'author') authorGitTokens.set(clients, token);
   return clients;

@@ -42,6 +42,13 @@ export const AI_DELIVERY_MCP_TOOLS = [
           maxAggregateRssBytes: z.number().int().positive().safe(),
           minFreeDiskBytes: z.number().int().positive().safe(),
           maxNewOutputBytes: z.number().int().positive().safe(),
+          maxCapturedOutputBytes: z
+            .number()
+            .int()
+            .positive()
+            .safe()
+            .max(8 * 1024 ** 2)
+            .optional(),
         })
         .optional(),
     }),

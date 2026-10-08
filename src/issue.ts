@@ -64,12 +64,13 @@ export async function loadDeliveryContext(input: {
   personalAuth?: boolean;
   repoRoot: string;
   role: 'author' | 'reviewer';
+  signal?: AbortSignal;
 }): Promise<DeliveryContext> {
   const root = gitRoot(input.repoRoot);
-  const loaded = await loadDeliveryConfig(
-    root,
-    input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth },
-  );
+  const loaded = await loadDeliveryConfig(root, {
+    ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+  });
   const config = loaded.config;
   const repo = resolveDeliveryRepo(config, root, loaded.remote);
   const clients = await createDeliveryGitHubClients({
@@ -77,6 +78,7 @@ export async function loadDeliveryContext(input: {
     identity: input.identity,
     ...(input.personalAuth ? { personalAuth: { enabled: true as const } } : {}),
     role: input.role,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   const routing = loaded.routing;
   const projectConfiguration: ProjectDeliveryConfiguration = {
