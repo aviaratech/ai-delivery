@@ -25,6 +25,7 @@ import { z } from 'zod';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import { assertPrivateFile } from './delivery/common.js';
+import { readRepositoryCommandOutput } from './delivery/stage.js';
 import {
   classifyRepositoryExactRange,
   assertRepositoryClassificationCurrent,
@@ -874,14 +875,14 @@ interface ObservedProcess {
   status: string;
 }
 
-interface OwnedProcessState {
+export interface OwnedProcessState {
   rootIdentity?: string;
   rootPid: number;
   sampled: boolean;
   tracked: Map<number, ObservedProcess>;
 }
 
-function processSnapshot(): Map<number, ObservedProcess> {
+export function processSnapshot(): Map<number, ObservedProcess> {
   const psPath = existsSync('/usr/bin/ps') ? '/usr/bin/ps' : '/bin/ps';
   const result = spawnSync(psPath, ['-A', '-o', 'pid=,ppid=,pgid=,rss=,stat=,lstart='], {
     encoding: 'utf8',
@@ -1017,7 +1018,7 @@ function controllerTreeRssBytes(snapshot = processSnapshot(), excluded = new Set
   return bytes;
 }
 
-async function confirmOwnedCleanup(state: OwnedProcessState): Promise<void> {
+export async function confirmOwnedCleanup(state: OwnedProcessState): Promise<void> {
   if (!state.sampled || state.rootIdentity === undefined) {
     throw new DeliveryError('Owned process cleanup cannot be verified without a root identity.');
   }
@@ -1045,7 +1046,7 @@ async function confirmOwnedCleanup(state: OwnedProcessState): Promise<void> {
 }
 
 /** Signal only birth identities established by this command, including observed detached children. */
-function terminateOwnedProcesses(state: OwnedProcessState): void {
+export function terminateOwnedProcesses(state: OwnedProcessState): void {
   if (!state.sampled || state.rootIdentity === undefined) throw new DeliveryError('Owned process identity is unknown.');
   const snapshot = processSnapshot();
   const root = snapshot.get(state.rootPid);
@@ -1576,7 +1577,7 @@ function reportVerificationProgress(input: {
   process.stderr.write(`ai-delivery.verify ${JSON.stringify(input)}\n`);
 }
 
-function runStageCommand(
+export function runStageCommand(
   repoRoot: string,
   argv: readonly string[],
   abortSignal?: AbortSignal,
@@ -1592,6 +1593,8 @@ function runStageCommand(
     includeControllerTree?: boolean;
     onCaptured?(bytes: number): void;
     onCleanupFailure?(reason: string): void;
+    failedOutput?(bytes: Buffer): string;
+    stdoutOnly?: boolean;
   },
 ): Promise<Buffer> {
   const [executable, ...args] = argv;
@@ -1650,6 +1653,7 @@ function runStageCommand(
           : ` First filesystem observation: ${firstOutputObservationFailure} Last filesystem observation: ${lastOutputObservationFailure}`;
       try {
         const bytes = Buffer.concat([...stdout, ...stderr]);
+        if (execution?.failedOutput) return execution.failedOutput(bytes);
         return ` Command output ${writeRepositoryCommandOutput({ bytes, gitCommonDir: gitCommonDir(repoRoot) })}.${observation}`;
       } catch (error) {
         return ` Command output persistence failed (${error instanceof Error ? error.message : String(error)}).${observation}`;
@@ -1893,7 +1897,7 @@ function runStageCommand(
       }
       writer?.idle();
       settled = true;
-      resolve(Buffer.concat([...stdout, ...stderr], outputBytes));
+      resolve(execution?.stdoutOnly ? Buffer.concat(stdout) : Buffer.concat([...stdout, ...stderr], outputBytes));
     };
     child.once('close', (code, signal) => {
       void handleClose(code, signal)
@@ -3348,11 +3352,53 @@ export async function withIssueSourcePhase(
   return sourceReceipt(record);
 }
 
+const RuntimeOutputLedgerSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.runtime-output@1'),
+    stageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    worktreeDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    producerDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .safe()
+      .max(8 * 1024 ** 2),
+    outputs: z
+      .array(
+        z.strictObject({
+          digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+          bytes: z
+            .number()
+            .int()
+            .nonnegative()
+            .safe()
+            .max(8 * 1024 ** 2),
+          status: z.enum(['reserved', 'complete']),
+        }),
+      )
+      .max(4096),
+    contentDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  })
+  .superRefine((value, context) => {
+    const { contentDigest, ...content } = value;
+    if (
+      contentDigest !== digestValue(content) ||
+      new Set(value.outputs.map((output) => output.digest)).size !== value.outputs.length ||
+      value.outputs.reduce((total, output) => total + output.bytes, 0) > value.limit
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Runtime retained-output ledger is corrupt.',
+      });
+  });
+
 /** @internal Runtime setup shares the existing writer, ownership handshake and bounded command runner. */
 export async function withRuntimeSetupWriter<T>(
   root: string,
   operation: (runner: {
     assertQuiescent(): void;
+    bindCapturedOutput(stageId: string): void;
     checkResources: () => Promise<void>;
     signal: AbortSignal;
     run(
@@ -3396,6 +3442,118 @@ export async function withRuntimeSetupWriter<T>(
   root = gitRoot(root);
   return withVerificationWriter(root, async (writer) =>
     withOutputObservationGate(root, scope !== undefined, async (scopeGate) => {
+      let ledger: z.infer<typeof RuntimeOutputLedgerSchema> | undefined;
+      let ledgerPath: string | undefined;
+      const common = gitCommonDir(root);
+      const saveLedger = (): void => {
+        if (ledger === undefined || ledgerPath === undefined)
+          throw new DeliveryError('Runtime output allowance is unbound.');
+        const { contentDigest: _previous, ...content } = ledger;
+        ledger = RuntimeOutputLedgerSchema.parse({
+          ...content,
+          contentDigest: digestValue(content),
+        });
+        if (Buffer.byteLength(JSON.stringify(ledger, null, 2)) > 1024 ** 2)
+          throw new DeliveryError('Runtime retained-output ledger exceeds its evidence bound.');
+        writePrivateJsonFileAtomically(ledgerPath, ledger);
+      };
+      const assertOutput = (output: z.infer<typeof RuntimeOutputLedgerSchema>['outputs'][number]): boolean => {
+        try {
+          const bytes = readRepositoryCommandOutput({
+            gitCommonDir: common,
+            digest: output.digest,
+            expectedBytes: output.bytes,
+          });
+          if (bytes.length !== output.bytes) throw new DeliveryError('Runtime retained-output evidence size changed.');
+          return true;
+        } catch (error) {
+          if (output.status === 'reserved' && (error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          throw error;
+        }
+      };
+      const bindCapturedOutput = (stageId: string): void => {
+        if (scope === undefined) return;
+        if (ledger !== undefined) throw new DeliveryError('Runtime output allowance is already bound.');
+        const identity = {
+          stageId,
+          worktreeDigest: worktreeDigest(root),
+          producerDigest: producerDigest(),
+          limit: scope.maxCapturedOutputBytes,
+        };
+        ledgerPath = join(
+          common,
+          'ai-delivery',
+          'verification@1',
+          'runtime-output',
+          identity.worktreeDigest.slice(7),
+          `${stageId.slice(7)}.json`,
+        );
+        let retained: Buffer | undefined;
+        try {
+          retained = assertPrivateFile(ledgerPath, { maxBytes: 1024 ** 2 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        if (retained !== undefined) {
+          ledger = RuntimeOutputLedgerSchema.parse(JSON.parse(retained.toString('utf8')));
+          if (
+            ledger.stageId !== identity.stageId ||
+            ledger.worktreeDigest !== identity.worktreeDigest ||
+            ledger.producerDigest !== identity.producerDigest ||
+            ledger.limit !== identity.limit
+          )
+            throw new DeliveryError('Runtime retained-output ledger belongs to an incompatible stage or controller.');
+          let recovered = false;
+          for (const output of ledger.outputs) {
+            if (assertOutput(output) && output.status === 'reserved') {
+              output.status = 'complete';
+              recovered = true;
+            }
+          }
+          if (recovered) saveLedger();
+        } else {
+          const content = {
+            schemaVersion: 'ai-delivery.runtime-output@1' as const,
+            ...identity,
+            outputs: [],
+          };
+          ledger = RuntimeOutputLedgerSchema.parse({
+            ...content,
+            contentDigest: digestValue(content),
+          });
+          saveLedger();
+        }
+      };
+      const remainingOutput = (): number => {
+        if (scope === undefined) return 8 * 1024 ** 2;
+        if (ledger === undefined) throw new DeliveryError('Runtime output allowance is unbound.');
+        return ledger.limit - ledger.outputs.reduce((total, output) => total + output.bytes, 0);
+      };
+      const persistFailedOutput = (bytes: Buffer): string => {
+        if (ledger === undefined) throw new DeliveryError('Runtime output allowance is unbound.');
+        const digest = digestBytes(bytes);
+        const prior = ledger.outputs.find((output) => output.digest === digest);
+        if (prior !== undefined) {
+          if (prior.bytes !== bytes.length || !assertOutput(prior))
+            throw new DeliveryError(
+              'Runtime retained-output reservation is unresolved; identical output cannot be rewritten.',
+            );
+          return ` Command output ${digest}.`;
+        }
+        if (bytes.length > remainingOutput()) throw new DeliveryError('Runtime retained-output allowance exceeded.');
+        const output = {
+          digest,
+          bytes: bytes.length,
+          status: 'reserved' as const,
+        };
+        ledger.outputs.push(output);
+        saveLedger();
+        writeRepositoryCommandOutput({ bytes, gitCommonDir: common });
+        if (!assertOutput(output)) throw new DeliveryError('Runtime retained-output publication is unresolved.');
+        ledger.outputs[ledger.outputs.length - 1]!.status = 'complete';
+        saveLedger();
+        return ` Command output ${digest}.`;
+      };
       if (scope !== undefined) {
         const paths = [...(scope.bounds.outputRoots ?? []), join(gitCommonDir(root), 'ai-delivery')]
           .map((path) => resolve(root, path))
@@ -3451,6 +3609,7 @@ export async function withRuntimeSetupWriter<T>(
       try {
         const result = await operation({
           assertQuiescent: () => writer.assertQuiescent(),
+          bindCapturedOutput,
           checkResources,
           signal,
           run: async (argv, bounds, commandSignal, environment, cwd) => {
@@ -3463,6 +3622,9 @@ export async function withRuntimeSetupWriter<T>(
                   throw new DeliveryError('Filesystem output roots must not overlap.');
             }
             const run = async (gate: OutputGate | undefined): Promise<Buffer> => {
+              const remaining = remainingOutput();
+              if (remaining <= 0)
+                throw new DeliveryError('Runtime retained-output allowance is exhausted; installer was not started.');
               const links: OutputBaseline['links'] = new Map();
               const files =
                 roots === undefined
@@ -3513,7 +3675,11 @@ export async function withRuntimeSetupWriter<T>(
                       ...(cwd === undefined ? {} : { cwd }),
                       ...(scope === undefined
                         ? {}
-                        : { maxCapturedOutputBytes: scope.maxCapturedOutputBytes, includeControllerTree: true }),
+                        : {
+                            maxCapturedOutputBytes: remaining,
+                            includeControllerTree: true,
+                            failedOutput: persistFailedOutput,
+                          }),
                       onCaptured: (bytes) => {
                         captured += bytes - commandCaptured;
                         commandCaptured = bytes;

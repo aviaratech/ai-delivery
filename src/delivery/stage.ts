@@ -260,6 +260,19 @@ export function writeRepositoryCommandOutput(input: { bytes: Buffer; gitCommonDi
   writeCreateOnly(outputPath(input.gitCommonDir, digest), input.bytes, digest);
   return digest;
 }
+/** @internal Read immutable command evidence through its existing storage owner. */
+export function readRepositoryCommandOutput(input: {
+  gitCommonDir: string;
+  digest: string;
+  expectedBytes?: number;
+}): Buffer {
+  const bytes = assertPrivateFile(outputPath(input.gitCommonDir, input.digest), {
+    maxBytes: 8 * 1024 ** 2,
+    ...(input.expectedBytes === undefined ? {} : { expectedBytes: input.expectedBytes }),
+  });
+  if (digestBytes(bytes) !== input.digest) throw new Error('Command output bytes are corrupt.');
+  return bytes;
+}
 export function assertRepositoryStageProof(input: {
   gitCommonDir: string;
   receipt: RepositoryStageReceipt;
@@ -268,8 +281,7 @@ export function assertRepositoryStageProof(input: {
   const receipt = RepositoryStageReceiptSchema.parse(input.receipt);
   for (const artifact of receipt.artifacts) assertArtifact(input.repoRoot, artifact);
   for (const command of receipt.commands)
-    if (digestBytes(assertPrivateFile(outputPath(input.gitCommonDir, command.outputDigest))) !== command.outputDigest)
-      throw new Error('Command output bytes are missing or corrupt.');
+    readRepositoryCommandOutput({ gitCommonDir: input.gitCommonDir, digest: command.outputDigest });
 }
 export function writeRepositoryStageCheckpoint(input: {
   gitCommonDir: string;

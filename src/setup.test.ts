@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  cpSync,
   existsSync,
+  truncateSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -21,16 +23,24 @@ import { test, vi } from 'vitest';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import * as privateFiles from './delivery/common.js';
-import { digestBytes } from './delivery/index.js';
+import { digestBytes, digestValue } from './delivery/index.js';
 import { syntheticDiscoveryClients, syntheticOverrides, syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { assertDeliveryRuntimeAdmitted, type RuntimeAdmission } from './services/deliveryAdmission.js';
 import * as atomicJson from './utils/atomicJson.js';
 
 const syncFailure = vi.hoisted(() => ({ directory: '' }));
+const sharedOutputRead = vi.hoisted(() => ({ path: '', unboundedReads: 0 }));
 vi.mock('node:fs', async (original) => {
   const actual = await original<typeof import('node:fs')>();
   return {
     ...actual,
+    readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
+      if (sharedOutputRead.path && String(args[0]) === sharedOutputRead.path) {
+        sharedOutputRead.unboundedReads++;
+        throw new Error('Unbounded shared command-output read attempted');
+      }
+      return actual.readFileSync(...args);
+    },
     fsyncSync: (fd: number) => {
       if (
         syncFailure.directory &&
@@ -115,6 +125,7 @@ type SetupInput = {
   expectedSourceCommit: string;
   expectedConfigDigest: string;
   runtimeDirectory: string;
+  nativePluginRoot?: string;
   signal?: AbortSignal;
   resourceBounds?: {
     maxAggregateRssBytes: number;
@@ -143,7 +154,7 @@ async function producer(): Promise<Producer> {
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
 }
-async function fixture() {
+async function fixture(native = false) {
   actors.author = 'host-user';
   actors.reviewer = 'reviewer[bot]';
   actors.access = true;
@@ -196,6 +207,11 @@ async function fixture() {
       deliveryCapabilityVersion: 2,
     }),
   };
+  if (native) {
+    files['plugins/ai-delivery/runtime/package.json'] = files['package.json']!;
+    files['plugins/ai-delivery/runtime/dist/cli.js'] = files['dist/cli.js']!;
+    files['plugins/ai-delivery/README.md'] = 'Synthetic copied native plugin.\n';
+  }
   for (const [relative, bytes] of Object.entries(files)) {
     const path = join(packageRoot, relative);
     mkdirSync(dirname(path), { recursive: true });
@@ -203,6 +219,8 @@ async function fixture() {
   }
   const archivePath = join(base, 'reviewed archive; inert.tgz');
   execFileSync('tar', ['-czf', archivePath, '-C', dirname(packageRoot), 'package']);
+  const nativePluginRoot = join(base, 'native-plugin');
+  if (native) cpSync(join(packageRoot, 'plugins', 'ai-delivery'), nativePluginRoot, { recursive: true });
   const bin = join(base, 'bin');
   mkdirSync(bin);
   const counter = join(base, 'installs');
@@ -225,6 +243,7 @@ async function fixture() {
     expectedSourceCommit: git(root, 'rev-parse', 'HEAD'),
     expectedConfigDigest: (await loadDeliveryConfig(root)).configDigest,
     runtimeDirectory: join(base, 'staged'),
+    ...(native ? { nativePluginRoot } : {}),
   };
   return {
     base,
@@ -239,9 +258,75 @@ async function fixture() {
   };
 }
 function admitInput(input: SetupInput, stageId: string, prior: string | null = null) {
-  const { archivePath: _archive, expectedArchiveSha256: _digest, packageVersion: _version, ...rest } = input;
+  const {
+    archivePath: _archive,
+    expectedArchiveSha256: _digest,
+    packageVersion: _version,
+    nativePluginRoot: _native,
+    ...rest
+  } = input;
   return { ...rest, authority: 'runtime:admit', stageId, expectedPriorAdmissionSha256: prior };
 }
+
+test('native stage binds exact copied runtime paths and bytes, reuses and admits only that completed stage', async () => {
+  const f = await fixture(true);
+  try {
+    const api = await producer();
+    const staged = await api.stageRuntime(f.input);
+    assert.equal(staged.admission.cliPath, join(f.input.nativePluginRoot!, 'runtime', 'dist', 'cli.js'));
+    assert.equal(staged.admission.mcpLauncherPath, join(f.input.nativePluginRoot!, 'dist', 'mcp-launcher.js'));
+    const record = readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'));
+    assert.equal((await api.stageRuntime(f.input)).reused, true);
+    assert.deepEqual(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json')), record);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    const other = join(f.base, 'other-native-plugin');
+    cpSync(f.input.nativePluginRoot!, other, { recursive: true });
+    await assert.rejects(api.stageRuntime({ ...f.input, nativePluginRoot: other }), /incompatible setup intent/u);
+    const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
+    assert.equal(admitted.admission.admissionId, staged.admission.admissionId);
+    assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
+    const readback = await assertDeliveryRuntimeAdmitted({
+      repoRoot: f.root,
+      runtimeEntryPath: staged.admission.cliPath,
+    });
+    assert.equal(readback.admissionId, staged.admission.admissionId);
+    writeFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'Changed native plugin bytes.\n');
+    await assert.rejects(api.stageRuntime(f.input), /native plugin.*reviewed/iu);
+    await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /native plugin.*reviewed/iu);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('native stage refuses unreviewed cache bytes without completing or mutating the cache', async () => {
+  const f = await fixture(true);
+  try {
+    const api = await producer();
+    const target = join(f.input.nativePluginRoot!, 'runtime', 'dist', 'cli.js');
+    const altered = 'console.log("unreviewed");\n';
+    writeFileSync(target, altered);
+    await assert.rejects(api.stageRuntime(f.input), /native plugin.*reviewed/iu);
+    assert.equal(readFileSync(target, 'utf8'), altered);
+    assert.equal(existsSync(join(f.root, '.git', 'ai-delivery', 'runtime-admission.json')), false);
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('native stage rejects aliased or overlapping cache paths before installing', async () => {
+  const f = await fixture(true);
+  try {
+    const api = await producer();
+    const alias = join(f.base, 'native-alias');
+    symlinkSync(f.input.nativePluginRoot!, alias);
+    await assert.rejects(api.stageRuntime({ ...f.input, nativePluginRoot: alias }), /symbolic link/u);
+    await assert.rejects(api.stageRuntime({ ...f.input, nativePluginRoot: f.base }), /overlap/iu);
+    assert.equal(existsSync(f.counter), false);
+  } finally {
+    f.cleanup();
+  }
+});
 
 test('runtime-stage controller memory is bounded before authenticated preflight', async () => {
   const api = await producer();
@@ -369,6 +454,155 @@ test('runtime-stage failure logs honor the caller retained-output cap outside th
   }
 });
 
+test('runtime-stage retries share the retained-output allowance and preserve earlier failure evidence', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const logLimit = 1024 ** 2;
+  const input = {
+    ...f.input,
+    resourceBounds: {
+      maxAggregateRssBytes: 512 * 1024 ** 2,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 128 * 1024 ** 2,
+      maxCapturedOutputBytes: logLimit,
+    },
+  };
+  const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+  try {
+    writeFileSync(join(f.base, 'fail'), 'go');
+    writeFileSync(join(f.base, 'log-bytes'), String(600 * 1024));
+    await assert.rejects(api.stageRuntime(input), /failed/u);
+    const prior = readdirSync(outputDirectory).map((name) => ({
+      name,
+      bytes: readFileSync(join(outputDirectory, name)),
+    }));
+    writeFileSync(join(f.base, 'log-bytes'), String(700 * 1024));
+    await assert.rejects(api.stageRuntime(input), /failed|captured output exceeded/u);
+    const total = readdirSync(outputDirectory).reduce(
+      (bytes, name) => bytes + lstatSync(join(outputDirectory, name)).size,
+      0,
+    );
+    assert.ok(total <= logLimit, `Retained retry logs ${total} exceed total allowance ${logLimit}.`);
+    for (const evidence of prior) assert.deepEqual(readFileSync(join(outputDirectory, evidence.name)), evidence.bytes);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+    await assert.rejects(api.stageRuntime(input), /retained.*exhausted/u);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'xx', 'exhausted allowance must refuse another installer invocation');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const existing of ['oversized', 'corrupt', 'valid', 'empty'] as const) {
+  test(`runtime-stage first publication bounds ${existing} shared output absent from its ledger`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    const bytes = Buffer.alloc(existing === 'empty' ? 0 : 100 * 1024, 65);
+    const digest = digestBytes(bytes);
+    const directory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+    const evidence = join(directory, `${digest.slice(7)}.bin`);
+    const ledgerDirectory = join(
+      f.root,
+      '.git/ai-delivery/verification@1/runtime-output',
+      digestValue(f.root).slice(7),
+    );
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      writeFileSync(evidence, existing === 'corrupt' ? Buffer.alloc(bytes.length, 66) : bytes, { mode: 0o600 });
+      if (existing === 'oversized') truncateSync(evidence, 9 * 1024 ** 2);
+      const originalDigest = digestBytes(readFileSync(evidence));
+      const originalIdentity = lstatSync(evidence);
+      assert.equal(existsSync(ledgerDirectory), false, 'shared evidence must precede this stage ledger');
+      writeFileSync(join(f.base, 'fail'), 'go');
+      writeFileSync(join(f.base, 'log-bytes'), String(bytes.length));
+      sharedOutputRead.path = evidence;
+      sharedOutputRead.unboundedReads = 0;
+      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+      assert.equal(sharedOutputRead.unboundedReads, 0, 'publication must bound existing evidence before reading it');
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      const ledgerPath = join(ledgerDirectory, readdirSync(ledgerDirectory)[0]!);
+      const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as {
+        outputs: { digest: string; bytes: number; status: string }[];
+      };
+      const refused = existing === 'oversized' || existing === 'corrupt';
+      assert.deepEqual(ledger.outputs, [{ digest, bytes: bytes.length, status: refused ? 'reserved' : 'complete' }]);
+      const retainedLedger = readFileSync(ledgerPath);
+      await assert.rejects(api.stageRuntime(f.input), refused ? /corrupt|size.*bound/u : /exit 7/u);
+      assert.equal(readFileSync(f.counter, 'utf8'), refused ? 'x' : 'xx');
+      assert.equal(sharedOutputRead.unboundedReads, 0);
+      assert.deepEqual(
+        readFileSync(ledgerPath),
+        retainedLedger,
+        'retry must preserve the existing reservation or completed charge',
+      );
+      sharedOutputRead.path = '';
+      assert.equal(
+        digestBytes(readFileSync(evidence)),
+        originalDigest,
+        'existing shared evidence must remain immutable',
+      );
+      const after = lstatSync(evidence);
+      assert.equal(after.ino, originalIdentity.ino);
+      assert.equal(after.size, originalIdentity.size);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+    } finally {
+      sharedOutputRead.path = '';
+      sharedOutputRead.unboundedReads = 0;
+      f.cleanup();
+    }
+  });
+}
+
+for (const fault of [
+  'corrupt ledger',
+  'incompatible controller',
+  'missing evidence',
+  'corrupt evidence',
+  'oversized evidence',
+] as const) {
+  test(`runtime-stage retained-output ${fault} refuses another installer without resetting its allowance`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      writeFileSync(join(f.base, 'fail'), 'go');
+      writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+      const directory = join(f.root, '.git/ai-delivery/verification@1/runtime-output', digestValue(f.root).slice(7));
+      const path = join(directory, readdirSync(directory)[0]!);
+      const ledger = JSON.parse(readFileSync(path, 'utf8')) as {
+        contentDigest: string;
+        producerDigest: string;
+        outputs: { digest: string }[];
+      };
+      const evidence = join(
+        f.root,
+        '.git/ai-delivery/verification@1/command-output',
+        `${ledger.outputs[0]!.digest.slice(7)}.bin`,
+      );
+      if (fault === 'corrupt ledger') {
+        ledger.contentDigest = `sha256:${'0'.repeat(64)}`;
+        writeFileSync(path, JSON.stringify(ledger));
+      } else if (fault === 'incompatible controller') {
+        ledger.producerDigest = `sha256:${'0'.repeat(64)}`;
+        const { contentDigest: _digest, ...content } = ledger;
+        ledger.contentDigest = digestValue(content);
+        writeFileSync(path, JSON.stringify(ledger));
+      } else if (fault === 'missing evidence') rmSync(evidence);
+      else if (fault === 'oversized evidence') truncateSync(evidence, 9 * 1024 ** 2);
+      else writeFileSync(evidence, 'changed immutable output');
+      const retained = readFileSync(path);
+      await assert.rejects(api.stageRuntime(f.input), /corrupt|incompatible|ENOENT|size.*bound/u);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.deepEqual(readFileSync(path), retained, 'failed integrity check must preserve the charged ledger');
+      assert.equal(readdirSync(directory).length, 1);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
 test('runtime-stage explicitly isolates npm cache, logs, configuration and temporary destinations', async () => {
   const api = await producer();
   const f = await fixture();
@@ -396,6 +630,63 @@ test('runtime-stage explicitly isolates npm cache, logs, configuration and tempo
     assert.equal((await api.stageRuntime(f.input)).reused, true);
     assert.equal(readFileSync(f.counter, 'utf8'), 'x');
   } finally {
+    f.cleanup();
+  }
+});
+
+test('runtime-stage cancellation shares prior failure charges and identical evidence is reused', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const cancellation = new AbortController();
+  const input = {
+    ...f.input,
+    resourceBounds: {
+      maxAggregateRssBytes: 512 * 1024 ** 2,
+      minFreeDiskBytes: 1,
+      maxNewOutputBytes: 128 * 1024 ** 2,
+      maxCapturedOutputBytes: 1024 ** 2,
+    },
+  };
+  const directory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+  const write = process.stderr.write.bind(process.stderr);
+  let sawCaptured = false;
+  const observation = vi.spyOn(process.stderr, 'write').mockImplementation((chunk, ...args) => {
+    const text = String(chunk);
+    if (text.startsWith('ai-delivery.verify ')) {
+      const value = JSON.parse(text.slice('ai-delivery.verify '.length)) as { capturedOutputBytes?: number };
+      if (value.capturedOutputBytes === 200 * 1024) {
+        sawCaptured = true;
+        cancellation.abort();
+      }
+    }
+    return write(chunk, ...args);
+  });
+  try {
+    writeFileSync(join(f.base, 'fail'), 'go');
+    writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+    await assert.rejects(api.stageRuntime(input), /exit 7/u);
+    await assert.rejects(api.stageRuntime(input), /exit 7/u);
+    assert.equal(readdirSync(directory).length, 1, 'identical complete command evidence must be reused');
+    const prior = readFileSync(join(directory, readdirSync(directory)[0]!));
+    rmSync(join(f.base, 'fail'));
+    writeFileSync(join(f.base, 'wait'), 'go');
+    writeFileSync(join(f.base, 'log-bytes'), String(200 * 1024));
+    await assert.rejects(api.stageRuntime({ ...input, signal: cancellation.signal }), /cancelled/u);
+    assert.equal(sawCaptured, true, 'cancel only after the full owned output is captured');
+    assert.ok(readdirSync(directory).some((name) => readFileSync(join(directory, name)).equals(prior)));
+    const ledgerRoot = join(f.root, '.git/ai-delivery/verification@1/runtime-output', digestValue(f.root).slice(7));
+    const ledger = JSON.parse(readFileSync(join(ledgerRoot, readdirSync(ledgerRoot)[0]!), 'utf8')) as {
+      outputs: { bytes: number }[];
+    };
+    assert.equal(
+      ledger.outputs.reduce((total, output) => total + output.bytes, 0),
+      300 * 1024,
+    );
+    assert.equal(readFileSync(f.counter, 'utf8'), 'xxx');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    cancellation.abort();
+    observation.mockRestore();
     f.cleanup();
   }
 });
@@ -493,98 +784,124 @@ test('runtime-stage changed resource intent preserves compatible completed bytes
   }
 });
 
-test('real npm isolation retains cache and logs inside the stage and preserves unrelated host destinations', async () => {
-  const api = await producer();
-  const realPath = process.env.PATH;
-  const f = await fixture();
-  const previous = {
-    cache: process.env.npm_config_cache,
-    logs: process.env.npm_config_logs_dir,
-    userconfig: process.env.npm_config_userconfig,
-  };
-  try {
-    process.env.PATH = realPath;
-    const outside = join(f.base, 'unrelated-host');
-    mkdirSync(outside);
-    const cache = join(outside, 'cache');
-    const logs = join(outside, 'logs');
-    for (const path of [cache, logs]) {
-      mkdirSync(path);
-      writeFileSync(join(path, 'keep'), 'unrelated');
-    }
-    const userconfig = join(outside, 'user.npmrc');
-    const config = `cache=${cache}\nlogs-dir=${logs}\n`;
-    writeFileSync(userconfig, config);
-    const nativeBin = join(f.base, 'native-bin');
-    mkdirSync(nativeBin);
-    const probe = join(f.input.runtimeDirectory, 'native-npm-observation.json');
-    const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
-    writeFileSync(
-      join(nativeBin, 'npm'),
-      `#!${process.execPath}\nconst fs=require('node:fs'),os=require('node:os');\nfs.writeFileSync(${JSON.stringify(probe)},JSON.stringify({args:process.argv.slice(2),cwd:process.cwd(),tmpdir:os.tmpdir(),npmVersion:require(${JSON.stringify(join(npmRoot, 'package.json'))}).version}),{mode:0o600});\nrequire(${JSON.stringify(join(npmRoot, 'bin/npm-cli.js'))});\n`,
-    );
-    chmodSync(join(nativeBin, 'npm'), 0o755);
-    process.env.PATH = `${nativeBin}:${realPath ?? ''}`;
-    process.env.npm_config_cache = cache;
-    process.env.npm_config_logs_dir = logs;
-    process.env.npm_config_userconfig = userconfig;
-    const stage = await api.stageRuntime({
-      ...f.input,
-      resourceBounds: {
-        maxAggregateRssBytes: 512 * 1024 ** 2,
-        minFreeDiskBytes: 1,
-        maxNewOutputBytes: 128 * 1024 ** 2,
-        maxCapturedOutputBytes: 1024 ** 2,
-      },
-    });
-    assert.equal(existsSync(f.counter), false, 'synthetic npm must not execute');
-    assert.equal(
-      execFileSync(process.execPath, [stage.admission.cliPath, '--version'], { encoding: 'utf8' }).trim(),
-      '0.3.5',
-    );
-    assert.ok(readdirSync(join(f.input.runtimeDirectory, '.npm/cache')).length > 0);
-    assert.ok(readdirSync(join(f.input.runtimeDirectory, '.npm/logs')).length > 0);
-    const native = JSON.parse(readFileSync(probe, 'utf8')) as {
-      args: string[];
-      cwd: string;
-      tmpdir: string;
-      npmVersion: string;
+for (const mode of ['success', 'failure', 'cancel'] as const) {
+  test(`real npm ${mode} disables file logs and preserves unrelated host destinations`, async () => {
+    const api = await producer();
+    const realPath = process.env.PATH;
+    const f = await fixture();
+    const cancellation = new AbortController();
+    let operation: Promise<Stage> | undefined;
+    const previous = {
+      cache: process.env.npm_config_cache,
+      logs: process.env.npm_config_logs_dir,
+      userconfig: process.env.npm_config_userconfig,
     };
-    assert.equal(native.npmVersion, '11.19.0');
-    assert.equal(native.cwd, f.input.runtimeDirectory);
-    assert.equal(native.tmpdir, join(f.input.runtimeDirectory, '.npm/tmp'));
-    for (const option of ['--cache', '--logs-dir', '--userconfig', '--globalconfig']) {
-      assert.ok(native.args.includes(option));
-      assert.ok(native.args[native.args.indexOf(option) + 1]!.startsWith(`${f.input.runtimeDirectory}/`));
+    try {
+      process.env.PATH = realPath;
+      const outside = join(f.base, 'unrelated-host');
+      mkdirSync(outside);
+      const cache = join(outside, 'cache');
+      const logs = join(outside, 'logs');
+      for (const path of [cache, logs]) {
+        mkdirSync(path);
+        writeFileSync(join(path, 'keep'), 'unrelated');
+      }
+      const userconfig = join(outside, 'user.npmrc');
+      const config = `cache=${cache}\nlogs-dir=${logs}\n`;
+      writeFileSync(userconfig, config);
+      const nativeBin = join(f.base, 'native-bin');
+      mkdirSync(nativeBin);
+      const probe = join(f.base, 'native-npm-observation.json');
+      const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
+      writeFileSync(
+        join(nativeBin, 'npm'),
+        `#!${process.execPath}\nconst fs=require('node:fs'),os=require('node:os'),path=require('node:path');\nconst observation={args:process.argv.slice(2),cwd:process.cwd(),tmpdir:os.tmpdir(),npmVersion:require(${JSON.stringify(join(npmRoot, 'package.json'))}).version};\nconst LogFile=require(${JSON.stringify(join(npmRoot, 'lib/utils/log-file.js'))}),load=LogFile.prototype.load;\nconst observe=()=>{const directory=path.join(process.cwd(),'.npm/logs');observation.fileLogs=fs.existsSync(directory)?fs.readdirSync(directory):[];observation.fileLogBytes=observation.fileLogs.reduce((sum,name)=>sum+fs.statSync(path.join(directory,name)).size,0);fs.writeFileSync(${JSON.stringify(probe)},JSON.stringify(observation),{mode:0o600});};\nLogFile.prototype.load=function(options){const result=load.call(this,options);observation.logsMax=options.logsMax;observe();${mode === 'cancel' ? 'setInterval(observe,20);' : ''}return result;};\nprocess.on('exit',observe);\n${mode === 'failure' ? 'process.argv[2]="synthetic-unknown-command";' : ''}\nrequire(${JSON.stringify(join(npmRoot, 'bin/npm-cli.js'))});\n`,
+      );
+      chmodSync(join(nativeBin, 'npm'), 0o755);
+      process.env.PATH = `${nativeBin}:${realPath ?? ''}`;
+      process.env.npm_config_cache = cache;
+      process.env.npm_config_logs_dir = logs;
+      process.env.npm_config_userconfig = userconfig;
+      operation = api.stageRuntime({
+        ...f.input,
+        signal: cancellation.signal,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+          maxCapturedOutputBytes: 1024 ** 2,
+        },
+      });
+      void operation.catch(() => undefined);
+      if (mode === 'cancel') {
+        for (let i = 0; i < 1000 && !existsSync(probe); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(existsSync(probe), true, 'actual npm log configuration was not observed');
+        cancellation.abort();
+        await assert.rejects(operation, /cancelled/u);
+      } else if (mode === 'failure') await assert.rejects(operation, /exit 1/u);
+      else {
+        const stage = await operation;
+        assert.equal(existsSync(f.counter), false, 'synthetic npm must not execute');
+        assert.equal(
+          execFileSync(process.execPath, [stage.admission.cliPath, '--version'], { encoding: 'utf8' }).trim(),
+          '0.3.5',
+        );
+        assert.ok(readdirSync(join(f.input.runtimeDirectory, '.npm/cache')).length > 0);
+        assert.deepEqual(readdirSync(join(f.input.runtimeDirectory, '.npm/logs')), []);
+      }
+      const native = JSON.parse(readFileSync(probe, 'utf8')) as {
+        args: string[];
+        cwd: string;
+        tmpdir: string;
+        npmVersion: string;
+        logsMax: number;
+        fileLogs: string[];
+        fileLogBytes: number;
+      };
+      assert.equal(native.npmVersion, '11.19.0');
+      assert.equal(native.cwd, f.input.runtimeDirectory);
+      assert.equal(native.tmpdir, join(f.input.runtimeDirectory, '.npm/tmp'));
+      assert.equal(native.logsMax, 0);
+      assert.equal(native.fileLogBytes, 0);
+      assert.deepEqual(native.fileLogs, []);
+      if (mode !== 'success') assert.equal(existsSync(f.input.runtimeDirectory), false);
+      for (const option of ['--cache', '--logs-dir', '--userconfig', '--globalconfig']) {
+        assert.ok(native.args.includes(option));
+        assert.ok(native.args[native.args.indexOf(option) + 1]!.startsWith(`${f.input.runtimeDirectory}/`));
+      }
+      assert.deepEqual(readdirSync(cache), ['keep']);
+      assert.deepEqual(readdirSync(logs), ['keep']);
+      assert.equal(readFileSync(userconfig, 'utf8'), config);
+      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+      console.log(
+        'REAL_NPM_ISOLATION_RECEIPT',
+        JSON.stringify({
+          mode,
+          npmFileLogBytes: native.fileLogBytes,
+          npmFileLogsDisabled: true,
+          temporaryAndConfigInsideStage: true,
+          unrelatedHostPreserved: true,
+          controllerInclusiveMemoryBytes: 512 * 1024 ** 2,
+          retainedLogCapBytes: 1024 ** 2,
+          hostActivated: false,
+          sharedAdmissionWritten: false,
+        }),
+      );
+    } finally {
+      cancellation.abort();
+      await operation?.catch(() => undefined);
+      for (const [name, value] of [
+        ['npm_config_cache', previous.cache],
+        ['npm_config_logs_dir', previous.logs],
+        ['npm_config_userconfig', previous.userconfig],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      f.cleanup();
     }
-    assert.deepEqual(readdirSync(cache), ['keep']);
-    assert.deepEqual(readdirSync(logs), ['keep']);
-    assert.equal(readFileSync(userconfig, 'utf8'), config);
-    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-    console.log(
-      'REAL_NPM_ISOLATION_RECEIPT',
-      JSON.stringify({
-        cacheAndLogsInsideStage: true,
-        temporaryAndConfigInsideStage: true,
-        unrelatedHostPreserved: true,
-        controllerInclusiveMemoryBytes: 512 * 1024 ** 2,
-        retainedLogCapBytes: 1024 ** 2,
-        hostActivated: false,
-        sharedAdmissionWritten: false,
-      }),
-    );
-  } finally {
-    for (const [name, value] of [
-      ['npm_config_cache', previous.cache],
-      ['npm_config_logs_dir', previous.logs],
-      ['npm_config_userconfig', previous.userconfig],
-    ] as const) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-    f.cleanup();
-  }
-});
+  });
+}
 
 test('public producer stages exact bytes, explicitly admits and reuses completed work without installing again', async () => {
   const api = await producer();
@@ -834,37 +1151,44 @@ test('post-rename errors reconcile desired bytes and never overwrite third-party
   }
 });
 
-test('failure and cancellation remove only the owned incomplete stage and preserve unrelated output', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const controller = new AbortController();
-  try {
-    const unrelated = join(f.base, 'unrelated');
-    mkdirSync(unrelated);
-    writeFileSync(join(unrelated, 'keep'), 'keep');
-    writeFileSync(join(f.base, 'fail'), 'go');
-    await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    rmSync(join(f.base, 'fail'));
-    writeFileSync(join(f.base, 'wait'), 'go');
-    const running = api.stageRuntime({ ...f.input, signal: controller.signal });
-    void running.catch(() => undefined);
-    for (let i = 0; i < 100 && !existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery')); i++)
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(
-      digestBytes(readFileSync(join(f.input.runtimeDirectory, 'reviewed-archive.tgz'))),
-      f.input.expectedArchiveSha256,
-    );
-    controller.abort();
-    await assert.rejects(running, /cancelled/u);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(readFileSync(join(unrelated, 'keep'), 'utf8'), 'keep');
-    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-  } finally {
-    controller.abort();
-    f.cleanup();
-  }
-});
+for (const native of [false, true]) {
+  test(`${native ? 'native ' : ''}failure and cancellation remove only the owned incomplete stage and preserve unrelated output`, async () => {
+    const api = await producer();
+    const f = await fixture(native);
+    const controller = new AbortController();
+    try {
+      const unrelated = join(f.base, 'unrelated');
+      mkdirSync(unrelated);
+      writeFileSync(join(unrelated, 'keep'), 'keep');
+      writeFileSync(join(f.base, 'fail'), 'go');
+      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      rmSync(join(f.base, 'fail'));
+      writeFileSync(join(f.base, 'wait'), 'go');
+      const running = api.stageRuntime({ ...f.input, signal: controller.signal });
+      void running.catch(() => undefined);
+      for (let i = 0; i < 100 && !existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery')); i++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(
+        digestBytes(readFileSync(join(f.input.runtimeDirectory, 'reviewed-archive.tgz'))),
+        f.input.expectedArchiveSha256,
+      );
+      controller.abort();
+      await assert.rejects(running, /cancelled/u);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(readFileSync(join(unrelated, 'keep'), 'utf8'), 'keep');
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+      if (native)
+        assert.equal(
+          readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
+          'Synthetic copied native plugin.\n',
+        );
+    } finally {
+      controller.abort();
+      f.cleanup();
+    }
+  });
+}
 
 test('admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes', async () => {
   const api = await producer();
@@ -954,109 +1278,217 @@ for (const denied of [
 
 test('setup interruption child', { skip: !process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT }, async () => {
   const api = await producer();
+  const phase = process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE;
+  if (phase) {
+    const actual = atomicJson.writePrivateJsonFileAtomically;
+    vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+      const record = value as { outputs?: { status: string }[] };
+      const interrupt =
+        path.includes('/runtime-output/') &&
+        record.outputs?.[0]?.status === (phase === 'reservation' ? 'reserved' : 'complete');
+      if (!(interrupt && phase === 'publication')) actual(path, value);
+      if (interrupt) {
+        writeFileSync(
+          process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_MARKER!,
+          JSON.stringify({ phase, path, owner: process.pid }),
+        );
+        process.kill(process.pid, 'SIGKILL');
+      }
+    });
+  }
   await api.stageRuntime(JSON.parse(process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT!) as SetupInput);
 });
 
-test('stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install', async () => {
-  const api = await producer();
-  const f = await fixture();
-  let child: ReturnType<typeof spawn> | undefined;
-  let ownedPid: number | undefined;
-  let ownedIdentity: string | undefined;
-  let ownerPid: number | undefined;
-  const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
-  try {
-    writeFileSync(join(f.base, 'wait'), 'go');
-    child = spawn(
-      process.execPath,
-      [
-        join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
-        'run',
-        'dist/setup.test.js',
-        '-t',
-        '^setup interruption child$',
-      ],
-      {
-        cwd: process.cwd(),
-        stdio: 'ignore',
-        env: { ...process.env, AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(f.input) },
+for (const phase of ['reservation', 'publication'] as const) {
+  test(`runtime-stage retained-output recovery preserves charges after hard interruption at ${phase}`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    const marker = join(f.base, 'log-interruption-marker');
+    const input = {
+      ...f.input,
+      resourceBounds: {
+        maxAggregateRssBytes: 512 * 1024 ** 2,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 128 * 1024 ** 2,
+        maxCapturedOutputBytes: 1024 ** 2,
       },
-    );
-    const closed = new Promise((resolve) => child!.once('close', resolve));
-    const writerPath = join(
-      f.root,
-      '.git/ai-delivery/writers@1',
-      `${(await import('./delivery/index.js')).digestValue(f.root).slice(7)}.json`,
-    );
-    let record:
-      | { owner: { pid: number }; command: { phase: string; root?: { pid: number; identity: string } } }
-      | undefined;
-    // Bound this cold installer-start observation, not the recovery run.
-    for (let i = 0; i < 1000; i++) {
-      if (existsSync(writerPath)) record = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof record;
-      if (record?.command.phase === 'running' && existsSync(f.marker)) break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
+    };
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      writeFileSync(join(f.base, 'fail'), 'go');
+      writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+      child = spawn(
+        process.execPath,
+        [
+          join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+          'run',
+          new URL(import.meta.url).pathname,
+          '-t',
+          '^setup interruption child$',
+          '--maxWorkers=1',
+          '--no-file-parallelism',
+        ],
+        {
+          env: {
+            ...process.env,
+            AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(input),
+            AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE: phase,
+            AI_DELIVERY_SETUP_LOG_INTERRUPT_MARKER: marker,
+          },
+          stdio: 'ignore',
+        },
+      );
+      await new Promise<void>((resolve) => child!.once('close', () => resolve()));
+      assert.equal(existsSync(marker), true, 'hard interruption must occur at the selected durable log boundary');
+      const writerPath = join(f.root, '.git/ai-delivery/writers@1', `${digestValue(f.root).slice(7)}.json`);
+      const stale = new Date(Date.now() - 20_000);
+      utimesSync(`${writerPath}.lock`, stale, stale);
+      const { path } = JSON.parse(readFileSync(marker, 'utf8')) as { path: string };
+      const prior = JSON.parse(readFileSync(path, 'utf8')) as {
+        outputs: { bytes: number; digest: string; status: string }[];
+      };
+      assert.equal(prior.outputs[0]!.status, 'reserved');
+      assert.equal(prior.outputs[0]!.bytes, 100 * 1024);
+      const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+      const priorOutput = join(outputDirectory, `${prior.outputs[0]!.digest.slice(7)}.bin`);
+      assert.equal(existsSync(priorOutput), phase === 'publication');
+      const preserved = phase === 'publication' ? readFileSync(priorOutput) : undefined;
+      writeFileSync(join(f.base, 'log-bytes'), String(128 * 1024));
+      await assert.rejects(api.stageRuntime(input), /exit 7/u);
+      const recovered = JSON.parse(readFileSync(path, 'utf8')) as typeof prior;
+      assert.equal(
+        recovered.outputs.reduce((total, output) => total + output.bytes, 0),
+        228 * 1024,
+      );
+      assert.equal(recovered.outputs[0]!.status, phase === 'publication' ? 'complete' : 'reserved');
+      if (preserved) assert.deepEqual(readFileSync(priorOutput), preserved);
+      if (phase === 'reservation') {
+        writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+        await assert.rejects(api.stageRuntime(input), /identical output cannot be rewritten/u);
+        assert.equal(
+          existsSync(priorOutput),
+          false,
+          'unresolved reservation must not authorize a second raw-log write',
+        );
+      }
+      rmSync(join(f.base, 'fail'));
+      rmSync(join(f.base, 'log-bytes'));
+      const completed = await api.stageRuntime(input);
+      const count = readFileSync(f.counter, 'utf8');
+      assert.equal(completed.reused, false);
+      assert.equal((await api.stageRuntime(input)).reused, true);
+      assert.equal(readFileSync(f.counter, 'utf8'), count, 'completed recovered stage must skip the installer');
+      assert.equal(readFileSync(completed.admission.cliPath, 'utf8'), "#!/usr/bin/env node\nconsole.log('0.3.5');\n");
+    } finally {
+      if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      f.cleanup();
     }
-    assert.equal(record?.command.phase, 'running');
-    assert.equal(existsSync(f.marker), true, 'interrupt only after the owned installer actually starts');
-    const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
-    assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
-    ownerPid = record!.owner.pid;
-    ownedPid = record!.command.root!.pid;
-    ownedIdentity = record!.command.root!.identity;
-    process.kill(ownerPid, 'SIGSTOP');
-    const stale = new Date(Date.now() - 20_000);
-    utimesSync(`${writerPath}.lock`, stale, stale);
-    await assert.rejects(api.stageRuntime(f.input), /live verification writer/u);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    process.kill(ownerPid, 'SIGKILL');
-    ownerPid = undefined;
-    await closed;
-    process.kill(ownedPid, 0);
-    writeFileSync(snapshot, 'interrupted incomplete snapshot');
-    rmSync(join(f.base, 'wait'));
-    const recovered = await api.stageRuntime(f.input);
-    assert.equal(recovered.reused, false);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-    assert.equal(existsSync(writerPath), false);
-    assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
-    const completedSnapshot = lstatSync(snapshot);
-    process.kill(peer.pid!, 0);
-    const state = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
-    assert.ok(state.status === 1 || state.stdout.trim().startsWith('Z'));
-    ownedPid = undefined;
-    assert.equal((await api.stageRuntime(f.input)).reused, true);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-    assert.equal(lstatSync(snapshot).ino, completedSnapshot.ino);
-    console.log(
-      'SETUP_INTERRUPTION_RECEIPT',
-      JSON.stringify({
-        completedStageId: recovered.stageId,
-        installerExecutions: 2,
-        peerPreserved: true,
-        ownedCleanupConfirmed: true,
-        completedRetrySkipped: true,
-        incompleteSnapshotRebuilt: true,
-        completedSnapshotReused: true,
-        archiveSha256: f.input.expectedArchiveSha256,
-      }),
-    );
-  } finally {
-    if (ownerPid !== undefined) {
-      process.kill(ownerPid, 'SIGCONT');
+  });
+}
+
+for (const native of [false, true]) {
+  test(`${native ? 'native ' : ''}stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install`, async () => {
+    const api = await producer();
+    const f = await fixture(native);
+    let child: ReturnType<typeof spawn> | undefined;
+    let ownedPid: number | undefined;
+    let ownedIdentity: string | undefined;
+    let ownerPid: number | undefined;
+    const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+    try {
+      writeFileSync(join(f.base, 'wait'), 'go');
+      child = spawn(
+        process.execPath,
+        [
+          join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+          'run',
+          'dist/setup.test.js',
+          '-t',
+          '^setup interruption child$',
+        ],
+        {
+          cwd: process.cwd(),
+          stdio: 'ignore',
+          env: { ...process.env, AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(f.input) },
+        },
+      );
+      const closed = new Promise((resolve) => child!.once('close', resolve));
+      const writerPath = join(
+        f.root,
+        '.git/ai-delivery/writers@1',
+        `${(await import('./delivery/index.js')).digestValue(f.root).slice(7)}.json`,
+      );
+      let record:
+        | { owner: { pid: number }; command: { phase: string; root?: { pid: number; identity: string } } }
+        | undefined;
+      // Bound this cold installer-start observation, not the recovery run.
+      for (let i = 0; i < 1000; i++) {
+        if (existsSync(writerPath)) record = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof record;
+        if (record?.command.phase === 'running' && existsSync(f.marker)) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(record?.command.phase, 'running');
+      assert.equal(existsSync(f.marker), true, 'interrupt only after the owned installer actually starts');
+      const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
+      assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
+      ownerPid = record!.owner.pid;
+      ownedPid = record!.command.root!.pid;
+      ownedIdentity = record!.command.root!.identity;
+      process.kill(ownerPid, 'SIGSTOP');
+      const stale = new Date(Date.now() - 20_000);
+      utimesSync(`${writerPath}.lock`, stale, stale);
+      await assert.rejects(api.stageRuntime(f.input), /live verification writer/u);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
       process.kill(ownerPid, 'SIGKILL');
+      ownerPid = undefined;
+      await closed;
+      process.kill(ownedPid, 0);
+      writeFileSync(snapshot, 'interrupted incomplete snapshot');
+      rmSync(join(f.base, 'wait'));
+      const recovered = await api.stageRuntime(f.input);
+      assert.equal(recovered.reused, false);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+      assert.equal(existsSync(writerPath), false);
+      assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
+      const completedSnapshot = lstatSync(snapshot);
+      process.kill(peer.pid!, 0);
+      const state = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
+      assert.ok(state.status === 1 || state.stdout.trim().startsWith('Z'));
+      ownedPid = undefined;
+      assert.equal((await api.stageRuntime(f.input)).reused, true);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+      assert.equal(lstatSync(snapshot).ino, completedSnapshot.ino);
+      console.log(
+        'SETUP_INTERRUPTION_RECEIPT',
+        JSON.stringify({
+          completedStageId: recovered.stageId,
+          installerExecutions: 2,
+          peerPreserved: true,
+          ownedCleanupConfirmed: true,
+          completedRetrySkipped: true,
+          incompleteSnapshotRebuilt: true,
+          completedSnapshotReused: true,
+          archiveSha256: f.input.expectedArchiveSha256,
+          nativePluginRoot: f.input.nativePluginRoot ?? null,
+        }),
+      );
+    } finally {
+      if (ownerPid !== undefined) {
+        process.kill(ownerPid, 'SIGCONT');
+        process.kill(ownerPid, 'SIGKILL');
+      }
+      if (
+        ownedPid !== undefined &&
+        spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim() ===
+          ownedIdentity
+      )
+        process.kill(ownedPid, 'SIGKILL');
+      if (peer.exitCode === null && peer.signalCode === null) peer.kill('SIGKILL');
+      if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      f.cleanup();
     }
-    if (
-      ownedPid !== undefined &&
-      spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim() ===
-        ownedIdentity
-    )
-      process.kill(ownedPid, 'SIGKILL');
-    if (peer.exitCode === null && peer.signalCode === null) peer.kill('SIGKILL');
-    if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    f.cleanup();
-  }
-});
+  });
+}
 
 test('CLI stage and admit execute the same public producer with explicit authority and prior absence', async () => {
   const f = await fixture();

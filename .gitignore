@@ -1,5 +1,8 @@
 /node_modules/
 /dist/
+/plugins/ai-delivery/dist/
+/plugins/ai-delivery/LICENSE
+/plugins/ai-delivery/runtime/
 *.tsbuildinfo
 .issue-cli/
 .worktrees/

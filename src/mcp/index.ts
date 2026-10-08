@@ -4,12 +4,13 @@ import { z } from 'zod';
 
 import { executeTool, type ExecutionContext } from '../dispatch.js';
 import { setLogsSuppressed } from '../logger.js';
+import { PACKAGE_VERSION } from '../version.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
 
 export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls?: Set<Promise<unknown>>): McpServer {
-  const server = new McpServer({ name: 'ai-delivery', version: '0.3.6' });
+  const server = new McpServer({ name: 'ai-delivery', version: PACKAGE_VERSION });
   const tools: readonly { name: string; description: string; inputSchema: z.ZodObject<z.ZodRawShape> }[] =
     AI_DELIVERY_MCP_TOOLS;
   for (const tool of tools) {

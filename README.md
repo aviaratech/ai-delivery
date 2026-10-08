@@ -1,6 +1,6 @@
 # ai-delivery
 
-Generic GitHub issue and pull request delivery with Git/GitHub discovery and a source-controlled `RepositoryDeliveryPolicy@1` module. Routing overrides are optional. The package provides one `ai-delivery` CLI, one stdio MCP server, and thin plugin assets in `plugins/ai-delivery`.
+Generic GitHub issue and pull request delivery with Git/GitHub discovery and a source-controlled `RepositoryDeliveryPolicy@1` module. Routing overrides are optional. The package provides one `ai-delivery` CLI, one stdio MCP server, and a self-contained plugin root in `plugins/ai-delivery`. The packaged root includes portable `plugin.json` / `mcp.json`, Claude-compatible manifests, the three delivery skills, a built stdio launcher and bundled dependency notices. Hosts can copy the root into their native cache without resolving a parent npm installation or running an installation build.
 
 The package contains no repository-specific policy, credential, model, or deployment configuration. A consuming repository owns its issue taxonomy, author and reviewer credentials, native Project fields, delivery stages, and phase constraints. The runtime refuses an untracked override file or a missing or untracked policy module. Credentials and delivery policy remain explicit.
 
@@ -145,11 +145,11 @@ does not use an ambient `gh` session or another environment token. The legacy
 and `config:resolve`; configure the personal author role above for complete PR
 delivery with matching review artifacts and policy evidence.
 
-| Route | Package behavior | Native required approval |
-| --- | --- | --- |
-| Configured personal author + reviewer App | One App submits the exact-head independent review. | With Contents write accepted on the App installation, confirm that GitHub counts it; an eligible independent human may still need to approve if another rule blocks it. |
-| Author App + reviewer App | Existing separate App roles keep their credential and review bindings. | With Contents write accepted on the reviewer App installation, confirm that GitHub counts its approval. |
-| Author App + eligible human reviewer | A valid GitHub route for a repository that requires human approval; the current package still needs its configured reviewer App for the formal artifact receipt. | The human reviews and approves in GitHub. |
+| Route                                     | Package behavior                                                                                                                                                 | Native required approval                                                                                                                                                |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Configured personal author + reviewer App | One App submits the exact-head independent review.                                                                                                               | With Contents write accepted on the App installation, confirm that GitHub counts it; an eligible independent human may still need to approve if another rule blocks it. |
+| Author App + reviewer App                 | Existing separate App roles keep their credential and review bindings.                                                                                           | With Contents write accepted on the reviewer App installation, confirm that GitHub counts its approval.                                                                 |
+| Author App + eligible human reviewer      | A valid GitHub route for a repository that requires human approval; the current package still needs its configured reviewer App for the formal artifact receipt. | The human reviews and approves in GitHub.                                                                                                                               |
 
 GitHub requires qualifying approvals under [branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches) and [rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets). Pull requests write permits submitting a review; it does not grant repository write access for a required approval. When a required-approval rule is visible and the reviewer App's effective Contents grant is read-only, `pr:create --dry-run` reports `approvalEligibility: insufficient-permission` before publication. Unknown grants or rules remain `unknown`. The post-review readback reports `submittedReviewAuthorCanPushToRepository` when GitHub exposes it for the exact submitted review. Neither an App's scopes nor a submitted `APPROVED` review proves that it counted. The live PR `reviewDecision` is the required-review readback; it does not attribute a counted approval to one actor. Recheck it on the current head before merge.
 
@@ -199,6 +199,32 @@ require the clean primary consumer checkout, its expected Git HEAD, the actual
 operation authority. The authenticated author and distinct reviewer App must
 pass the existing repository-access preflight. Unknown rule visibility or
 approval eligibility remains unknown; setup does not establish counted approval.
+
+Manage the native plugin with an explicit package version:
+
+```sh
+ai-delivery plugin install --host codex --scope user --version <published-version> --json
+ai-delivery plugin doctor --host codex --scope user --json
+ai-delivery plugin update --host codex --scope user --version <published-version> --json
+ai-delivery plugin rollback --host codex --scope user --json
+ai-delivery plugin remove --host codex --scope user --json
+```
+
+Use `--host claude-code` for Claude Code. Its supported scopes are `user`,
+`project`, and `local`; select the project directory with the global
+`--repo-root` option. Codex currently supports `user`. Install and update require
+a literal version. Rollback selects the recorded previous version. The commands
+keep verified version units in a private directory and use the native host's
+marketplace and plugin commands to select that exact local source. Removal keeps
+the managed version units for recovery and uses Claude Code's `--keep-data`.
+
+Every command supports `--dry-run` and `--json`. Dry-run reports the target
+without fetching an archive, running a native command, or writing configuration.
+Doctor reports managed installation and source integrity, skills, and a direct
+stdio startup check of the selected bundled MCP server. Restart the native host
+after changing a plugin so it reloads that selection. Installing a plugin does
+not admit a consumer repository: use the explicit setup operations below before
+a lifecycle write.
 
 First read `config:resolve` with the configured author, then stage a reviewed
 local archive using its independently accepted SHA-256 and package version:

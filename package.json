@@ -1,6 +1,6 @@
 {
   "name": "@aviaratech/ai-delivery",
-  "version": "0.3.22",
+  "version": "0.3.23",
   "private": false,
   "description": "Generic GitHub issue and pull request delivery CLI and MCP server",
   "homepage": "https://github.com/aviaratech/ai-delivery#readme",
@@ -46,11 +46,11 @@
     "access": "public"
   },
   "scripts": {
-    "format": "oxfmt src package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "format:check": "oxfmt --check src package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "format": "oxfmt src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "format:check": "oxfmt --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
     "lint": "oxlint",
     "typecheck": "tsc -p tsconfig.json",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/build-plugin.mjs",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "test": "npm run build && vitest run",
     "checks": "npm run format:check && npm run lint && npm run typecheck && npm test"

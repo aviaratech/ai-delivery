@@ -3,12 +3,14 @@ import { execFileSync } from 'node:child_process';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   closeSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -102,11 +104,57 @@ export function assertArtifact(repoRoot: string, artifact: { digest: string; pat
     throw new Error(`Repository artifact is corrupt: ${artifact.path}`);
 }
 
-export function assertPrivateFile(path: string): Buffer {
+export function assertPrivateFile(path: string, bounds?: { maxBytes?: number; expectedBytes?: number }): Buffer {
   const metadata = lstatSync(path);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600)
     throw new Error('Delivery evidence must be a private regular file.');
-  return readFileSync(path);
+  if (bounds === undefined) return readFileSync(path);
+  if (
+    (bounds.maxBytes !== undefined && metadata.size > bounds.maxBytes) ||
+    (bounds.expectedBytes !== undefined && metadata.size !== bounds.expectedBytes)
+  )
+    throw new Error('Delivery evidence size exceeds its bound or differs from retained evidence.');
+  const descriptor = openSync(path, 'r');
+  try {
+    const before = fstatSync(descriptor);
+    if (
+      before.dev !== metadata.dev ||
+      before.ino !== metadata.ino ||
+      before.size !== metadata.size ||
+      before.mode !== metadata.mode ||
+      before.nlink !== metadata.nlink ||
+      before.uid !== metadata.uid ||
+      before.mtimeMs !== metadata.mtimeMs ||
+      before.ctimeMs !== metadata.ctimeMs
+    )
+      throw new Error('Delivery evidence identity changed before its bounded read.');
+    const bytes = Buffer.alloc(metadata.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+      if (count === 0) throw new Error('Delivery evidence was truncated during its bounded read.');
+      offset += count;
+    }
+    const after = fstatSync(descriptor),
+      named = lstatSync(path);
+    if (
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mode !== before.mode ||
+      after.nlink !== before.nlink ||
+      after.uid !== before.uid ||
+      after.mtimeMs !== before.mtimeMs ||
+      after.ctimeMs !== before.ctimeMs ||
+      named.dev !== after.dev ||
+      named.ino !== after.ino ||
+      named.isSymbolicLink()
+    )
+      throw new Error('Delivery evidence bytes are missing, corrupt or changed during its bounded read.');
+    return bytes;
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function syncEvidenceDirectory(path: string): void {
@@ -126,7 +174,8 @@ export function writeCreateOnly(path: string, bytes: Buffer, bytesDigest?: strin
   )
     throw new Error('Immutable output path does not bind its bytes.');
   try {
-    if (!assertPrivateFile(path).equals(bytes)) throw new Error('Content addressed evidence path collision.');
+    if (!assertPrivateFile(path, { expectedBytes: bytes.length }).equals(bytes))
+      throw new Error('Content addressed evidence path collision.');
     syncEvidenceDirectory(path);
     return path;
   } catch (error) {
@@ -150,12 +199,17 @@ export function writeCreateOnly(path: string, bytes: Buffer, bytesDigest?: strin
         renamed = true;
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !assertPrivateFile(path).equals(bytes)) throw error;
+      if (
+        (error as NodeJS.ErrnoException).code !== 'EEXIST' ||
+        !assertPrivateFile(path, { expectedBytes: bytes.length }).equals(bytes)
+      )
+        throw error;
     }
   } finally {
     if (!renamed) unlinkSync(temporary);
   }
   syncEvidenceDirectory(path);
-  if (!assertPrivateFile(path).equals(bytes)) throw new Error('Content addressed evidence write failed.');
+  if (!assertPrivateFile(path, { expectedBytes: bytes.length }).equals(bytes))
+    throw new Error('Content addressed evidence write failed.');
   return path;
 }
