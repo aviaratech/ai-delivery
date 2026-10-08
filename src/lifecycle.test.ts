@@ -5200,6 +5200,8 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
     ],
   );
   const validInputs = {
+    issue_list: { state: 'open', perPage: 10 },
+    issue_search: { query: 'widget' },
     issue_comment: {
       issueNumber: 17,
       kind: 'start',
@@ -5211,8 +5213,6 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
       nextStep: 'Run checks',
       nextDate: '2026-10-09',
     },
-    issue_list: { state: 'open', perPage: 10 },
-    issue_search: { query: 'widget' },
     issue_create: { title: 'Synthetic tracking parent' },
     issue_update: { issueNumber: 17, park: true },
     issue_ready_check: { issueNumber: 17 },
