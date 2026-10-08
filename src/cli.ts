@@ -187,6 +187,33 @@ program
     }),
   );
 
+for (const name of ['list', 'search'] as const) {
+  program
+    .command(name)
+    .option('--query <text>', 'Literal text to search in the selected repository')
+    .option('--state <state>')
+    .option('--labels <labels>')
+    .option('--parent <number>')
+    .option('--type <type>')
+    .option('--project-status <status>')
+    .option('--updated-since <timestamp>')
+    .option('--page <number>')
+    .option('--per-page <number>')
+    .action(async (o: Record<string, string>) =>
+      run(name === 'list' ? 'issue_list' : 'issue_search', {
+        query: o.query,
+        state: o.state,
+        labels: list(o.labels),
+        parentIssueNumber: int(o.parent),
+        issueType: o.type,
+        projectStatus: o.projectStatus,
+        updatedSince: o.updatedSince,
+        page: int(o.page),
+        perPage: int(o.perPage),
+      }),
+    );
+}
+
 program
   .command('update')
   .requiredOption('--issue <number>')
@@ -201,8 +228,11 @@ program
   .option('--milestone <number>')
   .option('--parent <number>')
   .option('--state <state>')
+  .option('--preserve-history', 'Preserve the previous title and body before a rewrite')
+  .option('--close-reason <reason>')
+  .option('--superseded-by <number>')
   .option('--park', 'Park execution while retaining the issue worktree')
-  .action(async (o: Record<string, string> & { park?: boolean }) =>
+  .action(async (o: Record<string, string> & { park?: boolean; preserveHistory?: boolean }) =>
     run('issue_update', {
       issueNumber: int(o.issue),
       title: o.title,
@@ -215,6 +245,9 @@ program
       milestone: int(o.milestone),
       parentIssueNumber: int(o.parent),
       state: o.state,
+      preserveHistory: o.preserveHistory === true ? true : undefined,
+      closeReason: o.closeReason,
+      supersededBy: int(o.supersededBy),
       park: o.park === true ? true : undefined,
     }),
   );

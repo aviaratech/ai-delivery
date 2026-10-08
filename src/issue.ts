@@ -9,6 +9,7 @@ import { digestValue } from './delivery/index.js';
 import { DeliveryError } from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
 import {
+  NATIVE_ISSUE_API_VERSION,
   clearConfiguredNativeIssuePoints,
   getConfiguredNativeIssueMetadata,
   nativeIssueSettingsFromDeliveryConfig,
@@ -336,6 +337,331 @@ export async function createIssue(
   };
 }
 
+export interface ListIssuesInput {
+  query?: string;
+  state?: 'open' | 'closed' | 'all';
+  labels?: string[];
+  parentIssueNumber?: number | null;
+  issueType?: string;
+  projectStatus?: 'Todo' | 'In Progress' | 'Blocked' | 'Done' | null;
+  updatedSince?: string;
+  page?: number;
+  perPage?: number;
+}
+
+const FieldCatalogEntry = z.object({
+  id: z.number().int().positive().safe(),
+  name: z.string().min(1),
+  data_type: z.enum(['text', 'number', 'date', 'single_select', 'multi_select']),
+});
+const FieldValueEntry = z.object({
+  issue_field_id: z.number().int().positive().safe(),
+  issue_field_name: z.string().min(1),
+  data_type: FieldCatalogEntry.shape.data_type,
+  value: z.unknown().optional(),
+  single_select_option: z
+    .object({ name: z.string().min(1) })
+    .nullable()
+    .optional(),
+  multi_select_options: z.array(z.object({ name: z.string().min(1) })).optional(),
+});
+const ListedIssue = z.object({
+  number: z.number().int().positive().safe(),
+  node_id: z.string().min(1),
+  title: z.string(),
+  state: z.enum(['open', 'closed']),
+  labels: z.array(z.union([z.string(), z.object({ name: z.string() })])),
+  type: z.object({ name: z.string() }).nullable().optional(),
+  html_url: z.url(),
+  updated_at: z.iso.datetime({ offset: true }),
+});
+export interface ListedTrackingIssue {
+  number: number;
+  title: string;
+  state: 'open' | 'closed';
+  labels: string[];
+  issueType: string | null;
+  parentIssueNumber: number | null;
+  parent: { repository: string; number: number } | null;
+  blockers: { repository: string; number: number; title: string; state: 'OPEN' | 'CLOSED' }[];
+  projectStatus: string | null;
+  fields: Record<string, string | number | string[] | null>;
+  url: string;
+  updatedAt: string;
+}
+
+async function issueFieldPages(
+  context: DeliveryContext,
+  route: string,
+  parameters: Record<string, unknown>,
+): Promise<unknown[]> {
+  const values: unknown[] = [];
+  const seenPages = new Set<string>();
+  for (let page = 1; ; page += 1) {
+    const response = await context.clients.rest.request(route, {
+      ...parameters,
+      headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
+      page,
+      per_page: 100,
+    });
+    if (!Array.isArray(response.data)) throw new DeliveryError('GitHub returned invalid native issue fields.');
+    const fingerprint = digestValue(response.data);
+    if (response.data.length > 0 && seenPages.has(fingerprint))
+      throw new DeliveryError('Native issue fields repeated a pagination page.');
+    seenPages.add(fingerprint);
+    values.push(...(response.data as unknown[]));
+    if (response.data.length < 100) return values;
+  }
+}
+
+/** A bounded GitHub page; local filters can produce an empty page with a nextPage. */
+export async function listIssues(
+  context: DeliveryContext,
+  input: ListIssuesInput,
+): Promise<{ issues: ListedTrackingIssue[]; page: number; perPage: number; nextPage: number | null }> {
+  const page = input.page ?? 1;
+  const perPage = input.perPage ?? 30;
+  if (!Number.isSafeInteger(page) || page <= 0 || !Number.isSafeInteger(perPage) || perPage <= 0 || perPage > 100)
+    throw new DeliveryError('Issue pagination must use a positive page and perPage from 1 to 100.');
+  if (input.query !== undefined && (!input.query.trim() || input.query.length > 256 || /["\\\r\n]/u.test(input.query)))
+    throw new DeliveryError('Issue search requires literal text without quotes, backslashes or newlines.');
+  if (input.labels?.some((label) => !label || /["\\\r\n]/u.test(label)))
+    throw new DeliveryError('Issue filter labels must be nonempty literal names.');
+  if (input.updatedSince !== undefined && !z.iso.datetime({ offset: true }).safeParse(input.updatedSince).success)
+    throw new DeliveryError('updatedSince must be an ISO timestamp.');
+  let raw: unknown[];
+  let nextPage: number | null;
+  if (input.query !== undefined) {
+    const q = [
+      `repo:${context.repo.owner}/${context.repo.repo}`,
+      'is:issue',
+      JSON.stringify(input.query.trim()),
+      ...(input.state === undefined || input.state === 'all' ? [] : [`is:${input.state}`]),
+      ...(input.labels ?? []).map((label) => `label:${JSON.stringify(label)}`),
+      ...(input.updatedSince === undefined ? [] : [`updated:>=${input.updatedSince}`]),
+    ].join(' ');
+    const response = (
+      await context.clients.rest.search.issuesAndPullRequests({
+        q,
+        page,
+        per_page: perPage,
+        sort: 'updated',
+        order: 'desc',
+        headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
+      })
+    ).data;
+    if (response.incomplete_results)
+      throw new DeliveryError('GitHub issue search returned incomplete results; narrow the query.');
+    if (response.total_count > 1000)
+      throw new DeliveryError('GitHub issue search exceeds its 1000-result window; narrow the query.');
+    raw = response.items;
+    nextPage = page * perPage < response.total_count ? page + 1 : null;
+  } else {
+    raw = (
+      await context.clients.rest.issues.listForRepo({
+        ...context.repo,
+        state: input.state ?? 'open',
+        ...(input.labels === undefined ? {} : { labels: input.labels.join(',') }),
+        ...(input.updatedSince === undefined ? {} : { since: input.updatedSince }),
+        page,
+        per_page: perPage,
+        sort: 'updated',
+        direction: 'desc',
+        headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
+      })
+    ).data;
+    nextPage = raw.length === perPage ? page + 1 : null;
+  }
+  const catalog = z
+    .array(FieldCatalogEntry)
+    .parse(await issueFieldPages(context, 'GET /orgs/{org}/issue-fields', { org: context.config.native.organization }));
+  if (
+    new Set(catalog.map((field) => field.name)).size !== catalog.length ||
+    new Set(catalog.map((field) => field.id)).size !== catalog.length
+  )
+    throw new DeliveryError('Native issue field catalog has duplicate identities or names.');
+  const issues: ListedTrackingIssue[] = [];
+  const seen = new Set<number>();
+  for (const entry of raw) {
+    if (typeof entry === 'object' && entry !== null && 'pull_request' in entry) continue;
+    const current = ListedIssue.parse(entry);
+    if (seen.has(current.number)) throw new DeliveryError('GitHub issue page repeats an issue.');
+    seen.add(current.number);
+    if (
+      new URL(current.html_url).pathname.toLowerCase() !==
+      `/${context.repo.owner}/${context.repo.repo}/issues/${String(current.number)}`.toLowerCase()
+    )
+      throw new DeliveryError('GitHub issue list returned a foreign repository issue.');
+    const selectedLabels = current.labels.map((label) => (typeof label === 'string' ? label : label.name));
+    if (input.state !== undefined && input.state !== 'all' && current.state !== input.state) continue;
+    if (
+      (input.labels ?? []).some(
+        (label) => !selectedLabels.some((selected) => selected.toLowerCase() === label.toLowerCase()),
+      )
+    )
+      continue;
+    if (input.issueType !== undefined && current.type?.name !== input.issueType) continue;
+    if (input.updatedSince !== undefined && Date.parse(current.updated_at) < Date.parse(input.updatedSince)) continue;
+    const relationships = await getNativeBlockerRelationships({
+      graphql: context.clients.graphql,
+      issueNumber: current.number,
+      repo: context.repo,
+      requireRepositoryIdentity: true,
+    });
+    const localParent =
+      relationships.parentRepository?.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
+        ? relationships.parentNumber
+        : null;
+    if (
+      input.parentIssueNumber !== undefined &&
+      (input.parentIssueNumber === null ? relationships.parentNumber !== null : localParent !== input.parentIssueNumber)
+    )
+      continue;
+    const project = await getIssueProjectStatus({
+      graphql: context.clients.graphql,
+      issueNodeId: current.node_id,
+      org: context.config.native.organization,
+      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+      settings: projectSettingsFromDeliveryConfig(context.config),
+    });
+    if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) continue;
+    const fields: ListedTrackingIssue['fields'] = Object.fromEntries(catalog.map((field) => [field.name, null]));
+    const values = z.array(FieldValueEntry).parse(
+      await issueFieldPages(context, 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values', {
+        ...context.repo,
+        issue_number: current.number,
+      }),
+    );
+    const observed = new Set<number>();
+    for (const field of values) {
+      const definition = catalog.find((candidate) => candidate.id === field.issue_field_id);
+      if (
+        !definition ||
+        definition.name !== field.issue_field_name ||
+        definition.data_type !== field.data_type ||
+        observed.has(field.issue_field_id)
+      )
+        throw new DeliveryError('Native issue field readback conflicts with its catalog.');
+      observed.add(field.issue_field_id);
+      if (
+        ((field.data_type === 'single_select' && !field.single_select_option) ||
+          (field.data_type === 'multi_select' && field.multi_select_options === undefined)) &&
+        field.value !== null &&
+        field.value !== undefined
+      )
+        throw new DeliveryError('Native select field omitted its named option readback.');
+      const value =
+        field.data_type === 'single_select'
+          ? (field.single_select_option?.name ?? null)
+          : field.data_type === 'multi_select'
+            ? field.multi_select_options?.map((option) => option.name)
+            : field.value;
+      if (field.data_type === 'date' && value !== null && value !== undefined && !z.iso.date().safeParse(value).success)
+        throw new DeliveryError('Native date field has an invalid date value.');
+      if (value === null || value === undefined) fields[definition.name] = null;
+      else if (
+        field.data_type === 'number'
+          ? typeof value === 'number' && Number.isFinite(value)
+          : field.data_type === 'multi_select'
+            ? Array.isArray(value)
+            : typeof value === 'string'
+      )
+        fields[definition.name] = value as string | number | string[];
+      else throw new DeliveryError('Native issue field has an invalid value type.');
+    }
+    issues.push({
+      number: current.number,
+      title: current.title,
+      state: current.state,
+      labels: selectedLabels,
+      issueType: current.type?.name ?? null,
+      parentIssueNumber: localParent,
+      parent:
+        relationships.parentNumber === null
+          ? null
+          : { repository: relationships.parentRepository!, number: relationships.parentNumber },
+      blockers: relationships.blockers.map(({ number, title, state, repository }) => ({
+        repository: repository!,
+        number,
+        title,
+        state,
+      })),
+      projectStatus: project?.status ?? null,
+      fields,
+      url: current.html_url,
+      updatedAt: current.updated_at,
+    });
+  }
+  return { issues, page, perPage, nextPage };
+}
+
+/** @internal Render previous content as inert text without trimming or interpreting its Markdown. */
+export function renderIssueHistory(title: string, body: string): string {
+  const escape = (value: string): string =>
+    value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  return `<details>\n<summary>Previous issue title and body</summary>\n\nTitle:\n<pre>${escape(title)}</pre>\n\nBody:\n<pre>${escape(body)}</pre>\n\n</details>`;
+}
+
+export type IssueCloseReason = 'completed' | 'not_planned' | 'duplicate';
+export interface IssueClosureReadback {
+  state: 'open' | 'closed';
+  closeReason: IssueCloseReason | null;
+  duplicateOf: { number: number; repository: string } | null;
+}
+
+/** @internal Native closure evidence is independent of an input or a posted comment. */
+export async function readIssueClosure(context: DeliveryContext, issueNumber: number): Promise<IssueClosureReadback> {
+  const Repository = z.object({ nameWithOwner: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u) });
+  const response: unknown = await context.clients.graphql(
+    `
+    query IssueClosureReadback($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        issue(number: $number) {
+          number repository { nameWithOwner } state stateReason
+          duplicateOf { number repository { nameWithOwner } }
+        }
+      }
+    }
+  `,
+    { owner: context.repo.owner, name: context.repo.repo, number: issueNumber },
+  );
+  const parsed = z
+    .object({
+      repository: z.object({
+        issue: z.object({
+          number: z.number().int().positive().safe(),
+          repository: Repository,
+          state: z.enum(['OPEN', 'CLOSED']),
+          stateReason: z.enum(['COMPLETED', 'NOT_PLANNED', 'DUPLICATE', 'REOPENED']).nullable(),
+          duplicateOf: z.object({ number: z.number().int().positive().safe(), repository: Repository }).nullable(),
+        }),
+      }),
+    })
+    .parse(response).repository.issue;
+  if (
+    parsed.number !== issueNumber ||
+    parsed.repository.nameWithOwner.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
+  )
+    throw new DeliveryError('Native closure readback returned a foreign issue identity.');
+  if (
+    (parsed.state === 'OPEN' && parsed.stateReason !== null && parsed.stateReason !== 'REOPENED') ||
+    (parsed.state === 'CLOSED' && parsed.stateReason === 'REOPENED') ||
+    (parsed.duplicateOf !== null && parsed.stateReason !== 'DUPLICATE')
+  )
+    throw new DeliveryError('Native closure readback has contradictory state evidence.');
+  return {
+    state: parsed.state === 'OPEN' ? 'open' : 'closed',
+    closeReason:
+      parsed.stateReason === null || parsed.stateReason === 'REOPENED'
+        ? null
+        : (parsed.stateReason.toLowerCase() as IssueCloseReason),
+    duplicateOf:
+      parsed.duplicateOf === null
+        ? null
+        : { number: parsed.duplicateOf.number, repository: parsed.duplicateOf.repository.nameWithOwner },
+  };
+}
+
 export interface UpdateIssueInput {
   blockedBy?: number[];
   body?: string;
@@ -348,15 +674,31 @@ export interface UpdateIssueInput {
   points?: number;
   priority?: string;
   state?: 'open' | 'closed';
+  preserveHistory?: boolean;
+  closeReason?: 'completed' | 'not_planned' | 'duplicate';
+  supersededBy?: number;
   title?: string;
 }
 
-export async function updateIssue(
-  context: DeliveryContext,
-  input: UpdateIssueInput,
-): Promise<Awaited<ReturnType<typeof issueInfo>>> {
+export interface UpdateIssueResult extends IssueInfo {
+  historyComment?: IssueCommentReadback;
+  closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
+}
+
+export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
+  if (
+    (input.closeReason !== undefined && !['completed', 'not_planned', 'duplicate'].includes(input.closeReason)) ||
+    ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
+  )
+    throw new DeliveryError('Closure details require state closed and a supported close reason.');
+  if (
+    input.supersededBy !== undefined &&
+    (!Number.isSafeInteger(input.supersededBy) || input.supersededBy <= 0 || input.supersededBy === input.issueNumber)
+  )
+    throw new DeliveryError('A superseding issue must be a different positive issue number.');
   assertNativeIssueTrackingAdmission(input.issueNumber, context.root);
   const { clients, config, repo } = context;
+  const acceptedLabels = input.labels === undefined ? undefined : labels(input.labels);
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
     throw new DeliveryError('Unsupported configured Issue Type.');
   }
@@ -388,17 +730,99 @@ export async function updateIssue(
       rest: clients.rest,
     });
   }
+  const closeReason = input.closeReason ?? (input.supersededBy === undefined ? undefined : 'completed');
+  let supersedingIssueId: number | undefined;
+  if (input.supersededBy !== undefined) {
+    const target = (await clients.rest.issues.get({ ...repo, issue_number: input.supersededBy })).data;
+    if (
+      target.number !== input.supersededBy ||
+      'pull_request' in target ||
+      !Number.isSafeInteger(target.id) ||
+      target.id <= 0 ||
+      new URL(target.html_url).pathname.toLowerCase() !==
+        `/${repo.owner}/${repo.repo}/issues/${String(input.supersededBy)}`.toLowerCase()
+    )
+      throw new DeliveryError('Superseding issue readback is not the requested repository issue.');
+    supersedingIssueId = target.id;
+  }
+  const assertClosure = (closure: IssueClosureReadback): void => {
+    if (
+      closure.state !== 'closed' ||
+      closure.closeReason !== closeReason ||
+      (closeReason === 'duplicate' &&
+        input.supersededBy !== undefined &&
+        (closure.duplicateOf?.number !== input.supersededBy ||
+          closure.duplicateOf.repository.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()))
+    )
+      throw new DeliveryError('Native closure readback disagrees with the requested reason or superseding issue.');
+  };
+  if (closeReason !== undefined) {
+    const current = await readIssueClosure(context, input.issueNumber);
+    if (current.state === 'closed') {
+      try {
+        assertClosure(current);
+      } catch {
+        throw new DeliveryError('Issue is already closed with different closure evidence; reopen it explicitly first.');
+      }
+    }
+  }
+  let historyComment: IssueCommentReadback | undefined;
+  let priorContent: { title: string; body: string } | undefined;
+  if (input.preserveHistory === true && (input.title !== undefined || input.body !== undefined)) {
+    const current = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
+    if (current.number !== input.issueNumber || 'pull_request' in current)
+      throw new DeliveryError('History target is not the requested issue.');
+    const prior = { title: current.title, body: current.body ?? '' };
+    if (
+      (input.title !== undefined && input.title !== prior.title) ||
+      (input.body !== undefined && input.body !== prior.body)
+    ) {
+      const body = renderIssueHistory(prior.title, prior.body);
+      if (body.length > ISSUE_COMMENT_BODY_LIMIT)
+        throw new DeliveryError(
+          'Complete issue history exceeds the supported comment body limit; issue was not rewritten.',
+        );
+      priorContent = prior;
+      historyComment = await commentIssue(context, { issueNumber: input.issueNumber, body });
+    }
+  }
+  let closureComment: IssueCommentReadback | undefined;
+  if (closeReason !== undefined)
+    closureComment = await commentIssue(context, {
+      issueNumber: input.issueNumber,
+      body: `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`,
+    });
+  if (priorContent !== undefined) {
+    const current = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
+    if (
+      current.number !== input.issueNumber ||
+      'pull_request' in current ||
+      current.title !== priorContent.title ||
+      (current.body ?? '') !== priorContent.body
+    )
+      throw new DeliveryError(
+        'Issue content changed after history readback; retry against the current title and body.',
+      );
+  }
   await clients.rest.issues.update({
     issue_number: input.issueNumber,
     owner: repo.owner,
     repo: repo.repo,
     ...(input.body === undefined ? {} : { body: input.body }),
     ...(input.issueType === undefined ? {} : { type: input.issueType }),
-    ...(input.labels === undefined ? {} : { labels: labels(input.labels) }),
+    ...(acceptedLabels === undefined ? {} : { labels: acceptedLabels }),
     ...(input.milestone === undefined ? {} : { milestone: input.milestone }),
     ...(input.state === undefined ? {} : { state: input.state }),
+    ...(closeReason === undefined
+      ? {}
+      : { state_reason: closeReason, headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION } }),
+    ...(closeReason !== 'duplicate' || supersedingIssueId === undefined
+      ? {}
+      : { duplicate_issue_id: supersedingIssueId }),
     ...(input.title === undefined ? {} : { title: input.title }),
   });
+  const closure = closeReason === undefined ? undefined : await readIssueClosure(context, input.issueNumber);
+  if (closure !== undefined) assertClosure(closure);
   if (input.points !== undefined || input.priority !== undefined)
     await setConfiguredNativeIssueMetadata({
       issueNumber: input.issueNumber,
@@ -457,7 +881,21 @@ export async function updateIssue(
     settings: projectSettingsFromDeliveryConfig(config),
     status,
   });
-  return issueInfo(context, input.issueNumber);
+  const readback = await issueInfo(context, input.issueNumber);
+  if (
+    (input.preserveHistory === true || closeReason !== undefined) &&
+    ((input.title !== undefined && readback.title !== input.title) ||
+      (input.body !== undefined && readback.body !== input.body) ||
+      (input.state !== undefined && readback.state !== input.state))
+  )
+    throw new DeliveryError('Issue update readback disagrees with the requested content or state.');
+  return {
+    ...readback,
+    ...(historyComment === undefined ? {} : { historyComment }),
+    ...(closure === undefined || closureComment === undefined
+      ? {}
+      : { closure: { ...closure, supersededBy: input.supersededBy ?? null, comment: closureComment } }),
+  };
 }
 
 /** Complete the native tracking and Project state of an issue created before an interrupted response. */

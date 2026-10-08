@@ -11,12 +11,14 @@ export interface NativeBlockerRelationship {
   number: number;
   state: 'CLOSED' | 'OPEN';
   title: string;
+  repository?: string;
 }
 
 export interface NativeBlockerRelationshipReadback {
   blockers: NativeBlockerRelationship[];
   parentId: null | string;
   parentNumber: null | number;
+  parentRepository?: null | string;
 }
 
 export interface NativeRelationshipTargets {
@@ -66,6 +68,7 @@ const NativeBlockerPageSchema = z
                       number: z.number().int().positive(),
                       state: z.enum(['OPEN', 'CLOSED']),
                       title: z.string(),
+                      repository: z.object({ nameWithOwner: z.string() }).strict().optional(),
                     })
                     .strict(),
                 ),
@@ -77,7 +80,14 @@ const NativeBlockerPageSchema = z
                   .strict(),
               })
               .strict(),
-            parent: z.object({ id: z.string(), number: z.number().int().positive().optional() }).strict().nullable(),
+            parent: z
+              .object({
+                id: z.string(),
+                number: z.number().int().positive().optional(),
+                repository: z.object({ nameWithOwner: z.string() }).strict().optional(),
+              })
+              .strict()
+              .nullable(),
           })
           .strict(),
       })
@@ -123,11 +133,16 @@ export async function getNativeBlockerRelationships({
   graphql,
   issueNumber,
   repo,
-}: Omit<RelationshipContext, 'rest'> & { issueNumber: number }): Promise<NativeBlockerRelationshipReadback> {
-  const blockers = new Map<number, NativeBlockerRelationship>();
+  requireRepositoryIdentity = false,
+}: Omit<RelationshipContext, 'rest'> & {
+  issueNumber: number;
+  requireRepositoryIdentity?: boolean;
+}): Promise<NativeBlockerRelationshipReadback> {
+  const blockers = new Map<string, NativeBlockerRelationship>();
   let cursor: null | string = null;
   let hasNextPage = true;
   let parentId: null | string = null;
+  let parentRepository: null | string = null;
   let parentNumber: null | number = null;
   const seenCursors = new Set<string>();
   while (hasNextPage) {
@@ -139,6 +154,9 @@ export async function getNativeBlockerRelationships({
               parent {
                 id
                 number
+                repository {
+                  nameWithOwner
+                }
               }
               blockedBy(first: 100, after: $cursor) {
                 nodes {
@@ -146,6 +164,9 @@ export async function getNativeBlockerRelationships({
                   number
                   title
                   state
+                  repository {
+                    nameWithOwner
+                  }
                 }
                 pageInfo {
                   endCursor
@@ -164,8 +185,21 @@ export async function getNativeBlockerRelationships({
     }
     const issue = parsed.data.repository.issue;
     for (const blocker of issue.blockedBy.nodes) {
-      blockers.set(blocker.number, blocker);
+      if (requireRepositoryIdentity && !blocker.repository?.nameWithOwner.match(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u))
+        throw new CLIError('Native blocker omitted its repository identity.');
+      const { repository, ...identity } = blocker;
+      blockers.set(blocker.id, {
+        ...identity,
+        ...(requireRepositoryIdentity ? { repository: repository!.nameWithOwner } : {}),
+      });
     }
+    if (
+      requireRepositoryIdentity &&
+      issue.parent &&
+      (!issue.parent.number || !issue.parent.repository?.nameWithOwner.match(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u))
+    )
+      throw new CLIError('Native parent omitted its repository identity.');
+    parentRepository = issue.parent?.repository?.nameWithOwner ?? null;
     parentId = issue.parent?.id ?? null;
     parentNumber = issue.parent?.number ?? null;
     hasNextPage = issue.blockedBy.pageInfo.hasNextPage;
@@ -186,6 +220,7 @@ export async function getNativeBlockerRelationships({
     blockers: [...blockers.values()].sort((left, right) => left.number - right.number),
     parentId,
     parentNumber,
+    ...(requireRepositoryIdentity ? { parentRepository } : {}),
   };
 }
 

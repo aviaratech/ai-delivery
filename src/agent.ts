@@ -18,10 +18,12 @@ export {
   readyCheck,
   developIssue,
   listIssueSubissues,
+  listIssues,
   commentIssue,
 } from './issue.js';
 export { ISSUE_COMMENT_BODY_LIMIT } from './issue.js';
 export type { IssueCommentInput, IssueCommentReadback } from './issue.js';
+export type { ListIssuesInput, UpdateIssueInput, UpdateIssueResult, IssueClosureReadback } from './issue.js';
 export type { JournalInput } from './issueJournal.js';
 export { prInfo, listPrs, prChecks, checkoutPr, publishPr, submitFormalReview, mergePr, finishIssue } from './pr.js';
 export { preparePrWorktree, cleanupNonIssueWorktree } from './worktree.js';

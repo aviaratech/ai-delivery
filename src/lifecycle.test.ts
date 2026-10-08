@@ -5182,6 +5182,8 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
       'runtime_admit',
       'issue_create',
       'issue_start',
+      'issue_list',
+      'issue_search',
       'issue_update',
       'issue_info',
       'issue_ready_check',
@@ -5198,6 +5200,8 @@ test('MCP exposes one implementation surface for native lifecycle commands', () 
     ],
   );
   const validInputs = {
+    issue_list: { state: 'open', perPage: 10 },
+    issue_search: { query: 'widget' },
     issue_comment: {
       issueNumber: 17,
       kind: 'start',
