@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import * as issue from './issue.js';
 import type { DeliveryContext } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import { renderJournal, acceptanceCriteria, issueFollowUps } from './issueJournal.js';
+import { JournalInputSchema, renderJournal, acceptanceCriteria, issueFollowUps } from './issueJournal.js';
+import { executeTool } from './dispatch.js';
+import * as configuration from './config/deliveryConfig.js';
+import * as githubClients from './github/client.js';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,7 +26,7 @@ test('journal tool validates all five typed templates before dispatch', () => {
     keyNumbers: ['3 checks'],
     evidence: ['https://github.com/example/widget/pull/23'],
   };
-  for (const input of [
+  const valid: JournalInput[] = [
     { ...common, kind: 'start', outcome: 'Deliver a safe parser' },
     { ...common, kind: 'progress', done: ['Added validation'], decisionNeeded: 'None' },
     { ...common, kind: 'decision', decision: 'Use the existing parser', rationale: 'Preserves the contract' },
@@ -34,8 +37,19 @@ test('journal tool validates all five typed templates before dispatch', () => {
       acceptance: [{ criterion: 'Reject malformed input', evidence: 'https://github.com/example/widget/pull/23' }],
       followUps: [],
     },
-  ])
-    assert.equal(tool.inputSchema.safeParse(input).success, true);
+  ];
+  for (const input of valid) {
+    for (const repo of [undefined, 'example/widget']) {
+      for (const nextDate of [null, '2026-10-09', '2028-02-29']) {
+        const selected = { ...input, nextDate, ...(repo === undefined ? {} : { repo }) };
+        const parsed: ReturnType<typeof tool.inputSchema.safeParse> = tool.inputSchema.safeParse(selected);
+        assert.equal(parsed.success, true, JSON.stringify(selected));
+        if (parsed.success) assert.deepEqual(parsed.data, selected);
+      }
+    }
+    assert.equal(JournalInputSchema.safeParse(input).success, true);
+    assert.equal(JournalInputSchema.safeParse({ ...input, repo: 'example/widget' }).success, false);
+  }
   for (const input of [
     { ...common, kind: 'progress' },
     { ...common, kind: 'start', outcome: '' },
@@ -48,8 +62,74 @@ test('journal tool validates all five typed templates before dispatch', () => {
       evidence: ['/Users/operator/checks.log'],
     },
     { ...common, kind: 'start', outcome: 'Deliver', nextDate: 'tomorrow' },
+    { ...common, kind: 'start', outcome: 'Deliver', done: ['Wrong variant'] },
+    { ...common, kind: 'progress', done: ['Deliver'], decisionNeeded: 'None', rationale: 'Wrong variant' },
+    { ...common, kind: 'decision', decision: 'Use parser', rationale: 'Works', blocker: 'Wrong variant' },
+    { ...common, kind: 'blocker', blocker: 'Review', resolution: 'Accept', outcome: 'Wrong variant' },
+    { ...valid[4], done: ['Wrong variant'] },
+    { ...valid[0], unknown: true },
+    { ...valid[0], kind: 'unsupported' },
+    { ...valid[0], nextDate: '2026-02-30' },
+    { ...valid[0], nextDate: 20261009 },
+    { ...valid[0], keyNumbers: '3 checks' },
+    { ...valid[0], issueNumber: '17' },
+    { ...valid[4], acceptance: [{ criterion: 'Deliver', evidence: common.evidence[0], unknown: true }] },
   ])
-    assert.equal(tool.inputSchema.safeParse(input).success, false);
+    for (const repo of [undefined, 'example/widget'])
+      assert.equal(tool.inputSchema.safeParse({ ...input, ...(repo === undefined ? {} : { repo }) }).success, false);
+  for (const repo of [
+    '',
+    'example',
+    'example/widget/extra',
+    'https://github.com/example/widget',
+    'example/\nwidget',
+    17,
+    null,
+    [],
+  ])
+    assert.equal(tool.inputSchema.safeParse({ ...valid[0], repo }).success, false);
+});
+
+test('journal dispatch refuses invalid fields and repository conflicts before configuration or authentication', async () => {
+  const settings = vi.spyOn(configuration, 'loadDeliverySettings').mockImplementation(async () => {
+    throw new Error('Configuration must not load for an invalid journal');
+  });
+  const clients = vi.spyOn(githubClients, 'createDeliveryGitHubClients');
+  const valid = {
+    repo: 'example/widget',
+    issueNumber: 17,
+    kind: 'progress',
+    summary: 'Parser work is underway.',
+    status: 'In progress',
+    done: ['Added validation'],
+    decisionNeeded: 'None',
+    keyNumbers: [],
+    evidence: ['https://github.com/example/widget/pull/23'],
+    nextStep: 'Run checks',
+    nextDate: null,
+  };
+  try {
+    for (const input of [
+      { ...valid, kind: 'unsupported' },
+      { ...valid, outcome: 'Wrong variant' },
+      { ...valid, unknown: true },
+      { ...valid, done: [] },
+      { ...valid, evidence: [] },
+      { ...valid, repo: 'invalid' },
+      { ...valid, repo: 17 },
+      { ...valid, nextDate: '2026-02-30' },
+    ])
+      await assert.rejects(executeTool('issue_comment', input, { repoRoot: '/non-git-fixture' }));
+    await assert.rejects(
+      executeTool('issue_comment', valid, { repoRoot: '/non-git-fixture', repo: 'example/other' }),
+      /selectors disagree/u,
+    );
+    assert.equal(settings.mock.calls.length, 0);
+    assert.equal(clients.mock.calls.length, 0, 'no authenticated client or comment writer is reached');
+  } finally {
+    settings.mockRestore();
+    clients.mockRestore();
+  }
 });
 
 test('canonical comment writes read back and recover a lost response without duplicates', async () => {
@@ -132,6 +212,11 @@ test('canonical comment writes read back and recover a lost response without dup
     corruptReadback = true;
     await assert.rejects(comment(context, input), /readback/u);
     corruptReadback = false;
+
+    stored.push({ ...stored[0]!, id: 99, html_url: 'https://github.com/example/widget/issues/17#issuecomment-99' });
+    await assert.rejects(comment(context, input), /duplicate authored retry matches/u);
+    assert.equal(stored.length, 2, 'ambiguous retries must not write another comment');
+    stored.pop();
 
     const rawBody = `\r\n  <details>\n<summary>Prior content</summary>\n<pre>${'🙂 &amp; prior title/body\r\n'.repeat(600)}</pre>\n</details>  \t\n`;
     assert.ok(rawBody.length > 10000);

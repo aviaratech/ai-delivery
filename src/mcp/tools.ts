@@ -62,7 +62,15 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_comment',
     commandName: 'comment',
     description: 'Post a typed issue journal with authoritative comment readback',
-    inputSchema: JournalInputSchema.extend({ repo: Repo }),
+    inputSchema: z
+      .strictObject({ ...JournalInputSchema.shape, repo: Repo })
+      .superRefine(({ repo: _repo, ...journal }, ctx) => {
+        // Repository routing belongs to the MCP envelope, not the strict journal variants.
+        const parsed = JournalInputSchema.safeParse(journal);
+        if (!parsed.success)
+          for (const issue of parsed.error.issues)
+            ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });
+      }),
   },
   {
     name: 'runtime_stage',
