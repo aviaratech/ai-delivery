@@ -67,6 +67,7 @@ function fixture(
       : `${artifact.summary}\n\n${marker}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
   const pr = () => ({
     number: 23,
+    node_id: 'PR23',
     changed_files: 1,
     title: 'Improve widget',
     body: 'Closes #17',
@@ -87,7 +88,13 @@ function fixture(
     git: {
       getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
       getRef: async ({ ref }: { ref: string }) => ({
-        data: { object: { sha: ref === 'heads/main' ? (option.baseMoved ? 'e'.repeat(40) : 'c'.repeat(40)) : head } },
+        data: {
+          ref: `refs/${ref}`,
+          object: {
+            type: 'commit',
+            sha: ref === 'heads/main' ? (option.baseMoved ? 'e'.repeat(40) : 'c'.repeat(40)) : head,
+          },
+        },
       }),
     },
     pulls: {
@@ -164,7 +171,9 @@ function fixture(
     if (query.includes('DeliveryClosingIssues'))
       return {
         repository: {
+          nameWithOwner: 'example/widget',
           pullRequest: {
+            number: 23,
             closingIssuesReferences: {
               nodes: [{ number: option.wrongClosingIssue ? 18 : 17, repository: { nameWithOwner: 'example/widget' } }],
               pageInfo: { hasNextPage: false, endCursor: null },
