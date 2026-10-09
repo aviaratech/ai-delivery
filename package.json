@@ -53,8 +53,10 @@
     "build": "tsc -p tsconfig.build.json && node scripts/build-plugin.mjs",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "test": "npm run build && vitest run",
-    "checks": "node scripts/checks.mjs",
-    "checks:fast": "node scripts/checks.mjs --fast"
+    "checks": "node scripts/current-qualification.mjs",
+    "checks:fast": "node scripts/checks.mjs --fast",
+    "checks:producer": "node scripts/current-qualification.mjs --producer-only",
+    "checks:resume": "node scripts/current-qualification.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

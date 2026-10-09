@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { errorMessage, executeCommand, safeEnvironment } from './checks.mjs';
 
 /** @typedef {{root:string,index:string,originalIndexSha256:string,tree:string,snapshot:string,directory:string,fileCount:number}} StagedSnapshot */
-/** @typedef {{schemaVersion:string,startedAt:string,status:string,resultsDir:string,ownedDirectory:string,cleanupConfirmed:boolean,fullSuccess:boolean, stagedTree?:string,fileCount?:number,sourceIndexPath?:string,sourceIndexSha256?:string,command?:string[],process?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number,sourceIndexUnchanged?:boolean}} StagedReport */
+/** @typedef {{schemaVersion:string,startedAt:string,status:string,resultsDir:string,ownedDirectory:string,cleanupConfirmed:boolean,fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], stagedTree?:string,fileCount?:number,sourceIndexPath?:string,sourceIndexSha256?:string,command?:string[],process?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number,sourceIndexUnchanged?:boolean}} StagedReport */
 /** @typedef {{cwd?:string,resultsDir?:string,signal?:AbortSignal,execute?:typeof executeCommand}} StagedOptions */
 
 /** @param {string} cwd @param {string[]} args @param {NodeJS.ProcessEnv} env */
@@ -100,6 +100,8 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
     ownedDirectory: owned,
     cleanupConfirmed: false,
     fullSuccess: false,
+    artifactQualified: false,
+    artifactOmitted: ['actual archive', 'clean-HEAD production consumer and owned cleanup'],
   };
   const save = () => {
     const temporary = join(results, 'staged.json.tmp');
@@ -196,7 +198,7 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
     save();
     writeFileSync(
       join(results, 'staged.txt'),
-      `${record.status.toUpperCase()}; stagedTree=${record.stagedTree ?? 'unavailable'}; sourceIndexUnchanged=${record.sourceIndexUnchanged ?? 'unproved'}; cleanup=${record.cleanupConfirmed}; results=${results}\n${record.error ?? ''}\n`,
+      `${record.status.toUpperCase()}; artifactQualified=false; omitted=${record.artifactOmitted.join(', ')}; stagedTree=${record.stagedTree ?? 'unavailable'}; sourceIndexUnchanged=${record.sourceIndexUnchanged ?? 'unproved'}; cleanup=${record.cleanupConfirmed}; results=${results}\n${record.error ?? ''}\n`,
       { mode: 0o600 },
     );
     process.stdout.write(readFileSync(join(results, 'staged.txt'), 'utf8'));

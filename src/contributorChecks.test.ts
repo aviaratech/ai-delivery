@@ -199,7 +199,8 @@ test('local and CI share full entry; fast explicitly omits gates and no CI dupli
   const manifest = JSON.parse(readFileSync(join(repository, 'package.json'), 'utf8')) as {
     scripts: Record<string, string>;
   };
-  assert.equal(manifest.scripts.checks, 'node scripts/checks.mjs');
+  assert.equal(manifest.scripts.checks, 'node scripts/current-qualification.mjs');
+  assert.equal(manifest.scripts['checks:producer'], 'node scripts/current-qualification.mjs --producer-only');
   assert.equal(manifest.scripts['checks:fast'], 'node scripts/checks.mjs --fast');
   const ci = readFileSync(join(repository, '.github/workflows/ci.yml'), 'utf8');
   assert.match(ci, /npm run checks -- --results-dir/u);
@@ -565,11 +566,431 @@ test('coverage labels unobserved contributor scripts without synthesizing measur
     );
     assert.deepEqual(
       baseline.unmeasuredContributorScripts.map((file) => file.path),
-      ['scripts/checks.mjs', 'scripts/pre-commit.mjs'],
+      [
+        'scripts/checks.mjs',
+        'scripts/pre-commit.mjs',
+        'scripts/current-qualification.mjs',
+        'scripts/current-consumer.mjs',
+      ],
     );
     assert.ok(baseline.unmeasuredContributorScripts.every((file) => file.threshold === null && file.reason.length > 0));
     assert.match(baseline.thresholdProposal, /no derived floor until actual instrumentation/u);
     // This controlled parser fixture is not the measured canonical graph baseline.
+  } finally {
+    f.cleanup();
+  }
+});
+
+// Fictional orchestration fixtures exercise the real producer-join validator.
+// Archive safety/runtime qualification is covered by the separately owned #90 fixture.
+type SyntheticContract = {
+  sourceRoot: string;
+  sourceCommit: string;
+  sourceTree: string;
+  sourceManifestSha256: string;
+  sourceLockSha256: string;
+  packageVersion: string;
+  archivePath: string;
+  archiveSha256: string;
+  dryInventory: { path: string; size: number; mode: number }[];
+  producer: {
+    checksResultPath: string;
+    checksResultSha256: string;
+    artifactReceiptPath: string;
+    artifactReceiptSha256: string;
+  };
+};
+type Candidate = {
+  archiveSha256: string;
+  sourceManifestSha256: string;
+  sourceLockSha256: string;
+  archiveManifestSha256: string;
+  packageVersion: string;
+  inventorySha256: string;
+  inventory: { path: string; size: number; mode: number; sha256: string }[];
+  skills: { path: string; sha256: string }[];
+};
+type QualificationOptions = {
+  cwd: string;
+  resultsDir: string;
+  producerOnly?: boolean;
+  resume?: string;
+  consumerResult?: string;
+  signal?: AbortSignal;
+  checks?: (options: { resultsDir: string }) => Promise<Record<string, unknown>>;
+  execute?: (command: string[], options: CommandOptions) => Promise<CommandResult>;
+  inspect?: (contract: SyntheticContract) => Candidate;
+  consumer?: (
+    contract: SyntheticContract,
+    options: { authorizeInstall: boolean; signal?: AbortSignal },
+  ) => Promise<Record<string, unknown>>;
+};
+const qualification = (await import(new URL('../scripts/current-qualification.mjs', import.meta.url).href)) as {
+  sourceIdentity(cwd: string): {
+    commit: string;
+    tree: string;
+    fingerprint: { kind: string; sha256: string; fileCount: number };
+  };
+  validateCheckpoint(path: string, cwd: string, inspect: NonNullable<QualificationOptions['inspect']>): unknown;
+  runQualification(
+    options: QualificationOptions,
+  ): Promise<{ status: string; qualified: boolean; exitCode: number; error?: string }>;
+};
+const consumerProof = (await import(new URL('../scripts/current-consumer.mjs', import.meta.url).href)) as {
+  sha256(bytes: string | Buffer): string;
+  verifyProducerJoin(contract: SyntheticContract, candidate: Candidate): Record<string, unknown>;
+};
+
+function qualificationFixture() {
+  const f = fixture();
+  writeFileSync(join(f.cwd, 'package-lock.json'), '{}\n');
+  execFileSync('git', ['add', '.'], { cwd: f.cwd });
+  execFileSync(
+    'git',
+    [
+      '-c',
+      'user.name=Fictional fixture',
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'core.hooksPath=/dev/null',
+      'commit',
+      '-qm',
+      'fictional clean source',
+    ],
+    { cwd: f.cwd },
+  );
+  let producers = 0;
+  let packs = 0;
+  let consumers = 0;
+  let packStatus = 'passed';
+  let cleanup = true;
+  let mutateProducer: (report: Record<string, unknown>) => void = () => {};
+  const members = [{ path: 'package.json', size: readFileSync(join(f.cwd, 'package.json')).length, mode: 0o644 }];
+  const inspect: NonNullable<QualificationOptions['inspect']> = (contract) => {
+    assert.equal(consumerProof.sha256(readFileSync(contract.archivePath)), contract.archiveSha256);
+    assert.deepEqual(contract.dryInventory, members);
+    const inventory = members.map((item) => ({
+      ...item,
+      sha256: consumerProof.sha256(readFileSync(join(f.cwd, item.path))),
+    }));
+    return {
+      archiveSha256: contract.archiveSha256,
+      sourceManifestSha256: contract.sourceManifestSha256,
+      sourceLockSha256: contract.sourceLockSha256,
+      archiveManifestSha256: contract.sourceManifestSha256,
+      packageVersion: contract.packageVersion,
+      inventorySha256: consumerProof.sha256(JSON.stringify(inventory)),
+      inventory,
+      skills: ['intake-create', 'worktree-lifecycle', 'pr-handoff'].map((path) => ({ path, sha256: 'a'.repeat(64) })),
+    };
+  };
+  const produce: NonNullable<QualificationOptions['checks']> = async ({ resultsDir }) => {
+    producers++;
+    mkdirSync(resultsDir);
+    const report: Record<string, unknown> = {
+      schemaVersion: 'contributor-checks@1',
+      runId: 'fictional-one-producer',
+      scope: 'full',
+      status: 'passed',
+      fullSuccess: true,
+      exitCode: 0,
+      gates: checks.FULL_GATES,
+      omitted: [],
+      tree: qualification.sourceIdentity(f.cwd).fingerprint,
+      commands: checks.FULL_GATES.map((stage) => ({
+        stage,
+        status: 'passed',
+        exitCode: 0,
+        signal: null,
+        cleanupConfirmed: true,
+      })),
+      tests: { files: 1, total: 1, passed: 1, skips: [] },
+      selectedTestFiles: ['dist/original.test.js'],
+      toolchain: f.toolchain,
+      inventory: {
+        kind: 'dry-inventory-only',
+        name: '@aviaratech/ai-delivery',
+        version: '1.0.0',
+        fileCount: members.length,
+        files: members,
+      },
+    };
+    mutateProducer(report);
+    writeFileSync(join(resultsDir, 'result.json'), JSON.stringify(report));
+    return report;
+  };
+  const pack: NonNullable<QualificationOptions['execute']> = async (command, options) => {
+    packs++;
+    assert.deepEqual(command.slice(2, 5), ['pack', '--ignore-scripts', '--json']);
+    mkdirSync(options.directory);
+    const destination = command.at(-1)!;
+    writeFileSync(join(destination, 'fictional.tgz'), 'fictional archive boundary');
+    const stdoutPath = join(options.directory, 'stdout.txt');
+    const stderrPath = join(options.directory, 'stderr.txt');
+    writeFileSync(stdoutPath, JSON.stringify([{ filename: 'fictional.tgz', files: members }]));
+    writeFileSync(stderrPath, '');
+    return {
+      command,
+      startedAt: 'fictional',
+      status: packStatus,
+      exitCode: packStatus === 'passed' ? 0 : 9,
+      signal: null,
+      stdoutPath,
+      stderrPath,
+      cleanupConfirmed: cleanup,
+    };
+  };
+  const consume: NonNullable<QualificationOptions['consumer']> = async (contract, options) => {
+    consumers++;
+    assert.equal(options.authorizeInstall, true);
+    const candidate = inspect(contract);
+    return {
+      schemaVersion: 'ai-delivery.current-consumer@1',
+      boundary: 'current-artifact',
+      status: 'passed',
+      qualified: true,
+      sourceIdentityVerified: true,
+      scriptsDisabled: true,
+      sourceCommit: contract.sourceCommit,
+      sourceTree: contract.sourceTree,
+      sourceManifestSha256: contract.sourceManifestSha256,
+      sourceLockSha256: contract.sourceLockSha256,
+      archiveManifestSha256: contract.sourceManifestSha256,
+      archiveSha256: contract.archiveSha256,
+      packageVersion: contract.packageVersion,
+      inventorySha256: candidate.inventorySha256,
+      inventory: candidate.inventory,
+      producerJoin: consumerProof.verifyProducerJoin(contract, candidate),
+      cleanup: { quiescent: true, removed: true },
+      productionClosure: {},
+      mcp: {},
+      skills: candidate.skills,
+      resolutions: ['fictional owned resolution'],
+      phases: [
+        'node24',
+        'node26',
+        'npm',
+        'production-install',
+        'production-closure',
+        'cli-version',
+        'cli-json',
+        'exports-node24',
+        'library-node26',
+        'packaged-mcp',
+      ].map((phase) => ({ phase, code: 0, signal: null, quiescent: true })),
+    };
+  };
+  const options: QualificationOptions = {
+    cwd: f.cwd,
+    resultsDir: join(f.base, 'qualification'),
+    checks: produce,
+    execute: pack,
+    inspect,
+    consumer: consume,
+  };
+  return {
+    ...f,
+    options,
+    inspect,
+    consume,
+    counts: () => ({ producers, packs, consumers }),
+    mutate: (fn: typeof mutateProducer) => {
+      mutateProducer = fn;
+    },
+    packFailure: (status: string, quiescent = true) => {
+      packStatus = status;
+      cleanup = quiescent;
+    },
+  };
+}
+
+test('qualification checkpoints one producer and pack, resumes without replay, and retains immutable digests', async () => {
+  const f = qualificationFixture();
+  try {
+    const report = await qualification.runQualification({ ...f.options, producerOnly: true });
+    assert.equal(report.status, 'incomplete');
+    assert.equal(report.qualified, false);
+    assert.equal(report.exitCode, 2);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    const checkpoint = join(f.options.resultsDir, 'checkpoint.json');
+    const producer = readFileSync(join(f.options.resultsDir, 'producer/result.json'));
+    const resumed = await qualification.runQualification({
+      ...f.options,
+      resume: checkpoint,
+      resultsDir: join(f.base, 'resumed'),
+    });
+    assert.equal(resumed.qualified, true);
+    assert.equal(resumed.exitCode, 0);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+    assert.deepEqual(readFileSync(join(f.options.resultsDir, 'producer/result.json')), producer);
+    await assert.rejects(
+      qualification.runQualification({ ...f.options, resume: checkpoint, resultsDir: join(f.base, 'resumed') }),
+      /Existing overall result/u,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('full qualification executes one producer, actual pack and consumer in order', async () => {
+  const f = qualificationFixture();
+  try {
+    const report = await qualification.runQualification(f.options);
+    assert.equal(report.qualified, true);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const mutation of ['zero-selection', 'counts', 'skip', 'inventory', 'command-cleanup', 'ordered-gates']) {
+  test(`qualification rejects ${mutation} producer proof without installation`, async () => {
+    const f = qualificationFixture();
+    try {
+      f.mutate((report) => {
+        if (mutation === 'zero-selection') report.selectedTestFiles = [];
+        if (mutation === 'counts') report.tests = { files: 1, total: 99, passed: 1, skips: [] };
+        if (mutation === 'skip')
+          report.tests = {
+            files: 1,
+            total: 2,
+            passed: 1,
+            skips: [{ file: 'dist/original.test.js', title: 'unreviewed', kind: 'arbitrary' }],
+          };
+        if (mutation === 'inventory')
+          report.inventory = {
+            kind: 'dry-inventory-only',
+            name: '@aviaratech/ai-delivery',
+            version: '1.0.0',
+            fileCount: 0,
+            files: [],
+          };
+        if (mutation === 'command-cleanup')
+          report.commands = checks.FULL_GATES.map((stage) => ({
+            stage,
+            status: 'passed',
+            exitCode: 0,
+            signal: null,
+            cleanupConfirmed: false,
+          }));
+        if (mutation === 'ordered-gates') report.gates = [...checks.FULL_GATES].reverse();
+      });
+      const report = await qualification.runQualification(f.options);
+      assert.equal(report.qualified, false);
+      assert.equal(report.status, 'failed');
+      assert.equal(f.counts().consumers, 0);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+for (const mutation of ['wrong-head', 'producer-digest', 'archive-digest', 'contract-digest']) {
+  test(`resume rejects ${mutation} without replaying any process`, async () => {
+    const f = qualificationFixture();
+    try {
+      await qualification.runQualification({ ...f.options, producerOnly: true });
+      const checkpoint = join(f.options.resultsDir, 'checkpoint.json');
+      if (mutation === 'wrong-head')
+        execFileSync(
+          'git',
+          [
+            '-c',
+            'user.name=Fictional fixture',
+            '-c',
+            'user.email=fixture@example.invalid',
+            '-c',
+            'core.hooksPath=/dev/null',
+            'commit',
+            '--allow-empty',
+            '-qm',
+            'different head same tree',
+          ],
+          { cwd: f.cwd },
+        );
+      if (mutation === 'producer-digest') writeFileSync(join(f.options.resultsDir, 'producer/result.json'), '{}');
+      if (mutation === 'archive-digest') writeFileSync(join(f.options.resultsDir, 'pack/fictional.tgz'), 'changed');
+      if (mutation === 'contract-digest') {
+        const value = JSON.parse(readFileSync(checkpoint, 'utf8')) as { contractSha256: string };
+        value.contractSha256 = '0'.repeat(64);
+        writeFileSync(checkpoint, JSON.stringify(value));
+      }
+      const resumed = await qualification.runQualification({
+        ...f.options,
+        resume: checkpoint,
+        resultsDir: join(f.base, 'resume-bad'),
+      });
+      assert.equal(resumed.status, 'failed');
+      assert.equal(resumed.qualified, false);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('external consumer join never installs twice and rejects unconfirmed owned removal', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    const contract = JSON.parse(readFileSync(join(f.options.resultsDir, 'contract.json'), 'utf8')) as SyntheticContract;
+    const receipt = await f.consume(contract, { authorizeInstall: true });
+    const consumerResult = join(f.base, 'external-consumer.json');
+    writeFileSync(consumerResult, JSON.stringify(receipt));
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    const joined = await qualification.runQualification({
+      ...f.options,
+      resume,
+      consumerResult,
+      resultsDir: join(f.base, 'join'),
+    });
+    assert.equal(joined.qualified, true);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+    receipt.cleanup = { quiescent: true, removed: false };
+    writeFileSync(consumerResult, JSON.stringify(receipt));
+    const bad = await qualification.runQualification({
+      ...f.options,
+      resume,
+      consumerResult,
+      resultsDir: join(f.base, 'bad-join'),
+    });
+    assert.equal(bad.qualified, false);
+    assert.match(bad.error!, /removal/u);
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const status of ['failed', 'timed-out', 'cancelled', 'cleanup-unconfirmed']) {
+  test(`actual pack ${status} cannot produce a successful checkpoint`, async () => {
+    const f = qualificationFixture();
+    try {
+      f.packFailure(status === 'cleanup-unconfirmed' ? 'passed' : status, status !== 'cleanup-unconfirmed');
+      const report = await qualification.runQualification(f.options);
+      assert.equal(report.qualified, false);
+      assert.equal(existsSync(join(f.options.resultsDir, 'checkpoint.json')), false);
+      assert.equal(f.counts().consumers, 0);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('pre-start cancellation and inside-source evidence refuse all graph launches', async () => {
+  const f = qualificationFixture();
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    const report = await qualification.runQualification({ ...f.options, signal: controller.signal });
+    assert.equal(report.status, 'cancelled');
+    assert.equal(report.exitCode, 130);
+    assert.deepEqual(f.counts(), { producers: 0, packs: 0, consumers: 0 });
+    await assert.rejects(
+      qualification.runQualification({ ...f.options, resultsDir: join(f.cwd, '..looks-outside') }),
+      /outside source/u,
+    );
+    assert.deepEqual(f.counts(), { producers: 0, packs: 0, consumers: 0 });
   } finally {
     f.cleanup();
   }

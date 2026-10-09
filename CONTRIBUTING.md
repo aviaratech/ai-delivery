@@ -12,7 +12,7 @@ nvm use 24.21.0
 node -p 'JSON.stringify({version:process.version,execPath:process.execPath})'
 npm --version
 "$AI_DELIVERY_NODE26_EXECUTABLE" -p 'JSON.stringify({version:process.version,execPath:process.execPath})'
-npm ci
+npm ci --ignore-scripts --no-audit --no-fund
 npm run checks
 ```
 
@@ -20,13 +20,46 @@ The runner fails before gates for missing, wrong or inaccessible prerequisites.
 It resolves existing temporary-directory aliases to their physical paths so
 macOS synthetic fixtures do not mistake `/var` or `/tmp` aliases for managed
 plugin symlinks; this creates no new destination or host setting.
-Local, staged and CI checks share `scripts/checks.mjs`: formatting, native
-type-aware lint, strict TypeScript, a **clean single build**, all intended
-compiled Vitest files with one worker, and `npm pack --dry-run --ignore-scripts
---json` inventory validation. Source names, compiled names and actual Vitest
-selection must agree; deleted/renamed tests cannot survive in stale `dist`.
-Do not build or pack again after full checks. CI retains required jobs `checks`
-and `secrets` and uploads partial/final check evidence.
+Local and CI full entry `npm run checks` runs `scripts/current-qualification.mjs`:
+the canonical six-gate producer, one actual scripts-disabled pack, then an owned,
+credential-free production-only consumer installation of that exact archive.
+The producer in `scripts/checks.mjs` runs formatting, native type-aware lint,
+strict TypeScript, a **clean single build**, all intended compiled Vitest files
+with one worker, and complete dry inventory validation. The immutable
+`contributor-checks@1` snapshot records those six gates; its `fullSuccess` means
+producer success. Overall `ai-delivery.current-qualification@1` requires the
+exact archive, resolved production closure, installed byte/mode checks, CLI,
+exports, packaged stdio MCP schemas, skills, actual Node26 library use, and owned
+quiescent removal. Its `qualified: true` and exit 0 are full contributor proof.
+A producer pass alone reports `artifactQualified: false`.
+Source names, compiled names and actual Vitest selection must agree;
+deleted/renamed tests cannot survive in stale `dist`. Actual artifact qualification
+requires a clean committed source including untracked files. Results must be
+outside the checkout. CI retains required jobs `checks` and `secrets` and uploads
+partial/final evidence, immutable producer logs, and the actual archive.
+
+A serial artifact handoff uses `npm run checks:producer -- --results-dir
+/an/owned/new/result-directory`. It runs the producer and actual pack once,
+retains `contract.json` and `checkpoint.json`, and returns exit **2** with overall
+`incomplete` and the consumer omissions. Resume without rebuilding or repacking:
+
+```sh
+npm run checks:resume -- --resume /owned/original/checkpoint.json --results-dir /owned/new/resume-results
+```
+
+Resume revalidates clean HEAD/tree, source fingerprint, manifest/lock, all archive
+bytes/modes, immutable producer digest, six gates, counts, reviewed skips and
+pack quiescence before installation and again before completion. A changed or
+incomplete checkpoint fails. For an admitted separate consumer owner, invoke
+`node scripts/current-consumer.mjs /owned/original/contract.json
+/owned/consumer-result.json --authorize-install` once, then join its retained
+result with the same resume command plus `--consumer-result
+/owned/consumer-result.json`. That join performs no install, build or pack.
+Without `--authorize-install` the helper returns incomplete/exit 2; it cannot
+complete overall checks. Immutable receipts are referenced by SHA256 in the
+overall result, never inserted back into the producer hash. Do not rerun a
+successful producer or pack merely to report or join evidence. Each invocation
+needs fresh owned output storage; preserve uncertain/interrupted receipts.
 
 `npm run checks:fast` runs only format/lint/types. It reports `partial-passed`,
 `fullSuccess: false` and omitted build/tests/inventory. `npm test` is a separate
@@ -48,8 +81,8 @@ launch is distinct from its top-level skip. Absent
 and must not silently become an absent-input skip), the historical reviewed 0.3.4 archive
 qualification remains **unexecuted**. That skip, checkout-sharing consumer tests
 and dry inventory are not current production-only tarball or native adoption
-proof. Issue90 owns the additional current-tarball gate; integrate only its
-reviewed contract under the shared writer agreement. Unexpected skips,
+proof. The reviewed current-tarball consumer is joined by the maintained full entry;
+its installation proof remains distinct from the producer and historical archive. Unexpected skips,
 exclusions, unknown statuses, missing proof and zero tests fail full checks.
 
 Built-in Node/V8 coverage collects executed **observed V8 ranges** in compiled
@@ -80,7 +113,9 @@ The optional tracked hook is `scripts/pre-commit.mjs`. It copies the index into
 an owned temporary directory, honoring `GIT_INDEX_FILE` (including temporary
 indexes supplied by `git commit -a` and path-limited commits), computes the exact staged tree with private
 objects, materializes that tree, provisions from its staged lock and invokes
-its **staged** canonical runner. It does not stash, write the original index or
+its **staged** six-gate canonical producer. The snapshot hook reports actual
+archive/clean-HEAD consumer omissions and `artifactQualified: false`; it does not
+install or force an uncommitted index through clean-source qualification. It does not stash, write the original index or
 unstaged files, or borrow checkout node_modules. It checks the source index for
 drift and removes only its owned snapshot after quiescence; results survive.
 Unmerged/submodule/symlink index entries fail explicitly. Opt-in installation

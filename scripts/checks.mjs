@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 /** @typedef {{name:string, version:string, files:{path:string,mode:number}[]}} PackInventory */
 /** @typedef {{result?:{url:string, functions:{ranges:{startOffset:number,endOffset:number,count:number}[]}[]}[]}} V8Report */
 /** @typedef {Partial<CommandRecord> & {stage:string, command:string[], status:string, directory:string}} StageRecord */
-/** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
+/** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
 /** @typedef {{cwd?:string, resultsDir?:string, fast?:boolean, install?:boolean, stagedTree?:string, signal?:AbortSignal, timeoutMs?:number, execute?:typeof executeCommand, toolchain?:typeof validateToolchain, environment?:Environment}} CheckOptions */
 
 /** @param {unknown} error */
@@ -491,7 +491,12 @@ export function coverageBaseline(directory, cwd) {
     files: baseline,
     instrumentationLimits:
       'Startup collection measures native child invocations, including synthetic Git hooks; it does not instrument the main canonical controller or Vitest-transformed imports. Runner counters cover native fixture paths only.',
-    unmeasuredContributorScripts: ['scripts/checks.mjs', 'scripts/pre-commit.mjs']
+    unmeasuredContributorScripts: [
+      'scripts/checks.mjs',
+      'scripts/pre-commit.mjs',
+      'scripts/current-qualification.mjs',
+      'scripts/current-consumer.mjs',
+    ]
       .filter((path) => !files.has(path))
       .map((path) => ({
         path,
@@ -515,6 +520,7 @@ function persist(directory, report) {
     `Results: ${directory}`,
     `Gates: ${report.gates.join(', ')}`,
     `Omitted: ${report.omitted.join(', ') || 'none'}`,
+    `Actual artifact qualified: false; omitted: ${report.artifactOmitted.join(', ')}`,
     ...report.commands.map(
       (step) => `${step.stage}: ${step.status}; exit=${step.exitCode}; signal=${step.signal}; log=${step.directory}`,
     ),
@@ -569,6 +575,8 @@ export async function runChecks({
     scope: fast ? 'fast' : 'full',
     status: 'running',
     fullSuccess: false,
+    artifactQualified: false,
+    artifactOmitted: ['actual scripts-disabled archive', 'current-consumer application and owned cleanup'],
     gates: fast ? FAST_GATES : FULL_GATES,
     omitted: fast ? FULL_GATES.filter((gate) => !FAST_GATES.includes(gate)) : [],
     commands: [],
