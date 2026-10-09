@@ -124,6 +124,8 @@ async function matchingPrs(context: DeliveryContext, branch: string, base?: stri
         per_page: 100,
       })
     ).data;
+    if (!Array.isArray(batch) || batch.some((pr) => !pr || !Number.isSafeInteger(pr.number) || pr.number <= 0))
+      throw new DeliveryError('Incomplete GitHub PR match readback.');
     matches.push(...batch);
     if (batch.length < 100) return matches;
   }
@@ -386,20 +388,33 @@ export async function publishPr(
     dryRun?: boolean;
   },
 ) {
-  const branch = await issueBranch(context, input.issueNumber, input.headBranch);
-  if (input.headBranch !== undefined && input.headBranch !== branch)
-    throw new DeliveryError('Requested PR branch differs from the GitHub-linked issue branch.');
-  validBranch(branch);
   const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: input.issueNumber })).data;
   if ('pull_request' in issue || issue.number !== input.issueNumber || issue.state !== 'open')
     throw new DeliveryError('PR creation requires the requested open GitHub issue.');
-  const defaultBranch = (await context.clients.rest.repos.get({ ...context.repo })).data.default_branch;
+  const repository = (await context.clients.rest.repos.get({ ...context.repo })).data;
+  if (
+    repository.full_name?.toLowerCase() !== context.config.repository.toLowerCase() ||
+    context.config.repository.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
+  )
+    throw new DeliveryError('Configured and selected GitHub repository identities disagree.');
+  const defaultBranch = repository.default_branch;
   const base = input.baseBranch ?? defaultBranch;
   if (base !== defaultBranch)
     throw new DeliveryError('PR delivery requires the repository default branch for durable issue association.');
   validBranch(base);
+  // An explicit ready request can select an existing PR through GitHub itself.
+  // Creating a PR still requires the native issue-branch connection.
+  const explicitPromotion = input.draft === false && input.headBranch !== undefined;
+  if (input.headBranch !== undefined) validBranch(input.headBranch);
+  const selectedMatches = explicitPromotion ? await matchingPrs(context, input.headBranch!, base) : undefined;
+  const branch =
+    explicitPromotion && selectedMatches!.length > 0
+      ? input.headBranch!
+      : await issueBranch(context, input.issueNumber, input.headBranch);
+  validBranch(branch);
   const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${branch}` })).data;
-  if (!validSha(ref.object.sha)) throw new DeliveryError('Remote issue branch head is invalid.');
+  if (ref.ref !== `refs/heads/${branch}` || ref.object.type !== 'commit' || !validSha(ref.object.sha))
+    throw new DeliveryError('Remote issue branch head/ref readback is invalid.');
   const requestedBody = input.body ?? `Closes #${input.issueNumber}`;
   if (!requestedBody.trim()) throw new DeliveryError('PR body must contain text.');
   const body = new RegExp(`(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\\s+#${input.issueNumber}(?![0-9])`, 'iu').test(
@@ -407,7 +422,7 @@ export async function publishPr(
   )
     ? requestedBody
     : `${requestedBody}\n\nCloses #${input.issueNumber}`;
-  const matches = await matchingPrs(context, branch, base);
+  const matches = selectedMatches ?? (await matchingPrs(context, branch, base));
   if (matches.length > 1) throw new DeliveryError('Remote issue branch has conflicting PR matches.');
   let pr = matches[0] === undefined ? undefined : await getPr(context, matches[0].number);
   if (
@@ -416,6 +431,7 @@ export async function publishPr(
       pr.head.ref !== branch ||
       pr.base.ref !== base ||
       pr.state !== 'open' ||
+      pr.merged ||
       (input.body !== undefined && pr.body !== body) ||
       (input.title !== undefined && pr.title !== input.title))
   )
@@ -423,15 +439,57 @@ export async function publishPr(
   const reviewRoute = await preflightReviewRoute(context, base);
   if (pr && pr.user?.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase())
     throw new DeliveryError('Existing PR author differs from the configured authenticated author.');
-  if (pr) await verifyPrIssueAssociation(context, pr.number, input.issueNumber);
-  if (input.dryRun) return { dryRun: true, headSha: ref.object.sha, headBranch: branch, baseBranch: base, reviewRoute };
+  if (pr && (typeof pr.node_id !== 'string' || !pr.node_id))
+    throw new DeliveryError('Existing PR publication identity is incomplete.');
+  const existing = pr;
+  const readExisting = async () => {
+    const current = await verifyIssuePr(context, input.issueNumber, existing!.number);
+    if (
+      current.state !== 'open' ||
+      current.merged ||
+      current.node_id !== existing!.node_id ||
+      current.head.sha !== ref.object.sha ||
+      current.head.ref !== branch ||
+      current.base.ref !== base ||
+      current.base.sha !== existing!.base.sha ||
+      current.user?.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase() ||
+      (input.body !== undefined && current.body !== body) ||
+      (input.title !== undefined && current.title !== input.title)
+    )
+      throw new DeliveryError('Existing PR publication head, identity, intent or author readback drifted.');
+    return current;
+  };
+  if (pr) pr = await readExisting();
+  if (input.dryRun)
+    return {
+      dryRun: true,
+      ...(pr === undefined ? {} : { prNumber: pr.number, draft: pr.draft }),
+      headSha: ref.object.sha,
+      headBranch: branch,
+      baseBranch: base,
+      reviewRoute,
+    };
   if (pr) {
     if (input.draft === false && pr.draft) {
-      await context.clients.graphql(
-        'mutation DeliveryReadyPr($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}',
-        { id: pr.node_id },
-      );
-      pr = await getPr(context, pr.number);
+      pr = await readExisting();
+      if (pr.draft) {
+        if (typeof pr.node_id !== 'string' || !pr.node_id)
+          throw new DeliveryError('Existing PR promotion identity is incomplete.');
+        // The ready mutation has no server-side head precondition; reject
+        // observed drift on both sides without automatically repeating it.
+        const promoted = await context.clients.graphql<{
+          markPullRequestReadyForReview: { pullRequest: { id: string; isDraft: boolean } | null } | null;
+        }>(
+          'mutation DeliveryReadyPr($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}',
+          { id: pr.node_id },
+        );
+        if (
+          promoted?.markPullRequestReadyForReview?.pullRequest?.id !== pr.node_id ||
+          promoted.markPullRequestReadyForReview.pullRequest.isDraft !== false
+        )
+          throw new DeliveryError('PR promotion mutation readback is incomplete or conflicting; reconcile this PR.');
+      }
+      pr = await readExisting();
       if (pr.draft) throw new DeliveryError('PR promotion readback is still draft.');
     }
   } else {

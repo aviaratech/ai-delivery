@@ -29,6 +29,10 @@ function fixture(published = true) {
     headRef: 'issue/17',
     headRepo: repo,
     baseRepo: repo,
+    baseSha: base,
+    baseRef: 'main',
+    nodeId: 'PR23',
+    prAuthor: 'author',
     prState: 'open',
     merged: false as unknown,
     draft: true as unknown,
@@ -44,6 +48,13 @@ function fixture(published = true) {
     reviewerActor: 'reviewer[bot]',
     movedOnRead: 0,
     reads: 0,
+    readHook: undefined as ((reads: number) => void) | undefined,
+    matchReadback: undefined as unknown,
+    promotionReadback: undefined as unknown,
+    keepDraftOnPromotion: false,
+    promotions: 0,
+    creations: 0,
+    expectedCreationDraft: true,
     events: [] as string[],
     reviews: [] as Array<{
       id: number;
@@ -57,7 +68,7 @@ function fixture(published = true) {
   };
   const pr = () => ({
     number: 23,
-    node_id: 'PR23',
+    node_id: state.nodeId,
     changed_files: 1,
     title: 'Improve widget',
     body: 'Closes #17',
@@ -66,8 +77,8 @@ function fixture(published = true) {
     draft: state.draft,
     merged: state.merged,
     head: { sha: state.headSha, ref: state.headRef, repo: { full_name: state.headRepo } },
-    base: { sha: base, ref: 'main', repo: { full_name: state.baseRepo } },
-    user: { login: 'author' },
+    base: { sha: state.baseSha, ref: state.baseRef, repo: { full_name: state.baseRepo } },
+    user: { login: state.prAuthor },
   });
   const rest = {
     request: async () => ({ data: [] }),
@@ -88,13 +99,16 @@ function fixture(published = true) {
     pulls: {
       get: async () => {
         state.reads++;
+        state.readHook?.(state.reads);
         if (state.movedOnRead && state.reads >= state.movedOnRead) state.headSha = 'd'.repeat(40);
         return { data: pr() };
       },
-      list: async () => ({ data: state.published ? [{ number: 23 }] : [] }),
+      list: async () => ({ data: state.matchReadback ?? (state.published ? [{ number: 23 }] : []) }),
       create: async (input: { draft: boolean; head: string }) => {
-        assert.equal(input.draft, true);
+        assert.equal(input.draft, state.expectedCreationDraft);
         assert.equal(input.head, 'issue/17');
+        state.creations++;
+        state.draft = input.draft;
         state.published = true;
         state.linked = false;
         state.events.push('draft-publication-replaces-branch-link');
@@ -166,6 +180,13 @@ function fixture(published = true) {
           },
         }
       );
+    if (query.includes('DeliveryReadyPr')) {
+      state.promotions++;
+      if (!state.keepDraftOnPromotion) state.draft = false;
+      return (
+        state.promotionReadback ?? { markPullRequestReadyForReview: { pullRequest: { id: 'PR23', isDraft: false } } }
+      );
+    }
     throw new Error(`Unexpected synthetic query: ${query}`);
   };
   const reviewer = {
@@ -486,7 +507,194 @@ describe('native exact PR association after publication', () => {
   });
 });
 
+describe('authoritative existing PR promotion', () => {
+  const input = { issueNumber: 17, headBranch: 'issue/17', draft: false };
+
+  it('promotes after publication and exact-head review, then reuses authoritative ready readback', async () => {
+    const { context, reviewerContext, state, artifact } = fixture();
+    await submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact });
+    const preview = await publishPr(context, { ...input, dryRun: true });
+    assert.equal(preview.prNumber, 23);
+    assert.equal(preview.draft, true);
+    assert.equal(state.promotions, 0);
+    const promoted = await publishPr(context, input);
+    const reused = await publishPr(context, input);
+    assert.equal(promoted.prNumber, 23);
+    assert.equal(promoted.draft, false);
+    assert.deepEqual(reused, promoted);
+    assert.equal(state.promotions, 1);
+    assert.equal(state.creations, 0);
+    assert.equal(state.submissions, 1);
+    assert.equal(state.linked, false);
+    assert.deepEqual(state.events, []);
+  });
+
+  for (const [name, change] of [
+    ['wrong issue', { issueNumber: 18 }],
+    ['foreign PR head repository', { headRepo: 'other/widget' }],
+    ['foreign PR base repository', { baseRepo: 'other/widget' }],
+    ['foreign native repository', { associationRepo: 'other/widget' }],
+    ['wrong native PR', { associationPr: 24 }],
+    ['wrong author', { prAuthor: 'collaborator' }],
+    ['wrong head', { headSha: 'd'.repeat(40) }],
+    ['moved remote head', { remoteHead: 'd'.repeat(40) }],
+    ['wrong ref', { headRef: 'other' }],
+    ['wrong base', { baseRef: 'release' }],
+    ['closed PR', { prState: 'closed' }],
+    ['missing node identity', { nodeId: '' }],
+    ['incomplete draft state', { draft: undefined }],
+    ['ambiguous matches', { matchReadback: [{ number: 23 }, { number: 24 }] }],
+    ['incomplete match identity', { matchReadback: [{}] }],
+    ['incomplete match connection', { matchReadback: {} }],
+    ['incomplete association', { closingReadback: { repository: null } }],
+    ['incomplete branch connection', { branchReadback: { repository: null } }],
+  ] as const) {
+    it(`refuses ${name} before promotion, including already-ready reuse`, async () => {
+      for (const draft of [true, false]) {
+        const { context, state } = fixture();
+        state.draft = draft;
+        Object.assign(state, change);
+        await assert.rejects(publishPr(context, input));
+        assert.equal(state.promotions, 0);
+        assert.equal(state.creations, 0);
+        assert.deepEqual(state.events, []);
+      }
+    });
+  }
+
+  for (const read of [2, 3]) {
+    it(`refuses head drift on authoritative PR read ${read} before mutation`, async () => {
+      const { context, state } = fixture();
+      state.readHook = (count) => {
+        if (count === read) state.headSha = state.remoteHead = 'd'.repeat(40);
+      };
+      await assert.rejects(publishPr(context, input), /drift/u);
+      assert.equal(state.promotions, 0);
+    });
+  }
+
+  it('refuses author and native node drift immediately before mutation', async () => {
+    for (const field of ['prAuthor', 'nodeId'] as const) {
+      const { context, state } = fixture();
+      state.readHook = (count) => {
+        if (count === 3) state[field] = 'changed';
+      };
+      await assert.rejects(publishPr(context, input), /drift/u);
+      assert.equal(state.promotions, 0);
+    }
+  });
+
+  for (const response of [
+    {},
+    { markPullRequestReadyForReview: null },
+    { markPullRequestReadyForReview: { pullRequest: { id: 'PR24', isDraft: false } } },
+    { markPullRequestReadyForReview: { pullRequest: { id: 'PR23' } } },
+  ]) {
+    it('refuses incomplete or conflicting mutation acknowledgement without retrying it', async () => {
+      const { context, state } = fixture();
+      state.promotionReadback = response;
+      await assert.rejects(publishPr(context, input), /mutation readback/u);
+      assert.equal(state.promotions, 1);
+      assert.equal(state.creations, 0);
+    });
+  }
+
+  it('refuses a still-draft authoritative readback after a ready acknowledgement', async () => {
+    const { context, state } = fixture();
+    state.keepDraftOnPromotion = true;
+    await assert.rejects(publishPr(context, input), /still draft/u);
+    assert.equal(state.promotions, 1);
+  });
+
+  it('refuses post-mutation head or association drift without another mutation', async () => {
+    for (const kind of ['head', 'association']) {
+      const { context, state } = fixture();
+      state.readHook = (count) => {
+        if (count === 4) {
+          if (kind === 'head') state.headSha = state.remoteHead = 'd'.repeat(40);
+          else state.closingReadback = { repository: null };
+        }
+      };
+      await assert.rejects(publishPr(context, input), /drift|association/u);
+      assert.equal(state.promotions, 1);
+    }
+  });
+
+  it('requires explicit head and ready intent rather than guessing a post-publication branch', async () => {
+    const { context, state } = fixture();
+    await assert.rejects(publishPr(context, { issueNumber: 17, draft: false }), /linked/u);
+    await assert.rejects(publishPr(context, { ...input, draft: true }), /linked/u);
+    assert.equal(state.promotions, 0);
+  });
+
+  it('keeps new ready-PR creation behind native linked-branch authority', async () => {
+    const { context, state } = fixture(false);
+    await assert.rejects(publishPr(context, input), /linked/u);
+    assert.equal(state.creations, 0);
+    const started = await startIssueBranch(context, 17);
+    assert.equal(started.headSha, base);
+    state.remoteHead = head;
+    state.expectedCreationDraft = false;
+    const created = await publishPr(context, input);
+    assert.equal(created.draft, false);
+    assert.equal(state.creations, 1);
+    assert.equal(state.promotions, 0);
+  });
+
+  it('keeps incomplete native branch readback behind the unchanged start gate', async () => {
+    const { context, state } = fixture(false);
+    state.branchReadback = { repository: null };
+    await assert.rejects(startIssueBranch(context, 17), /Incomplete/u);
+    assert.deepEqual(state.events, []);
+  });
+
+  it('retains configured author role and distinct App preflight before promotion', async () => {
+    const { context, reviewerContext, state } = fixture();
+    await assert.rejects(publishPr(reviewerContext, input), /author/u);
+    state.reviewerActor = 'author';
+    await assert.rejects(publishPr(context, input), /distinct/u);
+    assert.equal(state.promotions, 0);
+  });
+});
+
 describe('directory-independent exact-PR contract', () => {
+  it('uses the existing MCP selector for author dry-run, promotion and ready reuse outside a checkout', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'delivery-pr-promotion-'));
+    const { context, state } = fixture();
+    vi.spyOn(settings, 'loadDeliverySettings').mockResolvedValue(
+      context.config as unknown as Awaited<ReturnType<typeof settings.loadDeliverySettings>>,
+    );
+    vi.spyOn(issues, 'loadDeliveryContext').mockImplementation(async (input) => {
+      assert.equal(input.repository, repo);
+      assert.equal(input.repoRoot, root);
+      assert.equal(input.role, 'author');
+      return context;
+    });
+    const server = createAiDeliveryMcpServer({ repoRoot: root });
+    const client = new Client({ name: 'promotion-fixture', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const input = { repo, issueNumber: 17, headBranch: 'issue/17', draft: false };
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const preview = await client.callTool({ name: 'issue_pr_create', arguments: { ...input, dryRun: true } });
+      assert.equal(preview.isError, undefined);
+      assert.equal(state.promotions, 0);
+      for (let call = 0; call < 2; call++) {
+        const result = await client.callTool({ name: 'issue_pr_create', arguments: input });
+        assert.equal(result.isError, undefined);
+      }
+      assert.equal(state.promotions, 1);
+      assert.equal(state.creations, 0);
+      assert.equal(state.draft, false);
+      assert.equal(state.linked, false);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('dispatches native inspection and App dry-run through MCP from a non-Git directory', async () => {
     const root = mkdtempSync(join(tmpdir(), 'delivery-pr-association-'));
     const { context, reviewerContext, state, artifact } = fixture();
@@ -538,6 +746,13 @@ describe('directory-independent exact-PR contract', () => {
       });
       assert.match(help, /combine --issue and --pr/u);
       assert.match(help, /issue-only lookup requires a GitHub-linked\s+branch/u);
+      const creationHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), 'pr:create', '--help'], {
+        cwd: root,
+        env: { HOME: root, PATH: process.env.PATH },
+        encoding: 'utf8',
+      }).replace(/\s+/gu, ' ');
+      assert.match(creationHelp, /promote an existing associated PR with --head and --ready/u);
+      assert.match(creationHelp, /Explicit remote head/u);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

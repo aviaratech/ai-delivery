@@ -67,6 +67,7 @@ function fixture(
       : `${artifact.summary}\n\n${marker}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
   const pr = () => ({
     number: 23,
+    node_id: 'PR23',
     changed_files: 1,
     title: 'Improve widget',
     body: 'Closes #17',
