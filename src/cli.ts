@@ -330,11 +330,12 @@ program
   });
 program
   .command('pr:create')
+  .description('Create a PR from a linked issue branch, or promote an existing associated PR with --head and --ready.')
   .requiredOption('--issue <number>')
   .option('--title <title>')
   .option('--body-file <path>')
-  .option('--head <branch>', 'Select one GitHub-linked issue branch')
-  .option('--ready')
+  .option('--head <branch>', 'Explicit remote head; existing PR promotion verifies its native issue association')
+  .option('--ready', 'Publish ready, or promote the author-owned PR selected by --head')
   .option('--dry-run')
   .action(
     async (o: { issue: string; title?: string; bodyFile?: string; head?: string; ready?: boolean; dryRun?: boolean }) =>
@@ -349,8 +350,9 @@ program
   );
 program
   .command('pr:info')
-  .option('--issue <number>')
-  .option('--pr <number>')
+  .description('Inspect an exact PR; combine --issue and --pr to verify its native closing-issue association.')
+  .option('--issue <number>', 'Issue to verify; issue-only lookup requires a GitHub-linked branch')
+  .option('--pr <number>', 'Exact PR number; include --issue after issue branch links are replaced on publication')
   .action(async (o: { issue?: string; pr?: string }) =>
     run('issue_pr_info', { issueNumber: int(o.issue), prNumber: int(o.pr) }),
   );
