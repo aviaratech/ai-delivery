@@ -13,7 +13,7 @@ export const logDebug = (message: string) => {
     return;
   }
   if (process.env.DEBUG === 'true' || process.env.DEBUG === '1') {
-    console.log(chalk.gray(formatTerminalLogLine('debug', message)));
+    console.error(chalk.gray(formatTerminalLogLine('debug', message)));
   }
 };
 
@@ -21,14 +21,14 @@ export const logInfo = (message: string) => {
   if (logsSuppressed) {
     return;
   }
-  console.log(chalk.blue(formatTerminalLogLine('info', message)));
+  console.error(chalk.blue(formatTerminalLogLine('info', message)));
 };
 
 export const logSuccess = (message: string) => {
   if (logsSuppressed) {
     return;
   }
-  console.log(chalk.green(formatTerminalLogLine('success', message)));
+  console.error(chalk.green(formatTerminalLogLine('success', message)));
 };
 
 export const logWarn = (message: string) => {
@@ -101,7 +101,7 @@ export const handleCommandError = (error: unknown): void => {
   if (error instanceof CLIError && typeof error.hint === 'string' && error.hint.trim().length > 0) {
     const hintLine = `💡 Recovery: ${error.hint}`;
     if (logsSuppressed) {
-      // logInfo writes to stdout and is silenced in JSON/MCP modes; route the
+      // logInfo is silenced in MCP mode; route the
       // recovery hint to stderr so failures stay diagnosable.
       console.error(chalk.blue(formatTerminalLogLine('info', hintLine)));
     } else {
