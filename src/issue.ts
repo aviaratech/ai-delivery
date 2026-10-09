@@ -1,11 +1,13 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { z } from 'zod';
 
-import type { DeliveryConfig, LoadedDeliveryConfig } from './config/deliveryConfig.js';
+import type {
+  DeliveryConfig,
+  GitHubDeliveryConfig,
+  LoadedDeliveryConfig,
+  LoadedGitHubConfig,
+} from './config/deliveryConfig.js';
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
-import { assertPrivateFile, digestBytes, stableJson } from './delivery/common.js';
-import { digestValue } from './delivery/index.js';
+import { digestValue } from './delivery/legacy.js';
 import { DeliveryError } from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
 import {
@@ -28,30 +30,8 @@ import {
   replaceParentIssue,
   resolveNativeRelationshipTargets,
 } from './github/relationships.js';
-import { resolveDeliveryRepo, type RepoCoordinates } from './github/repo.js';
-import { assertClean, git, gitCommonDir, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
-import { mergePr, preflightReviewRoute, readMergedContinuationTerminal } from './pr.js';
+import { type RepoCoordinates } from './github/repo.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
-import { assertDeliveryRuntimeAdmitted } from './services/deliveryAdmission.js';
-import {
-  addWorktreeEntry,
-  assertNativeIssueTrackingAdmission,
-  getIssueWorktreeStrict,
-  getWorktreeByIssue,
-  listWorktreesStrict,
-  committedContinuationPlanPath,
-  CommittedContinuationPlanSchema,
-  pendingCommittedContinuation,
-  withCommittedContinuationRegistry,
-  writeCommittedContinuationCheckpoint,
-  type CommittedContinuationPlan,
-  type WorktreeEntry,
-} from './services/worktreeRegistry.js';
-import { withRuntimeSetupWriter, withWorktreeTransitionWriterAbsent } from './verification.js';
-import { authenticatedWorktreeActors, assertNativeWorktreeAcceptance } from './worktreeTransition.js';
-import { assertIssueWorktreeLocation, prepareIssueWorktree } from './worktree.js';
-import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
-import { withLock } from './utils/lockfile.js';
 import { JournalInputSchema, renderJournal, type JournalInput } from './issueJournal.js';
 
 export interface IssueCommentReadback {
@@ -91,55 +71,53 @@ export async function commentIssue(
     throw new DeliveryError('Issue comments require the authenticated author role.');
   const actor = (await context.clients.authenticatedAuthor()).actorLogin;
   if (!actor) throw new DeliveryError('Issue comment author identity is missing.');
-  const directory = join(gitCommonDir(context.root), 'ai-delivery', 'journals');
-  ensurePrivateDirectoryDurably(directory);
-  return withLock(join(directory, String(input.issueNumber)), {
-    operation: async () => {
-      const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: input.issueNumber })).data;
-      if ('pull_request' in issue || issue.number !== input.issueNumber)
-        throw new DeliveryError('Issue comment target is not the requested issue.');
-      const matches = [];
-      for (let page = 1; ; page += 1) {
-        const batch = (
-          await context.clients.rest.issues.listComments({
-            ...context.repo,
-            issue_number: input.issueNumber,
-            page,
-            per_page: 100,
-          })
-        ).data;
-        matches.push(
-          ...batch.filter(
-            (comment) =>
-              (marker === undefined ? comment.body === body : comment.body?.endsWith(marker)) &&
-              comment.user?.login.toLowerCase() === actor.toLowerCase(),
-          ),
-        );
-        if (batch.length < 100) break;
-      }
-      if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
-      const existing = matches[0];
-      const created =
-        existing ??
-        (await context.clients.rest.issues.createComment({ ...context.repo, issue_number: input.issueNumber, body }))
-          .data;
-      const readback = (await context.clients.rest.issues.getComment({ ...context.repo, comment_id: created.id })).data;
-      const expectedIssuePath = `/repos/${context.repo.owner}/${context.repo.repo}/issues/${String(input.issueNumber)}`;
-      if (
-        !Number.isSafeInteger(readback.id) ||
-        readback.id <= 0 ||
-        readback.id !== created.id ||
-        readback.html_url !== created.html_url ||
-        readback.body !== (existing?.body ?? body) ||
-        (lifecycleKey === undefined && readback.body !== body) ||
-        readback.user?.login.toLowerCase() !== actor.toLowerCase() ||
-        new URL(readback.issue_url).pathname.toLowerCase() !== expectedIssuePath.toLowerCase() ||
-        !readback.html_url.startsWith('https://')
-      )
-        throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
-      return { commentId: readback.id, url: readback.html_url, body: readback.body!, reused: existing !== undefined };
-    },
-  });
+  const operation = async () => {
+    const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: input.issueNumber })).data;
+    if ('pull_request' in issue || issue.number !== input.issueNumber)
+      throw new DeliveryError('Issue comment target is not the requested issue.');
+    const matches = [];
+    for (let page = 1; page <= 20; page += 1) {
+      const batch = (
+        await context.clients.rest.issues.listComments({
+          ...context.repo,
+          issue_number: input.issueNumber,
+          page,
+          per_page: 100,
+        })
+      ).data;
+      matches.push(
+        ...batch.filter(
+          (comment) =>
+            (marker === undefined ? comment.body === body : comment.body?.endsWith(marker)) &&
+            comment.user?.login.toLowerCase() === actor.toLowerCase(),
+        ),
+      );
+      if (batch.length < 100) break;
+      if (page === 20) throw new DeliveryError('Issue comment history exceeds the bounded readback window.');
+    }
+    if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
+    const existing = matches[0];
+    const created =
+      existing ??
+      (await context.clients.rest.issues.createComment({ ...context.repo, issue_number: input.issueNumber, body }))
+        .data;
+    const readback = (await context.clients.rest.issues.getComment({ ...context.repo, comment_id: created.id })).data;
+    const expectedIssuePath = `/repos/${context.repo.owner}/${context.repo.repo}/issues/${String(input.issueNumber)}`;
+    if (
+      !Number.isSafeInteger(readback.id) ||
+      readback.id <= 0 ||
+      readback.id !== created.id ||
+      readback.html_url !== created.html_url ||
+      readback.body !== (existing?.body ?? body) ||
+      (lifecycleKey === undefined && readback.body !== body) ||
+      readback.user?.login.toLowerCase() !== actor.toLowerCase() ||
+      new URL(readback.issue_url).pathname.toLowerCase() !== expectedIssuePath.toLowerCase() ||
+      !readback.html_url.startsWith('https://')
+    )
+      throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
+    return { commentId: readback.id, url: readback.html_url, body: readback.body!, reused: existing !== undefined };
+  };
+  return operation();
 }
 
 export async function journalIssueStart(context: DeliveryContext, issueNumber: number): Promise<IssueCommentReadback> {
@@ -163,9 +141,10 @@ export async function journalIssueStart(context: DeliveryContext, issueNumber: n
 
 export interface DeliveryContext {
   clients: GitHubClients;
-  configuration?: LoadedDeliveryConfig;
+  reviewerClients?: GitHubClients;
+  configuration?: LoadedDeliveryConfig | LoadedGitHubConfig;
   projectConfiguration?: ProjectDeliveryConfiguration;
-  config: DeliveryConfig;
+  config: DeliveryConfig | GitHubDeliveryConfig;
   repo: RepoCoordinates;
   root: string;
 }
@@ -175,15 +154,18 @@ export async function loadDeliveryContext(input: {
   personalAuth?: boolean;
   repoRoot: string;
   role: 'author' | 'reviewer';
+  repository?: string;
   signal?: AbortSignal;
 }): Promise<DeliveryContext> {
-  const root = gitRoot(input.repoRoot);
-  const loaded = await loadDeliveryConfig(root, {
+  const loaded = await loadDeliveryConfig(input.repoRoot, {
+    ...(input.repository === undefined ? {} : { repository: input.repository }),
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   const config = loaded.config;
-  const repo = resolveDeliveryRepo(config, root, loaded.remote);
+  const [owner, repositoryName] = config.repository.split('/');
+  if (!owner || !repositoryName) throw new DeliveryError('Repository must be owner/name.');
+  const repo = { owner, repo: repositoryName };
   const clients = await createDeliveryGitHubClients({
     config,
     identity: input.identity,
@@ -203,15 +185,28 @@ export async function loadDeliveryContext(input: {
     settings: projectSettingsFromDeliveryConfig(config),
     writable: true,
   };
-  return { clients, config, configuration: loaded, projectConfiguration, repo, root: primaryGitRoot(root) };
+  return { clients, config, configuration: loaded, projectConfiguration, repo, root: '' };
 }
 
-function labels(input: readonly string[] | undefined): string[] {
+async function labels(context: DeliveryContext, input: readonly string[] | undefined): Promise<string[]> {
   const selected = input ?? [];
-  if (selected.some((label) => !/^(?:area|risk):[^\s:]+$/u.test(label)) || new Set(selected).size !== selected.length) {
-    throw new DeliveryError('Issue labels must be unique area:* or risk:* taxonomy labels.');
+  if (
+    selected.some((label) => !label.trim()) ||
+    new Set(selected.map((label) => label.toLowerCase())).size !== selected.length
+  )
+    throw new DeliveryError('Issue labels must be non-empty and unique.');
+  if (selected.length === 0) return [];
+  const available = new Set<string>();
+  for (let page = 1; page <= 100; page++) {
+    const batch = (await context.clients.rest.issues.listLabelsForRepo({ ...context.repo, page, per_page: 100 })).data;
+    for (const label of batch) available.add(label.name.toLowerCase());
+    if (batch.length < 100) {
+      const missing = selected.filter((label) => !available.has(label.toLowerCase()));
+      if (missing.length) throw new DeliveryError(`Unknown repository label(s): ${missing.join(', ')}.`);
+      return [...selected];
+    }
   }
-  return [...selected];
+  throw new DeliveryError('Repository label listing exceeds the bounded readback window.');
 }
 
 export interface CreateIssueInput {
@@ -262,14 +257,9 @@ export async function createIssue(
     repo,
     rest: clients.rest,
   });
-  for (const related of new Set(
-    [...(input.blockedBy ?? []), input.parentIssueNumber].filter((number): number is number => number !== undefined),
-  )) {
-    assertNativeIssueTrackingAdmission(related, context.root);
-  }
   const created = await clients.rest.issues.create({
     body: input.body ?? '',
-    labels: labels(input.labels),
+    labels: await labels(context, input.labels),
     ...(input.milestone === undefined ? {} : { milestone: input.milestone }),
     owner: repo.owner,
     repo: repo.repo,
@@ -696,9 +686,8 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
     (!Number.isSafeInteger(input.supersededBy) || input.supersededBy <= 0 || input.supersededBy === input.issueNumber)
   )
     throw new DeliveryError('A superseding issue must be a different positive issue number.');
-  assertNativeIssueTrackingAdmission(input.issueNumber, context.root);
   const { clients, config, repo } = context;
-  const acceptedLabels = input.labels === undefined ? undefined : labels(input.labels);
+  const acceptedLabels = input.labels === undefined ? undefined : await labels(context, input.labels);
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
     throw new DeliveryError('Unsupported configured Issue Type.');
   }
@@ -919,36 +908,6 @@ export interface IssueInfo {
   worktree: string | null;
 }
 
-function issueSnapshotPath(repoRoot: string, issueNumber: number): string {
-  return join(gitCommonDir(repoRoot), 'ai-delivery', 'issue-info', `${issueNumber}.json`);
-}
-
-export function cachedIssueInfo(repoRoot: string, issueNumber: number): IssueInfo {
-  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) throw new DeliveryError('Issue number must be positive.');
-  let snapshot: unknown;
-  try {
-    snapshot = JSON.parse(readFileSync(issueSnapshotPath(repoRoot, issueNumber), 'utf8')) as unknown;
-  } catch {
-    throw new DeliveryError('No readable cached issue snapshot exists.');
-  }
-  if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
-    throw new DeliveryError('Cached issue snapshot is invalid.');
-  }
-  const { snapshotId, ...content } = snapshot as Record<string, unknown>;
-  if (
-    content.schemaVersion !== 'ai-delivery.issue-info@1' ||
-    typeof content.savedAt !== 'string' ||
-    typeof snapshotId !== 'string' ||
-    snapshotId !== digestValue(content) ||
-    typeof content.issue !== 'object' ||
-    content.issue === null ||
-    (content.issue as Record<string, unknown>).issueNumber !== issueNumber
-  ) {
-    throw new DeliveryError('Cached issue snapshot is invalid or foreign.');
-  }
-  return content.issue as unknown as IssueInfo;
-}
-
 export async function issueInfo(context: DeliveryContext, issueNumber: number): Promise<IssueInfo> {
   const { clients, config, repo } = context;
   const issue = (await clients.rest.issues.get({ issue_number: issueNumber, owner: repo.owner, repo: repo.repo })).data;
@@ -983,17 +942,8 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
     state: issue.state,
     title: issue.title,
     url: issue.html_url,
-    worktree: getWorktreeByIssue(issueNumber, context.root)?.path ?? null,
+    worktree: null,
   };
-  const content = {
-    issue: info,
-    savedAt: new Date().toISOString(),
-    schemaVersion: 'ai-delivery.issue-info@1' as const,
-  };
-  writePrivateJsonFileAtomically(issueSnapshotPath(context.root, issueNumber), {
-    ...content,
-    snapshotId: digestValue(content),
-  });
   return info;
 }
 
@@ -1015,270 +965,117 @@ export async function readyCheck(context: DeliveryContext, issueNumber: number):
     blockedBy: info.blockedBy,
     body: info.body,
     ...(info.points === undefined ? {} : { points: info.points }),
-    repoRoot: context.root,
+    repoRoot: undefined,
     title: info.title,
     trackingParent,
   });
 }
 
-function continuationOperatorBody(plan: CommittedContinuationPlan): string {
-  return stableJson({
-    schemaVersion: 'ai-delivery.worktree-continuation-authority@1',
-    plan,
-    acceptedScope: 'the-complete-content-addressed-committed-descendant-plan-and-every-original',
-    operationalClosure: 'all-other-launchers-and-writers-are-quiescent-no-unknown-writers',
-    maintainedExclusion: 'all-other-launchers-and-writers-remain-excluded-through-apply-and-exact-plan-replay',
-    historicalAuthority: 'preservation-only-no-current-verification-review-retirement-or-hold-release',
-  });
+interface LinkedIssueBranch {
+  name: string;
+  sha: string;
+  repository: string;
 }
-function continuationReviewerBody(plan: CommittedContinuationPlan, authorityCommentId: number): string {
-  return stableJson({
-    schemaVersion: 'ai-delivery.worktree-continuation-acceptance@1',
-    plan,
-    authorityCommentId,
-    authorityDigest: digestBytes(Buffer.from(continuationOperatorBody(plan))),
-    acceptedScope: 'independent-acceptance-of-the-complete-plan-and-maintained-writer-exclusion',
-    result: 'approved',
-  });
+interface BranchQuery {
+  repository: {
+    issue: {
+      linkedBranches: {
+        nodes: Array<{
+          ref: { name: string; target: { oid: string }; repository: { nameWithOwner: string } } | null;
+        } | null>;
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      };
+    } | null;
+  } | null;
 }
-
-async function continueCommittedDescendant(
-  context: DeliveryContext,
-  issueNumber: number,
-  selected: WorktreeEntry,
-  runtimeEntryPath?: string,
-): Promise<void> {
-  if (context.config.roles.author.authSource !== 'personal')
-    throw new DeliveryError('Committed continuation requires configured personal author authentication.');
-  await withWorktreeTransitionWriterAbsent(context.root, selected.path, () =>
-    withCommittedContinuationRegistry(context.root, issueNumber, async (registry) => {
-      const original = registry.pending?.plan.row ?? registry.current;
-      assertIssueWorktreeLocation(original, context.root);
-      assertClean(original.path);
-      const actors = await authenticatedWorktreeActors(context);
-      const historical = await readMergedContinuationTerminal(context, original, actors.operator);
-      const head = {
-        sha: git(original.path, 'rev-parse', 'HEAD'),
-        tree: git(original.path, 'rev-parse', 'HEAD^{tree}'),
-      };
-      if (
-        head.sha === historical.terminal.headSha ||
-        gitExitCode(original.path, 'merge-base', '--is-ancestor', historical.terminal.headSha, head.sha) !== 0
-      )
-        throw new DeliveryError(
-          'Committed continuation requires a strict committed descendant of its exact terminal head.',
-        );
-      if (!context.configuration)
-        throw new DeliveryError('Committed continuation requires discovered current configuration.');
-      const readRuntime = () =>
-        assertDeliveryRuntimeAdmitted({
-          repoRoot: context.root,
-          configuration: context.configuration!,
-          ...(runtimeEntryPath === undefined ? {} : { runtimeEntryPath }),
-        });
-      const currentRuntime = await readRuntime();
-      const path = committedContinuationPlanPath(context.root, issueNumber, head.sha);
-      const stored =
-        registry.pending?.plan ??
-        (existsSync(path)
-          ? CommittedContinuationPlanSchema.parse(
-              (JSON.parse(assertPrivateFile(path).toString('utf8')) as { plan: unknown }).plan,
-            )
-          : undefined);
-      const { prNumber: _priorPr, ...retained } = original;
-      const content = {
-        schemaVersion: 'ai-delivery.committed-continuation-plan@1' as const,
-        repository: context.config.repository,
-        repoRoot: context.root,
-        configDigest: context.configuration.configDigest,
-        currentRuntime,
-        row: original,
-        replacement: {
-          ...retained,
-          type: 'issue' as const,
-          issueNumber,
-          identity: context.config.roles.author.identity,
-          status: 'active' as const,
-          updatedAt: stored?.replacement.updatedAt ?? new Date().toISOString(),
-        },
-        head,
-        terminalHead: { sha: historical.terminal.headSha, tree: historical.terminal.headTree },
-        terminalMergeId: historical.terminal.mergeId,
-        operator: actors.operator,
-        reviewerActor: actors.reviewerActor,
-        preserved: [...historical.preserved, registry.ownerWitness],
-      };
-      const plan = CommittedContinuationPlanSchema.parse({ ...content, planId: digestValue(content) });
-      if (stored && stableJson(stored) !== stableJson(plan))
-        throw new DeliveryError('Committed continuation approved source, configuration or custody plan drifted.');
-      registry.prepare();
-      writeCommittedContinuationCheckpoint(path, {
-        plan,
-        operatorBody: continuationOperatorBody(plan),
-        reviewerBody: continuationReviewerBody(plan, 0),
-      });
-      let ids = registry.pending && {
-        authorityCommentId: registry.pending.authorityCommentId,
-        acceptanceCommentId: registry.pending.acceptanceCommentId,
-      };
-      if (!ids) {
-        const comments = [];
-        for (let page = 1; ; page += 1) {
-          const batch = (
-            await context.clients.rest.issues.listComments({
-              ...context.repo,
-              issue_number: issueNumber,
-              per_page: 100,
-              page,
-            })
-          ).data;
-          comments.push(...batch);
-          if (batch.length < 100) break;
-        }
-        const authorities = comments.filter(
-          (comment) =>
-            comment.body === continuationOperatorBody(plan) &&
-            comment.user?.type === 'User' &&
-            comment.user.login.toLowerCase() === actors.operator.actorLogin.toLowerCase() &&
-            `user:${String(comment.user.id)}` === actors.operator.credentialIdentity,
-        );
-        const authority = authorities.length === 1 ? authorities[0] : undefined;
-        const acceptances = authority
-          ? comments.filter(
-              (comment) =>
-                comment.body === continuationReviewerBody(plan, authority.id) &&
-                comment.user?.type === 'Bot' &&
-                comment.user.login.toLowerCase() === actors.reviewerActor.toLowerCase(),
-            )
-          : [];
-        if (!authority || acceptances.length !== 1 || !acceptances[0])
-          throw new DeliveryError(
-            `Committed continuation requires exact native operator and configured reviewer-App acceptance. Saved plan: ${path}`,
-          );
-        ids = { authorityCommentId: authority.id, acceptanceCommentId: acceptances[0].id };
-      }
-      const assertAuthority = () =>
-        assertNativeWorktreeAcceptance(context, {
-          repository: plan.repository,
-          subject: issueNumber,
-          operator: plan.operator,
-          reviewerActor: plan.reviewerActor,
-          ...ids,
-          operatorBody: continuationOperatorBody(plan),
-          reviewerBody: continuationReviewerBody(plan, ids.authorityCommentId),
-          revokedBody: stableJson({
-            schemaVersion: 'ai-delivery.worktree-continuation-revocation@1',
-            planId: plan.planId,
-            authorityCommentId: ids.authorityCommentId,
-          }),
-        });
-      const assertPreservedSource = async () => {
-        const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
-        if (issue.state !== 'open' || !(await readyCheck(context, issueNumber)).ready)
-          throw new DeliveryError('Committed continuation requires an open, ready unfinished issue.');
-        assertIssueWorktreeLocation(original, context.root);
-        assertClean(original.path);
-        if (
-          git(original.path, 'rev-parse', 'HEAD') !== plan.head.sha ||
-          git(original.path, 'rev-parse', 'HEAD^{tree}') !== plan.head.tree
-        )
-          throw new DeliveryError('Committed continuation source changed during exact-plan recovery.');
-        const fresh = await readMergedContinuationTerminal(context, original, plan.operator);
-        if (
-          fresh.terminal.mergeId !== plan.terminalMergeId ||
-          stableJson([...fresh.preserved, registry.ownerWitness]) !== stableJson(plan.preserved)
-        )
-          throw new DeliveryError('Committed continuation original lineage changed.');
-        await assertAuthority();
-        if (stableJson(await readRuntime()) !== stableJson(plan.currentRuntime))
-          throw new DeliveryError('Committed continuation runtime admission changed during exact-plan recovery.');
-      };
-      await assertPreservedSource();
-      registry.begin(plan, ids);
-      await assertPreservedSource();
-      registry.commit();
-      await assertPreservedSource();
-      registry.complete();
-    }),
-  );
-}
-
-export async function developIssue(
-  context: DeliveryContext,
-  issueNumber: number,
-  runtimeEntryPath?: string,
-): Promise<{ path: string; branch: string }> {
-  await preflightReviewRoute(context, undefined, undefined, 'development');
-  const initialIssue = (await context.clients.rest.issues.get({ issue_number: issueNumber, ...context.repo })).data;
-  if (initialIssue.state === 'closed')
-    throw new DeliveryError(`Issue #${issueNumber} is closed. Reopen it before developing.`);
-  const readiness = await readyCheck(context, issueNumber);
-  if (!readiness.ready)
-    throw new DeliveryError(
-      `Issue #${issueNumber} is not ready: ${readiness.failures.map((f) => f.message).join('; ')}`,
+async function linkedIssueBranches(context: DeliveryContext, issueNumber: number): Promise<LinkedIssueBranch[]> {
+  const branches: LinkedIssueBranch[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | null = null;
+  for (let page = 0; page < 20; page++) {
+    const response: BranchQuery = await context.clients.graphql<{
+      repository: {
+        issue: {
+          linkedBranches: {
+            nodes: Array<{
+              ref: { name: string; target: { oid: string }; repository: { nameWithOwner: string } } | null;
+            } | null>;
+            pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          };
+        } | null;
+      } | null;
+    }>(
+      'query DeliveryIssueBranches($owner:String!,$repo:String!,$issue:Int!,$cursor:String){repository(owner:$owner,name:$repo){issue(number:$issue){linkedBranches(first:100,after:$cursor){nodes{ref{name target{oid} repository{nameWithOwner}}} pageInfo{hasNextPage endCursor}}}}}',
+      { owner: context.repo.owner, repo: context.repo.repo, issue: issueNumber, cursor },
     );
-  const registered = listWorktreesStrict(context.root).filter(
-    (entry) => entry.type === 'issue' && entry.issueNumber === issueNumber,
-  );
-  if (registered.length > 1) throw new DeliveryError('Issue has duplicate worktree registry rows.');
-  const pending = pendingCommittedContinuation(issueNumber, context.root);
-  const selected = registered[0];
-  if (
-    pending ||
-    (selected?.status === 'merged' &&
-      context.clients.authSource === 'personal' &&
-      !existsSync(
-        join(
-          gitCommonDir(selected.path),
-          'ai-delivery',
-          'merges',
-          String(issueNumber),
-          `${git(selected.path, 'rev-parse', 'HEAD')}.json`,
-        ),
-      ))
-  ) {
-    if (!selected) throw new DeliveryError('Committed continuation canonical custody is missing.');
-    await continueCommittedDescendant(context, issueNumber, selected, runtimeEntryPath);
-  } else if (selected?.status === 'merged') {
-    const previous = getIssueWorktreeStrict(issueNumber, context.root);
-    if (previous.identity !== context.config.roles.author.identity || previous.prNumber === undefined)
-      throw new DeliveryError('Merged continuation requires the same preparing owner and exact prior PR.');
-    assertIssueWorktreeLocation(previous, context.root);
-    assertClean(previous.path);
-    const head = git(previous.path, 'rev-parse', 'HEAD');
-    if (!existsSync(join(gitCommonDir(previous.path), 'ai-delivery', 'merges', String(issueNumber), `${head}.json`)))
-      throw new DeliveryError('Merged continuation lacks its exact terminal merge receipt.');
-    await withRuntimeSetupWriter(previous.path, async (writer) => {
-      writer.assertQuiescent();
-      // Existing terminal recovery validates the historical run, publication, intent and remote merge.
-      await mergePr(context, { issueNumber, prNumber: previous.prNumber! });
-      const currentIssue = (await context.clients.rest.issues.get({ issue_number: issueNumber, ...context.repo })).data;
-      if (currentIssue.state !== 'open' || !(await readyCheck(context, issueNumber)).ready)
-        throw new DeliveryError('Merged continuation requires an open, ready unfinished issue.');
-      assertIssueWorktreeLocation(previous, context.root);
-      assertClean(previous.path);
-      if (git(previous.path, 'rev-parse', 'HEAD') !== head)
-        throw new DeliveryError('Merged continuation source changed during terminal readback.');
-      const { prNumber: _priorPr, ...sameOwner } = previous;
-      await addWorktreeEntry({ ...sameOwner, status: 'active', updatedAt: new Date().toISOString() }, context.root);
-      writer.assertQuiescent();
-    });
+    const connection = response.repository?.issue?.linkedBranches;
+    if (!connection || !Array.isArray(connection.nodes) || typeof connection.pageInfo?.hasNextPage !== 'boolean')
+      throw new DeliveryError('Incomplete GitHub linked issue branch readback.');
+    for (const node of connection.nodes) {
+      const ref = node?.ref;
+      if (!ref || !ref.name || !/^[a-f0-9]{40}$/u.test(ref.target.oid) || !ref.repository.nameWithOwner)
+        throw new DeliveryError('Incomplete GitHub linked branch identity.');
+      if (ref.repository.nameWithOwner.toLowerCase() === context.config.repository.toLowerCase())
+        branches.push({ name: ref.name, sha: ref.target.oid, repository: ref.repository.nameWithOwner });
+    }
+    if (!connection.pageInfo.hasNextPage) return branches;
+    const next = connection.pageInfo.endCursor;
+    if (!next || cursors.has(next)) throw new DeliveryError('GitHub linked branch pagination did not advance.');
+    cursors.add(next);
+    cursor = next;
   }
-  const row = await prepareIssueWorktree({
-    ...(context.configuration?.remote ? { remote: context.configuration.remote } : {}),
-    identity: context.config.roles.author.identity,
-    issueNumber,
-    repoRoot: context.root,
-  });
-  const issue = (await context.clients.rest.issues.get({ issue_number: issueNumber, ...context.repo })).data;
-  await syncIssueProjectStatus({
-    graphql: context.clients.graphql,
-    issueNodeId: issue.node_id,
-    org: context.config.native.organization,
-    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-    settings: projectSettingsFromDeliveryConfig(context.config),
-    status: 'In Progress',
-  });
-  await journalIssueStart(context, issueNumber);
-  return { branch: row.branch, path: row.path };
+  throw new DeliveryError('GitHub linked issue branches exceed the bounded readback window.');
+}
+export async function issueBranch(context: DeliveryContext, issueNumber: number, selected?: string): Promise<string> {
+  const branches = (await linkedIssueBranches(context, issueNumber)).filter(
+    (branch) => selected === undefined || branch.name === selected,
+  );
+  if (branches.length !== 1)
+    throw new DeliveryError(
+      'Select exactly one GitHub-linked issue branch; no local worktree or receipt fallback is available.',
+    );
+  return branches[0]!.name;
+}
+export async function startIssueBranch(context: DeliveryContext, issueNumber: number, selected?: string) {
+  const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
+  if (issue.number !== issueNumber || 'pull_request' in issue || issue.state !== 'open')
+    throw new DeliveryError('Start requires the requested open GitHub issue.');
+  const branches = await linkedIssueBranches(context, issueNumber);
+  const name = selected ?? (branches.length === 1 ? branches[0]!.name : `issue/${issueNumber}`);
+  if (
+    !/^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u.test(name) ||
+    name.startsWith('/') ||
+    name.endsWith('/') ||
+    name.endsWith('.lock')
+  )
+    throw new DeliveryError('Invalid issue branch name.');
+  const existing = branches.filter((branch) => branch.name === name);
+  if (branches.length > 0 && existing.length !== 1)
+    throw new DeliveryError('Select exactly one existing GitHub-linked issue branch before start.');
+  if (existing.length > 1) throw new DeliveryError('GitHub issue branch has conflicting linked matches.');
+  if (existing.length === 1)
+    return { issueNumber, issueUrl: issue.html_url, branch: name, headSha: existing[0]!.sha, reused: true };
+  const repository = (await context.clients.rest.repos.get({ ...context.repo })).data;
+  const base = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${repository.default_branch}` }))
+    .data.object.sha;
+  if (!/^[a-f0-9]{40}$/u.test(base) || !repository.node_id)
+    throw new DeliveryError('GitHub repository default branch identity is incomplete.');
+  await context.clients.graphql(
+    'mutation DeliveryStartBranch($input:CreateLinkedBranchInput!){createLinkedBranch(input:$input){linkedBranch{ref{name target{oid}}}}}',
+    {
+      input: {
+        issueId: issue.node_id,
+        repositoryId: repository.node_id,
+        oid: base,
+        name,
+        clientMutationId: digestValue({ repository: context.config.repository, issueNumber, name, base }),
+      },
+    },
+  );
+  const readback = (await linkedIssueBranches(context, issueNumber)).filter((branch) => branch.name === name);
+  if (readback.length !== 1 || readback[0]!.sha !== base)
+    throw new DeliveryError(
+      'Started GitHub branch/link readback disagrees; resume this issue without creating another.',
+    );
+  return { issueNumber, issueUrl: issue.html_url, branch: name, headSha: base, reused: false };
 }

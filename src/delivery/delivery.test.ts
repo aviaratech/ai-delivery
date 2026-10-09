@@ -18,8 +18,8 @@ import {
   writeRepositoryCommandOutput,
   writeRepositoryDeliveryEvidence,
   writeRepositoryStageCheckpoint,
-} from './index.js';
-import type { RepositoryDeliveryPolicy, RepositoryStageReceipt } from './index.js';
+} from './legacy.js';
+import type { RepositoryDeliveryPolicy, RepositoryStageReceipt } from './legacy.js';
 
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -303,8 +303,10 @@ test('explicit component policy reuses compatible stages across heads and invali
 test('synthetic exact delivery, private checkpoint resume and phase evidence', async () => {
   const state = setup();
   try {
-    const selected = await loadSelectedRepositoryPolicy({ repoRoot: state.root, policySourcePath: './policy.mjs' });
-    assert.equal(selected.policyDigest, state.policyDigest);
+    await assert.rejects(
+      loadSelectedRepositoryPolicy({ repoRoot: state.root, policySourcePath: './policy.mjs' }),
+      /policy execution was removed/u,
+    );
     const p = proof(state);
     writeRepositoryStageCheckpoint({ gitCommonDir: state.gitCommonDir, receipt: p.receipt, repoRoot: state.root });
     assert.equal(

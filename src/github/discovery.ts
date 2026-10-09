@@ -104,6 +104,7 @@ export async function discoverDeliveryRouting(input: {
   clients: DiscoveryClients;
   repository: string;
   overrides: DeliveryOverrides;
+  repositorySelected?: boolean;
 }): Promise<DeliveryRouting> {
   const [owner, repo] = input.repository.split('/');
   if (!owner || !repo) throw new DeliveryError('Invalid delivery repository.');
@@ -119,7 +120,7 @@ export async function discoverDeliveryRouting(input: {
   if (repository.toLowerCase() !== input.repository.toLowerCase())
     throw new DeliveryError('GitHub repository does not match the selected Git remote.');
   if (typeof identity.isFork !== 'boolean') throw new DeliveryError('GitHub omitted repository fork identity.');
-  if (identity.isFork && input.overrides.remote === undefined)
+  if (identity.isFork && input.overrides.remote === undefined && input.repositorySelected !== true)
     throw new DeliveryError('A fork requires an explicit remote selection before delivery.');
   const org = record(identity.owner, 'repository owner');
   if (org.__typename !== 'Organization' || text(org.login, 'organization').toLowerCase() !== owner.toLowerCase()) {

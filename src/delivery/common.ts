@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { GIT_EXECUTABLE, inertGitArguments, gitEnvironment } from '../gitProcess.js';
 import { execFileSync } from 'node:child_process';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
@@ -52,7 +53,8 @@ export function isUniqueSorted(values: readonly string[]): boolean {
 }
 
 export function git(repoRoot: string, args: readonly string[]): string {
-  return execFileSync('git', [...args], {
+  return execFileSync(GIT_EXECUTABLE, [...inertGitArguments(repoRoot), ...args], {
+    env: gitEnvironment(),
     cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 4 * 1024 * 1024,
@@ -78,7 +80,10 @@ export function assertExactRange(input: {
     git(repoRoot, ['status', '--porcelain', '--untracked-files=all']) !== ''
   )
     throw new Error('Repository delivery requires exact clean Git source coordinates.');
-  const actual = git(repoRoot, ['diff', '--name-only', '-z', base.sha, head.sha]).split('\0').filter(Boolean).sort();
+  const actual = git(repoRoot, ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', base.sha, head.sha])
+    .split('\0')
+    .filter(Boolean)
+    .sort();
   if (stableJson(actual) !== stableJson(changedPaths))
     throw new Error('Changed paths do not match the exact Git range.');
 }

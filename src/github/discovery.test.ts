@@ -166,6 +166,17 @@ test('forks require an explicit remote choice and repository identity must agree
   });
   await assert.rejects(discover(fork), /fork requires an explicit remote/u);
   assert.equal((await discover(fork, { ...linked, remote: 'origin' })).repository, 'example/widget');
+  assert.equal(
+    (
+      await discoverDeliveryRouting({
+        clients: fork,
+        repository: 'example/widget',
+        overrides: linked,
+        repositorySelected: true,
+      })
+    ).repository,
+    'example/widget',
+  );
   await assert.rejects(
     discover(
       intercept((query, _variables, result) => {
@@ -199,8 +210,9 @@ test('custom meanings need explicit mapping and independent Project fields canno
   );
 });
 
-test('standard discovery needs no JSON file and effective Project identity changes the admission digest', async () => {
+test('standard discovery needs no repository configuration and effective Project identity changes the admission digest', async () => {
   const root = mkdtempSync(join(tmpdir(), 'delivery-discovery-'));
+  const previous = process.env.AI_DELIVERY_CONFIG;
   const git = (...args: string[]): string => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
   try {
     git('init', '-q');
@@ -218,23 +230,11 @@ test('standard discovery needs no JSON file and effective Project identity chang
         },
       ]),
     );
+    process.env.AI_DELIVERY_CONFIG = join(root, 'user.json');
     writeFileSync(
-      join(root, 'ai-delivery.policy.mjs'),
-      `export const deliverySettings = ${JSON.stringify({
-        roles,
-        commandPolicy: {
-          checks: {
-            format: 'REQUIRED',
-            gitClean: 'REQUIRED',
-            lint: 'REQUIRED',
-            test: 'REQUIRED',
-            typecheck: 'REQUIRED',
-          },
-          timeoutsMs: { lint: 1000, test: 1000, typecheck: 1000 },
-        },
-      })};`,
+      process.env.AI_DELIVERY_CONFIG,
+      JSON.stringify({ schemaVersion: 'ai-delivery.user@1', roles, project: 1, checkoutRoots: [] }),
     );
-    git('add', 'ai-delivery.policy.mjs');
     const standard = structuredClone(syntheticDiscoveryConfig);
     standard.native.points.name = 'Points';
     standard.native.priority.name = 'Priority';
@@ -242,16 +242,24 @@ test('standard discovery needs no JSON file and effective Project identity chang
     standard.native.project.statuses = { todo: 'Todo', inProgress: 'In Progress', blocked: 'Blocked', done: 'Done' };
     const clients = syntheticDiscoveryClients(standard);
     const first = await loadDeliveryConfig(root, { clients });
-    assert.equal(first.configPath, null);
-    assert.equal(first.routing.projectSource, 'linked');
-    const changed = structuredClone(standard);
-    changed.native.project.number = 2;
-    const second = await loadDeliveryConfig(root, { clients: syntheticDiscoveryClients(changed) });
+    assert.equal(first.configPath, process.env.AI_DELIVERY_CONFIG);
+    assert.equal(first.routing.projectSource, 'explicit');
+    const changed: DiscoveryClients = {
+      graphql: (async (query: string, variables: Record<string, unknown>) => {
+        const result = record(await clients.graphql(query, variables));
+        if (query.includes('query ProjectDeliveryConfiguration'))
+          record(record(result.organization).projectV2).id = 'PROJECT-2';
+        return result;
+      }) as DiscoveryClients['graphql'],
+    };
+    const second = await loadDeliveryConfig(root, { clients: changed });
     assert.notEqual(first.configDigest, second.configDigest);
     git('remote', 'add', 'upstream', 'https://github.com/upstream/widget.git');
     assert.throws(() => resolveRepoFromRemote(root), /multiple remotes/u);
     assert.deepEqual(resolveRepoFromRemote(root, 'origin'), { owner: 'example', repo: 'widget' });
   } finally {
+    if (previous === undefined) delete process.env.AI_DELIVERY_CONFIG;
+    else process.env.AI_DELIVERY_CONFIG = previous;
     rmSync(root, { recursive: true, force: true });
   }
 });

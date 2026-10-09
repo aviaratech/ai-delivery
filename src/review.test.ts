@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'vitest';
 
 import type { DeliveryConfig } from './config/deliveryConfig.js';
-import { digestValue, type RepositoryClassificationReceipt } from './delivery/index.js';
+import { digestValue, type RepositoryClassificationReceipt } from './delivery/legacy.js';
 import { createDeliveryGitHubClients, withAuthorGitToken } from './github/client.js';
 import type { DeliveryContext } from './issue.js';
-import { preflightReviewRoute, runAuthorGit } from './pr.js';
+import { preflightReviewRoute } from './pr.js';
 import { readRequiredReviewState, ReviewArtifactSchema, submitReview } from './review.js';
 
 const head = { sha: 'a'.repeat(40), tree: 'b'.repeat(40) };
@@ -58,6 +58,7 @@ function fixture(
     root,
     repo: { owner: 'example', repo: 'repo' },
     config: {
+      repository: 'example/repo',
       roles: {
         author: input.personalAuthor
           ? { authSource: 'personal', identity: 'host-author' }
@@ -78,14 +79,20 @@ function fixture(
             throw new Error('installation token cannot call GET /user');
           },
         },
+        git: { getCommit: async () => ({ data: { sha: head.sha, tree: { sha: head.tree } } }) },
         pulls: {
           get: async () => ({
             data: {
-              head: { sha: currentPrHead },
+              number: 19,
+              changed_files: 1,
+              base: { sha: 'c'.repeat(40), repo: { full_name: 'example/repo' } },
+              head: { sha: currentPrHead, repo: { full_name: 'example/repo' } },
               state: 'open',
               user: { login: input.authorLogin === undefined ? 'synthetic-author[bot]' : input.authorLogin },
             },
           }),
+          listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
+          getReview: async () => ({ data: review }),
           listReviews: async () => ({ data: reviews }),
           createReview: async () => {
             created += 1;
@@ -127,7 +134,7 @@ test('reviewer App bot submits and reuses an exact-head approval without GET /us
     assert.equal(state.created, 1);
     assert.equal(state.actorLookups, 2);
     state.setPrHead('d'.repeat(40));
-    await assert.rejects(state.submit(), /PR head changed/u);
+    await assert.rejects(state.submit(), /head changed/u);
   } finally {
     rmSync(state.root, { recursive: true, force: true });
   }
@@ -157,6 +164,17 @@ test('reviewer App bot recovers a matching remote marker without another review'
   }
 });
 
+test('reviewer refuses another exact-head artifact before creating a conflicting approval', async () => {
+  const state = fixture({ existingReview: true });
+  try {
+    state.reviews[0]!.body = marker(`sha256:${'e'.repeat(64)}`);
+    await assert.rejects(state.submit(), /conflict/u);
+    assert.equal(state.created, 0);
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
 test('reviewer App rejects self review and a foreign marker actor', async () => {
   const self = fixture({ authorLogin: 'synthetic-reviewer[bot]' });
   const unknownAuthor = fixture({ authorLogin: null });
@@ -164,7 +182,7 @@ test('reviewer App rejects self review and a foreign marker actor', async () => 
   try {
     await assert.rejects(self.submit(), /must differ from PR author/u);
     await assert.rejects(unknownAuthor.submit(), /must differ from PR author/u);
-    await assert.rejects(foreign.submit(), /does not match exact approval/u);
+    await assert.rejects(foreign.submit(), /conflicts with exact-head approval/u);
     assert.equal(self.created, 0);
     assert.equal(unknownAuthor.created, 0);
     assert.equal(foreign.created, 0);
@@ -699,106 +717,6 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
     appReadbackOverride = 102;
     await assert.rejects(author.authenticatedAuthor(), /Author GitHub App identity did not match/u);
     appReadbackOverride = null;
-    const shimDir = join(root, 'shim');
-    const marker = join(root, 'app-git-used');
-    mkdirSync(shimDir);
-    const shim = join(shimDir, 'git');
-    writeFileSync(
-      shim,
-      `#!/bin/sh
-if [ "$1" = config ]; then exec "${realGit}" "$@"; fi
-if [ "$1" = -c ] && [ "$2" = credential.helper= ] && [ "$3" = push ] &&
-   [ "$GIT_CONFIG_GLOBAL" = /dev/null ] && [ "$GIT_CONFIG_NOSYSTEM" = 1 ] &&
-   [ -z "$GIT_SSH_COMMAND" ] && [ -z "$GIT_CONFIG" ] && [ -z "$GIT_TRACE" ] &&
-   [ -z "$GH_TOKEN" ] && [ "$AI_DELIVERY_GIT_TOKEN" = ghs_synthetic_author ] &&
-   [ "$("$GIT_ASKPASS" Username)" = x-access-token ] &&
-   [ "$("$GIT_ASKPASS" Password)" = ghs_synthetic_author ]; then
-  : > "${marker}"
-  exit 0
-fi
-exit 97
-`,
-    );
-    chmodSync(shim, 0o700);
-    process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
-    process.env.GIT_SSH_COMMAND = 'ambient-ssh-identity';
-    process.env.GIT_CONFIG = '/dev/null';
-    process.env.GIT_TRACE = '1';
-    process.env.GH_TOKEN = 'synthetic-ambient-token';
-    const authorContext = { root, repo: { owner: 'example', repo: 'repo' }, clients: author } as DeliveryContext;
-    await runAuthorGit(
-      authorContext,
-      root,
-      ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
-      'push',
-    );
-    assert.equal(existsSync(marker), true);
-    const personalConfig = {
-      ...config,
-      roles: {
-        author: { authSource: 'personal', credentialEnv: { token: 'AUTHOR_TOKEN' }, identity: 'host-author' },
-        reviewer: config.roles.reviewer,
-      },
-    } as DeliveryConfig;
-    const personal = await createDeliveryGitHubClients({
-      config: personalConfig,
-      env: { ...env, AUTHOR_TOKEN: 'selected-personal-token', GH_TOKEN: 'ambient-token' },
-      identity: 'host-author',
-      role: 'author',
-    });
-    assert.equal(await withAuthorGitToken(personal, (token) => token), 'selected-personal-token');
-    writeFileSync(shim, readFileSync(shim, 'utf8').replaceAll('ghs_synthetic_author', 'selected-personal-token'));
-    chmodSync(shim, 0o700);
-    rmSync(marker);
-    await runAuthorGit(
-      { ...authorContext, clients: personal },
-      root,
-      ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
-      'push',
-    );
-    assert.equal(existsSync(marker), true);
-    delete process.env.GIT_CONFIG;
-    delete process.env.GIT_TRACE;
-    delete process.env.GH_TOKEN;
-    execFileSync(realGit, ['config', '--local', 'url.ssh://git@github.com/.pushInsteadOf', 'https://github.com/'], {
-      cwd: root,
-    });
-    process.env.GIT_CONFIG = '/dev/null';
-    await assert.rejects(
-      runAuthorGit(
-        authorContext,
-        root,
-        ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
-        'push',
-      ),
-      /transport configuration/u,
-    );
-    delete process.env.GIT_CONFIG;
-    execFileSync(realGit, ['config', '--local', '--unset', 'url.ssh://git@github.com/.pushInsteadOf'], { cwd: root });
-    execFileSync(realGit, ['config', '--local', 'http.extraHeader', 'Authorization: Basic synthetic'], { cwd: root });
-    await assert.rejects(
-      runAuthorGit(
-        authorContext,
-        root,
-        ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
-        'push',
-      ),
-      /transport configuration/u,
-    );
-    execFileSync(realGit, ['config', '--local', '--unset', 'http.extraHeader'], { cwd: root });
-    execFileSync(realGit, ['config', '--local', 'extensions.worktreeConfig', 'true'], { cwd: root });
-    execFileSync(realGit, ['config', '--worktree', 'url.ssh://git@github.com/.pushInsteadOf', 'https://github.com/'], {
-      cwd: root,
-    });
-    await assert.rejects(
-      runAuthorGit(
-        authorContext,
-        root,
-        ['push', 'https://github.com/example/repo.git', 'HEAD:refs/heads/issue/17'],
-        'push',
-      ),
-      /transport configuration/u,
-    );
     reviewerContentsPermission = 'write';
     const writeCapableReviewer = await createDeliveryGitHubClients({
       config,

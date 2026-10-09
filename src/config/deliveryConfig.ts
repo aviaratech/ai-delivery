@@ -1,14 +1,14 @@
-import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
-import { isAbsolute, join, relative, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { isAbsolute, join, relative } from 'node:path';
 import { z } from 'zod';
+
+import { git } from '../git.js';
 
 import { DeliveryError } from '../errors.js';
 import { digestValue } from '../delivery/common.js';
 import { createDeliveryGitHubClients } from '../github/client.js';
-import { resolveGitRemoteName, resolveRepoFromRemote } from '../github/repo.js';
+import { resolveRepoFromRemote } from '../github/repo.js';
 import { discoverDeliveryRouting, type DiscoveryClients, type DeliveryRouting } from '../github/discovery.js';
 
 export const DELIVERY_CONFIG_FILE = 'ai-delivery.config.json';
@@ -210,22 +210,8 @@ const OverridesSchema = z
   })
   .strict();
 export type DeliveryOverrides = z.infer<typeof OverridesSchema>;
-const PolicySettingsSchema = z
-  .object({
-    roles: DeliveryConfigSchema.shape.roles,
-    commandPolicy: DeliveryConfigSchema.shape.commandPolicy,
-  })
-  .strict();
-export type DeliveryPolicySettings = z.infer<typeof PolicySettingsSchema>;
-
-export interface LoadedDeliverySettings extends DeliveryPolicySettings {
-  configPath: string | null;
-  overrides: DeliveryOverrides;
-  policy: DeliveryConfig['policy'];
-  policyModulePath: string;
-  repository: string;
-  sourceDigest: string;
-}
+export type DeliveryPolicySettings = Pick<DeliveryConfig, 'roles' | 'commandPolicy'>;
+/** Historical schema parsing preserves identities; new configuration never imports it. */
 export interface LoadedDeliveryConfig {
   config: DeliveryConfig;
   configDigest: string;
@@ -233,6 +219,62 @@ export interface LoadedDeliveryConfig {
   policyModulePath: string;
   remote: string | undefined;
   routing: DeliveryRouting;
+}
+export type GitHubDeliveryConfig = Pick<DeliveryConfig, 'roles' | 'repository' | 'native'> & {
+  schemaVersion: 'ai-delivery.github@1';
+};
+export interface LoadedGitHubConfig {
+  config: GitHubDeliveryConfig;
+  configDigest: string;
+  configPath: string | null;
+  routing: DeliveryRouting;
+}
+const UserSettingsSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.user@1'),
+    roles: z.strictObject({
+      author: z.discriminatedUnion('authSource', [AppRole, AuthorRole.options[1]]),
+      reviewer: AppRole,
+    }),
+    project: PositiveInteger,
+    checkoutRoots: z.array(z.string().min(1).refine(isAbsolute, 'Checkout roots must be absolute.')),
+    pointsField: Name.optional(),
+    priorityField: Name.optional(),
+    statusField: Name.optional(),
+    statuses: OverridesSchema.shape.statuses,
+    issueTypes: UniqueNames.optional(),
+  })
+  .superRefine((value, context) => {
+    const roles = value.roles;
+    if (roles.author.identity.toLowerCase() === roles.reviewer.identity.toLowerCase())
+      context.addIssue({
+        code: 'custom',
+        path: ['roles'],
+        message: 'Author and reviewer identities must be distinct.',
+      });
+    if (
+      [roles.author, roles.reviewer].some(
+        (role) => role.authSource !== 'personal' && /^personal(?:$|[-_])/iu.test(role.identity),
+      )
+    )
+      context.addIssue({
+        code: 'custom',
+        path: ['roles'],
+        message: 'App role identities cannot be personal identities.',
+      });
+    if (value.statuses && new Set(Object.values(value.statuses)).size !== 4)
+      context.addIssue({ code: 'custom', path: ['statuses'], message: 'Project statuses must be distinct.' });
+    const names = [...Object.values(roles.author.credentialEnv), ...Object.values(roles.reviewer.credentialEnv)];
+    if (new Set(names).size !== names.length)
+      context.addIssue({ code: 'custom', path: ['roles'], message: 'Credential environment names must be distinct.' });
+  });
+export type UserDeliverySettings = z.infer<typeof UserSettingsSchema>;
+export interface LoadedDeliverySettings {
+  roles: DeliveryConfig['roles'];
+  configPath: string;
+  overrides: DeliveryOverrides;
+  checkoutRoots: string[];
+  sourceDigest: string;
 }
 
 /** The optional file contains choices, never a required copy of GitHub metadata. */
@@ -252,7 +294,11 @@ export function readDeliveryOverrides(repositoryRoot: string): {
   }
   if (!isWithin(root, realpathSync(path)))
     throw new DeliveryError(`${DELIVERY_CONFIG_FILE} must stay within the repository root.`);
-  assertSourceControlled({ filePath: path, label: DELIVERY_CONFIG_FILE, root });
+  try {
+    git(root, 'ls-files', '--error-unmatch', '--', DELIVERY_CONFIG_FILE);
+  } catch {
+    throw new DeliveryError(`${DELIVERY_CONFIG_FILE} must be source-controlled for historical parsing.`);
+  }
   const bytes = readFileSync(path);
   try {
     const raw: unknown = JSON.parse(bytes.toString('utf8')) as unknown;
@@ -264,125 +310,88 @@ export function readDeliveryOverrides(repositoryRoot: string): {
   }
 }
 
-/** Explicit credentials and checks stay with the already-required repository policy. */
-export async function loadDeliverySettings(repositoryRoot: string): Promise<LoadedDeliverySettings> {
-  const root = realpathSync(repositoryRoot);
-  const local = readDeliveryOverrides(root);
-  const module = local.overrides.policy?.module ?? './ai-delivery.policy.mjs';
-  const selectedPath = resolve(root, module);
-  let policyModulePath: string;
+/** Only operator-owned JSON supplies settings. Target repository files are never loaded. */
+export async function loadDeliverySettings(_repositoryRoot?: string): Promise<LoadedDeliverySettings> {
+  const path = process.env.AI_DELIVERY_CONFIG ?? join(homedir(), '.config', 'aviaratech-ai', 'ai-delivery.json');
+  if (!isAbsolute(path)) throw new DeliveryError('AI_DELIVERY_CONFIG must be an absolute user configuration path.');
+  let bytes: Buffer;
   try {
-    policyModulePath = realpathSync(selectedPath);
+    bytes = readFileSync(path);
   } catch {
     throw new DeliveryError(
-      `Missing repository delivery policy ${module}. Export explicit deliverySettings and RepositoryDeliveryPolicy@1.`,
+      `Missing user configuration ${path}; configure roles.author, roles.reviewer, project and checkoutRoots.`,
     );
   }
-  if (!isWithin(root, policyModulePath)) throw new DeliveryError('Policy module must stay within the repository root.');
-  assertSourceControlled({ filePath: policyModulePath, label: 'Policy module', root });
-  const policyBytes = readFileSync(policyModulePath);
-  const policyHash = createHash('sha256').update(policyBytes).digest('hex');
-  const imported: unknown = await import(`${pathToFileURL(policyModulePath).href}?policy=${policyHash}`);
-  const contract = z
-    .enum([DELIVERY_POLICY_CONTRACT, 'RepositoryDeliveryPolicy@2'])
-    .parse((imported as { default?: { schemaVersion?: unknown } }).default?.schemaVersion ?? DELIVERY_POLICY_CONTRACT);
-  const settings = PolicySettingsSchema.safeParse((imported as { deliverySettings?: unknown }).deliverySettings);
-  if (!settings.success)
-    throw new DeliveryError(
-      'Policy module must export valid explicit deliverySettings with commandPolicy and distinct author/reviewer roles.',
-    );
-  const roles = settings.data.roles;
-  const names = [...Object.values(roles.author.credentialEnv), ...Object.values(roles.reviewer.credentialEnv)];
-  if (
-    roles.author.identity.toLowerCase() === roles.reviewer.identity.toLowerCase() ||
-    new Set(names).size !== names.length ||
-    [roles.author, roles.reviewer].some(
-      (role) => role.authSource !== 'personal' && /^personal(?:$|[-_])/iu.test(role.identity),
-    )
-  ) {
-    throw new DeliveryError('Policy settings require distinct identities and credential environment names.');
+  let raw: unknown;
+  try {
+    raw = JSON.parse(bytes.toString('utf8')) as unknown;
+  } catch {
+    throw new DeliveryError(`Invalid user configuration JSON at ${path}.`);
   }
-  const repo = resolveRepoFromRemote(root, local.overrides.remote);
-  const repository = `${repo.owner}/${repo.repo}`;
-  if (
-    local.overrides.repository !== undefined &&
-    local.overrides.repository.toLowerCase() !== repository.toLowerCase()
-  ) {
-    throw new DeliveryError('Repository assertion does not match the selected Git remote.');
+  const result = UserSettingsSchema.safeParse(raw);
+  if (!result.success) {
+    const details = result.error.issues
+      .map((issue) => `${issue.path.join('.') || 'configuration'}: ${issue.message}`)
+      .join('; ');
+    throw new DeliveryError(`Invalid user configuration ${path}: ${details}`);
   }
-  return {
-    ...settings.data,
-    configPath: local.path,
-    overrides: local.overrides,
-    policy: { contract, module },
-    policyModulePath,
-    repository,
-    sourceDigest: digestValue({
-      overrides: local.bytes.toString('utf8'),
-      policy: policyBytes.toString('utf8'),
-      repository,
-    }),
-  };
+  const { roles, checkoutRoots, schemaVersion: _schema, ...overrides } = result.data;
+  return { roles, checkoutRoots, configPath: path, overrides, sourceDigest: digestValue(result.data) };
 }
 
-/** One resolver supplies the CLI, MCP, installer admission and verification evidence. */
 export async function loadDeliveryConfig(
   repositoryRoot: string,
-  options: {
-    clients?: DiscoveryClients;
-    personalAuth?: boolean;
-    signal?: AbortSignal;
-  } = {},
-): Promise<LoadedDeliveryConfig> {
+  options: { clients?: DiscoveryClients; personalAuth?: boolean; signal?: AbortSignal; repository?: string } = {},
+): Promise<LoadedGitHubConfig> {
   options.signal?.throwIfAborted();
-  const settings = await loadDeliverySettings(repositoryRoot);
-  options.signal?.throwIfAborted();
-  const legacyPersonalAuth = options.personalAuth === true && settings.roles.author.authSource !== 'personal';
+  const settings = await loadDeliverySettings();
+  const repository =
+    options.repository ??
+    (() => {
+      const coordinates = resolveRepoFromRemote(repositoryRoot, 'origin');
+      return `${coordinates.owner}/${coordinates.repo}`;
+    })();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository))
+    throw new DeliveryError('Repository must be owner/name.');
   const clients =
     options.clients ??
     (await createDeliveryGitHubClients({
       config: settings,
-      identity: legacyPersonalAuth ? 'personal' : settings.roles.author.identity,
-      ...(legacyPersonalAuth ? { personalAuth: { enabled: true as const } } : {}),
+      identity:
+        options.personalAuth === true && settings.roles.author.authSource !== 'personal'
+          ? 'personal'
+          : settings.roles.author.identity,
       role: 'author',
+      ...(options.personalAuth === true ? { personalAuth: { enabled: true as const } } : {}),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     }));
   let routing: DeliveryRouting;
   try {
     routing = await discoverDeliveryRouting({
       clients,
-      repository: settings.repository,
+      repository,
       overrides: settings.overrides,
+      repositorySelected: options.repository !== undefined,
     });
   } catch (error) {
     if (
       options.clients === undefined &&
       settings.roles.author.authSource === 'personal' &&
       (error as { status?: number }).status === 401
-    ) {
+    )
       throw new DeliveryError('Configured personal author token is invalid or expired; refresh the selected token.');
-    }
     throw error;
   }
-  const config = parseDeliveryConfig({
-    schemaVersion: 'ai-delivery.config@2',
+  const config: GitHubDeliveryConfig = {
+    schemaVersion: 'ai-delivery.github@1',
     repository: routing.repository,
-    policy: settings.policy,
     roles: settings.roles,
-    commandPolicy: settings.commandPolicy,
     native: routing.native,
-  });
+  };
   return {
     config,
-    configDigest: digestValue({
-      sourceDigest: settings.sourceDigest,
-      routing,
-      roles: config.roles,
-      commandPolicy: config.commandPolicy,
-    }),
+    configDigest: digestValue({ sourceDigest: settings.sourceDigest, routing, roles: config.roles }),
     configPath: settings.configPath,
-    policyModulePath: settings.policyModulePath,
-    remote: resolveGitRemoteName(repositoryRoot, settings.overrides.remote),
     routing,
   };
 }
@@ -431,17 +440,6 @@ export function resolveDeliveryRoleCredentials(input: {
     throw new DeliveryError(`Invalid GitHub App ID for ${role} role (${names.appId}).`);
   }
   return { appId: values.appId, installationId, privateKeyPath: values.privateKeyPath };
-}
-
-function assertSourceControlled(input: { filePath: string; label: string; root: string }): void {
-  const { filePath, label, root } = input;
-  const result = spawnSync('git', ['ls-files', '--error-unmatch', '--', relative(root, filePath)], {
-    cwd: root,
-    stdio: 'ignore',
-  });
-  if (result.status !== 0) {
-    throw new DeliveryError(`${label} must be source-controlled.`);
-  }
 }
 
 function isWithin(root: string, path: string): boolean {

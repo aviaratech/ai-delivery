@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it } from 'vitest';
+import { afterEach, describe, it, vi } from 'vitest';
 
 import { assertDeliveryRolePermissions, createDeliveryGitHubClients, withAuthorGitToken } from '../github/client.js';
 import { evaluateCommandIdentityPolicy } from '../github/commandIdentityPolicy.js';
@@ -25,7 +25,12 @@ import {
   syncIssueProjectStatus,
 } from '../github/projectDelivery.js';
 import { resolveDeliveryRepo } from '../github/repo.js';
-import { loadDeliveryConfig, parseDeliveryConfig, resolveDeliveryRoleCredentials } from './deliveryConfig.js';
+import {
+  readDeliveryOverrides,
+  loadDeliveryConfig,
+  parseDeliveryConfig,
+  resolveDeliveryRoleCredentials,
+} from './deliveryConfig.js';
 
 function git(args: string[], options: { cwd?: string } = {}): void {
   const result = spawnSync('git', args, { ...options, encoding: 'utf8' });
@@ -84,7 +89,7 @@ function syntheticConfig(input: { owner: string; projectNumber: number; repo: st
   } as const;
 }
 
-function syntheticProject(config: ReturnType<typeof parseDeliveryConfig>) {
+function syntheticProject(config: Pick<ReturnType<typeof parseDeliveryConfig>, 'native'>) {
   const settings = projectSettingsFromDeliveryConfig(config);
   const field = (input: { databaseId: string; name: string; values: readonly string[] }) => ({
     __typename: 'ProjectV2SingleSelectField',
@@ -121,6 +126,22 @@ function syntheticProject(config: ReturnType<typeof parseDeliveryConfig>) {
     title: settings.title,
     viewerCanUpdate: true,
   };
+}
+
+afterEach(() => vi.unstubAllEnvs());
+function userConfig(path: string, config: ReturnType<typeof parseDeliveryConfig>) {
+  const {
+    policy: _policy,
+    repository: _repository,
+    remote: _remote,
+    schemaVersion: _schema,
+    ...overrides
+  } = syntheticOverrides(config);
+  writeFileSync(
+    path,
+    JSON.stringify({ schemaVersion: 'ai-delivery.user@1', roles: config.roles, checkoutRoots: [], ...overrides }),
+  );
+  vi.stubEnv('AI_DELIVERY_CONFIG', path);
 }
 
 describe('portable delivery configuration', () => {
@@ -325,6 +346,7 @@ describe('portable delivery configuration', () => {
       );
       writeFileSync(join(temp, 'ai-delivery.config.json'), JSON.stringify(syntheticOverrides(config)));
       git(['add', 'policy.mjs', 'ai-delivery.config.json'], { cwd: temp });
+      userConfig(join(temp, 'user.json'), config);
       process.env.AUTHOR_TOKEN = 'selected-token';
       let selectedRequests = 0;
       globalThis.fetch = async (_url, init) => {
@@ -371,6 +393,7 @@ describe('portable delivery configuration', () => {
           JSON.stringify(syntheticOverrides(parseDeliveryConfig(syntheticConfig({ owner, projectNumber, repo })))),
         );
         git(['add', 'policy.mjs', 'ai-delivery.config.json'], { cwd: root });
+        userConfig(join(temp, 'user.json'), configured);
         const loaded = await loadDeliveryConfig(root, { clients: syntheticDiscoveryClients(configured) });
         assert.match(loaded.configDigest, /^sha256:[a-f0-9]{64}$/u);
         assert.deepEqual(resolveDeliveryRepo(loaded.config, root), { owner, repo });
@@ -490,7 +513,8 @@ describe('portable delivery configuration', () => {
     const base = syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' });
     const temp = mkdtempSync(join(tmpdir(), 'delivery-invalid-'));
     try {
-      await assert.rejects(loadDeliveryConfig(temp), /Missing repository delivery policy/u);
+      vi.stubEnv('AI_DELIVERY_CONFIG', join(temp, 'missing.json'));
+      await assert.rejects(loadDeliveryConfig(temp), /Missing user configuration/u);
       assert.throws(
         () => parseDeliveryConfig({ ...base, policy: { ...base.policy, contract: 'wrong' } }),
         /policy.contract/u,
@@ -547,8 +571,7 @@ describe('portable delivery configuration', () => {
         join(temp, 'ai-delivery.config.json'),
         JSON.stringify(syntheticOverrides(parseDeliveryConfig(base))),
       );
-      git(['add', 'ai-delivery.config.json'], { cwd: temp });
-      await assert.rejects(loadDeliveryConfig(temp), /must be source-controlled/u);
+      assert.throws(() => readDeliveryOverrides(temp), /must be source-controlled/u);
       assert.throws(
         () => resolveDeliveryRoleCredentials({ config, env: {}, role: 'author' }),
         /Missing GitHub App credentials for author/u,

@@ -254,7 +254,7 @@ export async function readProjectDeliveryDefinition(input: {
   return project;
 }
 
-export function projectSettingsFromDeliveryConfig(config: DeliveryConfig): ProjectDeliverySettings {
+export function projectSettingsFromDeliveryConfig(config: Pick<DeliveryConfig, 'native'>): ProjectDeliverySettings {
   const project = config.native.project;
   return {
     number: project.number,

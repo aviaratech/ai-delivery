@@ -2,8 +2,12 @@ import { z } from 'zod';
 import { JournalInputSchema } from '../issueJournal.js';
 
 const Positive = z.number().int().positive();
-const Labels = z.array(z.string().regex(/^(?:area|risk):[^\s:]+$/u));
-export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@1' as const;
+const Labels = z.array(z.string().trim().min(1));
+const Repo = z
+  .string()
+  .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
+  .optional();
+export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@2' as const;
 const Tracking = {
   blockedBy: z.array(Positive).optional(),
   body: z.string().optional(),
@@ -21,6 +25,7 @@ const Tracking = {
 };
 
 const IssueListing = {
+  repo: Repo,
   state: z.enum(['open', 'closed', 'all']).optional(),
   labels: z
     .array(
@@ -45,6 +50,7 @@ const SearchText = z
   .regex(/^[^"\\\r\n]+$/u);
 
 const RuntimeController = {
+  repo: Repo,
   identity: z.string().min(1).optional(),
   expectedSourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
   expectedConfigDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
@@ -56,7 +62,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_comment',
     commandName: 'comment',
     description: 'Post a typed issue journal with authoritative comment readback',
-    inputSchema: JournalInputSchema,
+    inputSchema: JournalInputSchema.extend({ repo: Repo }),
   },
   {
     name: 'runtime_stage',
@@ -108,7 +114,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_start',
     commandName: 'start',
-    description: 'Create or resume a tracked issue and optionally prepare its worktree',
+    description: 'Create or resume a tracked issue and its GitHub-linked branch',
     inputSchema: z.strictObject({
       ...Tracking,
       body: Tracking.body.optional(),
@@ -118,9 +124,10 @@ export const AI_DELIVERY_MCP_TOOLS = [
       title: Tracking.title.optional(),
       issueNumber: Positive.optional(),
       request: z.string().min(1).optional(),
-      develop: z.boolean().optional(),
+      requestId: z.string().trim().min(1).max(256).optional(),
+
       resumeCreated: z.boolean().optional(),
-      scratch: z.boolean().optional(),
+
       branch: z.string().min(1).optional(),
     }),
   },
@@ -142,6 +149,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Update native issue fields and exact relationship sets with readback',
     inputSchema: z
       .strictObject({
+        repo: Repo,
         blockedBy: z.array(Positive).optional(),
         body: z.string().optional(),
         issueNumber: Positive,
@@ -166,8 +174,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_info',
     commandName: 'info',
-    description: 'Read live issue metadata, relationships, Project status and registered worktree',
-    inputSchema: z.strictObject({ issueNumber: Positive, cached: z.boolean().optional() }),
+    description: 'Read live issue metadata, relationships and Project status',
+    inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo }),
   },
   {
     name: 'issue_ready_check',
@@ -176,52 +184,31 @@ export const AI_DELIVERY_MCP_TOOLS = [
     inputSchema: z.strictObject({ issueNumber: Positive, repo: Tracking.repo }),
   },
   {
-    name: 'issue_develop',
-    commandName: 'develop',
-    description: 'Prepare the one registered issue worktree after readiness passes',
-    inputSchema: z.strictObject({ issueNumber: Positive, assignee: z.string().min(1).optional() }),
-  },
-  {
-    name: 'issue_verify',
-    commandName: 'verify',
-    description: 'Resume exact-head policy stages and produce versioned delivery evidence',
-    inputSchema: z.strictObject({
-      issueNumber: Positive,
-      admit: z.array(z.string().min(1)).optional(),
-      prepublicationReview: z.string().min(1).optional(),
-      resourceBounds: z
-        .strictObject({
-          maxAggregateRssBytes: z.number().int().positive().safe(),
-          maxNewOutputBytes: z.number().int().positive().safe().optional(),
-          minFreeDiskBytes: z.number().int().positive().safe(),
-          outputRoots: z.array(z.string().min(1)).min(1).optional(),
-        })
-        .optional(),
-    }),
-  },
-  {
     name: 'issue_pr_create',
     commandName: 'pr:create',
-    description: 'Publish a verified draft or promote the unchanged reviewed PR',
+    description: 'Create or reuse a PR from its GitHub-linked issue branch',
     inputSchema: z.strictObject({
+      repo: Repo,
       issueNumber: Positive,
       body: z.string().min(1).optional(),
       draft: z.boolean().optional(),
       dryRun: z.boolean().optional(),
       title: z.string().min(1).optional(),
+      headBranch: z.string().min(1).optional(),
     }),
   },
   {
     name: 'issue_pr_info',
     commandName: 'pr:info',
-    description: 'Inspect a PR by PR number or by its registered issue branch',
-    inputSchema: z.strictObject({ issueNumber: Positive.optional(), prNumber: Positive.optional() }),
+    description: 'Inspect a PR by number or its GitHub-linked issue branch',
+    inputSchema: z.strictObject({ repo: Repo, issueNumber: Positive.optional(), prNumber: Positive.optional() }),
   },
   {
     name: 'issue_pr_review',
     commandName: 'pr:review',
     description: 'Submit one existing exact-head independent review with the reviewer App role',
     inputSchema: z.strictObject({
+      repo: Repo,
       issueNumber: Positive,
       prNumber: Positive,
       artifact: z.string().min(1),
@@ -234,8 +221,13 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'pr:merge',
     description: 'Guarded exact-head merge with live blocker, check and review readback',
     inputSchema: z.strictObject({
+      repo: Repo,
       issueNumber: Positive,
       prNumber: Positive,
+      reviewedHeadSha: z
+        .string()
+        .regex(/^[a-f0-9]{40}$/u)
+        .optional(),
       strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
       dryRun: z.boolean().optional(),
     }),
@@ -243,25 +235,25 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_finish',
     commandName: 'finish',
-    description: 'Resume merge, issue completion and non-force worktree cleanup',
+    description: 'Resume a guarded merge and close its issue after merged-PR readback',
     inputSchema: z.strictObject({
+      repo: Repo,
       issueNumber: Positive,
       prNumber: Positive,
+      reviewedHeadSha: z
+        .string()
+        .regex(/^[a-f0-9]{40}$/u)
+        .optional(),
       strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
       dryRun: z.boolean().optional(),
     }),
-  },
-  {
-    name: 'issue_worktree_create',
-    commandName: 'worktree:create',
-    description: 'Prepare one explicit standalone worktree without an issue',
-    inputSchema: z.strictObject({ name: z.string().min(1), branch: z.string().min(1) }),
   },
   {
     name: 'issue_worktree_transition_inspect',
     commandName: 'worktree:transition:inspect',
     description: 'Read a legacy issue row, original evidence and exact closure gaps without changing ownership',
     inputSchema: z.strictObject({
+      repo: Repo,
       issueNumber: Positive,
       purpose: z.enum(['active-resume', 'merged-cleanup']),
       disposition: z.enum(['retain', 'remove']).optional(),
@@ -277,6 +269,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description:
       'Apply or resume one exact independently accepted transition with immutable preservation and closure proof',
     inputSchema: z.strictObject({
+      repo: Repo,
       authority: z.literal('worktree:transition'),
       planPath: z.string().min(1),
       expectedPlanId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),

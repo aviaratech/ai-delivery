@@ -26,7 +26,7 @@ export function evaluateAgentReadiness(input: {
   blockedBy?: number[];
   body: string;
   points?: NativePointValue;
-  repoRoot: string;
+  repoRoot: string | undefined;
   title: string;
   trackingParent?: boolean;
 }): AgentReadinessResult {
@@ -198,7 +198,7 @@ function hasExecutableVerification(body: string): boolean {
   );
 }
 
-function hasRepositoryEvidence(body: string, repoRoot: string): boolean {
+function hasRepositoryEvidence(body: string, repoRoot: string | undefined): boolean {
   const evidenceSource = body.replace(extractSection(body, 'Scope'), '');
   if (/\b[0-9a-f]{40}:[^\s`]+/iu.test(evidenceSource) || /\/blob\/[0-9a-f]{40}\//iu.test(evidenceSource)) {
     return true;
@@ -222,9 +222,10 @@ function isAggregateScope(scopePath: string): boolean {
   return normalized.length === 0 || ['.', 'apps', 'packages', 'plugins'].includes(normalized);
 }
 
-function isRepositoryPath(candidate: string, repoRoot: string): boolean {
+function isRepositoryPath(candidate: string, repoRoot: string | undefined): boolean {
   const path = normalizeScopePath(candidate);
   if (path === null) return false;
+  if (repoRoot === undefined) return true;
   const resolved = normalize(join(repoRoot, path));
   const normalizedRoot = normalize(repoRoot);
   return (resolved === normalizedRoot || resolved.startsWith(`${normalizedRoot}/`)) && existsSync(resolved);
