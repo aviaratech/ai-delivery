@@ -95,7 +95,14 @@ the managed version units for recovery and uses Claude Code's `--keep-data`.
 Every command supports `--dry-run` and `--json`. Dry-run reports the target
 without fetching an archive, running a native command, or writing configuration.
 Doctor reports managed installation and source integrity, skills, and a direct
-stdio startup check of the selected bundled MCP server. Restart the native host
+credential-free stdio startup check of the selected bundled MCP server. Startup
+means that the server initialized and listed its tools; it does not validate
+user settings, receive GitHub credentials, or authenticate either delivery role.
+Use an explicitly selected read-only `config:resolve` call for CLI authentication
+readback, and check an actual tool call in the native host separately. The
+[credential and readiness guide](plugins/ai-delivery/README.md#credentials-and-readiness)
+explains the environment boundary and the evidence to retain without secrets.
+Restart the native host
 after changing a plugin so it reloads that selection. Installing a plugin does not admit a consumer controller. Ordinary remote GitHub delivery uses user configuration; explicit controller staging and admission remain separate operations.
 
 First read `config:resolve` with the configured author, then stage a reviewed
@@ -202,12 +209,12 @@ operator's machine. Validation requires HTTPS with a DNS hostname; it rejects
 file paths, credential-bearing URLs, IP literals, localhost and `.local` names.
 It does not probe remote reachability. Each kind also requires these fields:
 
-| Kind | Required fields |
-| --- | --- |
-| `start` | `outcome` |
-| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link |
-| `decision` | `decision`, `rationale` |
-| `blocker` | `blocker`, `resolution` |
+| Kind       | Required fields                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------- |
+| `start`    | `outcome`                                                                                 |
+| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link                      |
+| `decision` | `decision`, `rationale`                                                                   |
+| `blocker`  | `blocker`, `resolution`                                                                   |
 | `closeout` | `acceptance` (nonempty `{criterion, evidence}` list), `followUps` (list; empty when none) |
 
 Optional `details` adds supporting prose. `lengthCap` (600–10,000 characters,
