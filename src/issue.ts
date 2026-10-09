@@ -988,7 +988,7 @@ interface BranchQuery {
     } | null;
   } | null;
 }
-async function linkedIssueBranches(context: DeliveryContext, issueNumber: number): Promise<LinkedIssueBranch[]> {
+export async function linkedIssueBranches(context: DeliveryContext, issueNumber: number): Promise<LinkedIssueBranch[]> {
   const branches: LinkedIssueBranch[] = [];
   const cursors = new Set<string>();
   let cursor: string | null = null;
