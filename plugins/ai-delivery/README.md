@@ -57,9 +57,33 @@ Treat each readiness layer separately:
 | Supplied-environment CLI authentication | Explicit `config:resolve` returns the selected repository, author, reviewer, and rule visibility | The native GUI/CLI host process received the same inputs |
 | Native authentication                   | A read-only tool call succeeds through the selected host's actual MCP process                    | Reviewer approval counts on a later exact PR head        |
 
-Default doctor is credential-free and does not contact GitHub. For an explicitly
-selected CLI authentication check, run this read-only command from the intended
-credential environment:
+Default doctor is credential-free and does not contact GitHub or read user
+settings, selected credential variables or keys. To opt in, run from the intended
+credential environment with an explicit repository (required even outside Git):
+
+```sh
+ai-delivery --repo example/widget plugin doctor --host codex --scope user --check-auth --json
+```
+
+Use `--host claude-code` for the corresponding managed native selection. The
+diagnostic refuses absent, disabled, modified or failed-startup selections. It
+then validates settings and reports required/missing variable names without
+values. Missing or invalid references stop before any key read or authentication
+request. Credential names must not overlap runtime selectors (`PATH`, `HOME`,
+host/configuration selectors or Node/npm/Git environment controls).
+
+The verified selected runtime's existing `config:resolve` owns the readback.
+Only configured references and necessary selectors are forwarded; unrelated
+variables, legacy personal overrides and caller Node injection flags are excluded.
+Output separates settings, process references, authenticated author/reviewer,
+repository access and visible rules. Authentication/discovery failure can leave
+both identity and repository access unverified; a generic failure is not a
+permission diagnosis. Raw errors, upstream bodies/headers and private-key paths
+are withheld. Rule visibility or App permissions never imply counted approval.
+The invocation context is `selected_runtime_cli`, and native GUI propagation
+remains `unverified`. Dry-run does not validate settings or authenticate.
+
+For a direct package CLI readback, the existing command is:
 
 ```sh
 ai-delivery --repo example/widget config:resolve

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import {
   existsSync,
   closeSync,
@@ -21,6 +22,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 
+import { loadDeliverySettings, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
 import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 import { withLock } from './utils/lockfile.js';
 import {
@@ -42,6 +44,11 @@ const InputSchema = z.strictObject({
   scope: z.enum(['user', 'project', 'local']),
   version: Version.optional(),
   dryRun: z.boolean().default(false),
+  checkAuth: z.boolean().default(false),
+  repo: z
+    .string()
+    .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
+    .optional(),
   repoRoot: z.string().min(1),
 });
 type Input = z.infer<typeof InputSchema>;
@@ -111,6 +118,206 @@ export interface PluginResult {
   mcp?: { configuration: string; startup: string; version?: string; error?: string };
   restartRequired?: boolean;
   recoveryRequired?: boolean;
+  authProbe?: PluginAuthProbe;
+}
+
+export interface PluginAuthProbe {
+  invocationContext: 'selected_runtime_cli';
+  nativeGuiPropagation: 'unverified';
+  settings: 'not_checked' | 'valid' | 'unavailable_or_invalid';
+  processReferences: {
+    status: 'not_checked' | 'complete' | 'missing' | 'invalid';
+    requiredNames: string[];
+    missingNames: string[];
+  };
+  authentication: {
+    status: 'not_checked' | 'verified' | 'failed' | 'unverified';
+    author?: { actorLogin: string; authSource: 'app' | 'personal' };
+    reviewer?: { actorLogin: string; authSource: 'app' };
+  };
+  repositoryAccess: { repository: string; status: 'not_checked' | 'verified' | 'denied' | 'unverified' };
+  reviewRules?: {
+    visibility: 'complete' | 'partial' | 'unknown';
+    observedRequiredApprovals: number | null;
+    approvalEligibility: 'unknown' | 'insufficient-permission';
+  };
+  outcome: 'not_checked' | 'blocked' | 'failed' | 'readback_complete';
+  reason?:
+    | 'dry_run'
+    | 'native_plugin_not_ready'
+    | 'settings_unavailable_or_invalid'
+    | 'missing_references'
+    | 'invalid_references'
+    | 'authentication_failed'
+    | 'repository_denied'
+    | 'probe_failed'
+    | 'invalid_readback';
+}
+
+// Native inventory and startup must not inherit the caller's credentials or
+// runtime injection flags. Install/update/recovery keep their existing owner.
+function doctorEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '', DISABLE_AUTOUPDATER: '1' };
+  for (const name of ['HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR'])
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  return env;
+}
+
+const AuthReadback = z.object({
+  routing: z.object({ repository: InputSchema.shape.repo.unwrap() }),
+  reviewRoute: z.object({
+    author: z.object({
+      actorLogin: z
+        .string()
+        .regex(/^[A-Za-z0-9-]+(?:\[bot\])?$/u)
+        .max(200),
+      authSource: z.enum(['app', 'personal']),
+      identity: z.string(),
+    }),
+    reviewer: z.object({
+      actorLogin: z
+        .string()
+        .regex(/^[A-Za-z0-9-]+(?:\[bot\])?$/u)
+        .max(200),
+      identity: z.string(),
+      repositoryAccess: z.literal('readable'),
+    }),
+    rules: z.object({
+      visibility: z.enum(['complete', 'partial', 'unknown']),
+      observedRequiredApprovals: z.number().int().nonnegative().nullable(),
+    }),
+    approvalEligibility: z.enum(['unknown', 'insufficient-permission']),
+  }),
+});
+
+async function checkAuthentication(input: Input, root: string, probe: PluginAuthProbe): Promise<void> {
+  let settings: Awaited<ReturnType<typeof loadDeliverySettings>>;
+  try {
+    settings = await loadDeliverySettings();
+    probe.settings = 'valid';
+  } catch {
+    probe.settings = 'unavailable_or_invalid';
+    probe.outcome = 'blocked';
+    probe.reason = 'settings_unavailable_or_invalid';
+    return;
+  }
+  const names = Object.values(settings.roles).flatMap((role) => Object.values(role.credentialEnv));
+  probe.processReferences.requiredNames = names;
+  const missing = names.filter((name) => !process.env[name]?.trim());
+  probe.processReferences.missingNames = missing;
+  if (missing.length > 0) {
+    probe.processReferences.status = 'missing';
+    probe.outcome = 'blocked';
+    probe.reason = 'missing_references';
+    return;
+  }
+  // A credential reference cannot also change the selected Node/configuration
+  // boundary. No legacy personal override or ambient fallback is forwarded.
+  if (
+    names.some(
+      (name) =>
+        /^(?:NODE_|NPM_|GIT_)/u.test(name) ||
+        [
+          'PATH',
+          'HOME',
+          'CODEX_HOME',
+          'CLAUDE_CONFIG_DIR',
+          'AI_DELIVERY_CONFIG',
+          'AI_DELIVERY_IDENTITY',
+          'DISABLE_AUTOUPDATER',
+        ].includes(name),
+    )
+  ) {
+    probe.processReferences.status = 'invalid';
+    probe.outcome = 'blocked';
+    probe.reason = 'invalid_references';
+    return;
+  }
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? '',
+    AI_DELIVERY_CONFIG: settings.configPath,
+    NODE_OPTIONS: '--max-old-space-size=512 --v8-pool-size=1',
+    DISABLE_AUTOUPDATER: '1',
+  };
+  for (const name of names) env[name] = process.env[name]!.trim();
+  try {
+    for (const role of ['author', 'reviewer'] as const)
+      if (settings.roles[role].authSource !== 'personal')
+        resolveDeliveryRoleCredentials({ config: settings, role, env });
+  } catch {
+    probe.processReferences.status = 'invalid';
+    probe.outcome = 'blocked';
+    probe.reason = 'invalid_references';
+    return;
+  }
+  probe.processReferences.status = 'complete';
+  // Capture only in bounded memory. Never send authentication stdout/stderr to
+  // the installer stage logger, argv, a file, or the caller. The selected CLI
+  // owns settings, contextFor, discovery and preflightReviewRoute.
+  const captured = await new Promise<{ failed: boolean; stdout: string; stderr: string }>((finish) => {
+    execFile(
+      process.execPath,
+      [join(root, 'runtime/dist/cli.js'), '--repo', input.repo!, 'config:resolve'],
+      {
+        cwd: input.repoRoot,
+        env,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024,
+        timeout: 30000,
+      },
+      (error, stdout, stderr) => finish({ failed: error !== null, stdout, stderr }),
+    );
+  });
+  if (captured.failed) {
+    probe.outcome = 'failed';
+    probe.authentication.status = 'unverified';
+    probe.repositoryAccess.status = 'unverified';
+    // Classify only the existing owners' exact safe messages, never an upstream
+    // error body or a guessed status/permission. Other failures stay unverified.
+    if (
+      captured.stderr.trim() ===
+      'ai-delivery: Configured personal author token is invalid or expired; refresh the selected token.'
+    ) {
+      probe.authentication.status = 'failed';
+      probe.reason = 'authentication_failed';
+    } else if (
+      [
+        'ai-delivery: Author cannot read the selected GitHub repository; verify configured access.',
+        'ai-delivery: Reviewer GitHub App cannot read the selected repository; verify its installation and repository access.',
+      ].includes(captured.stderr.trim())
+    ) {
+      probe.repositoryAccess.status = 'denied';
+      probe.reason = 'repository_denied';
+    } else probe.reason = 'probe_failed';
+    return;
+  }
+  try {
+    const data = AuthReadback.parse(JSON.parse(captured.stdout) as unknown);
+    const route = data.reviewRoute;
+    if (
+      data.routing.repository.toLowerCase() !== input.repo!.toLowerCase() ||
+      route.author.authSource !== (settings.roles.author.authSource ?? 'app') ||
+      route.author.identity !== settings.roles.author.identity ||
+      route.reviewer.identity !== settings.roles.reviewer.identity ||
+      route.author.actorLogin.toLowerCase() === route.reviewer.actorLogin.toLowerCase()
+    )
+      throw new Error('Inconsistent readback');
+    const projected = {
+      author: { actorLogin: route.author.actorLogin, authSource: route.author.authSource },
+      reviewer: { actorLogin: route.reviewer.actorLogin, authSource: 'app' as const },
+    };
+    // Even a syntactically valid actor must not reproduce a supplied credential.
+    if (names.some((name) => JSON.stringify(projected).includes(env[name]!))) throw new Error('Unsafe readback');
+    probe.authentication = { status: 'verified', ...projected };
+    probe.repositoryAccess.status = 'verified';
+    probe.reviewRules = { ...route.rules, approvalEligibility: route.approvalEligibility };
+    probe.outcome = 'readback_complete';
+  } catch {
+    probe.authentication.status = 'unverified';
+    probe.repositoryAccess.status = 'unverified';
+    probe.outcome = 'failed';
+    probe.reason = 'invalid_readback';
+  }
 }
 
 function assertCanonical(path: string): void {
@@ -202,6 +409,7 @@ async function command(
   cwd: string,
   signal: AbortSignal,
   publish?: (command: z.infer<typeof Pending>['command']) => void,
+  credentialFreeDoctor = false,
 ): Promise<string> {
   const output = await runStageCommand(
     cwd,
@@ -223,11 +431,14 @@ async function command(
       assertQuiescent: () => {},
     },
     {
-      environment: { ...process.env, DISABLE_AUTOUPDATER: '1' },
+      environment: credentialFreeDoctor ? doctorEnvironment() : { ...process.env, DISABLE_AUTOUPDATER: '1' },
       cwd,
       maxCapturedOutputBytes: 1024 * 1024,
       stdoutOnly: true,
-      failedOutput: (bytes) => ` Native command output: ${bytes.toString('utf8').slice(-2000)}`,
+      failedOutput: (bytes) =>
+        credentialFreeDoctor
+          ? ' Native inventory failed; raw output withheld.'
+          : ` Native command output: ${bytes.toString('utf8').slice(-2000)}`,
     },
   );
   return output.toString('utf8');
@@ -521,6 +732,7 @@ async function inventory(
       target.projectRoot,
       signal,
       publish,
+      input.action === 'doctor',
     ),
   );
   if (input.host === 'claude-code') return z.array(z.record(z.string(), z.unknown())).parse(value);
@@ -645,11 +857,11 @@ async function startup(root: string, version: string, cwd: string): Promise<NonN
       throw new Error('MCP server version differs from the selected archive.');
     await client.listTools({}, { timeout: 30000 });
     return { configuration: 'native_manifest_present', startup: 'ready', version };
-  } catch (error) {
+  } catch {
     return {
       configuration: 'native_manifest_present',
       startup: 'failed',
-      error: (error instanceof Error ? error.message : String(error)).slice(0, 2000),
+      error: 'Bundled MCP startup failed; raw output withheld.',
     };
   } finally {
     await client.close();
@@ -659,6 +871,9 @@ async function startup(root: string, version: string, cwd: string): Promise<NonN
 
 export async function managePlugin(value: unknown): Promise<PluginResult> {
   const input = InputSchema.parse(value);
+  if (input.checkAuth && input.action !== 'doctor') throw new Error('--check-auth is supported only for doctor.');
+  if (input.checkAuth && input.repo === undefined)
+    throw new Error('doctor --check-auth requires explicit --repo owner/name.');
   if (input.host === 'codex' && input.scope !== 'user')
     throw new Error('Codex currently supports user plugin installation; select --scope user.');
   if ((input.action === 'install' || input.action === 'update') && input.version === undefined)
@@ -686,12 +901,29 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
     managedDirectory: target.directory,
     repositoryAdmission: 'explicit_stage_and_admit_required',
   };
+  if (input.checkAuth)
+    result.authProbe = {
+      invocationContext: 'selected_runtime_cli',
+      nativeGuiPropagation: 'unverified',
+      settings: 'not_checked',
+      processReferences: { status: 'not_checked', requiredNames: [], missingNames: [] },
+      authentication: { status: 'not_checked' },
+      repositoryAccess: { repository: input.repo!, status: 'not_checked' },
+      outcome: input.dryRun ? 'not_checked' : 'blocked',
+      reason: input.dryRun ? 'dry_run' : 'native_plugin_not_ready',
+    };
   if (input.dryRun) return result;
   if (input.action === 'doctor') {
     if (!state) return result;
     result.recoveryRequired = state.pending !== undefined;
     if (state.pending || !state.currentVersion) return result;
-    verifiedUnit(target, state.currentVersion);
+    try {
+      verifiedUnit(target, state.currentVersion);
+    } catch {
+      result.sourceIntegrity = false;
+      result.mcp = { configuration: 'unverified', startup: 'not_checked', error: 'Managed archive integrity failed.' };
+      return result;
+    }
     const entries = await inventory(input, target, new AbortController().signal);
     const registered = registration(input, target, entries),
       entry = nativeEntry(input, target, entries);
@@ -715,8 +947,14 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       result.mcp = {
         configuration: 'unverified',
         startup: 'not_checked',
-        error: (error instanceof Error ? error.message : String(error)).slice(0, 2000),
+        error: input.checkAuth
+          ? 'Selected native plugin integrity failed; raw output withheld.'
+          : (error instanceof Error ? error.message : String(error)).slice(0, 2000),
       };
+    }
+    if (result.authProbe && result.sourceIntegrity && result.enabled && result.mcp?.startup === 'ready') {
+      delete result.authProbe.reason;
+      await checkAuthentication(input, result.nativePluginRoot!, result.authProbe);
     }
     return result;
   }

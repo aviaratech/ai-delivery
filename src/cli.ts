@@ -80,14 +80,25 @@ for (const action of ['install', 'doctor', 'update', 'rollback', 'remove'] as co
     .option('--json', 'Print the result as JSON');
   if (action === 'install' || action === 'update')
     command.requiredOption('--version <version>', 'Explicit published package version');
+  if (action === 'doctor')
+    command.option('--check-auth', 'Read configured role identities and repository access; requires explicit --repo');
   command.action(
-    async (options: { host: string; scope: string; version?: string; dryRun?: boolean; json?: boolean }) => {
+    async (options: {
+      host: string;
+      scope: string;
+      version?: string;
+      dryRun?: boolean;
+      json?: boolean;
+      checkAuth?: boolean;
+    }) => {
       const result = await managePlugin({
         action,
         host: options.host,
         scope: options.scope,
         ...(options.version === undefined ? {} : { version: options.version }),
         dryRun: options.dryRun === true,
+        checkAuth: options.checkAuth === true,
+        ...(options.checkAuth && execution().repo ? { repo: execution().repo } : {}),
         repoRoot: execution().repoRoot,
       });
       if (options.json) {
@@ -103,6 +114,10 @@ for (const action of ['install', 'doctor', 'update', 'rollback', 'remove'] as co
         );
       if (result.recoveryRequired)
         process.stdout.write('Resume the interrupted original plugin command to recover this target.\n');
+      if (result.authProbe)
+        process.stdout.write(
+          `Selected-runtime CLI auth probe: ${result.authProbe.outcome}; settings ${result.authProbe.settings}; process references ${result.authProbe.processReferences.status}; authentication ${result.authProbe.authentication.status}; repository access ${result.authProbe.repositoryAccess.status}${result.authProbe.reason ? ` (${result.authProbe.reason})` : ''}\nNative GUI credential propagation and counted exact-head approval remain unverified.\n`,
+        );
     },
   );
 }

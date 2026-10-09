@@ -98,8 +98,21 @@ Doctor reports managed installation and source integrity, skills, and a direct
 credential-free stdio startup check of the selected bundled MCP server. Startup
 means that the server initialized and listed its tools; it does not validate
 user settings, receive GitHub credentials, or authenticate either delivery role.
-Use an explicitly selected read-only `config:resolve` call for CLI authentication
-readback, and check an actual tool call in the native host separately. The
+For an opt-in authentication check, select a repository explicitly:
+
+```sh
+ai-delivery --repo example/widget plugin doctor --host codex --scope user --check-auth --json
+```
+
+This checks settings and named process references before running the verified,
+enabled plugin's selected CLI `config:resolve`. It reports authenticated actors,
+repository access and visible review rules separately. Only configured credential
+names and required runtime selectors reach that subprocess; unrelated tokens and
+legacy personal overrides do not. Missing or invalid inputs stop before key
+access or network authentication. Dry-run performs none of these checks.
+The readback is labelled `selected_runtime_cli`; it does not prove GUI credential
+propagation or counted exact-head approval. `config:resolve` remains available
+for direct CLI readback; check an actual native tool call separately. The
 [credential and readiness guide](plugins/ai-delivery/README.md#credentials-and-readiness)
 explains the environment boundary and the evidence to retain without secrets.
 Restart the native host
