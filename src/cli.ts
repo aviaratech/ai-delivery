@@ -349,8 +349,9 @@ program
   );
 program
   .command('pr:info')
-  .option('--issue <number>')
-  .option('--pr <number>')
+  .description('Inspect an exact PR; combine --issue and --pr to verify its native closing-issue association.')
+  .option('--issue <number>', 'Issue to verify; issue-only lookup requires a GitHub-linked branch')
+  .option('--pr <number>', 'Exact PR number; include --issue after issue branch links are replaced on publication')
   .action(async (o: { issue?: string; pr?: string }) =>
     run('issue_pr_info', { issueNumber: int(o.issue), prNumber: int(o.pr) }),
   );

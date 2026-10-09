@@ -87,7 +87,13 @@ function fixture(
     git: {
       getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
       getRef: async ({ ref }: { ref: string }) => ({
-        data: { object: { sha: ref === 'heads/main' ? (option.baseMoved ? 'e'.repeat(40) : 'c'.repeat(40)) : head } },
+        data: {
+          ref: `refs/${ref}`,
+          object: {
+            type: 'commit',
+            sha: ref === 'heads/main' ? (option.baseMoved ? 'e'.repeat(40) : 'c'.repeat(40)) : head,
+          },
+        },
       }),
     },
     pulls: {
@@ -164,7 +170,9 @@ function fixture(
     if (query.includes('DeliveryClosingIssues'))
       return {
         repository: {
+          nameWithOwner: 'example/widget',
           pullRequest: {
+            number: 23,
             closingIssuesReferences: {
               nodes: [{ number: option.wrongClosingIssue ? 18 : 17, repository: { nameWithOwner: 'example/widget' } }],
               pageInfo: { hasNextPage: false, endCursor: null },
