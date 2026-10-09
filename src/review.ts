@@ -199,6 +199,53 @@ export function parseReviewArtifact(raw: unknown): ReviewArtifact {
   return ReviewArtifactSchema.parse(value);
 }
 
+/** Preserve the original binding: GitHub can remap a review's commit_id after a rebase. */
+export function parseGitHubReviewArtifact(body: string | null | undefined): ReviewArtifact {
+  try {
+    if (typeof body !== 'string' || Buffer.byteLength(body, 'utf8') > 64 * 1024) throw new Error('Invalid size.');
+    const markers = body.match(/<!-- ai-delivery-review-artifact:[\s\S]*?-->/gu) ?? [];
+    const payloads = body.match(/<!-- ai-delivery-review-artifact-data:[\s\S]*?-->/gu) ?? [];
+    if (markers.length !== 1 || payloads.length !== 1) throw new Error('Ambiguous binding.');
+    const id = markers[0]!.match(/^<!-- ai-delivery-review-artifact: (sha256:[a-f0-9]{64}) -->$/u)?.[1];
+    const encoded = payloads[0]!.match(/^<!-- ai-delivery-review-artifact-data: ([A-Za-z0-9_-]+) -->$/u)?.[1];
+    if (!id || !encoded) throw new Error('Invalid binding.');
+    const bytes = Buffer.from(encoded, 'base64url');
+    const json = bytes.toString('utf8');
+    if (bytes.toString('base64url') !== encoded || !Buffer.from(json, 'utf8').equals(bytes))
+      throw new Error('Invalid encoding.');
+    const artifact = parseReviewArtifact(json);
+    if (artifact.artifactId !== id) throw new Error('Artifact identity differs.');
+    return artifact;
+  } catch {
+    throw new DeliveryError('GitHub review artifact binding is missing, invalid or ambiguous; obtain a fresh review.');
+  }
+}
+
+function githubReviewBody(artifact: ReviewArtifact): string {
+  ReviewArtifactSchema.parse(artifact);
+  const body = `${artifact.summary}\n\n<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
+  parseGitHubReviewArtifact(body);
+  return body;
+}
+
+export async function readGitHubPrScopeHash(
+  context: DeliveryContext,
+  prNumber: number,
+  changedFiles: number,
+): Promise<string> {
+  const files: string[] = [];
+  for (let page = 1; page <= 30; page++) {
+    const batch = (
+      await context.clients.rest.pulls.listFiles({ ...context.repo, pull_number: prNumber, page, per_page: 100 })
+    ).data;
+    files.push(...batch.map((file) => file.filename));
+    if (batch.length < 100) break;
+  }
+  if (!Number.isSafeInteger(changedFiles) || files.length !== changedFiles || new Set(files).size !== files.length)
+    throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
+  return digestValue(files.sort());
+}
+
 export function reviewArtifactApproval(input: {
   artifact: ReviewArtifact;
   classification: RepositoryClassificationReceipt;
@@ -341,21 +388,9 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
   const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: artifact.head.sha })).data;
   if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
     throw new DeliveryError('Independent review tree differs from the remote commit.');
-  const files: string[] = [];
-  for (let page = 1; page <= 30; page++) {
-    const batch = (
-      await context.clients.rest.pulls.listFiles({ ...context.repo, pull_number: prNumber, page, per_page: 100 })
-    ).data;
-    files.push(...batch.map((file) => file.filename));
-    if (batch.length < 100) break;
-  }
-  if (
-    !Number.isSafeInteger(pr.changed_files) ||
-    files.length !== pr.changed_files ||
-    new Set(files).size !== files.length ||
-    artifact.diffScopeHash !== digestValue(files.sort())
-  )
+  if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, prNumber, pr.changed_files)))
     throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
+  const body = githubReviewBody(artifact);
   const marker = `<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->`;
   const history = await listAllReviews(context, prNumber);
   if (
@@ -377,7 +412,8 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
     (prior.state !== 'APPROVED' ||
       prior.commit_id !== artifact.head.sha ||
       prior.user?.login.toLowerCase() !== actor.toLowerCase() ||
-      !prior.html_url)
+      !prior.html_url ||
+      parseGitHubReviewArtifact(prior.body).artifactId !== artifact.artifactId)
   )
     throw new DeliveryError('Prior GitHub review marker conflicts with exact-head approval.');
   const fresh = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
@@ -391,7 +427,7 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
         ...context.repo,
         pull_number: prNumber,
         commit_id: artifact.head.sha,
-        body: `${artifact.summary}\n\n${marker}`,
+        body,
         event: 'APPROVE',
       })
     ).data;
@@ -425,7 +461,7 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
     readback.state !== 'APPROVED' ||
     readback.commit_id !== receipt.headSha ||
     readback.user?.login !== receipt.login ||
-    !readback.body?.includes(marker)
+    parseGitHubReviewArtifact(readback.body).artifactId !== artifact.artifactId
   )
     throw new DeliveryError('GitHub exact-head App review readback disagrees.');
 
@@ -464,7 +500,7 @@ export async function assertSubmittedReviewCurrent(
     review.commit_id !== receipt.headSha ||
     review.user?.login !== receipt.login ||
     review.html_url !== receipt.githubReviewUrl ||
-    !review.body?.includes(`<!-- ai-delivery-review-artifact: ${receipt.artifact.artifactId} -->`)
+    parseGitHubReviewArtifact(review.body).artifactId !== receipt.artifact.artifactId
   ) {
     throw new DeliveryError('GitHub exact-head review no longer matches the stored receipt.');
   }

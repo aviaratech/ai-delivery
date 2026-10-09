@@ -48,7 +48,7 @@ function fixture(
     commit_id: head.sha,
     user: { login: input.reviewLogin ?? 'synthetic-reviewer[bot]' },
     html_url: 'https://github.com/example/repo/pull/19#pullrequestreview-41',
-    body: marker(artifact.artifactId),
+    body: `${artifact.summary}\n\n${marker(artifact.artifactId)}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`,
   };
   const reviews = input.existingReview ? [review] : [];
   let created = 0;
@@ -94,7 +94,8 @@ function fixture(
           listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
           getReview: async () => ({ data: review }),
           listReviews: async () => ({ data: reviews }),
-          createReview: async () => {
+          createReview: async (input: { body: string }) => {
+            review.body = input.body;
             created += 1;
             reviews.push(review);
             return { data: review };
@@ -129,6 +130,9 @@ test('reviewer App bot submits and reuses an exact-head approval without GET /us
     const first = await state.submit();
     assert.equal(first.login, 'synthetic-reviewer[bot]');
     assert.equal(state.created, 1);
+    const encoded = state.reviews[0]!.body.match(/<!-- ai-delivery-review-artifact-data: ([A-Za-z0-9_-]+) -->/u)?.[1];
+    assert.ok(encoded, 'App review must retain its independently hash-verifiable artifact binding');
+    assert.deepEqual(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')), state.artifact);
     const second = await state.submit();
     assert.equal(second.receiptId, first.receiptId);
     assert.equal(state.created, 1);

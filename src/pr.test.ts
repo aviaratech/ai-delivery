@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'vitest';
 import { publishPr, mergePr, finishIssue } from './pr.js';
 import type { DeliveryContext } from './issue.js';
+import { digestValue } from './delivery/common.js';
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
@@ -19,13 +20,54 @@ function fixture(
     wrongClosingIssue?: boolean;
     reviewCannotPush?: boolean;
     reviewAccessUnknown?: boolean;
+    reviewBinding?:
+      | 'stale-head'
+      | 'wrong-tree'
+      | 'wrong-scope'
+      | 'invalid-digest'
+      | 'marker-only'
+      | 'wrong-issue'
+      | 'wrong-pr'
+      | 'wrong-role';
   } = {},
 ) {
   let merged = false;
   let closes = 0;
   const merges: Record<string, unknown>[] = [];
+  const artifactContent = {
+    authorIdentity: option.reviewBinding === 'wrong-role' ? 'collaborator' : 'author',
+    reviewerIdentity: 'reviewer',
+    checks: ['retained checks'],
+    diffScopeHash: digestValue([option.reviewBinding === 'wrong-scope' ? 'elsewhere.ts' : 'change.ts']),
+    elapsedMs: 1,
+    findings: [],
+    head: {
+      sha: option.reviewBinding === 'stale-head' ? 'e'.repeat(40) : head,
+      tree: option.reviewBinding === 'wrong-tree' ? 'f'.repeat(40) : '0'.repeat(40),
+    },
+    issueNumber: option.reviewBinding === 'wrong-issue' ? 18 : 17,
+    prNumber: option.reviewBinding === 'wrong-pr' ? 24 : 23,
+    readOnly: true,
+    requestedEffort: 'xhigh',
+    requestedModel: 'gpt-6-astra',
+    effectiveEffort: 'unknown',
+    effectiveModel: 'unknown',
+    schemaVersion: 'ai-delivery.review-artifact@1',
+    summary: 'Independent review.',
+    verdict: 'approve',
+  };
+  const artifact = {
+    ...artifactContent,
+    artifactId: option.reviewBinding === 'invalid-digest' ? `sha256:${'d'.repeat(64)}` : digestValue(artifactContent),
+  };
+  const marker = `<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->`;
+  const reviewBody =
+    option.reviewBinding === 'marker-only'
+      ? marker
+      : `${artifact.summary}\n\n${marker}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
   const pr = () => ({
     number: 23,
+    changed_files: 1,
     title: 'Improve widget',
     body: 'Closes #17',
     html_url: 'https://github.com/example/widget/pull/23',
@@ -43,6 +85,7 @@ function fixture(
     request: async () => ({ data: [] }),
     repos: { get: async () => ({ data: { default_branch: 'main', full_name: 'example/widget' } }) },
     git: {
+      getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
       getRef: async ({ ref }: { ref: string }) => ({
         data: { object: { sha: ref === 'heads/main' ? (option.baseMoved ? 'e'.repeat(40) : 'c'.repeat(40)) : head } },
       }),
@@ -50,6 +93,7 @@ function fixture(
     pulls: {
       get: async () => ({ data: { ...pr(), head: { ...pr().head, sha: option.headMoved ? 'f'.repeat(40) : head } } }),
       list: async () => ({ data: [] }),
+      listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
       create: async (input: Record<string, unknown>) => {
         assert.equal(input.body, 'Plain explanation\n\nCloses #17');
         return { data: pr() };
@@ -60,7 +104,7 @@ function fixture(
           user: { login: 'reviewer[bot]' },
           state: option.reviewMoved ? 'DISMISSED' : 'APPROVED',
           commit_id: head,
-          body: '<!-- ai-delivery-review-artifact: sha256:' + 'd'.repeat(64) + ' -->',
+          body: reviewBody,
           html_url: 'https://github.com/example/widget/pull/23#pullrequestreview-99',
         },
       }),
@@ -71,7 +115,7 @@ function fixture(
             user: { login: 'reviewer[bot]' },
             state: 'APPROVED',
             commit_id: head,
-            body: '<!-- ai-delivery-review-artifact: sha256:' + 'd'.repeat(64) + ' -->',
+            body: reviewBody,
           },
         ],
       }),
@@ -181,6 +225,26 @@ function fixture(
 }
 
 describe('remote GitHub lifecycle', () => {
+  for (const reviewBinding of [
+    'stale-head',
+    'wrong-tree',
+    'wrong-scope',
+    'invalid-digest',
+    'marker-only',
+    'wrong-issue',
+    'wrong-pr',
+    'wrong-role',
+  ] as const) {
+    it(`refuses ${reviewBinding} artifact binding despite remapped current API commit and CLEAN approval`, async () => {
+      const { context, merges, closes } = fixture('clean', { reviewBinding });
+      await assert.rejects(
+        finishIssue(context, { issueNumber: 17, prNumber: 23 }),
+        /artifact|binding|review|scope|tree/u,
+      );
+      assert.equal(merges.length, 0);
+      assert.equal(closes(), 0);
+    });
+  }
   for (const option of [{ reviewCannotPush: true }, { reviewAccessUnknown: true }]) {
     it(`refuses an unqualified App review despite aggregate human approval: ${JSON.stringify(option)}`, async () => {
       const { context, merges } = fixture('clean', option);

@@ -2,7 +2,13 @@ import { DeliveryError } from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
 import { issueBranch, startIssueBranch, type DeliveryContext } from './issue.js';
-import { parseReviewArtifact, readRequiredReviewState, submitReview } from './review.js';
+import {
+  parseGitHubReviewArtifact,
+  parseReviewArtifact,
+  readGitHubPrScopeHash,
+  readRequiredReviewState,
+  submitReview,
+} from './review.js';
 
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
@@ -483,7 +489,22 @@ export async function mergePr(
     readReview.body !== approved.body
   )
     throw new DeliveryError('Independent GitHub review readback changed or was dismissed.');
-  const reviewedHead = reviews[0]!.commit_id;
+  const artifact = parseGitHubReviewArtifact(readReview.body);
+  if (
+    artifact.verdict !== 'approve' ||
+    artifact.issueNumber !== input.issueNumber ||
+    (artifact.prNumber !== null && artifact.prNumber !== input.prNumber) ||
+    artifact.authorIdentity !== context.config.roles.author.identity ||
+    artifact.reviewerIdentity !== context.config.roles.reviewer.identity ||
+    artifact.head.sha !== pr.head.sha
+  )
+    throw new DeliveryError('Independent review artifact binding is stale, foreign or rejected.');
+  const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: pr.head.sha })).data;
+  if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
+    throw new DeliveryError('Independent review tree differs from the remote commit.');
+  if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, input.prNumber, pr.changed_files)))
+    throw new DeliveryError('Independent review scope differs from the remote PR diff.');
+  const reviewedHead = artifact.head.sha;
   if (input.reviewedHeadSha !== undefined && input.reviewedHeadSha !== reviewedHead)
     throw new DeliveryError('Requested reviewed head differs from the independent GitHub review.');
   const decision = await readRequiredReviewState(context, input.prNumber, reviewedHead!, {
