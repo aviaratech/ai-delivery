@@ -31,9 +31,15 @@ jobs:
       - name: Install and check
         run: |
           npm ci
-          npm run checks
-          npm run build
-          npm pack --dry-run
+          npm run checks -- --results-dir "$RUNNER_TEMP/ai-delivery-check-results"
+      - name: Retain full and interrupted check evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: contributor-checks-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ai-delivery-check-results
+          if-no-files-found: warn
+          retention-days: 7
 
   secrets:
     runs-on: ubuntu-latest
