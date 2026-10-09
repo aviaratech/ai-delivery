@@ -130,11 +130,38 @@ jobs:
           const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
           const integrity = `sha512-${createHash('sha512').update(archive).digest('base64')}`;
           if (process.env.GITHUB_SHA !== source || sha256(archive) !== digest || pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Downloaded package differs from the reviewed release.');
-          const request = (url, options = {}) => fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(30_000) });
+          let reconciliationDeadline;
+          const unresolved = () => new Error('Registry reconciliation unresolved within its external-job allowance; qualify the original publication read-only. Publication will not be repeated.');
+          const request = async (url, options = {}) => {
+            const remaining = reconciliationDeadline === undefined ? 30_000 : Math.min(30_000, Math.ceil(reconciliationDeadline - performance.now()));
+            if (remaining <= 0) throw unresolved();
+            try {
+              return await fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(remaining) });
+            } catch (error) {
+              if (reconciliationDeadline !== undefined && performance.now() >= reconciliationDeadline) throw unresolved();
+              throw error;
+            }
+          };
+          const readBody = async (response, limit) => {
+            const parts = [];
+            let size = 0;
+            try {
+              for await (const part of response.body) {
+                size += part.length;
+                if (size > limit) throw new Error('Registry response exceeds the reviewed readback bound.');
+                parts.push(part);
+              }
+            } catch (error) {
+              if (reconciliationDeadline !== undefined && performance.now() >= reconciliationDeadline && ['AbortError', 'TimeoutError'].includes(error.name)) throw unresolved();
+              throw error;
+            }
+            return Buffer.concat(parts);
+          };
+          const readJson = async response => JSON.parse((await readBody(response, 4 * 1024 * 1024)).toString('utf8'));
           const requireMain = async () => {
             const response = await request('https://api.github.com/repos/aviaratech/ai-delivery/branches/main', { headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' } });
             if (!response.ok) throw new Error(`Main readback failed: ${response.status}`);
-            const branch = await response.json();
+            const branch = await readJson(response);
             const checks = branch.protection?.required_status_checks;
             if (branch.name !== 'main' || branch.protected !== true || branch.commit?.sha !== source || checks?.enforcement_level !== 'everyone' || !['checks', 'secrets'].every(name => checks.contexts?.includes(name))) throw new Error('Protected main or its required checks drifted from the reviewed release.');
           };
@@ -143,31 +170,77 @@ jobs:
           const readPackage = async () => {
             const response = await request(packageUrl);
             if (!response.ok) throw new Error(`Package registry readback failed: ${response.status}`);
-            return response.json();
+            return readJson(response);
           };
           const readVersion = () => request(`${packageUrl}/${version}`);
-          const verifyPublished = async response => {
-            if (!response.ok) throw new Error(`Version registry readback failed: ${response.status}; read the registry before retrying.`);
-            const published = await response.json();
-            if (published.name !== pkg.name || published.version !== version || published.dist?.integrity !== integrity || published.dist?.attestations?.provenance?.predicateType !== 'https://slsa.dev/provenance/v1') throw new Error('Registry version, integrity or provenance evidence differs from the reviewed release.');
+          const compareLatest = latest => {
+            if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(latest ?? '')) throw new Error('Missing or non-stable latest registry version.');
+            const next = version.split('.').map(BigInt), prior = latest.split('.').map(BigInt);
+            const difference = next.findIndex((part, index) => part !== prior[index]);
+            return difference < 0 ? 0 : next[difference] > prior[difference] ? 1 : -1;
+          };
+          const inspectManifest = published => {
+            if (published.name !== pkg.name || published.version !== version || published.dist?.integrity !== integrity) throw new Error('Registry version or integrity differs from the reviewed release.');
+            const predicate = published.dist?.attestations?.provenance?.predicateType;
+            if (predicate !== undefined && predicate !== 'https://slsa.dev/provenance/v1') throw new Error('Registry provenance evidence differs from the reviewed release.');
             const tarball = new URL(published.dist.tarball);
             if (tarball.origin !== registry || tarball.username || tarball.password) throw new Error('Unexpected registry tarball origin.');
-            const bytes = await request(tarball);
-            if (!bytes.ok || sha256(Buffer.from(await bytes.arrayBuffer())) !== digest) throw new Error('Registry archive differs from the reviewed bytes.');
-            if ((await readPackage())['dist-tags']?.latest !== version) throw new Error('Registry latest tag differs from the reviewed release; refusing to retag.');
+            return { tarball, hasProvenance: predicate !== undefined };
+          };
+          const verifyPublished = async (initialResponse, initialPackage) => {
+            // Five minutes of GET-only reconciliation fit inside the existing ten-minute publish job.
+            reconciliationDeadline = performance.now() + 5 * 60_000;
+            for (let attempt = 1; ; attempt++) {
+              const pending = [];
+              const index = initialPackage ?? await readPackage();
+              initialPackage = undefined;
+              const latestComparison = compareLatest(index['dist-tags']?.latest);
+              if (latestComparison < 0) throw new Error('Registry latest tag advanced beyond the reviewed release; refusing to retag.');
+              if (latestComparison > 0) pending.push('latest tag');
+              const indexed = index.versions?.[version];
+              const indexedManifest = indexed === undefined ? undefined : inspectManifest(indexed);
+              if (!indexedManifest) pending.push('package index');
+              else if (!indexedManifest.hasProvenance) pending.push('index provenance');
+              const response = initialResponse ?? await readVersion();
+              initialResponse = undefined;
+              if (response.status === 404) pending.push('version visibility');
+              else {
+                if (!response.ok) throw new Error(`Version registry readback failed: ${response.status}; no publication retry permitted.`);
+                const published = inspectManifest(await readJson(response));
+                if (!published.hasProvenance) pending.push('version provenance');
+                if (indexedManifest && published.tarball.href !== indexedManifest.tarball.href) throw new Error('Registry index tarball differs from the version readback.');
+                const bytes = await request(published.tarball);
+                if (bytes.status === 404) pending.push('archive visibility');
+                else {
+                  if (!bytes.ok) throw new Error(`Archive registry readback failed: ${bytes.status}; no publication retry permitted.`);
+                  if (sha256(await readBody(bytes, archive.length)) !== digest) throw new Error('Registry archive differs from the reviewed bytes.');
+                }
+              }
+              if (performance.now() >= reconciliationDeadline) throw unresolved();
+              if (pending.length === 0) {
+                console.log('Exact reviewed registry version, archive, integrity, provenance metadata, package index and latest reconciled.');
+                return;
+              }
+              console.log(JSON.stringify({ registryReconciliation: 'pending', attempt, waitingFor: pending, remainingMs: Math.floor(reconciliationDeadline - performance.now()) }));
+              await new Promise(resolve => setTimeout(resolve, Math.min(15_000, reconciliationDeadline - performance.now())));
+            }
           };
           await requireMain();
           const response = await readVersion();
           if (response.status === 404) {
-            const latest = (await readPackage())['dist-tags']?.latest;
-            if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(latest ?? '')) throw new Error('Missing or non-stable latest registry version.');
-            const next = version.split('.').map(BigInt), prior = latest.split('.').map(BigInt);
-            const difference = next.findIndex((part, index) => part !== prior[index]);
-            if (difference < 0 || next[difference] < prior[difference]) throw new Error('Release would not advance latest; refusing to publish.');
-            await requireMain();
-            const result = spawnSync('npm', ['publish', '.', '--ignore-scripts', '--access', 'public', '--tag', 'latest', '--registry', registry, '--provenance'], { stdio: 'inherit' });
-            await verifyPublished(await readVersion());
-            if (result.status !== 0) throw new Error('npm publish failed or was ambiguous; matching registry readback was recorded. Retry only after qualification.');
+            const index = await readPackage();
+            const latestComparison = compareLatest(index['dist-tags']?.latest);
+            if (latestComparison < 0) throw new Error('Release would not advance latest; refusing to publish.');
+            if (latestComparison === 0 || index.versions?.[version] !== undefined) {
+              await verifyPublished(response, index);
+              console.log('The exact reviewed release is already published with latest and provenance evidence; no publication repeated.');
+            } else {
+              await requireMain();
+              const result = spawnSync('npm', ['publish', '.', '--ignore-scripts', '--access', 'public', '--tag', 'latest', '--registry', registry, '--provenance'], { stdio: 'inherit' });
+              console.log(JSON.stringify({ publicationInvokedOnce: true, status: result.status, signal: result.signal ?? null, error: result.error?.message ?? null }));
+              await verifyPublished();
+              if (result.status !== 0) throw new Error('npm publish failed or was ambiguous; matching registry readback was recorded. Qualify the original invocation; no automatic publication retry.');
+            }
           } else {
             await verifyPublished(response);
             console.log('The exact reviewed release is already published with latest and provenance evidence; no publication repeated.');

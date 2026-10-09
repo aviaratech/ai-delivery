@@ -69,6 +69,15 @@ after publication, including a failed or ambiguous publish command, and never
 automatically retries publication. Read the registry before any explicit retry.
 Metadata presence alone does not verify a provenance signature or source identity.
 
+Expected version/archive 404s, missing provenance metadata or package-index entries,
+and a lagging stable `latest` tag receive paced read-only reconciliation for up to
+five minutes inside the existing ten-minute publish job. Requests retain a
+30-second limit, shortened to the remaining reconciliation allowance, with bounded
+response bodies and pending-state output. Conflicting evidence, a newer `latest`
+tag and authentication/service errors fail immediately. Exhausted reconciliation
+or an ambiguous publish result requires read-only qualification of the original
+invocation; it never triggers another publication or retag.
+
 Any packaged-file edit, including this guide, changes the release candidate.
 Preserve previously accepted archives as evidence and independently qualify a
 new exact source/archive before dispatching; never substitute it silently.
