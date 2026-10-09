@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 /** @typedef {{kind:string, sha256:string, fileCount:number, stagedGitTree?:string}} TreeIdentity */
 /** @typedef {{success:boolean, numTotalTests:number, numPassedTests:number, testResults:{name:string, status:string, assertionResults:{fullName:string, status:string}[]}[]}} TestReport */
 /** @typedef {{name:string, version:string, bin:Record<string,string>, exports:Record<string,Record<string,string>>}} Manifest */
-/** @typedef {{name:string, version:string, files:{path:string,mode:number}[]}} PackInventory */
+/** @typedef {{name:string, version:string, files:{path:string,mode:number,size:number}[]}} PackInventory */
 /** @typedef {{result?:{url:string, functions:{ranges:{startOffset:number,endOffset:number,count:number}[]}[]}[]}} V8Report */
 /** @typedef {Partial<CommandRecord> & {stage:string, command:string[], status:string, directory:string}} StageRecord */
 /** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
@@ -210,6 +210,22 @@ function processes() {
         ]);
       }),
   );
+}
+
+/** Read-only reconciliation never signals a retained process or guesses ownership.
+ * @param {CommandRecord} command */
+export function confirmCommandQuiescence(command) {
+  assert.ok(
+    command.pid && command.observedProcesses.some(({ pid, birth }) => pid === command.pid && birth),
+    'Retained command lacks its observed root PID/birth; completion cannot be reconciled.',
+  );
+  const rows = processes();
+  for (const { pid, birth } of command.observedProcesses) {
+    assert.ok(birth, 'Retained process birth is missing.');
+    const current = rows.get(pid);
+    assert.ok(!current || current.birth !== birth || current.zombie, `Retained owned PID ${pid} is still active.`);
+  }
+  return { checkedAt: new Date().toISOString(), observedProcesses: command.observedProcesses, quiescent: true };
 }
 
 /** @param {number} milliseconds @returns {Promise<void>} */
@@ -447,12 +463,24 @@ export function analyzeInventory(pack, cwd) {
     assert.ok(paths.includes(entry.replace(/^\.\//u, '')), `Missing packaged entry: ${entry}`);
   const cli = item.files.find((file) => file.path === 'dist/cli.js');
   assert.equal(cli.mode & 0o111, 0o111, 'CLI executable mode missing.');
+  // Ignored build files are outside the source fingerprint. Capture their bytes
+  // now, inside the successful producer, before an actual archive can be packed.
+  const files = item.files.map(({ path, size, mode }) => {
+    const full = join(cwd, path);
+    assert.equal(realpathSync(full), join(realpathSync(cwd), path), 'Aliased inventory member.');
+    const stat = lstatSync(full);
+    assert.ok(stat.isFile() && !stat.isSymbolicLink(), 'Inventory member requires a regular file.');
+    const content = readFileSync(full);
+    assert.equal(content.length, size, `Inventory byte count differs: ${path}`);
+    assert.equal(stat.mode & 0o777, mode, `Inventory mode differs: ${path}`);
+    return { path, size, mode, sha256: createHash('sha256').update(content).digest('hex') };
+  });
   return {
     kind: 'dry-inventory-only',
     name: item.name,
     version: item.version,
     fileCount: paths.length,
-    files: item.files,
+    files,
     currentTarballConsumerGate: 'unexecuted; issue90 owns the separately reviewed gate',
   };
 }

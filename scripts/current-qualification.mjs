@@ -2,18 +2,26 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, resolve, relative, sep, isAbsolute } from 'node:path';
+import { basename, dirname, join, resolve, relative, sep, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { errorMessage, executeCommand, runChecks, safeEnvironment, treeIdentity } from './checks.mjs';
-import { inspectCandidate, runCurrentConsumer, sha256, verifyProducerJoin } from './current-consumer.mjs';
+import {
+  confirmCommandQuiescence,
+  errorMessage,
+  executeCommand,
+  runChecks,
+  safeEnvironment,
+  treeIdentity,
+} from './checks.mjs';
+import { inspectCandidate, sha256, verifyProducerJoin } from './current-consumer.mjs';
 
 /** @typedef {import('./current-consumer.mjs').Contract} Contract */
 /** @typedef {{commit:string,tree:string,manifestSha256:string,lockSha256:string,fingerprint:ReturnType<typeof treeIdentity>}} Source */
 /** @typedef {{schemaVersion:string,status:string,contract:Contract,contractSha256:string,source:Source}} Checkpoint */
-/** @typedef {{schemaVersion:string,runId:string,startedAt:string,status:string,qualified:boolean,omitted:string[],resultsDir:string,source?:Source,producer?:{path:string,sha256:string},pack?:import('./checks.mjs').CommandRecord,artifact?:{path:string,sha256:string},checkpoint?:{path:string,sha256:string},consumer?:{path:string,sha256:string},consumerProcess?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number}} Qualification */
-/** @typedef {{cwd?:string,resultsDir?:string,producerOnly?:boolean,resume?:string,consumerResult?:string,signal?:AbortSignal,timeoutMs?:number,checks?:typeof runChecks,execute?:typeof executeCommand,inspect?:typeof inspectCandidate,consumer?:typeof runCurrentConsumer}} Options */
+/** @typedef {{schemaVersion:string,runId:string,startedAt:string,status:string,qualified:boolean,omitted:string[],resultsDir:string,source?:Source,producer?:{path:string,sha256:string},pack?:import('./checks.mjs').CommandRecord,artifact?:{path:string,sha256:string},checkpoint?:{path:string,sha256:string},consumer?:{path:string,sha256:string},consumerAttempt?:{path:string,sha256:string},consumerProcess?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number}} Qualification */
+/** @typedef {{schemaVersion:string,runId:string,checkpointSha256:string,contractSha256:string,status:string,startedAt:string,directory:string,tempRoot:string,consumerPath:string,temporaryRemoved?:boolean,command?:import('./checks.mjs').CommandRecord,receipt?:{path:string,sha256:string},reconciliation?:ReturnType<typeof confirmCommandQuiescence>}} ConsumerAttempt */
+/** @typedef {{cwd?:string,resultsDir?:string,producerOnly?:boolean,resume?:string,consumerResult?:string,reconcileConsumer?:boolean,signal?:AbortSignal,timeoutMs?:number,checks?:typeof runChecks,execute?:typeof executeCommand,inspect?:typeof inspectCandidate}} Options */
 
 /** @param {string} path */
 function bytes(path) {
@@ -32,6 +40,25 @@ function reference(path) {
 function save(path, value) {
   writeFileSync(path + '.tmp', JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
   renameSync(path + '.tmp', path);
+}
+
+/** Producer member digests precede packing, including ignored generated files.
+ * @param {import('./checks.mjs').CheckReport} producer
+ * @param {ReturnType<typeof inspectCandidate>} candidate */
+export function verifyProducedBytes(producer, candidate) {
+  assert.ok(producer.inventory?.files.length, 'Producer member-byte inventory is missing.');
+  const files = producer.inventory.files;
+  for (const file of files) assert.match(file.sha256, /^[a-f0-9]{64}$/u, 'Producer member digest is missing.');
+  /** @param {{path:string,size:number,mode:number,sha256:string}[]} entries */
+  const normalize = (entries) =>
+    entries
+      .map(({ path, size, mode, sha256 }) => ({ path, size, mode, sha256 }))
+      .sort((a, b) => a.path.localeCompare(b.path));
+  assert.deepEqual(
+    normalize(candidate.inventory),
+    normalize(files),
+    'Archive bytes differ from the successful producer.',
+  );
 }
 
 /** Clean Git identity is mandatory for an actual artifact, never for the staged hook.
@@ -80,7 +107,55 @@ export function validateCheckpoint(path, cwd, inspect = inspectCandidate) {
   assert.equal(checkpoint.contract.sourceLockSha256, checkpoint.source.lockSha256);
   const candidate = inspect(checkpoint.contract);
   const joinProof = verifyProducerJoin(checkpoint.contract, candidate);
+  assert.ok(checkpoint.contract.producer);
+  verifyProducedBytes(
+    /** @type {import('./checks.mjs').CheckReport} */ (
+      JSON.parse(bytes(checkpoint.contract.producer.checksResultPath).toString('utf8'))
+    ),
+    candidate,
+  );
   return { checkpoint, candidate, joinProof };
+}
+
+/** The checkpoint-wide reservation survives controller loss and blocks duplicate installs.
+ * Completion with a lost controller can be reconciled only with a fully qualified
+ * retained receipt plus absence of every observed PID/birth. No process is killed.
+ * @param {string} path @param {string} checkpointPath @param {Checkpoint} checkpoint
+ * @param {ReturnType<typeof inspectCandidate>} candidate @param {boolean} reconcile */
+function retainedConsumer(path, checkpointPath, checkpoint, candidate, reconcile) {
+  const attempt = /** @type {ConsumerAttempt} */ (JSON.parse(bytes(path).toString('utf8')));
+  assert.equal(attempt.schemaVersion, 'ai-delivery.current-consumer-attempt@1');
+  assert.equal(
+    attempt.checkpointSha256,
+    reference(checkpointPath).sha256,
+    'Consumer attempt belongs to another checkpoint.',
+  );
+  assert.equal(attempt.contractSha256, checkpoint.contractSha256, 'Consumer attempt contract differs.');
+  assert.equal(dirname(attempt.directory), dirname(checkpointPath), 'Consumer ownership directory differs.');
+  assert.match(basename(attempt.directory), /^consumer-[a-f0-9-]{36}$/u);
+  assert.equal(attempt.tempRoot, join(attempt.directory, 'temporary'), 'Consumer temporary ownership differs.');
+  assert.equal(attempt.consumerPath, join(attempt.directory, 'result.json'), 'Consumer receipt ownership differs.');
+  if (!['completed', 'reconciled'].includes(attempt.status)) {
+    assert.ok(
+      reconcile,
+      `Unresolved consumer attempt: ${path}. Reconcile its retained PID/birth, temporary root and receipt before resume.`,
+    );
+    assert.ok(
+      attempt.command,
+      'Consumer launch identity is unavailable; keep the reservation and reconcile with its owner.',
+    );
+    const receipt = /** @type {unknown} */ (JSON.parse(bytes(attempt.consumerPath).toString('utf8')));
+    validateConsumer(receipt, checkpoint.contract, candidate);
+    attempt.reconciliation = confirmCommandQuiescence(attempt.command);
+    attempt.receipt = reference(attempt.consumerPath);
+    attempt.status = 'reconciled';
+    save(path, attempt);
+  }
+  if (attempt.status === 'completed')
+    assert.equal(attempt.command?.cleanupConfirmed, true, 'Retained consumer command quiescence is unconfirmed.');
+  if (attempt.receipt)
+    assert.deepEqual(reference(attempt.consumerPath), attempt.receipt, 'Retained consumer receipt changed.');
+  return attempt;
 }
 
 /** A standalone qualified flag cannot complete the graph without exact joins and cleanup.
@@ -146,12 +221,12 @@ export async function runQualification({
   producerOnly = false,
   resume,
   consumerResult,
+  reconcileConsumer = false,
   signal,
   timeoutMs = 0,
   checks = runChecks,
   execute = executeCommand,
   inspect = inspectCandidate,
-  consumer = runCurrentConsumer,
 } = {}) {
   const directory = resolve(resultsDir ?? join(tmpdir(), `ai-delivery-qualification-${randomUUID()}`));
   assert.ok(
@@ -180,6 +255,7 @@ export async function runQualification({
   try {
     assert.ok(!consumerResult || resume, 'An external consumer result requires a retained checkpoint.');
     assert.ok(!producerOnly || !resume, 'Producer-only and resume cannot be combined.');
+    assert.ok(!reconcileConsumer || resume, 'Consumer reconciliation requires a retained checkpoint.');
     if (signal?.aborted) throw new Error('Cancelled before qualification.');
     /** @type {string} */ let checkpointPath;
     if (resume) checkpointPath = resolve(resume);
@@ -248,7 +324,7 @@ export async function runQualification({
         packageVersion: manifest.version,
         archivePath,
         archiveSha256: sha256(readFileSync(archivePath)),
-        dryInventory: /** @type {{path:string,size:number,mode:number}[]} */ (producer.inventory.files),
+        dryInventory: producer.inventory.files.map(({ path, size, mode }) => ({ path, size, mode })),
         node24: producer.toolchain.controller.executable,
         node26: producer.toolchain.libraryConsumer.executable,
         npmCli: producer.toolchain.npm.executable,
@@ -262,6 +338,7 @@ export async function runQualification({
         normalize(contract.dryInventory),
         'Actual npm inventory differs from successful dry inventory.',
       );
+      verifyProducedBytes(producer, candidate);
       assert.deepEqual(sourceIdentity(cwd), source, 'Source changed during actual pack.');
       const artifactPath = join(packDirectory, 'producer.json');
       save(artifactPath, {
@@ -322,12 +399,73 @@ export async function runQualification({
       result.omitted = ['current-consumer production install, resolution, CLI, exports, MCP, Node26 and owned cleanup'];
     } else {
       if (signal?.aborted) throw new Error('Cancelled at consumer checkpoint.');
-      let consumerPath = consumerResult ? resolve(consumerResult) : join(directory, 'consumer.json');
-      if (!consumerResult) {
-        assert.ok(!existsSync(consumerPath), 'Existing consumer evidence requires reconciliation.');
-        const receipt = await consumer(contract, { authorizeInstall: true, signal });
-        save(consumerPath, receipt);
+      const attemptPath = join(dirname(checkpointPath), 'consumer-attempt.json');
+      /** @type {ConsumerAttempt|undefined} */ let attempt;
+      if (existsSync(attemptPath)) {
+        attempt = retainedConsumer(attemptPath, checkpointPath, checkpoint, candidate, reconcileConsumer);
+        result.consumerProcess = attempt.command;
+        result.consumerAttempt = reference(attemptPath);
+        persist();
       }
+      if (!consumerResult && !attempt) {
+        const attemptDirectory = join(dirname(checkpointPath), `consumer-${randomUUID()}`);
+        attempt = {
+          schemaVersion: 'ai-delivery.current-consumer-attempt@1',
+          runId: result.runId,
+          checkpointSha256: result.checkpoint.sha256,
+          contractSha256: checkpoint.contractSha256,
+          status: 'starting',
+          startedAt: new Date().toISOString(),
+          directory: attemptDirectory,
+          tempRoot: join(attemptDirectory, 'temporary'),
+          consumerPath: join(attemptDirectory, 'result.json'),
+        };
+        // Exclusive reservation is durable before any child, even if the next
+        // mkdir/spawn fails or the controller disappears before its first sample.
+        writeFileSync(attemptPath, JSON.stringify(attempt, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        result.consumerAttempt = reference(attemptPath);
+        persist();
+        mkdirSync(attempt.tempRoot, { recursive: true, mode: 0o700 });
+        const contractPath = join(attemptDirectory, 'contract.json');
+        save(contractPath, contract);
+        const env = safeEnvironment();
+        env.TMPDIR = env.TEMP = env.TMP = attempt.tempRoot;
+        const retained = attempt;
+        const command = await execute(
+          [
+            contract.node24,
+            join(cwd, 'scripts/current-consumer.mjs'),
+            contractPath,
+            attempt.consumerPath,
+            '--authorize-install',
+          ],
+          {
+            cwd,
+            env,
+            directory: join(attemptDirectory, 'command'),
+            signal,
+            timeoutMs,
+            progress: (partial) => {
+              retained.command = partial;
+              retained.status = partial.completedAt ? 'completed' : 'running';
+              save(attemptPath, retained);
+              result.consumerProcess = partial;
+              result.consumerAttempt = reference(attemptPath);
+              persist();
+            },
+          },
+        );
+        attempt.command = command;
+        attempt.status = 'completed';
+        if (existsSync(attempt.consumerPath)) attempt.receipt = reference(attempt.consumerPath);
+        save(attemptPath, attempt);
+        result.consumerProcess = command;
+        result.consumerAttempt = reference(attemptPath);
+        persist();
+        assert.equal(command.cleanupConfirmed, true, 'Consumer supervisor quiescence is unconfirmed.');
+      }
+      const consumerPath = consumerResult ? resolve(consumerResult) : attempt?.consumerPath;
+      assert.ok(consumerPath, 'Consumer result is missing.');
       result.consumer = reference(consumerPath);
       persist();
       const receipt = /** @type {import('./current-consumer.mjs').Receipt} */ (
@@ -339,7 +477,26 @@ export async function runQualification({
           receipt.status === 'cancelled' ? 'cancelled' : receipt.status === 'failed' ? 'failed' : 'incomplete';
         result.omitted = ['successful current-consumer application and owned cleanup'];
       } else {
+        if (!consumerResult && attempt?.status === 'completed') {
+          assert.equal(attempt.command?.status, 'passed', 'Consumer supervisor did not pass.');
+          assert.equal(attempt.command.exitCode, 0);
+          assert.equal(attempt.command.signal, null);
+        }
         validateConsumer(receipt, contract, candidate);
+        if (attempt) {
+          // The helper removes its own workspace. Remove only our empty launch
+          // root; leftovers or a replaced link remain an explicit blocker.
+          if (existsSync(attempt.tempRoot)) {
+            assert.ok(
+              lstatSync(attempt.tempRoot).isDirectory() && !lstatSync(attempt.tempRoot).isSymbolicLink(),
+              'Consumer temporary root changed.',
+            );
+            rmdirSync(attempt.tempRoot);
+          }
+          attempt.temporaryRemoved = true;
+          save(attemptPath, attempt);
+          result.consumerAttempt = reference(attemptPath);
+        }
         result.status = 'passed';
         result.qualified = true;
       }
@@ -367,6 +524,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     else if (args[i] === '--results-dir') options.resultsDir = args[++i];
     else if (args[i] === '--resume') options.resume = args[++i];
     else if (args[i] === '--consumer-result') options.consumerResult = args[++i];
+    else if (args[i] === '--reconcile-consumer') options.reconcileConsumer = true;
     else if (args[i] === '--command-timeout-ms') options.timeoutMs = Number(args[++i]);
     else throw new Error(`Unknown qualification option: ${args[i]}`);
   }

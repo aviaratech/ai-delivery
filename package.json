@@ -46,9 +46,9 @@
     "access": "public"
   },
   "scripts": {
-    "format": "oxfmt src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "format:check": "oxfmt --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "lint": "oxlint",
+    "format": "oxfmt --threads=1 src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "format:check": "oxfmt --threads=1 --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "lint": "oxlint --threads=1",
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json && node scripts/build-plugin.mjs",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",

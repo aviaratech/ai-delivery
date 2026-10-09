@@ -48,9 +48,20 @@ npm run checks:resume -- --resume /owned/original/checkpoint.json --results-dir 
 ```
 
 Resume revalidates clean HEAD/tree, source fingerprint, manifest/lock, all archive
-bytes/modes, immutable producer digest, six gates, counts, reviewed skips and
+bytes/modes against member SHA256s captured inside the successful producer,
+immutable producer digest, six gates, counts, reviewed skips and
 pack quiescence before installation and again before completion. A changed or
-incomplete checkpoint fails. For an admitted separate consumer owner, invoke
+incomplete checkpoint fails. Consumer launch is supervised and reserves one
+checkpoint-wide `consumer-attempt.json` before starting a child. It retains the
+command, observed PID/birth identities, logs and owned temporary root during
+execution. An unresolved attempt blocks another install even with fresh overall
+results storage. After controller loss, `--reconcile-consumer` joins an already
+qualified retained receipt only after every observed identity is absent; it
+does not launch or kill a process. Missing launch identity, incomplete receipts,
+active processes or leftover temporary contents require owner reconciliation.
+A completed retained consumer is reused without installation. For an admitted
+separate consumer owner, prefer the supervised resume entry. If its independently
+supervised invocation retains equivalent launch and cleanup proof, invoke
 `node scripts/current-consumer.mjs /owned/original/contract.json
 /owned/consumer-result.json --authorize-install` once, then join its retained
 result with the same resume command plus `--consumer-result

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'vitest';
 
@@ -91,7 +92,10 @@ function fixture() {
   const base = mkdtempSync(join(tmpdir(), 'contributor-check-fixture-'));
   const cwd = join(base, 'repo');
   mkdirSync(join(cwd, 'src'), { recursive: true });
-  writeFileSync(join(cwd, '.gitignore'), '/dist/\n/node_modules/\n');
+  writeFileSync(
+    join(cwd, '.gitignore'),
+    '/dist/\n/node_modules/\n/plugins/ai-delivery/runtime/dist/\n/plugins/ai-delivery/dist/\n',
+  );
   writeFileSync(join(cwd, 'src/original.test.ts'), '// synthetic original test\n');
   writeFileSync(
     join(cwd, 'package.json'),
@@ -143,6 +147,16 @@ function executor(f: ReturnType<typeof fixture>, failStage = ''): Checks['execut
       mkdirSync(join(f.cwd, 'dist'), { recursive: true });
       const source = existsSync(join(f.cwd, 'src/renamed.test.ts')) ? 'renamed' : 'original';
       writeFileSync(join(f.cwd, `dist/${source}.test.js`), '// compiled synthetic test\n');
+      for (const path of [
+        'dist/cli.js',
+        'dist/index.js',
+        'plugins/ai-delivery/runtime/dist/cli.js',
+        'plugins/ai-delivery/dist/mcp-launcher.js',
+      ]) {
+        mkdirSync(dirname(join(f.cwd, path)), { recursive: true });
+        writeFileSync(join(f.cwd, path), '// fictional packaged output\n');
+        chmodSync(join(f.cwd, path), 0o755);
+      }
     }
     if (stage === 'tests') {
       const names = command.filter((arg) => arg.startsWith('dist/') && arg.endsWith('.test.js'));
@@ -166,7 +180,7 @@ function executor(f: ReturnType<typeof fixture>, failStage = ''): Checks['execut
               'dist/index.js',
               'plugins/ai-delivery/runtime/dist/cli.js',
               'plugins/ai-delivery/dist/mcp-launcher.js',
-            ].map((path) => ({ path, mode: 0o755 })),
+            ].map((path) => ({ path, mode: 0o755, size: readFileSync(join(f.cwd, path)).length })),
           },
         ]),
       );
@@ -222,7 +236,7 @@ test('clean full graph removes deleted/renamed compiled tests and retains exact 
       toolchain: () => f.toolchain,
       execute: executor(f),
     });
-    assert.equal(report.fullSuccess, true);
+    assert.equal(report.fullSuccess, true, report.error);
     assert.deepEqual(
       report.commands.map((entry) => entry.stage),
       checks.FULL_GATES,
@@ -616,14 +630,11 @@ type QualificationOptions = {
   producerOnly?: boolean;
   resume?: string;
   consumerResult?: string;
+  reconcileConsumer?: boolean;
   signal?: AbortSignal;
   checks?: (options: { resultsDir: string }) => Promise<Record<string, unknown>>;
   execute?: (command: string[], options: CommandOptions) => Promise<CommandResult>;
   inspect?: (contract: SyntheticContract) => Candidate;
-  consumer?: (
-    contract: SyntheticContract,
-    options: { authorizeInstall: boolean; signal?: AbortSignal },
-  ) => Promise<Record<string, unknown>>;
 };
 const qualification = (await import(new URL('../scripts/current-qualification.mjs', import.meta.url).href)) as {
   sourceIdentity(cwd: string): {
@@ -643,6 +654,8 @@ const consumerProof = (await import(new URL('../scripts/current-consumer.mjs', i
 
 function qualificationFixture() {
   const f = fixture();
+  mkdirSync(join(f.cwd, 'dist'));
+  writeFileSync(join(f.cwd, 'dist/generated.js'), 'original');
   writeFileSync(join(f.cwd, 'package-lock.json'), '{}\n');
   execFileSync('git', ['add', '.'], { cwd: f.cwd });
   execFileSync(
@@ -666,7 +679,10 @@ function qualificationFixture() {
   let packStatus = 'passed';
   let cleanup = true;
   let mutateProducer: (report: Record<string, unknown>) => void = () => {};
-  const members = [{ path: 'package.json', size: readFileSync(join(f.cwd, 'package.json')).length, mode: 0o644 }];
+  const members = [
+    { path: 'dist/generated.js', size: 8, mode: 0o644 },
+    { path: 'package.json', size: readFileSync(join(f.cwd, 'package.json')).length, mode: 0o644 },
+  ];
   const inspect: NonNullable<QualificationOptions['inspect']> = (contract) => {
     assert.equal(consumerProof.sha256(readFileSync(contract.archivePath)), contract.archiveSha256);
     assert.deepEqual(contract.dryInventory, members);
@@ -713,14 +729,35 @@ function qualificationFixture() {
         name: '@aviaratech/ai-delivery',
         version: '1.0.0',
         fileCount: members.length,
-        files: members,
+        files: members.map((item) => ({ ...item, sha256: consumerProof.sha256(readFileSync(join(f.cwd, item.path))) })),
       },
     };
     mutateProducer(report);
     writeFileSync(join(resultsDir, 'result.json'), JSON.stringify(report));
     return report;
   };
-  const pack: NonNullable<QualificationOptions['execute']> = async (command, options) => {
+  const execute: NonNullable<QualificationOptions['execute']> = async (command, options) => {
+    if (command.at(-1) === '--authorize-install') {
+      const contract = JSON.parse(readFileSync(command[2], 'utf8')) as SyntheticContract;
+      const receipt = await consume(contract, { authorizeInstall: true });
+      mkdirSync(options.directory);
+      const stdoutPath = join(options.directory, 'stdout.txt');
+      const stderrPath = join(options.directory, 'stderr.txt');
+      writeFileSync(stdoutPath, 'fictional supervised consumer');
+      writeFileSync(stderrPath, '');
+      writeFileSync(command[3], JSON.stringify(receipt));
+      const result = {
+        command,
+        status: 'passed',
+        exitCode: 0,
+        signal: null,
+        stdoutPath,
+        stderrPath,
+        cleanupConfirmed: true,
+      };
+      options.progress?.(result);
+      return result;
+    }
     packs++;
     assert.deepEqual(command.slice(2, 5), ['pack', '--ignore-scripts', '--json']);
     mkdirSync(options.directory);
@@ -741,7 +778,7 @@ function qualificationFixture() {
       cleanupConfirmed: cleanup,
     };
   };
-  const consume: NonNullable<QualificationOptions['consumer']> = async (contract, options) => {
+  const consume = async (contract: SyntheticContract, options: { authorizeInstall: boolean }) => {
     consumers++;
     assert.equal(options.authorizeInstall, true);
     const candidate = inspect(contract);
@@ -785,9 +822,8 @@ function qualificationFixture() {
     cwd: f.cwd,
     resultsDir: join(f.base, 'qualification'),
     checks: produce,
-    execute: pack,
+    execute,
     inspect,
-    consumer: consume,
   };
   return {
     ...f,
@@ -839,6 +875,191 @@ test('full qualification executes one producer, actual pack and consumer in orde
     const report = await qualification.runQualification(f.options);
     assert.equal(report.qualified, true);
     assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('producer byte inventory rejects a same-length ignored build change before consumer launch', async () => {
+  const f = qualificationFixture();
+  try {
+    const before = qualification.sourceIdentity(f.cwd).fingerprint;
+    f.mutate(() => writeFileSync(join(f.cwd, 'dist/generated.js'), 'replaced'));
+    const report = await qualification.runQualification(f.options);
+    assert.deepEqual(qualification.sourceIdentity(f.cwd).fingerprint, before);
+    assert.equal(report.qualified, false);
+    assert.match(report.error!, /Archive bytes differ from the successful producer/u);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    assert.equal(existsSync(join(f.options.resultsDir, 'checkpoint.json')), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('resume rejects changed generated bytes and missing retained producer member hashes', async () => {
+  for (const change of ['bytes', 'missing-digest']) {
+    const f = qualificationFixture();
+    try {
+      if (change === 'missing-digest')
+        f.mutate((report) => {
+          const inventory = report.inventory as { files: { sha256?: string }[] };
+          delete inventory.files[0].sha256;
+        });
+      const produced = await qualification.runQualification({ ...f.options, producerOnly: true });
+      if (change === 'bytes') {
+        assert.equal(produced.status, 'incomplete');
+        writeFileSync(join(f.cwd, 'dist/generated.js'), 'replaced');
+        const resumed = await qualification.runQualification({
+          ...f.options,
+          resume: join(f.options.resultsDir, 'checkpoint.json'),
+          resultsDir: join(f.base, 'changed-bytes'),
+        });
+        assert.match(resumed.error!, /Archive bytes differ|freshness join is incomplete/u);
+      } else assert.equal(produced.status, 'failed');
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('consumer cancellation retains actual PID/birth and logs, and resume cannot duplicate it', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    const controller = new AbortController();
+    let launches = 0;
+    const execute: NonNullable<QualificationOptions['execute']> = async (_command, options) => {
+      launches++;
+      return checks.executeCommand(
+        [process.execPath, '-e', "console.log('fictional consumer started');setInterval(()=>{},1000)"],
+        {
+          ...options,
+          progress: (partial) => {
+            options.progress?.(partial);
+            if ((partial as CommandResult).observedProcesses?.length) controller.abort();
+          },
+        },
+      );
+    };
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    const report = await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      signal: controller.signal,
+      resultsDir: join(f.base, 'cancelled-consumer'),
+    });
+    assert.equal(report.status, 'cancelled');
+    const attempt = JSON.parse(readFileSync(join(f.options.resultsDir, 'consumer-attempt.json'), 'utf8')) as {
+      status: string;
+      tempRoot: string;
+      command: CommandResult;
+    };
+    assert.equal(attempt.status, 'completed');
+    assert.equal(attempt.command.status, 'cancelled');
+    assert.equal(attempt.command.cleanupConfirmed, true);
+    assert.ok(attempt.command.observedProcesses!.every((row) => row.birth.length > 0));
+    assert.ok(existsSync(attempt.tempRoot));
+    const retried = await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      resultsDir: join(f.base, 'blocked-retry'),
+    });
+    assert.equal(retried.qualified, false);
+    assert.equal(launches, 1);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('lost consumer completion retains a reservation, blocks duplicate launch and reconciles without producer or pack replay', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    const contract = JSON.parse(readFileSync(join(f.options.resultsDir, 'contract.json'), 'utf8')) as SyntheticContract;
+    const fictionalReceipt = await f.consume(contract, { authorizeInstall: true });
+    let launches = 0;
+    const execute: NonNullable<QualificationOptions['execute']> = async (command, options) => {
+      launches++;
+      // A real credential-free child writes fictional application evidence.
+      // Withhold terminal supervisor transport after its actual quiescent exit.
+      const code = "const fs=require('node:fs');setTimeout(()=>fs.writeFileSync(process.argv[1],process.argv[2]),200)";
+      const completed = await checks.executeCommand(
+        [process.execPath, '-e', code, command[3], JSON.stringify(fictionalReceipt)],
+        {
+          ...options,
+          progress: (partial) => {
+            if (!(partial as { completedAt?: string }).completedAt) options.progress?.(partial);
+          },
+        },
+      );
+      assert.equal(completed.cleanupConfirmed, true);
+      throw new Error('fictional controller lost terminal consumer response');
+    };
+    const lost = await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      resultsDir: join(f.base, 'lost-response'),
+    });
+    assert.equal(lost.qualified, false);
+    const attemptPath = join(f.options.resultsDir, 'consumer-attempt.json');
+    const attempt = JSON.parse(readFileSync(attemptPath, 'utf8')) as { status: string; command: CommandResult };
+    assert.equal(attempt.status, 'running');
+    assert.ok(attempt.command.observedProcesses!.length > 0);
+    const blocked = await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      resultsDir: join(f.base, 'unreconciled'),
+    });
+    assert.match(blocked.error!, /Unresolved consumer attempt/u);
+    const reconciled = await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      reconcileConsumer: true,
+      resultsDir: join(f.base, 'reconciled'),
+    });
+    assert.equal(reconciled.qualified, true);
+    assert.equal(launches, 1);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+    assert.equal((JSON.parse(readFileSync(attemptPath, 'utf8')) as { status: string }).status, 'reconciled');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('reservation before launch survives an uncertain spawn and refuses automatic retry', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    let launches = 0;
+    const execute: NonNullable<QualificationOptions['execute']> = async () => {
+      launches++;
+      throw new Error('fictional spawn response unknown');
+    };
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      resultsDir: join(f.base, 'uncertain-launch'),
+    });
+    const blocked = await qualification.runQualification({
+      ...f.options,
+      execute,
+      resume,
+      reconcileConsumer: true,
+      resultsDir: join(f.base, 'uncertain-retry'),
+    });
+    assert.match(blocked.error!, /launch identity is unavailable/u);
+    assert.equal(launches, 1);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
   } finally {
     f.cleanup();
   }
