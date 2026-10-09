@@ -8,7 +8,7 @@ import {
   RepositoryApprovalBindingSchema,
   type RepositoryApprovalBinding,
   type RepositoryClassificationReceipt,
-} from './delivery/index.js';
+} from './delivery/legacy.js';
 import { DeliveryError } from './errors.js';
 import { gitCommonDir } from './git.js';
 import type { DeliveryContext } from './issue.js';
@@ -199,10 +199,57 @@ export function parseReviewArtifact(raw: unknown): ReviewArtifact {
   return ReviewArtifactSchema.parse(value);
 }
 
+/** Preserve the original binding: GitHub can remap a review's commit_id after a rebase. */
+export function parseGitHubReviewArtifact(body: string | null | undefined): ReviewArtifact {
+  try {
+    if (typeof body !== 'string' || Buffer.byteLength(body, 'utf8') > 64 * 1024) throw new Error('Invalid size.');
+    const markers = body.match(/<!-- ai-delivery-review-artifact:[\s\S]*?-->/gu) ?? [];
+    const payloads = body.match(/<!-- ai-delivery-review-artifact-data:[\s\S]*?-->/gu) ?? [];
+    if (markers.length !== 1 || payloads.length !== 1) throw new Error('Ambiguous binding.');
+    const id = markers[0]!.match(/^<!-- ai-delivery-review-artifact: (sha256:[a-f0-9]{64}) -->$/u)?.[1];
+    const encoded = payloads[0]!.match(/^<!-- ai-delivery-review-artifact-data: ([A-Za-z0-9_-]+) -->$/u)?.[1];
+    if (!id || !encoded) throw new Error('Invalid binding.');
+    const bytes = Buffer.from(encoded, 'base64url');
+    const json = bytes.toString('utf8');
+    if (bytes.toString('base64url') !== encoded || !Buffer.from(json, 'utf8').equals(bytes))
+      throw new Error('Invalid encoding.');
+    const artifact = parseReviewArtifact(json);
+    if (artifact.artifactId !== id) throw new Error('Artifact identity differs.');
+    return artifact;
+  } catch {
+    throw new DeliveryError('GitHub review artifact binding is missing, invalid or ambiguous; obtain a fresh review.');
+  }
+}
+
+function githubReviewBody(artifact: ReviewArtifact): string {
+  ReviewArtifactSchema.parse(artifact);
+  const body = `${artifact.summary}\n\n<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
+  parseGitHubReviewArtifact(body);
+  return body;
+}
+
+export async function readGitHubPrScopeHash(
+  context: DeliveryContext,
+  prNumber: number,
+  changedFiles: number,
+): Promise<string> {
+  const files: string[] = [];
+  for (let page = 1; page <= 30; page++) {
+    const batch = (
+      await context.clients.rest.pulls.listFiles({ ...context.repo, pull_number: prNumber, page, per_page: 100 })
+    ).data;
+    files.push(...batch.map((file) => file.filename));
+    if (batch.length < 100) break;
+  }
+  if (!Number.isSafeInteger(changedFiles) || files.length !== changedFiles || new Set(files).size !== files.length)
+    throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
+  return digestValue(files.sort());
+}
+
 export function reviewArtifactApproval(input: {
   artifact: ReviewArtifact;
   classification: RepositoryClassificationReceipt;
-  config: DeliveryConfig;
+  config: Pick<DeliveryConfig, 'roles'>;
   issueNumber: number;
   prNumber?: number;
 }): RepositoryApprovalBinding {
@@ -241,7 +288,7 @@ function prepublicationPath(repoRoot: string, issueNumber: number, headSha: stri
 export function savePrepublicationArtifact(input: {
   artifact: ReviewArtifact;
   classification: RepositoryClassificationReceipt;
-  config: DeliveryConfig;
+  config: Pick<DeliveryConfig, 'roles'>;
   issueNumber: number;
   repoRoot: string;
 }): void {
@@ -283,58 +330,96 @@ async function listAllReviews(context: DeliveryContext, prNumber: number) {
   throw new DeliveryError('Review history exceeds the bounded readback window.');
 }
 
-export async function submitReview(input: {
+interface ReviewSubmissionInput {
   artifact: ReviewArtifact;
   context: DeliveryContext;
   issueNumber: number;
   prNumber: number;
-  publicationEvidenceId: string;
-  classification: RepositoryClassificationReceipt;
-}): Promise<SubmittedReviewReceipt> {
+  dryRun?: boolean;
+  publicationEvidenceId?: string;
+  classification?: RepositoryClassificationReceipt;
+}
+export interface GitHubReviewReceipt {
+  artifact: ReviewArtifact;
+  repository: string;
+  baseSha: string;
+  headSha: string;
+  githubReviewId: number;
+  githubReviewUrl: string;
+  login: string;
+  prNumber: number;
+  schemaVersion: 'ai-delivery.github-review@1';
+  state: 'APPROVED';
+  receiptId: string;
+}
+export interface ReviewDryRun {
+  dryRun: true;
+  artifactId: string;
+  headSha: string;
+}
+export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
+export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
+export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
+export async function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun> {
   const { artifact, context, issueNumber, prNumber } = input;
-  reviewArtifactApproval({
-    artifact,
-    classification: input.classification,
-    config: context.config,
-    issueNumber,
-    prNumber,
-  });
-  if (context.clients.authSource !== 'app' || context.clients.role !== 'reviewer' || !context.clients.appActorLogin) {
-    throw new DeliveryError('Formal review requires the reviewer GitHub App role.');
-  }
+  ReviewArtifactSchema.parse(artifact);
+  if (
+    artifact.verdict !== 'approve' ||
+    artifact.issueNumber !== issueNumber ||
+    artifact.authorIdentity !== context.config.roles.author.identity ||
+    artifact.reviewerIdentity !== context.config.roles.reviewer.identity ||
+    (artifact.prNumber !== null && artifact.prNumber !== prNumber)
+  )
+    throw new DeliveryError('Independent review artifact is foreign or rejected.');
+  if (context.clients.authSource !== 'app' || context.clients.role !== 'reviewer' || !context.clients.appActorLogin)
+    throw new DeliveryError('Formal review requires the independent reviewer GitHub App role.');
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
-  if (pr.head.sha !== artifact.head.sha || pr.state !== 'open')
-    throw new DeliveryError('PR head changed before formal review.');
+  if (
+    pr.number !== prNumber ||
+    pr.head.sha !== artifact.head.sha ||
+    pr.state !== 'open' ||
+    pr.base.repo?.full_name.toLowerCase() !== context.config.repository.toLowerCase() ||
+    pr.head.repo?.full_name.toLowerCase() !== context.config.repository.toLowerCase()
+  )
+    throw new DeliveryError('PR identity or head changed before formal review.');
   const actor = await context.clients.appActorLogin();
-  if (!actor || !pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase()) {
+  if (!actor || !pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase())
     throw new DeliveryError('Reviewer GitHub actor must differ from PR author.');
-  }
-  const existing = loadSubmittedReview(context.root, issueNumber, artifact.head.sha);
-  if (existing) {
-    if (
-      existing.artifact.artifactId !== artifact.artifactId ||
-      existing.prNumber !== prNumber ||
-      existing.publicationEvidenceId !== input.publicationEvidenceId ||
-      existing.login.toLowerCase() !== actor.toLowerCase()
-    ) {
-      throw new DeliveryError('An exact-head review receipt already binds different review evidence.');
-    }
-    await assertSubmittedReviewCurrent(context, existing);
-    return existing;
-  }
+  const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: artifact.head.sha })).data;
+  if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
+    throw new DeliveryError('Independent review tree differs from the remote commit.');
+  if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, prNumber, pr.changed_files)))
+    throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
+  const body = githubReviewBody(artifact);
   const marker = `<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->`;
-  const matches = (await listAllReviews(context, prNumber)).filter((review) => review.body?.includes(marker));
-  if (matches.length > 1) throw new DeliveryError('Multiple GitHub reviews claim the same artifact identity.');
+  const history = await listAllReviews(context, prNumber);
+  if (
+    history.some(
+      (review) =>
+        review.user?.login.toLowerCase() === actor.toLowerCase() &&
+        review.commit_id === artifact.head.sha &&
+        review.state === 'APPROVED' &&
+        /<!-- ai-delivery-review-artifact: sha256:[a-f0-9]{64} -->/u.test(review.body ?? '') &&
+        !review.body?.includes(marker),
+    )
+  )
+    throw new DeliveryError('Another independent artifact conflicts with the existing exact-head App approval.');
+  const matches = history.filter((review) => review.body?.includes(marker));
+  if (matches.length > 1) throw new DeliveryError('Conflicting GitHub reviews claim the same artifact identity.');
   const prior = matches[0];
   if (
     prior &&
     (prior.state !== 'APPROVED' ||
       prior.commit_id !== artifact.head.sha ||
-      prior.user?.login?.toLowerCase() !== actor.toLowerCase() ||
-      !prior.html_url)
-  ) {
-    throw new DeliveryError('Prior GitHub review marker does not match exact approval.');
-  }
+      prior.user?.login.toLowerCase() !== actor.toLowerCase() ||
+      !prior.html_url ||
+      parseGitHubReviewArtifact(prior.body).artifactId !== artifact.artifactId)
+  )
+    throw new DeliveryError('Prior GitHub review marker conflicts with exact-head approval.');
+  const fresh = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+  if (fresh.head.sha !== artifact.head.sha || fresh.base.sha !== pr.base.sha || fresh.state !== 'open')
+    throw new DeliveryError('PR moved during independent review validation.');
+  if (input.dryRun) return { dryRun: true as const, artifactId: artifact.artifactId, headSha: artifact.head.sha };
   const submitted =
     prior ??
     (
@@ -342,7 +427,7 @@ export async function submitReview(input: {
         ...context.repo,
         pull_number: prNumber,
         commit_id: artifact.head.sha,
-        body: `${artifact.summary}\n\n${marker}`,
+        body,
         event: 'APPROVE',
       })
     ).data;
@@ -350,26 +435,39 @@ export async function submitReview(input: {
     !submitted.id ||
     submitted.state !== 'APPROVED' ||
     submitted.commit_id !== artifact.head.sha ||
-    submitted.user?.login?.toLowerCase() !== actor.toLowerCase() ||
+    submitted.user?.login.toLowerCase() !== actor.toLowerCase() ||
     !submitted.html_url
-  ) {
-    throw new DeliveryError('GitHub did not return complete exact-head approval readback.');
-  }
+  )
+    throw new DeliveryError('GitHub did not return complete exact-head independent approval.');
   const content = {
     artifact,
-    completedAt: new Date().toISOString(),
+    repository: context.config.repository,
+    baseSha: pr.base.sha,
+    headSha: artifact.head.sha,
     githubReviewId: submitted.id,
     githubReviewUrl: submitted.html_url,
-    headSha: artifact.head.sha,
     login: submitted.user.login,
     prNumber,
-    publicationEvidenceId: input.publicationEvidenceId,
-    schemaVersion: 'ai-delivery.review-receipt@1' as const,
+    schemaVersion: 'ai-delivery.github-review@1' as const,
     state: 'APPROVED' as const,
   };
-  const receipt = SubmittedReviewReceiptSchema.parse({ ...content, receiptId: digestValue(content) });
-  await assertSubmittedReviewCurrent(context, receipt);
-  writePrivateJsonFileAtomically(receiptPath(context.root, issueNumber, artifact.head.sha), receipt);
+  const receipt = { ...content, receiptId: digestValue(content) };
+  const readback = (
+    await context.clients.rest.pulls.getReview({ ...context.repo, pull_number: prNumber, review_id: submitted.id })
+  ).data;
+  if (
+    readback.id !== receipt.githubReviewId ||
+    readback.html_url !== receipt.githubReviewUrl ||
+    readback.state !== 'APPROVED' ||
+    readback.commit_id !== receipt.headSha ||
+    readback.user?.login !== receipt.login ||
+    parseGitHubReviewArtifact(readback.body).artifactId !== artifact.artifactId
+  )
+    throw new DeliveryError('GitHub exact-head App review readback disagrees.');
+
+  const current = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+  if (current.head.sha !== artifact.head.sha || current.base.sha !== pr.base.sha || current.state !== 'open')
+    throw new DeliveryError('PR moved during independent review submission; approval is not current.');
   return receipt;
 }
 
@@ -402,7 +500,7 @@ export async function assertSubmittedReviewCurrent(
     review.commit_id !== receipt.headSha ||
     review.user?.login !== receipt.login ||
     review.html_url !== receipt.githubReviewUrl ||
-    !review.body?.includes(`<!-- ai-delivery-review-artifact: ${receipt.artifact.artifactId} -->`)
+    parseGitHubReviewArtifact(review.body).artifactId !== receipt.artifact.artifactId
   ) {
     throw new DeliveryError('GitHub exact-head review no longer matches the stored receipt.');
   }

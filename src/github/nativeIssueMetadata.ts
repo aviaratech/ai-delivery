@@ -46,7 +46,7 @@ interface RawIssueFieldValue {
   value?: unknown;
 }
 
-export function nativeIssueSettingsFromDeliveryConfig(config: DeliveryConfig): NativeIssueSettings {
+export function nativeIssueSettingsFromDeliveryConfig(config: Pick<DeliveryConfig, 'native'>): NativeIssueSettings {
   return {
     points: {
       databaseId: config.native.points.databaseId,
@@ -63,7 +63,7 @@ export function nativeIssueSettingsFromDeliveryConfig(config: DeliveryConfig): N
 
 export function validateConfiguredNativeTracking(input: {
   blockedBy?: readonly number[];
-  config: DeliveryConfig;
+  config: Pick<DeliveryConfig, 'native'>;
   issueNumber?: number;
   issueType: string;
   milestone?: number;

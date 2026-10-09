@@ -13,9 +13,152 @@ import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
 import type { LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { buildRuntimeAdmission, validateRuntimeAdmission } from './services/deliveryAdmission.js';
 import { retainedWorktreeTransitionProducerDigest } from './verification.js';
+import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 
 const packageRoot = fileURLToPath(new URL('../', import.meta.url));
 const pluginRoot = join(packageRoot, 'plugins', 'ai-delivery');
+
+test('README and delivery skill CLI examples name supported commands and required options', () => {
+  const cli = readFileSync(join(packageRoot, 'src', 'cli.ts'), 'utf8');
+  const declarations = [...cli.matchAll(/\.command\('([^']+)'\)/gu)];
+  const required = new Map(
+    declarations.map((match) => {
+      const next = cli.indexOf('.command(', match.index + match[0].length);
+      return [
+        match[1]!,
+        [...cli.slice(match.index, next < 0 ? undefined : next).matchAll(/\.requiredOption\('--([a-z0-9-]+)/gu)].map(
+          (option) => `--${option[1]}`,
+        ),
+      ];
+    }),
+  );
+  const globals = new Set(['--repo', '--repo-root', '--identity']);
+  for (const path of [
+    'README.md',
+    'plugins/ai-delivery/skills/worktree-lifecycle/SKILL.md',
+    'plugins/ai-delivery/skills/pr-handoff/SKILL.md',
+  ]) {
+    const source = readFileSync(join(packageRoot, path), 'utf8').replace(/\\\r?\n\s*/gu, ' ');
+    for (const match of source.matchAll(/^ai-delivery\s+(.+)$/gmu)) {
+      const words = match[1]!.split(/\s+/u);
+      let index = 0;
+      while (globals.has(words[index] ?? '')) index += 2;
+      const command = words[index]!;
+      const subcommand = command === 'plugin' ? words[index + 1] : undefined;
+      const help = execFileSync(
+        process.execPath,
+        [join(packageRoot, 'dist', 'cli.js'), command, ...(subcommand === undefined ? [] : [subcommand]), '--help'],
+        { encoding: 'utf8', maxBuffer: 65536 },
+      );
+      for (const flag of required.get(command) ?? [])
+        assert.ok(words.includes(flag), `${path}: ${command} requires ${flag}`);
+      for (const flag of words.filter((word) => word.startsWith('--')))
+        assert.ok(globals.has(flag) || help.includes(flag), `${path}: ${command} does not support ${flag}`);
+    }
+  }
+});
+
+for (const launchCheckout of [false, true]) {
+  test(`the bundled launcher creates and updates repository B from ${launchCheckout ? 'checkout A' : 'a non-Git directory'} without an identity environment`, async () => {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-launch-routing-')));
+    if (launchCheckout) {
+      execFileSync('git', ['init', '-q', directory]);
+      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/a.git'], { cwd: directory });
+    }
+    const preload = join(directory, 'mock-github.mjs');
+    const calls = join(directory, 'requests.json');
+    const settings = join(directory, 'user.json');
+    writeFileSync(
+      settings,
+      JSON.stringify({
+        schemaVersion: 'ai-delivery.user@1',
+        roles: {
+          author: { authSource: 'personal', identity: 'operator', credentialEnv: { token: 'SYNTHETIC_TOKEN' } },
+          reviewer: {
+            identity: 'reviewer',
+            credentialEnv: { appId: 'REVIEW_APP', installationId: 'REVIEW_INSTALL', privateKeyPath: 'REVIEW_KEY' },
+          },
+        },
+        project: 1,
+        checkoutRoots: [],
+        pointsField: 'Estimate',
+        priorityField: 'Urgency',
+        statusField: 'Flow',
+        statuses: syntheticDiscoveryConfig.native.project.statuses,
+      }),
+    );
+    writeFileSync(
+      preload,
+      `
+import {writeFileSync} from 'node:fs';
+import {syntheticDiscoveryClients} from ${JSON.stringify(new URL('./fixtures/discovery.js', import.meta.url).href)};
+const configuration=${JSON.stringify(syntheticDiscoveryConfig)};
+const requests=[];
+let issue={id:117,number:17,node_id:'ISSUE17',title:'Widget',body:'',state:'open',labels:[],html_url:'https://github.com/example/b/issues/17'};
+const page=nodes=>({nodes,pageInfo:{hasNextPage:false,endCursor:null}});
+globalThis.fetch=async(url,init)=>{
+  const path=new URL(String(url)).pathname;const method=init?.method??'GET';
+  requests.push({path,method});writeFileSync(${JSON.stringify(calls)},JSON.stringify(requests));
+  const json=init?.body?JSON.parse(init.body):{};
+  let data;
+  if(path==='/graphql'){
+    const query=json.query;
+    if(query.includes('ProjectDeliveryItems'))data={organization:{projectV2:{items:page([{id:'ITEM17',isArchived:false,content:{id:'ISSUE17'},fieldValueByName:{name:'Queued',optionId:'STATUS-0'}}])}}};
+    else if(query.includes('blockedBy('))data={repository:{issue:{parent:null,blockedBy:page([])}}};
+    else data=await syntheticDiscoveryClients({...configuration,repository:'example/'+(json.variables?.repo??'b')}).graphql(query,json.variables);
+    return new Response(JSON.stringify({data}),{status:200,headers:{'content-type':'application/json'}});
+  }
+  if(path.endsWith('/labels'))data=[{name:'enhancement'},{name:'bug'}];
+  else if(path.endsWith('/issue-field-values'))data=[];
+  else if(path.endsWith('/issues')&&method==='POST'){issue={...issue,...json};data=issue;}
+  else if(path.endsWith('/issues/17')){if(method==='PATCH')issue={...issue,...json};data=issue;}
+  else throw new Error('Unexpected synthetic request '+method+' '+path);
+  return new Response(JSON.stringify(data),{status:200,headers:{'content-type':'application/json'}});
+};
+`,
+    );
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [join(pluginRoot, 'dist', 'mcp-launcher.js')],
+      cwd: directory,
+      env: {
+        PATH: process.env.PATH ?? '',
+        TMPDIR: tmpdir(),
+        AI_DELIVERY_CONFIG: settings,
+        SYNTHETIC_TOKEN: 'inert-personal-token',
+        NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'actual-launch-routing', version: '1' });
+    try {
+      await client.connect(transport, { timeout: 30000 });
+      const created = await client.callTool({
+        name: 'issue_create',
+        arguments: { repo: 'example/b', title: 'Widget', labels: ['enhancement'] },
+      });
+      assert.equal(created.isError, undefined, JSON.stringify(created));
+      const updated = await client.callTool({
+        name: 'issue_update',
+        arguments: { repo: 'example/b', issueNumber: 17, labels: ['bug'] },
+      });
+      assert.equal(updated.isError, undefined, JSON.stringify(updated));
+      const unknown = await client.callTool({
+        name: 'issue_create',
+        arguments: { repo: 'example/b', title: 'Unknown', labels: ['missing-label'] },
+      });
+      assert.equal(unknown.isError, true);
+      assert.match(JSON.stringify(unknown), /Unknown repository label.*missing-label/u);
+      const requests = JSON.parse(readFileSync(calls, 'utf8')) as Array<{ path: string; method: string }>;
+      assert.equal(requests.filter((call) => call.path.endsWith('/issues') && call.method === 'POST').length, 1);
+      assert.equal(existsSync(join(directory, '.issue-cli')), false);
+    } finally {
+      await client.close();
+      await transport.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
 
 test('CLI reports the selected package version', () => {
   const displayed = execFileSync(process.execPath, [join(packageRoot, 'dist', 'cli.js'), '--version'], {

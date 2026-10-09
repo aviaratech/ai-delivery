@@ -34,7 +34,7 @@ The earlier default-JSON requirement remains in issue history, not in the active
 1. Use `issue_create` to create one coherent tracking issue with the applicable native issue metadata and relationships.
 2. Use `issue_info` to inspect a known issue and `issue_update` for authoritative metadata, relationship, or lifecycle changes.
 3. Run `issue_ready_check` before development. Resolve any reported gaps in the issue before proceeding.
-4. Continue with `issue_develop` when the issue is ready.
+4. Continue with `issue_start` and an explicit repository when the issue is ready; prepare its worktree through the host.
 
 ## CLI fallback
 

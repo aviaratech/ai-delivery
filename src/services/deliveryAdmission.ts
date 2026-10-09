@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 
-import { loadDeliveryConfig, type LoadedDeliveryConfig } from '../config/deliveryConfig.js';
+import { loadDeliveryConfig, type LoadedDeliveryConfig, type LoadedGitHubConfig } from '../config/deliveryConfig.js';
 import { assertPrivateFile } from '../delivery/common.js';
 import { digestValue } from '../delivery/index.js';
 import { DeliveryError } from '../errors.js';
@@ -79,7 +79,7 @@ export async function assertDeliveryRuntimeAdmitted(input: {
   repoRoot: string;
   runtimeEntryPath?: string;
   personalAuth?: boolean;
-  configuration?: LoadedDeliveryConfig;
+  configuration?: LoadedDeliveryConfig | LoadedGitHubConfig;
 }): Promise<RuntimeAdmission> {
   const root = gitRoot(input.repoRoot);
   const loaded =
@@ -100,7 +100,7 @@ export async function assertDeliveryRuntimeAdmitted(input: {
 /** @internal Shared installed-byte validation for explicit setup and lifecycle admission. */
 export function validateRuntimeAdmission(
   admission: RuntimeAdmission,
-  loaded: LoadedDeliveryConfig,
+  loaded: LoadedDeliveryConfig | LoadedGitHubConfig,
   runtimeEntryPath?: string,
 ): RuntimeAdmission {
   const entry = runtimeEntryPath ?? process.argv[1];
@@ -152,7 +152,7 @@ export function buildRuntimeAdmission(input: {
   packageVersion: string;
   sourceArchiveSha256: string;
   sourceCommit: string;
-  configuration: LoadedDeliveryConfig;
+  configuration: LoadedDeliveryConfig | LoadedGitHubConfig;
 }): RuntimeAdmission {
   for (const path of [input.cliPath, input.mcpLauncherPath, input.pluginManifestPath]) {
     if (realpathSync(path) !== path)

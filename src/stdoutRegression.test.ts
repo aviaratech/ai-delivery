@@ -78,6 +78,7 @@ function fixture(developmentFails = false): { context: DeliveryContext; cleanup:
           : { ...issue, number: issue_number, id: issue_number * 10, node_id: `ISSUE-${String(issue_number)}` },
     }),
     create: async () => ({ data: issue }),
+    listForRepo: async () => ({ data: [] }),
     update: async () => ({ data: issue }),
     listSubIssues: async () => ({ data: parent === null ? [] : [issue] }),
     addSubIssue: async ({ issue_number }: { issue_number: number }) => {
@@ -219,9 +220,9 @@ async function runCli(
   const dispatch = await import('./dispatch.js');
   vi.spyOn(configuration, 'loadDeliverySettings').mockResolvedValue({
     ...context.config,
-    configPath: null,
+    configPath: 'synthetic-user.json',
+    checkoutRoots: [],
     overrides: { schemaVersion: 'ai-delivery.config@2' },
-    policyModulePath: join(context.root, 'policy.mjs'),
     sourceDigest: 'synthetic',
   });
   vi.spyOn(issues, 'loadDeliveryContext').mockResolvedValue(context);
@@ -282,7 +283,7 @@ test('parent update through the CLI entry produces one parseable JSON result', a
   }
 });
 
-test('failed development after parent linking preserves parseable CLI recovery JSON and nonzero exit', async () => {
+test('failed remote branch start after parent linking preserves parseable CLI recovery JSON and nonzero exit', async () => {
   const f = fixture(true);
   try {
     const output = await runCli(f.context, [
@@ -293,7 +294,6 @@ test('failed development after parent linking preserves parseable CLI recovery J
       '## Outcome\nDeliver a verified synthetic change to the local repository.\n\n## Scope\n- `artifact.txt`\n\n## Acceptance Criteria\n- [ ] Change works\n- [ ] Review passes\n\n## Verification\nRun `node --version`.',
       '--parent',
       '5',
-      '--develop',
     ]);
     const result = JSON.parse(output.stdout) as {
       status: string;
@@ -305,11 +305,10 @@ test('failed development after parent linking preserves parseable CLI recovery J
     };
     assert.equal(result.status, 'created-not-started');
     assert.equal(result.createdIssue.number, 17);
-    assert.equal(result.failure.phase, 'development');
-    assert.match(result.failure.message, /closed/u);
+    assert.equal(result.failure.phase, 'branch-or-journal');
+    assert.match(result.failure.message, /open GitHub issue/u);
     assert.equal(result.safeResume.arguments.issueNumber, 17);
     assert.equal(result.safeResume.arguments.parentIssueNumber, 5);
-    assert.equal(result.safeResume.arguments.develop, true);
     assert.equal(result.safeResume.arguments.resumeCreated, true);
     assert.equal(output.exitCode, 1);
     assert.match(output.stderr, /Linked issue #17 as sub-issue of issue #5\./u);

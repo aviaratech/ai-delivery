@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import {
   assertArtifact,
@@ -173,22 +172,10 @@ export async function loadSelectedRepositoryPolicy(input: {
   repoRoot: string;
   policySourcePath: string;
 }): Promise<{ policy: RepositoryDeliveryPolicy; policyDigest: `sha256:${string}` }> {
-  const path = resolveRepositoryFile(input.repoRoot, input.policySourcePath);
-  git(input.repoRoot, ['ls-files', '--error-unmatch', '--', input.policySourcePath]);
-  const policyDigest = digestBytes(readFileSync(path));
-  const loaded: unknown = await import(`${pathToFileURL(path).href}?policy=${policyDigest.slice(7)}`);
-  const policy = (loaded as { default?: unknown }).default;
-  if (
-    policy === null ||
-    typeof policy !== 'object' ||
-    !['RepositoryDeliveryPolicy@1', 'RepositoryDeliveryPolicy@2'].includes(
-      (policy as RepositoryDeliveryPolicy).schemaVersion,
-    ) ||
-    typeof (policy as RepositoryDeliveryPolicy).classifyExactRange !== 'function' ||
-    typeof (policy as RepositoryDeliveryPolicy).validateBoundary !== 'function'
-  )
-    throw new Error('Selected repository policy module is missing or invalid.');
-  return { policy: policy as RepositoryDeliveryPolicy, policyDigest };
+  void input;
+  throw new Error(
+    'Repository policy execution was removed; use GitHub-gated delivery. Historical policy bindings require their original controller.',
+  );
 }
 
 function selectedPolicyDigest(repoRoot: string, policySourcePath: string): `sha256:${string}` {

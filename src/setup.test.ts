@@ -19,7 +19,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { test, vi } from 'vitest';
+import { afterEach, test, vi } from 'vitest';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import * as privateFiles from './delivery/common.js';
@@ -27,6 +27,8 @@ import { digestBytes, digestValue } from './delivery/index.js';
 import { syntheticDiscoveryClients, syntheticOverrides, syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { assertDeliveryRuntimeAdmitted, type RuntimeAdmission } from './services/deliveryAdmission.js';
 import * as atomicJson from './utils/atomicJson.js';
+
+afterEach(() => vi.unstubAllEnvs());
 
 const syncFailure = vi.hoisted(() => ({ directory: '' }));
 const sharedOutputRead = vi.hoisted(() => ({ path: '', unboundedReads: 0 }));
@@ -187,6 +189,19 @@ async function fixture(native = false) {
     join(root, 'policy.mjs'),
     `export const deliverySettings=${JSON.stringify({ roles, commandPolicy: { checks: { format: 'REQUIRED', gitClean: 'REQUIRED', lint: 'REQUIRED', test: 'REQUIRED', typecheck: 'REQUIRED' }, timeoutsMs: { lint: 60000, test: 60000, typecheck: 60000 } } })};\n`,
   );
+  const {
+    policy: _policy,
+    repository: _repository,
+    remote: _remote,
+    schemaVersion: _schema,
+    ...overrides
+  } = syntheticOverrides(syntheticDiscoveryConfig);
+  const userPath = join(base, 'user.json');
+  writeFileSync(
+    userPath,
+    JSON.stringify({ schemaVersion: 'ai-delivery.user@1', roles, checkoutRoots: [], ...overrides }),
+  );
+  vi.stubEnv('AI_DELIVERY_CONFIG', userPath);
   git(root, 'add', '.');
   git(root, 'commit', '-qm', 'Synthetic consumer');
   git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
@@ -1258,14 +1273,12 @@ for (const denied of [
       if (denied === 'archive-drift') writeFileSync(f.input.archivePath, 'changed archive');
       if (denied === 'source-drift') git(f.root, 'commit', '--allow-empty', '-qm', 'source drift');
       if (denied === 'config-drift') {
-        writeFileSync(
-          join(f.root, 'policy.mjs'),
-          readFileSync(join(f.root, 'policy.mjs'), 'utf8') + 'deliverySettings.commandPolicy.checks.test="SKIP";\n',
-        );
-        git(f.root, 'add', '.');
-        git(f.root, 'commit', '-qm', 'config drift');
-        f.input.expectedSourceCommit = git(f.root, 'rev-parse', 'HEAD');
+        const userPath = process.env.AI_DELIVERY_CONFIG!;
+        const settings = JSON.parse(readFileSync(userPath, 'utf8')) as { roles: { author: { identity: string } } };
+        settings.roles.author.identity = 'changed-author';
+        writeFileSync(userPath, JSON.stringify(settings));
       }
+
       await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)));
       assert.equal(readFileSync(path, 'utf8'), before);
       assert.equal(existsSync(f.input.runtimeDirectory), true);

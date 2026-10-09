@@ -1,33 +1,22 @@
 ---
 name: "ai-delivery:worktree-lifecycle"
-description: Prepare an issue-backed or explicitly standalone worktree, develop there, and verify the resulting commit.
+description: Start a GitHub-linked issue branch, prepare a host-owned worktree and verify its change through repository contributor checks.
 ---
 
-# Prepared worktree lifecycle
+# Host-owned worktree lifecycle
 
-Use a registered prepared worktree for implementation so changes and delivery evidence stay associated with the intended issue.
+Read user configuration and inspect `ai-delivery --repo <owner/name> config:resolve`. Confirm configured author and independent reviewer actors and repository access. Unknown GitHub rule visibility remains unknown.
 
-Before development, run the read-only `ai-delivery --identity <configured-author> config:resolve` in the selected checkout, or use `--identity personal --personal-auth config:resolve` for the explicit development override under an App author policy. Inspect the selected author and independent reviewer actors, credential sources, repository access and available review rules. Resolve missing credentials or actor/repository mismatches before preparing work. Unknown approval eligibility remains unknown; runtime admission is still required separately for lifecycle writes. Publication requires the configured author credential.
+Use `issue_info` and `issue_ready_check` with an explicit `repo`, then `issue_start` with the existing issue number to create or reuse its GitHub-linked branch. Prepare the local worktree using the host's supported worktree tools. Run the repository's own contributor checks, commit and push through its normal workflow. The ai-delivery runtime never executes repository policy modules or checks, or creates local worktrees. Continue to pull request handoff at the unchanged remote head.
 
-## MCP tools first
-
-1. For tracked work, inspect the issue with `issue_info`, check it with `issue_ready_check`, then prepare it with `issue_develop`.
-2. For explicitly standalone work, use `issue_worktree_create`.
-3. Make changes in the prepared worktree, run the focused checks, and commit the change.
-4. Run `issue_verify` after the commit. Continue to pull request handoff with the exact verified commit.
-
-To park execution without removing the worktree, call `issue_update` with `park: true` or `ai-delivery update --issue <number> --park`. The Project shows Todo or Blocked from current native blockers; closed/Done remains Done. Resume through `issue_develop`/`develop` with the existing readiness checks. A retained worktree does not establish active execution.
-
-For an unwitnessed legacy issue row, use the read-only `issue_worktree_transition_inspect` with purpose `active-resume` or `merged-cleanup`. Installation does not adopt the row. Preserve unknown historical evidence as original bytes; never treat it as current verification/review or operational closure. The supported closure family is the retained official public 0.3.5 archive/installed runtime admission, producer-bound run@3 and writers@1 on supported POSIX hosts. Missing closure, operative issue-cli v1/v2 or unknown resources must remain refused.
-
-Apply only the exact plan with authenticated personal-operator native relinquishment and distinct configured reviewer-App whole-plan native acceptance. `issue_worktree_transition_apply` requires explicit authority, the saved plan/plan ID and both native comment IDs. Use the same inputs for interruption recovery. Pending and terminal-purpose intent blocks ordinary source mutations and re-registration. Active resume needs fresh current verification and review; original receipts retain their historical schema/accounting. Terminal disposition retains source/holds by default. Explicit unheld removal uses existing non-force cleanup; this skill grants no hold release, private adoption, launcher change, shared admission or legacy-protocol retirement authority.
-
-## CLI fallback
-
-```bash
-ai-delivery --identity <configured-author> config:resolve
-ai-delivery ready:check --issue <number>
-ai-delivery develop --issue <number>
-# edit, run focused checks, and commit in the prepared worktree
-ai-delivery verify
+```sh
+ai-delivery --repo <owner/name> ready:check --issue <number>
+ai-delivery --repo <owner/name> start --issue <number>
+# Prepare a host-owned worktree, implement, run contributor checks, commit and push.
 ```
+
+Parking an issue with `issue_update({repo, issueNumber, park: true})` retains its remote tracking presentation. Worktree cleanup remains with the host owner.
+
+Legacy `issue_worktree_transition_inspect` and `issue_worktree_transition_apply` preserve their separate custody contract. Preserve original bytes and accounting; unsupported configuration or closure bindings fail closed. Apply only an exact independently accepted plan with native personal-operator relinquishment, distinct reviewer-App acceptance, complete immutable inventory, runtime admission and quiescent writer proof. This skill grants no private adoption, hold release, launcher change, shared admission or protocol retirement authority.
+
+This runtime's CLI/MCP cannot reconstruct the historical repository-policy binding, so those transition commands refuse. Use the original controller for their successful execution; retained engine tests do not imply compatibility of the new public entrypoint.

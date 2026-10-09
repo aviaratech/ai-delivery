@@ -16,6 +16,7 @@ import {
 import { DeliveryError } from './errors.js';
 import { assertClean, defaultBaseRef, git, gitCommonDir, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
 import { createDeliveryGitHubClients } from './github/client.js';
+import type { LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import type { DeliveryContext } from './issue.js';
 import {
   assertDeliveryRuntimeAdmitted,
@@ -525,7 +526,7 @@ async function revalidateTransition(
   });
   if (
     stableJson(admitted) !== stableJson(plan.currentRuntime) ||
-    digestBytes(evidenceBytes(context.configuration.policyModulePath)) !== plan.policyDigest
+    digestBytes(evidenceBytes(historicalConfiguration(context).policyModulePath)) !== plan.policyDigest
   )
     throw new DeliveryError('Transition current runtime/configuration/policy drifted.');
   const { inventory: producerInventory, ...producer } = retainedProducer(
@@ -566,7 +567,7 @@ async function revalidateTransition(
       !terminal ||
       stableJson(await nativeRemoteRefs(context, plan.row.branch, terminal.baseBranch)) !==
         stableJson(plan.remoteRefs) ||
-      git(plan.repoRoot, 'rev-parse', defaultBaseRef(plan.repoRoot, context.configuration.remote)) !==
+      git(plan.repoRoot, 'rev-parse', defaultBaseRef(plan.repoRoot, historicalConfiguration(context).remote)) !==
         plan.remoteRefs?.baseSha
     )
       throw new DeliveryError('Transition native remote branch readback or local retaining ref drifted.');
@@ -862,7 +863,7 @@ export async function applyWorktreeTransition(
         }
         if (plan.disposition === 'remove') {
           step('removal-intent', { head: plan.head, path: plan.row.path });
-          removeMergedSourceForTransition(plan, context.configuration?.remote);
+          removeMergedSourceForTransition(plan, historicalConfiguration(context).remote);
           if (present(plan.row.path)) throw new DeliveryError('Terminal source removal readback is not absent.');
           step('removed', { absent: true });
           removeRow();
@@ -1278,7 +1279,7 @@ export async function inspectWorktreeTransition(
     if (
       remoteRefs &&
       ((remoteRefs.headSha !== null && remoteRefs.headSha !== head.sha) ||
-        git(root, 'rev-parse', defaultBaseRef(root, context.configuration.remote)) !== remoteRefs.baseSha)
+        git(root, 'rev-parse', defaultBaseRef(root, historicalConfiguration(context).remote)) !== remoteRefs.baseSha)
     )
       throw new DeliveryError('Native remote branch readback disagrees with exact source or local retaining ref.');
     const retainedHoldCommentIds = [...(input.retainedHoldCommentIds ?? [])].sort((a, b) => a - b);
@@ -1315,7 +1316,7 @@ export async function inspectWorktreeTransition(
       historicalProducer: 'UNKNOWN' as const,
       closure: { family: 'public-ai-delivery-0.3.5-posix@1' as const, ...producer, runManifestIds },
       currentRuntime,
-      policyDigest: digestBytes(evidenceBytes(context.configuration.policyModulePath)),
+      policyDigest: digestBytes(evidenceBytes(historicalConfiguration(context).policyModulePath)),
       operator: actors.operator,
       reviewerActor: actors.reviewerActor,
     };
@@ -1335,4 +1336,12 @@ export function preserveTransitionEvidence(directory: string, inventory: readonl
       throw new DeliveryError(`Historical evidence drifted: ${file.path}`);
     writeCreateOnly(join(directory, `${file.digest.slice(7)}.bin`), bytes, file.digest);
   }
+}
+
+function historicalConfiguration(context: DeliveryContext): LoadedDeliveryConfig {
+  if (!context.configuration || !('policyModulePath' in context.configuration))
+    throw new DeliveryError(
+      'Historical repository configuration binding is unsupported by this runtime; preserve its original controller and records. No policy module was loaded.',
+    );
+  return context.configuration;
 }

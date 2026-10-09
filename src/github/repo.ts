@@ -1,3 +1,7 @@
+import { readdirSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
+import { GIT_EXECUTABLE, inertGitArguments, gitEnvironment } from '../gitProcess.js';
+
 import { spawnSync } from 'node:child_process';
 
 import type { DeliveryConfig } from '../config/deliveryConfig.js';
@@ -14,7 +18,7 @@ export function formatRepoCoordinates(repo: RepoCoordinates): string {
 }
 
 export function resolveDeliveryRepo(
-  config: DeliveryConfig,
+  config: Pick<DeliveryConfig, 'repository'>,
   repoRoot: string,
   selectedRemote?: string,
 ): RepoCoordinates {
@@ -31,7 +35,11 @@ export function resolveDeliveryRepo(
 }
 
 export function resolveGitRemoteName(repoRoot: string, selectedRemote?: string): string {
-  const remotes = spawnSync('git', ['remote'], { cwd: repoRoot, encoding: 'utf8' });
+  const remotes = spawnSync(GIT_EXECUTABLE, [...inertGitArguments(repoRoot), 'remote'], {
+    env: gitEnvironment(),
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
   if (remotes.status !== 0) throw new DeliveryError('Unable to list Git remotes.');
   const names = remotes.stdout.trim().split('\n').filter(Boolean);
   if (selectedRemote !== undefined && !names.includes(selectedRemote)) {
@@ -47,10 +55,15 @@ export function resolveGitRemoteName(repoRoot: string, selectedRemote?: string):
 
 export function resolveRepoFromRemote(repoRoot: string, selectedRemote?: string): RepoCoordinates {
   const remoteName = resolveGitRemoteName(repoRoot, selectedRemote);
-  const result = spawnSync('git', ['config', '--get', `remote.${remoteName}.url`], {
-    cwd: repoRoot,
-    encoding: 'utf8',
-  });
+  const result = spawnSync(
+    GIT_EXECUTABLE,
+    [...inertGitArguments(repoRoot), 'config', '--local', '--no-includes', '--get', `remote.${remoteName}.url`],
+    {
+      env: gitEnvironment(),
+      cwd: repoRoot,
+      encoding: 'utf8',
+    },
+  );
   if (result.status !== 0) {
     throw new DeliveryError('Unable to determine repository identity from the selected Git remote.');
   }
@@ -63,4 +76,53 @@ export function resolveRepoFromRemote(repoRoot: string, selectedRemote?: string)
     throw new DeliveryError('The selected Git remote must be a github.com repository URL.');
   }
   return { owner: match[1], repo: match[2] };
+}
+
+/** No process-wide checkout binding: select an origin-matched clone on each local call. */
+export function resolveCheckout(input: {
+  repository: string;
+  launchDirectory: string;
+  checkoutRoots: string[];
+}): string {
+  const matches = (path: string): string | null => {
+    try {
+      const remote = resolveRepoFromRemote(path, 'origin');
+      if (formatRepoCoordinates(remote).toLowerCase() !== input.repository.toLowerCase()) return null;
+      const result = spawnSync(GIT_EXECUTABLE, [...inertGitArguments(path), 'rev-parse', '--show-toplevel'], {
+        env: gitEnvironment(),
+        cwd: path,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024,
+      });
+      return result.status === 0 ? realpathSync(result.stdout.trim()) : null;
+    } catch {
+      return null;
+    }
+  };
+  const current = matches(input.launchDirectory);
+  if (current) return current;
+  const candidates = new Set<string>();
+  for (const root of input.checkoutRoots) {
+    const direct = matches(root);
+    if (direct) {
+      candidates.add(direct);
+      continue;
+    }
+    let entries;
+    try {
+      entries = readdirSync(root, { withFileTypes: true });
+    } catch {
+      throw new DeliveryError(`Checkout root is unreadable: ${root}`);
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const path = matches(join(root, entry.name));
+      if (path) candidates.add(path);
+    }
+  }
+  if (candidates.size !== 1)
+    throw new DeliveryError(
+      `Repository ${input.repository} has ${candidates.size === 0 ? 'no matching' : 'ambiguous'} checkout; select its checkout with --repo-root or configure checkoutRoots.`,
+    );
+  return [...candidates][0]!;
 }

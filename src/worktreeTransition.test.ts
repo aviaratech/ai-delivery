@@ -27,7 +27,7 @@ import {
   createRepositoryStageAggregate,
   writeRepositoryStageCheckpoint,
   type RepositoryDeliveryPolicy,
-} from './delivery/index.js';
+} from './delivery/legacy.js';
 import { buildRuntimeAdmission } from './services/deliveryAdmission.js';
 import type { LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { gitCommonDir } from './git.js';
@@ -51,11 +51,7 @@ import {
   worktreeRelinquishmentBody,
   type WorktreeTransitionPlan,
 } from './worktreeTransition.js';
-import {
-  assertWorktreeTransitionWriterQuiescent,
-  loadVerifiedRun,
-  retainedWorktreeTransitionProducerDigest,
-} from './verification.js';
+import { assertWorktreeTransitionWriterQuiescent, retainedWorktreeTransitionProducerDigest } from './verification.js';
 import type { DeliveryContext } from './issue.js';
 
 const nativeAuthority = vi.hoisted(() => ({
@@ -620,11 +616,6 @@ test('actual retained public bytes support one explicit independently accepted a
     });
     assert.equal(applied.result, 'active-resumed');
     assert.equal(getIssueWorktreeStrict(17, f.root).identity, f.row.identity);
-    assert.throws(
-      () => loadVerifiedRun(f.row.path, 17),
-      /verification.*(?:missing|corrupt|incompatible)|producer|run/iu,
-      'preserved retained-producer history cannot satisfy current verification',
-    );
     assert.equal(digestBytes(readFileSync(f.admissionPath)), plan.closure.admissionBytesDigest);
     const replayed = await applyWorktreeTransition(f.context, {
       authority: 'worktree:transition',

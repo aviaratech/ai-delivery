@@ -2,6 +2,8 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 
+import { GIT_EXECUTABLE, inertGitArguments, gitEnvironment } from './gitProcess.js';
+
 import { DeliveryError } from './errors.js';
 import { resolveGitRemoteName } from './github/repo.js';
 
@@ -12,7 +14,8 @@ export interface GitCoordinate {
 
 export function git(cwd: string, ...args: string[]): string {
   try {
-    return execFileSync('git', args, {
+    return execFileSync(GIT_EXECUTABLE, [...inertGitArguments(cwd), ...args], {
+      env: gitEnvironment(),
       cwd,
       encoding: 'utf8',
       maxBuffer: 4 * 1024 * 1024,
@@ -26,7 +29,12 @@ export function git(cwd: string, ...args: string[]): string {
 }
 
 export function gitExitCode(cwd: string, ...args: string[]): number {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const result = spawnSync(GIT_EXECUTABLE, [...inertGitArguments(cwd), ...args], {
+    env: gitEnvironment(),
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   if (result.error) throw result.error;
   return result.status ?? 1;
 }
@@ -61,7 +69,7 @@ export function assertClean(cwd: string): void {
 }
 
 export function changedPaths(cwd: string, baseSha: string, headSha: string): string[] {
-  const output = git(cwd, 'diff', '--name-only', '-z', baseSha, headSha);
+  const output = git(cwd, 'diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', baseSha, headSha);
   return output.split('\0').filter(Boolean).sort();
 }
 
