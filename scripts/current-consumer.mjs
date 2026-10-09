@@ -578,7 +578,9 @@ export async function runOwnedProcess(
     'Environment contains an unapproved ambient reference',
   );
   if (signal?.aborted) throw new ConsumerFailure('cancelled', 'Operation cancelled before spawn', { quiescent: true });
-  const child = spawn(command, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  // Node's coverage propagation can add a key to options.env during spawn.
+  // Keep that internal mutation separate from the validated caller-owned input.
+  const child = spawn(command, args, { cwd, env: { ...env }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = Buffer.alloc(0);
   let outputBytes = 0;
   const stderrDigest = createHash('sha256');

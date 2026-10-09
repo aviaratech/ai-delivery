@@ -110,6 +110,95 @@ const failure =
   (error: unknown): boolean =>
     error instanceof Error && (error as Failure).code === code;
 
+test.each([false, true])(
+  'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=%s',
+  (frozen) => {
+    const f = fixture();
+    let confirmedQuiescence = false;
+    try {
+      const coverage = join(f.directory, 'coverage');
+      mkdirSync(coverage);
+      const program = `import {runOwnedProcess,consumerEnvironment,sha256} from ${JSON.stringify(pathToFileURL(source).href)};
+import process from 'node:process';
+const input=consumerEnvironment(${JSON.stringify(f.directory)},process.execPath);
+const env=${frozen ? 'Object.freeze(input)' : 'input'};
+const before={...env};const keys=Object.keys(env).sort();
+const report={boundary:'fictional synthetic process, actual Node24 coverage parent',actualRuntime:process.version,
+ coverageParentEnabled:typeof process.env.NODE_V8_COVERAGE==='string',frozenCaller:Object.isFrozen(env),
+ environmentValuesSerialized:false,phases:[],rejectedKeys:[],unresolvedOwnedChild:false,status:'failed'};
+try{
+ if(process.version!=='v24.21.0'||!report.coverageParentEnabled)throw new Error('runtime');
+ for(let i=0;i<2;i++){
+  let spawned=false,result;
+  try{result=await runOwnedProcess(process.execPath,['-e','process.stdout.write("fictional child")'],{cwd:${JSON.stringify(f.directory)},env,onSpawn:()=>{spawned=true;}});}
+  catch(error){report.unresolvedOwnedChild=spawned&&error?.evidence?.quiescent!==true;throw error;}
+  if(result.stdout!=='fictional child'||!result.evidence.quiescent)throw new Error('proof');
+  report.phases.push({...result.evidence,stdoutSha256:sha256(result.stdout)});
+ }
+ for(const key of ['NODE_V8_COVERAGE','GH_TOKEN','GH_APP_ID_GPT_REVIEWER','AI_DELIVERY_CONFIG','NODE_PATH']){
+  let spawned=false,rejected=false;
+  try{await runOwnedProcess(process.execPath,['-e','process.exit(0)'],{cwd:${JSON.stringify(f.directory)},
+   env:{...env,[key]:'fictional unapproved value'},onSpawn:()=>{spawned=true;}});}
+  catch(error){rejected=error?.code==='environment';}
+  if(!rejected||spawned)throw new Error('exclusion');
+  report.rejectedKeys.push(key);
+ }
+ report.status='passed';
+}catch(error){report.failureCode=typeof error?.code==='string'?error.code:'process';}
+report.callerKeysUnchanged=JSON.stringify(Object.keys(env).sort())===JSON.stringify(keys);
+report.callerValuesUnchanged=keys.every(key=>env[key]===before[key]);
+console.log(JSON.stringify(report));`;
+      const parent = spawnSync(process.execPath, ['--input-type=module', '-e', program], {
+        cwd: f.directory,
+        env: {
+          PATH: dirname(process.execPath) + ':/usr/bin:/bin',
+          HOME: f.directory,
+          TMPDIR: f.directory,
+          NO_COLOR: '1',
+          NODE_V8_COVERAGE: coverage,
+        },
+        encoding: 'utf8',
+        maxBuffer: 512 * 1024,
+      });
+      assert.ok(parent.status === 0, 'Synthetic coverage parent failed before its bounded receipt');
+      const report = JSON.parse(parent.stdout) as {
+        status: string;
+        actualRuntime: string;
+        coverageParentEnabled: boolean;
+        frozenCaller: boolean;
+        callerKeysUnchanged: boolean;
+        callerValuesUnchanged: boolean;
+        environmentValuesSerialized: boolean;
+        phases: { quiescent: boolean }[];
+        rejectedKeys: string[];
+        unresolvedOwnedChild: boolean;
+      };
+      recordSynthetic({ kind: 'coverage-caller-env-regression', report, stderrSha256: helper.sha256(parent.stderr) });
+      confirmedQuiescence = !report.unresolvedOwnedChild && report.phases.every((phase) => phase.quiescent);
+      assert.equal(report.actualRuntime, 'v24.21.0');
+      assert.equal(report.coverageParentEnabled, true);
+      assert.equal(report.status, 'passed');
+      assert.equal(report.frozenCaller, frozen);
+      assert.equal(report.callerKeysUnchanged, true);
+      assert.equal(report.callerValuesUnchanged, true);
+      assert.equal(report.environmentValuesSerialized, false);
+      assert.equal(report.unresolvedOwnedChild, false);
+      assert.equal(report.phases.length, 2);
+      assert.ok(report.phases.every((phase) => phase.quiescent));
+      assert.deepEqual(report.rejectedKeys, [
+        'NODE_V8_COVERAGE',
+        'GH_TOKEN',
+        'GH_APP_ID_GPT_REVIEWER',
+        'AI_DELIVERY_CONFIG',
+        'NODE_PATH',
+      ]);
+    } finally {
+      if (confirmedQuiescence) f.cleanup();
+      else recordSynthetic({ kind: 'fixture-retained', directory: f.directory, quiescent: false });
+    }
+  },
+);
+
 function archive(members: Member[]): Buffer {
   const chunks: Buffer[] = [];
   for (const member of members) {
