@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +17,17 @@ type Contract = {
   sourceLockSha256: string;
   packageVersion: string;
   dryInventory: { path: string; size: number; mode: number }[];
+  sourceCommit?: string;
+  sourceTree?: string;
+  node24?: string;
+  node26?: string;
+  npmCli?: string;
+  producer?: {
+    checksResultPath: string;
+    checksResultSha256: string;
+    artifactReceiptPath: string;
+    artifactReceiptSha256: string;
+  };
 };
 type Failure = Error & {
   code: string;
@@ -48,6 +60,7 @@ type Helper = {
   sha256(bytes: Buffer | string): string;
   readArchive(bytes: Buffer, digest: string): unknown[];
   inspectCandidate(contract: Contract): { inventory: unknown[]; packageVersion: string; inventorySha256: string };
+  verifyProducerJoin(contract: Contract, candidate: ReturnType<Helper['inspectCandidate']>): Record<string, unknown>;
   runCurrentConsumer(contract: Contract): Promise<{ status: string; qualified: boolean; reason: string }>;
   consumerEnvironment(directory: string, executable: string): Record<string, string>;
   resolutionGuard(consumer: string): string;
@@ -233,6 +246,219 @@ test.each(['../escape', '/absolute', 'dist/../../escape', 'dist\\escape', 'dist/
     }
   },
 );
+
+function producerFixture(): {
+  f: ReturnType<typeof fixture>;
+  contract: Contract;
+  checks: Record<string, unknown>;
+  artifact: Record<string, unknown>;
+  persist: () => void;
+} {
+  const f = fixture();
+  const contract = f.make();
+  const init = spawnSync('git', ['init', '--quiet'], {
+    cwd: f.root,
+    env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    encoding: 'utf8',
+  });
+  assert.equal(init.status, 0, init.stderr);
+  contract.sourceCommit = 'a'.repeat(40);
+  contract.sourceTree = 'b'.repeat(40);
+  contract.node24 = process.execPath;
+  contract.node26 = '/fictional/node26';
+  contract.npmCli = '/fictional/npm-cli.js';
+  const files = spawnSync('git', ['ls-files', '-co', '--exclude-standard', '-z'], {
+    cwd: f.root,
+    env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    encoding: 'utf8',
+  });
+  assert.equal(files.status, 0);
+  const fingerprint = {
+    kind: 'working-copy',
+    sha256: helper.sha256(
+      JSON.stringify(
+        [...new Set(files.stdout.split('\0').filter(Boolean))].sort().map((path) => ({
+          path,
+          executable: f.members.some((member) => member.path === path && (member.mode & 0o111) !== 0),
+          sha256: helper.sha256(readFileSync(join(f.root, path))),
+        })),
+      ),
+    ),
+    fileCount: new Set(files.stdout.split('\0').filter(Boolean)).size,
+  };
+  const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
+  const checks: Record<string, unknown> = {
+    schemaVersion: 'contributor-checks@1',
+    runId: 'fictional-producer-run',
+    scope: 'full',
+    status: 'passed',
+    fullSuccess: true,
+    exitCode: 0,
+    selectedTestFiles: ['dist/fictional.test.js'],
+    tests: { files: 1, total: 1, passed: 1, skips: [] },
+    gates,
+    omitted: [],
+    tree: fingerprint,
+    commands: gates.map((stage) => ({ stage, status: 'passed', exitCode: 0, signal: null, cleanupConfirmed: true })),
+    toolchain: {
+      controller: { version: 'v24.21.0', executable: contract.node24 },
+      npm: { version: '11.19.0', executable: contract.npmCli },
+      libraryConsumer: { version: 'v26.2.0', executable: contract.node26 },
+    },
+    inventory: {
+      kind: 'dry-inventory-only',
+      name: '@aviaratech/ai-delivery',
+      version: '0.0.0',
+      fileCount: contract.dryInventory.length,
+      files: contract.dryInventory,
+    },
+  };
+  const artifact: Record<string, unknown> = {
+    schemaVersion: 'ai-delivery.current-artifact-producer@1',
+    status: 'passed',
+    sourceCommit: contract.sourceCommit,
+    sourceTree: contract.sourceTree,
+    sourceManifestSha256: contract.sourceManifestSha256,
+    sourceLockSha256: contract.sourceLockSha256,
+    packageVersion: contract.packageVersion,
+    archiveSha256: contract.archiveSha256,
+    inventorySha256: helper.inspectCandidate(contract).inventorySha256,
+    sourceFingerprint: fingerprint,
+    pack: { status: 'passed', exitCode: 0, quiescent: true, archiveSha256: contract.archiveSha256 },
+  };
+  const persist = () => {
+    const checksPath = join(f.directory, 'checks.json');
+    writeFileSync(checksPath, JSON.stringify(checks));
+    const digest = helper.sha256(readFileSync(checksPath));
+    artifact['checksResultSha256'] = digest;
+    const artifactPath = join(f.directory, 'producer.json');
+    writeFileSync(artifactPath, JSON.stringify(artifact));
+    contract.producer = {
+      checksResultPath: checksPath,
+      checksResultSha256: digest,
+      artifactReceiptPath: artifactPath,
+      artifactReceiptSha256: helper.sha256(readFileSync(artifactPath)),
+    };
+  };
+  persist();
+  return { f, contract, checks, artifact, persist };
+}
+
+test('synthetic canonical producer join accepts matching source and archive, but never qualifies without install admission', async () => {
+  const { f, contract } = producerFixture();
+  try {
+    const joined = helper.verifyProducerJoin(contract, helper.inspectCandidate(contract));
+    assert.equal(joined['actualArchiveSha256'], contract.archiveSha256);
+    const result = await helper.runCurrentConsumer(contract);
+    assert.equal(result.status, 'incomplete');
+    assert.equal(result.qualified, false);
+    recordSynthetic({ kind: 'fictional-canonical-producer-join', joined, result, actualApplicationBoundary: false });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each([
+  'scope',
+  'status',
+  'fullSuccess',
+  'exitCode',
+  'gates',
+  'omitted',
+  'tree',
+  'commands',
+  'toolchain',
+  'inventory',
+  'tests',
+  'selectedTestFiles',
+])('synthetic canonical %s incompleteness cannot qualify rebuilt artifact', (field) => {
+  const { f, contract, checks, persist } = producerFixture();
+  try {
+    checks[field] = field === 'gates' || field === 'omitted' ? ['build'] : null;
+    persist();
+    assert.throws(() => helper.verifyProducerJoin(contract, helper.inspectCandidate(contract)), failure('producer'));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each([
+  'sourceCommit',
+  'sourceTree',
+  'sourceManifestSha256',
+  'sourceLockSha256',
+  'packageVersion',
+  'archiveSha256',
+  'inventorySha256',
+  'pack',
+  'sourceFingerprint',
+])('synthetic artifact producer %s drift cannot reuse old producer proof', (field) => {
+  const { f, contract, artifact, persist } = producerFixture();
+  try {
+    artifact[field] = null;
+    persist();
+    assert.throws(() => helper.verifyProducerJoin(contract, helper.inspectCandidate(contract)), failure('producer'));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('synthetic producer hash and source-file drift are refused before any install', () => {
+  const { f, contract, persist } = producerFixture();
+  try {
+    assert.ok(contract.producer);
+    appendFileSync(contract.producer.checksResultPath, ' ');
+    assert.throws(() => helper.verifyProducerJoin(contract, helper.inspectCandidate(contract)), failure('producer'));
+    persist();
+    writeFileSync(join(f.root, 'changed-untracked-source.ts'), 'synthetic new source');
+    assert.throws(() => helper.verifyProducerJoin(contract, helper.inspectCandidate(contract)), failure('producer'));
+    delete contract.producer;
+    assert.throws(() => helper.verifyProducerJoin(contract, helper.inspectCandidate(contract)), failure('producer'));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each([
+  'missing-gate',
+  'duplicate-gate',
+  'nonquiescent',
+  'zero-tests',
+  'zero-selection',
+  'unexpected-skip',
+  'dry-inventory-byte-drift',
+])('synthetic canonical producer refuses %s despite a claimed full success', (kind) => {
+  const { f, contract, checks, persist } = producerFixture();
+  try {
+    const steps = checks['commands'] as Record<string, unknown>[];
+    if (kind === 'missing-gate') steps.pop();
+    else if (kind === 'duplicate-gate') steps[5] = steps[4]!;
+    else if (kind === 'nonquiescent') steps[3]!['cleanupConfirmed'] = false;
+    else if (kind === 'zero-tests') checks['tests'] = { files: 1, total: 0, passed: 0, skips: [] };
+    else if (kind === 'zero-selection') {
+      checks['selectedTestFiles'] = [];
+      checks['tests'] = { files: 0, total: 1, passed: 1, skips: [] };
+    } else if (kind === 'unexpected-skip')
+      checks['tests'] = {
+        files: 1,
+        total: 2,
+        passed: 1,
+        skips: [{ file: 'dist/fictional.test.js', title: 'unreviewed skip', kind: 'unreviewed' }],
+      };
+    else
+      checks['inventory'] = {
+        kind: 'dry-inventory-only',
+        name: '@aviaratech/ai-delivery',
+        version: '0.0.0',
+        fileCount: 1,
+        files: [{ path: 'package.json', size: 1, mode: 0o644 }],
+      };
+    persist();
+    assert.throws(() => helper.verifyProducerJoin(contract, helper.inspectCandidate(contract)), failure('producer'));
+  } finally {
+    f.cleanup();
+  }
+});
 
 test.each(['1', '2', '3', '6'])('synthetic tar link/special type %s cannot reach npm extraction', (type) => {
   const f = fixture();

@@ -20,19 +20,26 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+// Consume the reviewed runner's public evidence ABI without changing its
+// independent JavaScript type-check policy in this focused helper check.
+const { FULL_GATES, SKIP_ALLOWLIST, treeIdentity } =
+  /** @type {{FULL_GATES:string[],SKIP_ALLOWLIST:{file:string,title:string,kind:string}[],treeIdentity:(cwd:string)=>{kind:string,sha256:string,fileCount:number}}} */ (
+    await import(new URL('./checks.mjs', import.meta.url).href)
+  );
 
 /** @typedef {{path:string, mode:number, size:number}} DryMember */
 /** @typedef {DryMember & {sha256:string}} InventoryMember */
 /** @typedef {InventoryMember & {bytes:Buffer}} ArchiveMember */
+/** @typedef {{checksResultPath:string,checksResultSha256:string,artifactReceiptPath:string,artifactReceiptSha256:string}} Producer */
 /** @typedef {{sourceRoot:string, archivePath:string, archiveSha256:string, packageVersion:string,
- * dryInventory:DryMember[], sourceManifestSha256:string, sourceLockSha256:string, sourceCommit?:string, sourceTree?:string, node24?:string, node26?:string, npmCli?:string}} Contract */
+ * dryInventory:DryMember[], sourceManifestSha256:string, sourceLockSha256:string, sourceCommit?:string, sourceTree?:string, node24?:string, node26?:string, npmCli?:string,producer?:Producer}} Contract */
 /** @typedef {{pid:number,birth:string,rssBytes:number}} ProcessIdentity */
 /** @typedef {{cwd:string,env:Record<string,string>,signal?:AbortSignal,maxOutputBytes?:number,
  * onSpawn?:(pid:number)=>void,snapshot?:(group:number)=>ProcessIdentity[]|null}} ProcessOptions */
 /** @typedef {{schemaVersion:string,boundary:string,status:string,qualified:boolean,sourceCommit?:string,
  * sourceTree?:string,archiveSha256:string,inventorySha256:string,inventory:InventoryMember[],packageVersion:string,
  * scriptsDisabled:boolean,sourceManifestSha256:string,sourceLockSha256:string,archiveManifestSha256:string,sourceIdentityVerified:boolean,networkBoundary:string,phases:Record<string,unknown>[],cleanup:Record<string,unknown>|null,
- * productionClosure?:Record<string,unknown>,reason?:string,failure?:Record<string,unknown>,mcp?:Record<string,unknown>,skills?:unknown[],resolutions?:unknown[]}} Receipt */
+ * producerJoin?:Record<string,unknown>,productionClosure?:Record<string,unknown>,reason?:string,failure?:Record<string,unknown>,mcp?:Record<string,unknown>,skills?:unknown[],resolutions?:unknown[]}} Receipt */
 
 /** @param {unknown} value @param {string} [code] @returns {Record<string,unknown>} */
 function record(value, code = 'package-identity') {
@@ -359,6 +366,146 @@ export function inspectCandidate(contract) {
     inventory,
     inventorySha256: sha256(JSON.stringify(inventory)),
     skills,
+  };
+}
+
+/** Bind the reviewed canonical six-gate result to this exact rebuilt artifact.
+ * This verifies retained evidence, never launches a producer or installs.
+ * @param {Contract} contract @param {ReturnType<typeof inspectCandidate>} candidate */
+export function verifyProducerJoin(contract, candidate) {
+  const producer = contract.producer;
+  if (!producer) throw new ConsumerFailure('producer', 'Fresh canonical producer evidence is required');
+  /** @param {string} path @param {string} digest */
+  const proof = (path, digest) => {
+    const stat = lstatSync(path);
+    requireProof(
+      stat.isFile() && !stat.isSymbolicLink() && stat.size <= 32 * 1024 * 1024,
+      'producer',
+      'Producer receipt must be a bounded regular file',
+    );
+    const bytes = readFileSync(path);
+    requireProof(/^[a-f0-9]{64}$/u.test(digest) && sha256(bytes) === digest, 'producer', 'Producer digest differs');
+    return record(parseJsonOutput(bytes.toString('utf8')), 'producer');
+  };
+  const checks = proof(producer.checksResultPath, producer.checksResultSha256);
+  const artifact = proof(producer.artifactReceiptPath, producer.artifactReceiptSha256);
+  const fingerprint = treeIdentity(contract.sourceRoot);
+  /** @param {unknown} value */
+  const sameFingerprint = (value) => {
+    const observed = record(value, 'producer');
+    return (
+      observed.kind === fingerprint.kind &&
+      observed.sha256 === fingerprint.sha256 &&
+      observed.fileCount === fingerprint.fileCount &&
+      observed.stagedGitTree === undefined
+    );
+  };
+  requireProof(
+    checks.schemaVersion === 'contributor-checks@1' &&
+      checks.scope === 'full' &&
+      checks.status === 'passed' &&
+      checks.fullSuccess === true &&
+      checks.exitCode === 0 &&
+      JSON.stringify(checks.gates) === JSON.stringify(FULL_GATES) &&
+      JSON.stringify(checks.omitted) === '[]' &&
+      sameFingerprint(checks.tree),
+    'producer',
+    'Canonical full checks are incomplete or stale',
+  );
+  if (!Array.isArray(checks.commands)) throw new ConsumerFailure('producer', 'Canonical command evidence is missing');
+  const commands = checks.commands.map((value) => record(value, 'producer'));
+  requireProof(
+    JSON.stringify(commands.map((step) => step.stage)) === JSON.stringify(FULL_GATES) &&
+      commands.every(
+        (step) =>
+          step.status === 'passed' && step.exitCode === 0 && step.signal === null && step.cleanupConfirmed === true,
+      ),
+    'producer',
+    'Canonical gates or owned cleanup are incomplete',
+  );
+  const tests = record(checks.tests, 'producer');
+  if (!Array.isArray(checks.selectedTestFiles) || !Array.isArray(tests.skips))
+    throw new ConsumerFailure('producer', 'Canonical test selection or skip proof is missing');
+  requireProof(
+    Number.isSafeInteger(tests.files) &&
+      Number(tests.files) > 0 &&
+      tests.files === checks.selectedTestFiles.length &&
+      Number.isSafeInteger(tests.passed) &&
+      Number(tests.passed) > 0 &&
+      tests.total === Number(tests.passed) + tests.skips.length &&
+      new Set(checks.selectedTestFiles).size === checks.selectedTestFiles.length &&
+      checks.selectedTestFiles.every((value) => typeof value === 'string' && /^dist\/.*\.test\.js$/u.test(value)) &&
+      tests.skips.every((value) => {
+        const skip = record(value, 'producer');
+        return SKIP_ALLOWLIST.some(
+          (allowed) => allowed.file === skip.file && allowed.title === skip.title && allowed.kind === skip.kind,
+        );
+      }),
+    'producer',
+    'Canonical tests are zero, incomplete, or contain unreviewed skips',
+  );
+  const toolchain = record(checks.toolchain, 'producer');
+  for (const [name, version, executable] of [
+    ['controller', 'v24.21.0', contract.node24],
+    ['npm', '11.19.0', contract.npmCli],
+    ['libraryConsumer', 'v26.2.0', contract.node26],
+  ]) {
+    const runtime = record(toolchain[string(name)], 'producer');
+    requireProof(
+      runtime.version === version && runtime.executable === string(executable, 'producer'),
+      'producer',
+      'Producer toolchain differs',
+    );
+  }
+  const inventory = record(checks.inventory, 'producer');
+  if (!Array.isArray(inventory.files)) throw new ConsumerFailure('producer', 'Canonical dry inventory is missing');
+  const dry = inventory.files
+    .map((value) => {
+      const member = record(value, 'producer');
+      return { path: string(member.path, 'producer'), mode: member.mode, size: member.size };
+    })
+    .sort((a, b) => a.path.localeCompare(b.path));
+  const expectedDry = contract.dryInventory
+    .map(({ path, mode, size }) => ({ path, mode, size }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  requireProof(
+    inventory.kind === 'dry-inventory-only' &&
+      inventory.name === '@aviaratech/ai-delivery' &&
+      inventory.version === candidate.packageVersion &&
+      inventory.fileCount === dry.length &&
+      JSON.stringify(dry) === JSON.stringify(expectedDry),
+    'producer',
+    'Producer dry inventory differs from the actual archive contract',
+  );
+  for (const key of /** @type {(keyof Contract)[]} */ ([
+    'sourceCommit',
+    'sourceTree',
+    'sourceManifestSha256',
+    'sourceLockSha256',
+    'packageVersion',
+    'archiveSha256',
+  ]))
+    requireProof(artifact[key] === contract[key], 'producer', 'Artifact producer source or archive binding differs');
+  const pack = record(artifact.pack, 'producer');
+  requireProof(
+    artifact.schemaVersion === 'ai-delivery.current-artifact-producer@1' &&
+      artifact.status === 'passed' &&
+      artifact.checksResultSha256 === producer.checksResultSha256 &&
+      artifact.inventorySha256 === candidate.inventorySha256 &&
+      sameFingerprint(artifact.sourceFingerprint) &&
+      pack.status === 'passed' &&
+      pack.exitCode === 0 &&
+      pack.quiescent === true &&
+      pack.archiveSha256 === candidate.archiveSha256,
+    'producer',
+    'Actual pack producer or freshness join is incomplete',
+  );
+  return {
+    checksResultSha256: producer.checksResultSha256,
+    artifactReceiptSha256: producer.artifactReceiptSha256,
+    sourceFingerprint: fingerprint,
+    canonicalRunId: string(checks.runId, 'producer'),
+    actualArchiveSha256: candidate.archiveSha256,
   };
 }
 
@@ -742,6 +889,7 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
     phases: [],
     cleanup: null,
   };
+  if (contract.producer) receipt.producerJoin = verifyProducerJoin(contract, candidate);
   if (!authorizeInstall) {
     receipt.reason = 'Production closure installation has not been admitted';
     return receipt;
@@ -772,6 +920,7 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
     );
   }
   receipt.sourceIdentityVerified = true;
+  receipt.producerJoin = verifyProducerJoin(contract, candidate);
   return withDisposableConsumer(
     source,
     string(string(contract.node24, 'runtime'), 'runtime'),
@@ -927,6 +1076,15 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
           'archive-digest',
           'Original archive drifted during smoke',
         );
+        for (const [args, expected] of sourceChecks) {
+          const check = sourceCheck(args);
+          requireProof(
+            check.status === 0 && check.stdout.trim() === expected,
+            'source-identity',
+            'Source drifted during smoke',
+          );
+        }
+        verifyProducerJoin(contract, inspectCandidate(contract));
         receipt.status = 'passed';
         receipt.qualified = true;
       } catch (error) {
@@ -1041,6 +1199,19 @@ function contractFromJson(input) {
     ...(typeof value.node24 === 'string' ? { node24: value.node24 } : {}),
     ...(typeof value.node26 === 'string' ? { node26: value.node26 } : {}),
     ...(typeof value.npmCli === 'string' ? { npmCli: value.npmCli } : {}),
+    ...(value.producer === undefined
+      ? {}
+      : {
+          producer: (() => {
+            const producer = record(value.producer, 'contract');
+            return {
+              checksResultPath: string(producer.checksResultPath, 'contract'),
+              checksResultSha256: string(producer.checksResultSha256, 'contract'),
+              artifactReceiptPath: string(producer.artifactReceiptPath, 'contract'),
+              artifactReceiptSha256: string(producer.artifactReceiptSha256, 'contract'),
+            };
+          })(),
+        }),
   };
 }
 
