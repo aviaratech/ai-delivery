@@ -77,6 +77,7 @@ export function safeEnvironment(input = process.env) {
     'npm_config_userconfig',
     'npm_config_globalconfig',
     'AI_DELIVERY_NODE26_EXECUTABLE',
+    'AI_DELIVERY_REAL_PACKAGE_ARCHIVE',
   ]) {
     if (input[key] !== undefined) env[key] = input[key];
   }
@@ -260,9 +261,13 @@ export async function executeCommand(
     const root = child?.pid;
     const rootRow = root ? rows.get(root) : undefined;
     const knownBirth = root ? owned.get(root) : undefined;
+    // Known descendants can create more children after the original root exits.
+    // Continue discovery from every live identity-checked owned process.
     const descendants = new Set(
-      !closed && root && rootRow && (!knownBirth || rootRow.birth === knownBirth) ? [root] : [],
+      [...owned].filter(([pid, birth]) => rows.get(pid)?.birth === birth && !rows.get(pid).zombie).map(([pid]) => pid),
     );
+    if (!closed && root && rootRow && !rootRow.zombie && (!knownBirth || rootRow.birth === knownBirth))
+      descendants.add(root);
     for (let changed = true; changed;) {
       const size = descendants.size;
       for (const [pid, row] of rows) if (descendants.has(row.ppid)) descendants.add(pid);
@@ -291,18 +296,15 @@ export async function executeCommand(
             if (!(error instanceof Error) || !('code' in error) || error.code !== 'ESRCH') throw error;
           }
         }
-      if (!closed && child?.pid) {
-        try {
-          process.kill(-child.pid, kind);
-        } catch (error) {
-          if (!(error instanceof Error) || !('code' in error) || error.code !== 'ESRCH') throw error;
-        }
-      }
     };
     send('SIGTERM');
     const until = Date.now() + 3000;
     while (Date.now() < until && observe().live.length) await delay(50);
-    if (observe().live.length) send('SIGKILL');
+    if (observe().live.length) {
+      send('SIGKILL');
+      const confirmation = Date.now() + 1000;
+      while (Date.now() < confirmation && observe().live.length) await delay(50);
+    }
   };
   try {
     processes(); // Fail before launch when owned cleanup cannot be observed.
@@ -366,8 +368,8 @@ export async function executeCommand(
   return record;
 }
 
-/** @param {TestReport} report @param {string[]} expected @param {string} cwd @param {string} output */
-export function analyzeTests(report, expected, cwd, output) {
+/** @param {TestReport} report @param {string[]} expected @param {string} cwd @param {string} output @param {Environment} [env] */
+export function analyzeTests(report, expected, cwd, output, env = {}) {
   assert.equal(report.success, true, 'Vitest did not report success.');
   assert.ok(
     report.testResults.every((file) => file.status === 'passed'),
@@ -388,6 +390,10 @@ export function analyzeTests(report, expected, cwd, output) {
   const skips = skipped.map((test) => {
     const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
     assert.ok(allowed, `Unexpected skip: ${test.file}: ${test.fullName}`);
+    assert.ok(
+      allowed.kind !== 'external-historical-qualification' || !env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE,
+      'Historical archive qualification skipped despite explicit AI_DELIVERY_REAL_PACKAGE_ARCHIVE input.',
+    );
     return allowed;
   });
   if (skips.some((entry) => entry.kind === 'parent-launched-helper')) {
@@ -483,8 +489,17 @@ export function coverageBaseline(directory, cwd) {
   return {
     metric: 'V8 executed observed ranges in compiled/library and contributor scripts; not source line/branch coverage',
     files: baseline,
+    instrumentationLimits:
+      'Startup collection measures native child invocations, including synthetic Git hooks; it does not instrument the main canonical controller or Vitest-transformed imports. Runner counters cover native fixture paths only.',
+    unmeasuredContributorScripts: ['scripts/checks.mjs', 'scripts/pre-commit.mjs']
+      .filter((path) => !files.has(path))
+      .map((path) => ({
+        path,
+        reason: 'Startup V8 collection does not observe this controller or Vitest-transformed module in this graph.',
+        threshold: null,
+      })),
     thresholdProposal:
-      'For each contributor script, review its first measured baseline and stage a floor five percentage points below it; measure the same Node/V8 graph before enforcing. No global arbitrary percentage is enforced.',
+      'For measured files, review a staged floor five percentage points below the first measured baseline using the same Node/V8 graph. Unmeasured contributor scripts have no derived floor until actual instrumentation measures them. No global arbitrary percentage is enforced.',
   };
 }
 
@@ -516,6 +531,15 @@ function persist(directory, report) {
       ...report.tests.skips.map((skip) => `SKIP ${skip.title}: ${skip.reason}`),
     );
   if (report.error) lines.push(`Failure: ${report.error}`);
+  if (report.coverage)
+    lines.push(
+      `Coverage: ${report.coverage.files.length} measured files; ${report.coverage.metric}`,
+      `Coverage limits: ${report.coverage.instrumentationLimits}`,
+      ...report.coverage.unmeasuredContributorScripts.map(
+        (entry) => `UNMEASURED ${entry.path}: ${entry.reason} No derived threshold.`,
+      ),
+      `Threshold proposal: ${report.coverage.thresholdProposal}`,
+    );
   writeFileSync(join(directory, 'result.txt'), `${lines.join('\n')}\n`, { mode: 0o600 });
 }
 
@@ -599,13 +623,17 @@ export async function runChecks({
           failed: cases.filter((test) => test.status === 'failed').length,
           skips: cases
             .filter((test) => ['pending', 'skipped'].includes(test.status))
-            .map((test) => ({
-              file: test.file,
-              title: test.fullName,
-              reason:
-                SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName)?.reason ??
-                'Unexpected skip; full-check validation rejects it.',
-            })),
+            .map((test) => {
+              const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
+              return {
+                file: test.file,
+                title: test.fullName,
+                reason:
+                  allowed?.kind === 'external-historical-qualification' && environment.AI_DELIVERY_REAL_PACKAGE_ARCHIVE
+                    ? 'Explicit historical archive input was supplied but qualification skipped; full-check validation rejects it.'
+                    : (allowed?.reason ?? 'Unexpected skip; full-check validation rejects it.'),
+              };
+            }),
         };
       }
       persist(directory, report);
@@ -642,6 +670,7 @@ export async function runChecks({
         report.selectedTestFiles,
         cwd,
         readFileSync(testRun.stdoutPath, 'utf8'),
+        environment,
       );
       const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);
       report.inventory = analyzeInventory(

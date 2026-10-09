@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { errorMessage, executeCommand, safeEnvironment } from './checks.mjs';
 
 /** @typedef {{root:string,index:string,originalIndexSha256:string,tree:string,snapshot:string,directory:string,fileCount:number}} StagedSnapshot */
-/** @typedef {{schemaVersion:string,startedAt:string,status:string,resultsDir:string,ownedDirectory:string,cleanupConfirmed:boolean,fullSuccess:boolean, stagedTree?:string,fileCount?:number,sourceIndexSha256?:string,command?:string[],process?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number,sourceIndexUnchanged?:boolean}} StagedReport */
+/** @typedef {{schemaVersion:string,startedAt:string,status:string,resultsDir:string,ownedDirectory:string,cleanupConfirmed:boolean,fullSuccess:boolean, stagedTree?:string,fileCount?:number,sourceIndexPath?:string,sourceIndexSha256?:string,command?:string[],process?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number,sourceIndexUnchanged?:boolean}} StagedReport */
 /** @typedef {{cwd?:string,resultsDir?:string,signal?:AbortSignal,execute?:typeof executeCommand}} StagedOptions */
 
 /** @param {string} cwd @param {string[]} args @param {NodeJS.ProcessEnv} env */
@@ -34,8 +34,13 @@ const digest = (path) => createHash('sha256').update(readFileSync(path)).digest(
 /** @param {string} cwd @param {string} directory @returns {StagedSnapshot} */
 export function prepareStagedSnapshot(cwd, directory) {
   const env = safeEnvironment();
-  const root = git(cwd, ['rev-parse', '--show-toplevel'], env);
-  const index = resolve(root, git(root, ['rev-parse', '--git-path', 'index'], env));
+  // Git supplies temporary indexes for commit -a/path-limited commits. Capture
+  // that one caller input before sanitizing child environments; never mutate it.
+  const indexEnv = process.env.GIT_INDEX_FILE
+    ? { ...env, GIT_INDEX_FILE: resolve(cwd, process.env.GIT_INDEX_FILE) }
+    : env;
+  const root = git(cwd, ['rev-parse', '--show-toplevel'], indexEnv);
+  const index = resolve(cwd, git(cwd, ['rev-parse', '--git-path', 'index'], indexEnv));
   assert.ok(existsSync(index), 'No staged index exists.');
   const originalIndexSha256 = digest(index);
   mkdirSync(directory, { recursive: false, mode: 0o700 });
@@ -110,6 +115,7 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
     Object.assign(record, {
       stagedTree: snapshot.tree,
       fileCount: snapshot.fileCount,
+      sourceIndexPath: snapshot.index,
       sourceIndexSha256: snapshot.originalIndexSha256,
     });
     const runner = join(snapshot.snapshot, 'scripts/checks.mjs');

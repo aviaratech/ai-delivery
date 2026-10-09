@@ -44,7 +44,8 @@ start a fresh attempt. Abrupt process/service loss can prevent final transport.
 The reviewed `SKIP_ALLOWLIST` names only two top-level skips. The setup
 interruption helper requires passing recovery parents and its receipt; their
 launch is distinct from its top-level skip. Absent
-`AI_DELIVERY_REAL_PACKAGE_ARCHIVE`, the historical reviewed 0.3.4 archive
+`AI_DELIVERY_REAL_PACKAGE_ARCHIVE` (an explicitly supplied path is forwarded
+and must not silently become an absent-input skip), the historical reviewed 0.3.4 archive
 qualification remains **unexecuted**. That skip, checkout-sharing consumer tests
 and dry inventory are not current production-only tarball or native adoption
 proof. Issue90 owns the additional current-tarball gate; integrate only its
@@ -53,23 +54,31 @@ exclusions, unknown statuses, missing proof and zero tests fail full checks.
 
 Built-in Node/V8 coverage collects executed **observed V8 ranges** in compiled
 library/contributor scripts without a new dependency; it is not TypeScript
-source line/branch coverage. Review the measured baseline and propose staged
-per-contributor-script floors five percentage points below it using the same
-Node/V8 graph before enforcement. No arbitrary global 100% threshold or
-metric-only tests are required.
+source line/branch coverage. Startup collection measures compiled library files,
+`scripts/build-plugin.mjs`, and native invocations of the two runners by synthetic
+Git hooks. The runners' counters measure those native fixture paths; the main
+canonical controller and Vitest-transformed imports are not instrumented. Each
+result explicitly lists scripts without any raw measurement as unmeasured,
+with no derived floors. For measured files, review staged floors five percentage
+points below their first baseline using the same Node/V8 graph before
+enforcement; retain these instrumentation limits when assessing those floors.
+No arbitrary global 100% threshold or metric-only tests are required.
 
 There is no local total wall-clock deadline. Set an explicit operator-requested
 per-command budget with `--command-timeout-ms <milliseconds>` (default 0,
 disabled). A timeout is separate from source assertion failure. Cancellation
 stops identity-checked owned descendants (including observed separate sessions),
-then uses a three-second TERM grace before KILL for children that did not stop.
+continues discovery from those descendants after the root exits, then uses a
+three-second TERM grace before identity-checked KILL and up to one second to
+confirm quiescence. Unconfirmed cleanup stays explicit.
 Logs are limited to 32 MiB per command and process RSS is sampled against 3 GiB,
 not a hard ceiling or model-service measurement. PID/birth observation must work
 before launch. CI keeps its existing 15-minute service job limit; interruption
 or failed artifact transport requires reconciliation, not a blind retry.
 
 The optional tracked hook is `scripts/pre-commit.mjs`. It copies the index into
-an owned temporary directory, computes the exact staged tree with private
+an owned temporary directory, honoring `GIT_INDEX_FILE` (including temporary
+indexes supplied by `git commit -a` and path-limited commits), computes the exact staged tree with private
 objects, materializes that tree, provisions from its staged lock and invokes
 its **staged** canonical runner. It does not stash, write the original index or
 unstaged files, or borrow checkout node_modules. It checks the source index for

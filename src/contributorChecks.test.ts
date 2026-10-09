@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -65,7 +65,16 @@ type Checks = {
     expected: string[],
     cwd: string,
     output: string,
+    env?: Record<string, string>,
   ): { files: number; total: number; passed: number; skips: object[] };
+  coverageBaseline(
+    directory: string,
+    cwd: string,
+  ): {
+    files: { path: string }[];
+    unmeasuredContributorScripts: { path: string; threshold: null; reason: string }[];
+    thresholdProposal: string;
+  };
   executeCommand(command: string[], options: CommandOptions): Promise<CommandResult>;
   runChecks(options: {
     cwd: string;
@@ -278,11 +287,13 @@ test('toolchain preflight rejects absent/inaccessible/wrong consumer before gate
     NODE_OPTIONS: '--require fictional',
     NODE_PATH: 'checkout-only',
     NPM_TOKEN: 'fictional-token',
+    AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/synthetic/explicit-historical.tgz',
   });
   assert.equal(env.GH_TOKEN, undefined);
   assert.equal(env.NODE_OPTIONS, undefined);
   assert.equal(env.NODE_PATH, undefined);
   assert.equal(env.NPM_TOKEN, undefined);
+  assert.equal(env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE, '/synthetic/explicit-historical.tgz');
   assert.throws(() => checks.validateToolchain(repository, env), /AI_DELIVERY_NODE26_EXECUTABLE/u);
   assert.throws(
     () =>
@@ -335,6 +346,13 @@ test('selection, counts and explicit skip reasons reject unexpected/zero/exclude
   report.numPassedTests = 2;
   const result = checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT');
   assert.equal(result.skips.length, 2);
+  assert.throws(
+    () =>
+      checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT', {
+        AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/synthetic/explicit.tgz',
+      }),
+    /skipped despite explicit/u,
+  );
   assert.match(JSON.stringify(result.skips), /qualification is unexecuted/u);
   assert.throws(() => checks.analyzeTests(report, ['dist/setup.test.js'], cwd, ''), /proof is missing/u);
   assert.throws(() => checks.analyzeTests(report, ['dist/other.test.js'], cwd, ''), /unexpected file/u);
@@ -439,6 +457,119 @@ test('source identity preserves leading filename whitespace and refuses dangling
     symlinkSync('nonexistent-target', join(f.cwd, 'dangling-link'));
     execFileSync('git', ['add', '--', 'dangling-link'], { cwd: f.cwd });
     assert.throws(() => checks.treeIdentity(f.cwd), /regular tracked\/source files/u);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('cancellation discovers children born from a detached owner after the root exits and preserves a peer', async () => {
+  const f = fixture();
+  const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+  const marker = join(f.base, 'late-children.json');
+  const controller = new AbortController();
+  const identity = (pid: number) => {
+    const result = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'stat=,lstart='], { encoding: 'utf8' });
+    assert.ok(!result.error, result.error?.message);
+    assert.ok(result.status === 0 || result.status === 1, result.stderr);
+    return result.status === 1 ? undefined : result.stdout.trim();
+  };
+  let timer: ReturnType<typeof setInterval> | undefined;
+  try {
+    const descendant = `const cp=require('node:child_process'),fs=require('node:fs');
+const id=(pid)=>cp.execFileSync('/bin/ps',['-p',String(pid),'-o','stat=,lstart='],{encoding:'utf8'}).trim().split(/\\s+/).slice(1).join(' ');
+const record={a:process.pid,aBirth:id(process.pid)};fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify(record));
+process.once('SIGTERM',()=>setTimeout(()=>{
+const root=cp.spawnSync('/bin/ps',['-p',process.argv[1],'-o','stat='],{encoding:'utf8'});
+record.rootExited=root.status===1||root.stdout.trim().startsWith('Z');
+const b=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+record.b=b.pid;record.bBirth=id(b.pid);fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify(record));
+},200));setInterval(()=>{},1000);`;
+    // The root exits on TERM. Its detached child ignores TERM and births B later.
+    const script = `const cp=require('node:child_process');cp.spawn(process.execPath,['-e',${JSON.stringify(descendant)},String(process.pid)],{detached:true,stdio:'ignore'});setInterval(()=>{},1000);`;
+    timer = setInterval(() => {
+      if (existsSync(marker)) {
+        clearInterval(timer);
+        setTimeout(() => controller.abort(), 250);
+      }
+    }, 20);
+    const result = await checks.executeCommand([process.execPath, '-e', script], {
+      cwd: f.cwd,
+      env: checks.safeEnvironment(process.env as Record<string, string>),
+      directory: join(f.base, 'late-cancellation'),
+      signal: controller.signal,
+    });
+    const children = JSON.parse(readFileSync(marker, 'utf8')) as {
+      a: number;
+      aBirth: string;
+      b: number;
+      bBirth: string;
+      rootExited: boolean;
+    };
+    assert.ok(children.b, 'The TERM-resistant owner must create a late descendant.');
+    assert.equal(children.rootExited, true, 'The late descendant must be born after the root exits.');
+    assert.equal(result.status, 'cancelled');
+    assert.equal(result.cleanupConfirmed, true);
+    assert.ok(result.observedProcesses?.some((row) => row.pid === children.b && row.birth === children.bBirth));
+    for (const pid of [children.a, children.b]) assert.ok(identity(pid)?.startsWith('Z') ?? true);
+    process.kill(peer.pid!, 0);
+  } finally {
+    clearInterval(timer);
+    // On a failing assertion, signal only the synthetic identities this fixture recorded.
+    if (existsSync(marker)) {
+      const children = JSON.parse(readFileSync(marker, 'utf8')) as {
+        a: number;
+        aBirth: string;
+        b?: number;
+        bBirth?: string;
+      };
+      for (const [pid, birth] of [
+        [children.a, children.aBirth],
+        [children.b, children.bBirth],
+      ] as const) {
+        if (pid && birth) {
+          const state = identity(pid);
+          if (state && !state.startsWith('Z') && state.split(/\s+/u).slice(1).join(' ') === birth)
+            process.kill(pid, 'SIGKILL');
+        }
+      }
+    }
+    peer.kill('SIGKILL');
+    await new Promise<void>((done) => {
+      if (peer.exitCode !== null || peer.signalCode !== null) done();
+      else peer.once('close', () => done());
+    });
+    f.cleanup();
+  }
+});
+
+test('coverage labels unobserved contributor scripts without synthesizing measured ranges or floors', () => {
+  const f = fixture();
+  try {
+    const directory = join(f.base, 'unit-coverage');
+    mkdirSync(directory);
+    writeFileSync(
+      join(directory, 'fixture.json'),
+      JSON.stringify({
+        result: [
+          {
+            url: new URL('scripts/build-plugin.mjs', `file://${f.cwd}/`).href,
+            functions: [{ ranges: [{ startOffset: 0, endOffset: 1, count: 1 }] }],
+          },
+        ],
+      }),
+    );
+    const baseline = checks.coverageBaseline(directory, f.cwd);
+    assert.deepEqual(
+      baseline.files.map((file) => file.path),
+      ['scripts/build-plugin.mjs'],
+    );
+    assert.deepEqual(
+      baseline.unmeasuredContributorScripts.map((file) => file.path),
+      ['scripts/checks.mjs', 'scripts/pre-commit.mjs'],
+    );
+    assert.ok(baseline.unmeasuredContributorScripts.every((file) => file.threshold === null && file.reason.length > 0));
+    assert.match(baseline.thresholdProposal, /no derived floor until actual instrumentation/u);
+    // This controlled parser fixture is not the measured canonical graph baseline.
   } finally {
     f.cleanup();
   }

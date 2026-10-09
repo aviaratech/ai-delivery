@@ -1,9 +1,20 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'vitest';
 
 type Snapshot = {
@@ -21,6 +32,7 @@ type StagedResult = {
   stagedTree?: string;
   cleanupConfirmed: boolean;
   sourceIndexUnchanged?: boolean;
+  sourceIndexPath?: string;
   error?: string;
   ownedDirectory: string;
 };
@@ -190,5 +202,66 @@ test('unconfirmed child completion preserves the owned snapshot and marks cleanu
     // The injected executor launched no process; this fixture owns safe cleanup.
     if (ownedDirectory) rmSync(ownedDirectory, { recursive: true, force: true });
     f.cleanup();
+  }
+});
+
+test('caller relative alternate index supplies the exact tree and preserves both indexes and unstaged bytes', () => {
+  const f = fixture();
+  const previous = process.env.GIT_INDEX_FILE;
+  try {
+    const primary = join(f.cwd, '.git/index');
+    const alternate = join(f.cwd, '.git/alternate-index');
+    writeFileSync(join(f.cwd, 'partial.txt'), 'primary staged\n');
+    f.git('add', 'partial.txt');
+    copyFileSync(primary, alternate);
+    writeFileSync(join(f.cwd, 'partial.txt'), 'alternate staged\n');
+    execFileSync('git', ['add', 'partial.txt'], { cwd: f.cwd, env: { ...process.env, GIT_INDEX_FILE: alternate } });
+    writeFileSync(join(f.cwd, 'partial.txt'), 'final unstaged bytes\n');
+    const primaryHash = hash(readFileSync(primary)),
+      alternateHash = hash(readFileSync(alternate));
+    assert.notEqual(primaryHash, alternateHash);
+    process.env.GIT_INDEX_FILE = '.git/alternate-index';
+    const snapshot = staged.prepareStagedSnapshot(f.cwd, join(f.base, 'alternate-snapshot'));
+    assert.equal(snapshot.index, alternate);
+    assert.equal(snapshot.originalIndexSha256, alternateHash);
+    assert.equal(readFileSync(join(snapshot.snapshot, 'partial.txt'), 'utf8'), 'alternate staged\n');
+    assert.equal(hash(readFileSync(primary)), primaryHash);
+    assert.equal(hash(readFileSync(alternate)), alternateHash);
+    assert.equal(readFileSync(join(f.cwd, 'partial.txt'), 'utf8'), 'final unstaged bytes\n');
+  } finally {
+    if (previous === undefined) delete process.env.GIT_INDEX_FILE;
+    else process.env.GIT_INDEX_FILE = previous;
+    f.cleanup();
+  }
+});
+
+test('synthetic commit -a and path-limited hooks validate the Git-supplied temporary commit index', () => {
+  const entry = fileURLToPath(new URL('../scripts/pre-commit.mjs', import.meta.url));
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  for (const mode of ['all', 'path']) {
+    const f = fixture(syntheticRunner());
+    try {
+      const resultsDir = join(f.base, 'hook-results');
+      const hook = join(f.cwd, '.git/hooks/pre-commit');
+      writeFileSync(
+        hook,
+        `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(entry)} --results-dir ${quote(resultsDir)}\n`,
+      );
+      chmodSync(hook, 0o755); // Only this disposable synthetic repository owns the hook.
+      writeFileSync(join(f.cwd, 'partial.txt'), `${mode} committed content\n`);
+      if (mode === 'path') writeFileSync(join(f.cwd, 'delete.txt'), 'unrelated unstaged content\n');
+      f.git('commit', '-qm', `Synthetic ${mode} commit`, ...(mode === 'all' ? ['-a'] : ['--', 'partial.txt']));
+      const result = JSON.parse(readFileSync(join(resultsDir, 'staged.json'), 'utf8')) as StagedResult;
+      assert.equal(result.fullSuccess, true);
+      assert.equal(result.sourceIndexUnchanged, true);
+      assert.equal(result.cleanupConfirmed, true);
+      assert.notEqual(resolve(result.sourceIndexPath!), join(f.cwd, '.git/index'));
+      assert.equal(result.stagedTree, f.git('rev-parse', 'HEAD^{tree}'));
+      assert.equal(f.git('show', 'HEAD:partial.txt'), `${mode} committed content`);
+      if (mode === 'path')
+        assert.equal(readFileSync(join(f.cwd, 'delete.txt'), 'utf8'), 'unrelated unstaged content\n');
+    } finally {
+      f.cleanup();
+    }
   }
 });
