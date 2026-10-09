@@ -162,7 +162,8 @@ test('consumer-to-generator serialization preserves a small valid flat map', () 
 
 patchedTest('patched SourceNode skips exhausted code with a strict operation bound', () => {
   let additions = 0;
-  const originalAdd = SourceNode.prototype.add;
+  const originalAdd = Object.getOwnPropertyDescriptor(SourceNode.prototype, 'add')?.value as SourceNode['add'];
+  assert.equal(typeof originalAdd, 'function', 'The operation guard must capture the original prototype method.');
   const add = vi.spyOn(SourceNode.prototype, 'add').mockImplementation(function (this: SourceNode, chunk: string) {
     additions += 1;
     assert.ok(additions <= 64, 'Stop a regressed loop before it can do excessive work.');
