@@ -19,6 +19,8 @@ const fixture = vi.hoisted(() => ({
   authCalls: 0,
   keyReads: 0,
   settingsReads: 0,
+  requestErrorLogs: [] as string[],
+  childStderrLines: [] as string[],
   commands: [] as { args: string[]; environment: Record<string, string | undefined> }[],
   requests: [] as string[],
   startupEnvironments: [] as Record<string, string>[],
@@ -38,7 +40,29 @@ vi.mock('node:fs', async (original) => {
     },
   };
 });
-vi.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
+// Octokit binds console.error at module import. Capture its real request-log
+// hook through a logger sink instead of a later console spy, as subprocess
+// stderr would do. Requests, authentication and error owners remain real.
+vi.mock('@octokit/rest', async (original) => {
+  const actual = await original<typeof import('@octokit/rest')>();
+  return {
+    ...actual,
+    Octokit: actual.Octokit.defaults({
+      log: {
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: (...values: unknown[]) => {
+          const line = values.filter((value): value is string => typeof value === 'string').join(' ');
+          fixture.childStderrLines.push(line);
+          fixture.requestErrorLogs.push(line);
+        },
+      },
+    }),
+  };
+});
+vi.mock('@modelcontextprotocol/sdk/client/stdio.js', async (original) => ({
+  ...(await original<typeof import('@modelcontextprotocol/sdk/client/stdio.js')>()),
   StdioClientTransport: class {
     constructor(options: { env: Record<string, string> }) {
       fixture.startupEnvironments.push(options.env);
@@ -143,6 +167,7 @@ vi.mock('node:child_process', async (original) => ({
       }
       const ambient = process.env;
       process.env = { ...options.env };
+      fixture.childStderrLines = [];
       try {
         const { contextFor } = await import('./dispatch.js');
         const { preflightReviewRoute } = await import('./pr.js');
@@ -167,7 +192,9 @@ vi.mock('node:child_process', async (original) => ({
         callback(
           new Error('Selected CLI failed'),
           '',
-          `ai-delivery: ${error instanceof Error ? error.message : 'unknown'}\n`,
+          [...fixture.childStderrLines, `ai-delivery: ${error instanceof Error ? error.message : 'unknown'}`].join(
+            '\n',
+          ) + '\n',
         );
       } finally {
         process.env = ambient;
@@ -251,6 +278,8 @@ beforeEach(() => {
   fixture.authCalls = 0;
   fixture.keyReads = 0;
   fixture.settingsReads = 0;
+  fixture.requestErrorLogs = [];
+  fixture.childStderrLines = [];
   fixture.commands = [];
   fixture.requests = [];
   fixture.startupEnvironments = [];
@@ -370,6 +399,41 @@ test('default doctor has no settings, reference, key or authentication access; n
     assert.equal(env.AI_DELIVERY_IDENTITY, undefined);
   }
 });
+
+test('the actual SDK startup subprocess receives no inherited-name credential sentinels', async () => {
+  const sdk = await vi.importActual<typeof import('@modelcontextprotocol/sdk/client/stdio.js')>(
+    '@modelcontextprotocol/sdk/client/stdio.js',
+  );
+  settings.roles.author.credentialEnv = { token: 'LOGNAME' };
+  file(fixture.config, JSON.stringify(settings));
+  for (const name of sdk.DEFAULT_INHERITED_ENV_VARS) vi.stubEnv(name, `fictional-inherited-${name}`);
+  await doctor('example/widget', false);
+  const transport = new sdk.StdioClientTransport({
+    command: process.execPath,
+    args: [
+      '--input-type=module',
+      '-e',
+      "process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'fixture.environment',params:Object.fromEntries(['HOME','LOGNAME','PATH','SHELL','TERM','USER'].map(name=>[name,process.env[name]]))})+'\\n');process.stdin.resume();",
+    ],
+    cwd: fixture.home,
+    env: fixture.startupEnvironments[0]!,
+    stderr: 'pipe',
+  });
+  try {
+    const readback = new Promise<unknown>((resolve, reject) => {
+      transport.onmessage = resolve;
+      transport.onerror = reject;
+    });
+    await transport.start();
+    const message = (await readback) as { params: Record<string, string> };
+    assert.deepEqual(message.params, Object.fromEntries(sdk.DEFAULT_INHERITED_ENV_VARS.map((name) => [name, ''])));
+    assert.equal(fixture.settingsReads, 0);
+    assert.equal(fixture.authCalls, 0);
+    assert.equal(fixture.keyReads, 0);
+  } finally {
+    await transport.close();
+  }
+});
 test('auth opt-in requires an explicit valid repository, even outside Git or in dry-run', async () => {
   await assert.rejects(
     managePlugin({ action: 'doctor', host: 'codex', scope: 'user', repoRoot: fixture.home, checkAuth: true }),
@@ -475,6 +539,11 @@ test.each(['expired', 'denied', 'raw_failure'])(
       result.authProbe?.reason,
       mode === 'expired' ? 'authentication_failed' : mode === 'denied' ? 'repository_denied' : 'probe_failed',
     );
+    if (mode !== 'raw_failure')
+      assert.ok(
+        fixture.requestErrorLogs.some((line) => line.startsWith('GET ')),
+        'Installed Octokit REST logger must precede the final diagnostic',
+      );
     assert.notEqual(result.authProbe?.authentication.status, 'verified');
     assert.notEqual(result.authProbe?.repositoryAccess.status, 'verified');
     for (const sentinel of [

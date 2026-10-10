@@ -19,7 +19,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 
 import { loadDeliverySettings, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
@@ -272,11 +272,11 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     probe.outcome = 'failed';
     probe.authentication.status = 'unverified';
     probe.repositoryAccess.status = 'unverified';
-    // Classify only the existing owners' exact safe messages, never an upstream
-    // error body or a guessed status/permission. Other failures stay unverified.
+    // REST request logging can precede the CLI-owned final diagnostic. Classify
+    // only that exact final line; all surrounding opaque output stays withheld.
+    const diagnostic = captured.stderr.trimEnd().split(/\r?\n/u).at(-1);
     if (
-      captured.stderr.trim() ===
-      'ai-delivery: Configured personal author token is invalid or expired; refresh the selected token.'
+      diagnostic === 'ai-delivery: Configured personal author token is invalid or expired; refresh the selected token.'
     ) {
       probe.authentication.status = 'failed';
       probe.reason = 'authentication_failed';
@@ -284,7 +284,7 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
       [
         'ai-delivery: Author cannot read the selected GitHub repository; verify configured access.',
         'ai-delivery: Reviewer GitHub App cannot read the selected repository; verify its installation and repository access.',
-      ].includes(captured.stderr.trim())
+      ].includes(diagnostic ?? '')
     ) {
       probe.repositoryAccess.status = 'denied';
       probe.reason = 'repository_denied';
@@ -846,7 +846,12 @@ async function startup(root: string, version: string, cwd: string): Promise<NonN
     command: process.execPath,
     args: [join(root, 'dist/mcp-launcher.js')],
     cwd,
-    env: { PATH: process.env.PATH ?? '', NODE_OPTIONS: '--max-old-space-size=1024' },
+    // The SDK merges its default inherited names even when env is supplied.
+    // Explicitly mask every one; startup needs no caller environment values.
+    env: {
+      ...Object.fromEntries(DEFAULT_INHERITED_ENV_VARS.map((name) => [name, ''])),
+      NODE_OPTIONS: '--max-old-space-size=1024',
+    },
     stderr: 'pipe',
     maxBufferSize: 1024 * 1024,
   });
