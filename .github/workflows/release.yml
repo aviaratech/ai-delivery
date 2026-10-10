@@ -60,14 +60,12 @@ jobs:
           if (process.env.GITHUB_SHA !== source || execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== source) throw new Error('Dispatch or checkout differs from the reviewed source.');
           if (pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Reviewed release metadata differs from the source package.');
           JS
-      - name: Verify and pack
+      - name: Qualify and retain the exact archive
         run: |
-          npm ci
-          npm run checks
-          npm run build
-          mkdir -p package-artifact
-          npm pack --pack-destination package-artifact
-          cd package-artifact
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run checks -- --results-dir "$RUNNER_TEMP/release-qualification"
+          node scripts/release-artifact.mjs select "$RUNNER_TEMP/release-qualification" "$RUNNER_TEMP/release-artifact"
+          cd "$RUNNER_TEMP/release-artifact"
           test "$(find . -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
           printf '%s  %s\n' "$REVIEWED_ARCHIVE_SHA256" "aviaratech-ai-delivery-$RELEASE_VERSION.tgz" | shasum -a 256 -c -
           shasum -a 256 ./*.tgz > SHA256SUMS
@@ -80,7 +78,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
-          path: package-artifact/
+          path: ${{ runner.temp }}/release-artifact/
           if-no-files-found: error
           retention-days: 1
 
@@ -94,6 +92,10 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.reviewed_source_sha }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.21.0
@@ -110,6 +112,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          node scripts/release-artifact.mjs verify package-artifact
           test "$(find package-artifact -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
           cd package-artifact
           printf '%s  %s\n' "$REVIEWED_ARCHIVE_SHA256" "aviaratech-ai-delivery-$RELEASE_VERSION.tgz" | shasum -a 256 -c -
@@ -124,9 +127,11 @@ jobs:
           import { createHash } from 'node:crypto';
           import { readFileSync } from 'node:fs';
           import { spawnSync } from 'node:child_process';
+          import { resolve } from 'node:path';
           import pkg from './package.json' with { type: 'json' };
           const { REVIEWED_SOURCE_SHA: source, RELEASE_VERSION: version, REVIEWED_ARCHIVE_SHA256: digest } = process.env;
-          const archive = readFileSync(`../../aviaratech-ai-delivery-${version}.tgz`);
+          const archivePath = resolve(`../../aviaratech-ai-delivery-${version}.tgz`);
+          const archive = readFileSync(archivePath);
           const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
           const integrity = `sha512-${createHash('sha512').update(archive).digest('base64')}`;
           if (process.env.GITHUB_SHA !== source || sha256(archive) !== digest || pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Downloaded package differs from the reviewed release.');
@@ -236,7 +241,7 @@ jobs:
               console.log('The exact reviewed release is already published with latest and provenance evidence; no publication repeated.');
             } else {
               await requireMain();
-              const result = spawnSync('npm', ['publish', '.', '--ignore-scripts', '--access', 'public', '--tag', 'latest', '--registry', registry, '--provenance'], { stdio: 'inherit' });
+              const result = spawnSync('npm', ['publish', archivePath, '--ignore-scripts', '--access', 'public', '--tag', 'latest', '--registry', registry, '--provenance'], { stdio: 'inherit' });
               console.log(JSON.stringify({ publicationInvokedOnce: true, status: result.status, signal: result.signal ?? null, error: result.error?.message ?? null }));
               await verifyPublished();
               if (result.status !== 0) throw new Error('npm publish failed or was ambiguous; matching registry readback was recorded. Qualify the original invocation; no automatic publication retry.');

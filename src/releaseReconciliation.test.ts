@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { posix } from 'node:path';
 import { Script } from 'node:vm';
 import { test } from 'vitest';
 
@@ -17,6 +18,7 @@ const source = 'a'.repeat(40);
 const registry = 'https://registry.npmjs.org';
 const packageUrl = `${registry}/@aviaratech%2fai-delivery`;
 const version = '0.8.1';
+const archivePath = posix.resolve('/synthetic/package-artifact', `aviaratech-ai-delivery-${version}.tgz`);
 const pkg = {
   name: '@aviaratech/ai-delivery',
   version,
@@ -146,14 +148,16 @@ async function runRelease(fixture: Fixture = {}) {
   };
   const context = {
     createHash,
+    resolve: (path: string) => posix.resolve('/synthetic/package-artifact/unpacked/package', path),
     readFileSync: (path: string) => {
-      assert.equal(path, `../../aviaratech-ai-delivery-${version}.tgz`);
+      assert.equal(path, archivePath);
       return archive;
     },
     spawnSync: (command: string, args: string[]) => {
       commands.push({ command, args: [...args] });
       assert.equal(command, 'npm');
       assert.equal(args[0], 'publish');
+      assert.equal(args[1], archivePath);
       publications++;
       return { status: fixture.publishStatus === undefined ? 0 : fixture.publishStatus };
     },
@@ -211,7 +215,7 @@ test('successful publication reconciles staggered registry visibility without an
   assert.equal(result.commands.length, 1);
   assert.deepEqual(result.commands[0]?.args, [
     'publish',
-    '.',
+    archivePath,
     '--ignore-scripts',
     '--access',
     'public',

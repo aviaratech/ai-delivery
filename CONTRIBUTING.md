@@ -176,11 +176,21 @@ the `npm-publish` environment. Before enabling it, the repository owner must:
    version, actual built archive, complete inventory and confidentiality scan.
    Dispatch the workflow on `main` with `reviewed_source_sha`, `package_version`
    and `archive_sha256` from that accepted candidate. Missing or mismatched
-   inputs fail closed. The build job checks, scans and packages without OIDC
-   permission; only the publish job receives `id-token: write`. It checks the
-   downloaded archive against the accepted digest, compares an inert repack
+   inputs fail closed. The package job checks, scans and retains its qualified archive without OIDC
+   permission; only the publish job receives `id-token: write`. The package job
+   runs full checks once with results outside the checkout, then
+   `scripts/release-artifact.mjs select` validates the successful source-bound
+   producer/pack/consumer joins and owned cleanup before copying that exact
+   archive and original receipt bytes into the uploaded artifact. It performs
+   no subsequent build or production pack. Missing, incomplete or mismatched
+   receipts fail before upload. The publish job checks the portable receipt and
+   downloaded archive against the accepted source/version/digest, compares an inert repack
    byte for byte, and rejects observed protected-main or required-check drift
-   before publishing through the existing trusted publisher. Inputs are passed
+   before passing the verified tarball path directly to `npm publish` through the
+   existing trusted publisher. The inert repack is a byte comparison only;
+   its output never becomes the upload or publication source. Receipt hashes
+   preserve evidence integrity; reviewed workflow source and its actual execution
+   remain necessary provenance. Inputs are passed
    as environment values, never interpolated into shell commands.
 
 Release dispatch remains an explicit action by the authorized delivery owner;
