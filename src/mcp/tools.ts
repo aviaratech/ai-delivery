@@ -178,10 +178,15 @@ export const AI_DELIVERY_MCP_TOOLS = [
           supersededBy: Positive.optional(),
           title: IssueWriteFields.title,
         })
-        .refine(
-          (input) => (input.closeReason === undefined && input.supersededBy === undefined) || input.state === 'closed',
-          'Closure details require state closed',
-        ),
+        .superRefine((input, ctx) => {
+          if ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
+            ctx.addIssue({
+              code: 'custom',
+              path: ['state'],
+              message: 'Closure details require state closed',
+              params: { issueCode: 'closure.state' },
+            });
+        }),
     ),
   },
   {

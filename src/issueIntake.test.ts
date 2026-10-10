@@ -457,6 +457,35 @@ test('actual compiled stdio MCP returns every Ready diagnostic before credential
       ]);
       assert.ok(failure.failures.every((f) => f.code && f.fixHint));
       assert.doesNotMatch(blocks[0]!.text, /missing-config/u);
+      const unknown = await client.callTool({
+        name,
+        arguments: {
+          ...ready(),
+          ...(name === 'issue_update' ? { issueNumber: 17 } : {}),
+          unexpectedField: 'Root field must be refused.',
+          context: { ...ready().context, unexpectedField: 'Nested field must be refused.' },
+          acceptanceCriteria: [{ ...ready().acceptanceCriteria[0]!, unexpectedField: 'Unknown criterion field.' }],
+        },
+      });
+      assert.equal(unknown.isError, true);
+      const unknownBlocks = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(unknown.content);
+      const unknownFailure = z
+        .object({
+          contract: z.literal('ai-delivery.issue@1'),
+          failures: z.array(z.object({ code: z.literal('field.unknown'), field: z.string(), fixHint: z.string() })),
+        })
+        .parse(JSON.parse(unknownBlocks[0]!.text) as unknown);
+      assert.deepEqual(unknownFailure.failures.map((f) => f.field).sort(), [
+        'acceptanceCriteria.0',
+        'context',
+        'issue',
+      ]);
+      assert.ok(unknownFailure.failures.every((f) => f.fixHint.length > 10));
+      assert.doesNotMatch(
+        unknownBlocks[0]!.text,
+        /unexpectedField|Nested field|Unknown criterion/u,
+        'Diagnostics do not echo untrusted keys or values.',
+      );
     }
     const foreign = await client.callTool({ name: 'issue_create', arguments: { ...ready(), repo: 'other/widget' } });
     assert.equal(foreign.isError, true);

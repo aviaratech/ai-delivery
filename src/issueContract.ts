@@ -170,21 +170,20 @@ export const IssueWriteSchema = z.strictObject(IssueWriteFields);
 
 /** Keep advertised structural schemas while returning domain diagnostics before SDK error wrapping. */
 export function issueInputSchema<T extends z.ZodObject>(schema: T): T {
-  return schema.refine(
-    (value) => {
-      const parsed = schema.safeParse(value);
-      if (!parsed.success) throw new IssueValidationError(issueDiagnostics(parsed.error.issues));
+  return schema.refine(() => true, {
+    when: ({ issues }) => {
+      // Parsed values have already lost unknown keys. Preserve the original structural failures.
+      if (issues.length) throw new IssueValidationError(issueDiagnostics(issues));
       return true;
     },
-    { when: () => true },
-  );
+  });
 }
 
-function issueDiagnostics(issues: readonly z.core.$ZodIssue[]): IssueDiagnostic[] {
+function issueDiagnostics(issues: readonly (z.core.$ZodIssue | z.core.$ZodRawIssue)[]): IssueDiagnostic[] {
   const seen = new Set<string>();
   return issues
     .map((issue) => {
-      const field = issue.path.map(String).join('.') || 'issue';
+      const field = (issue.path ?? []).map(String).join('.') || 'issue';
       const code =
         issue.code === 'custom' && typeof issue.params?.issueCode === 'string'
           ? issue.params.issueCode
@@ -200,11 +199,20 @@ function issueDiagnostics(issues: readonly z.core.$ZodIssue[]): IssueDiagnostic[
                     ? 'acceptance-criteria'
                     : field === 'draft'
                       ? 'draft'
-                      : 'field.type';
+                      : issue.code === 'unrecognized_keys'
+                        ? 'field.unknown'
+                        : 'field.type';
       return hint(
         code,
         field,
-        code === 'points' ? 'Choose Points from 1 through 8; split a 13-point issue into sub-issues.' : issue.message,
+        code === 'points'
+          ? 'Choose Points from 1 through 8; split a 13-point issue into sub-issues.'
+          : issue.code === 'unrecognized_keys'
+            ? 'Remove unrecognized fields from ' + field + '.'
+            : (issue.message ??
+              (issue.code === 'invalid_type'
+                ? 'Provide a valid ' + issue.expected + ' value.'
+                : 'Provide a value satisfying the declared issue field schema.')),
       );
     })
     .filter((issue) => {
