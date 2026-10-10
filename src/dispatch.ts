@@ -37,6 +37,7 @@ import {
 } from './worktreeTransition.js';
 import { stageRuntime, admitRuntime, type StageRuntimeInput, type AdmitRuntimeInput } from './setup.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
+import { IssueValidationError } from './issueContract.js';
 
 export interface ExecutionContext {
   identity?: string;
@@ -184,6 +185,8 @@ export async function startTrackedIssue(
     }
   }
   try {
+    const readiness = await readyCheck(context, number);
+    if (!readiness.ready) throw new IssueValidationError(readiness.failures);
     const branch = await startIssueBranch(context, number, optionalString(input, 'branch'));
     await journalIssueStart(context, number);
     return {

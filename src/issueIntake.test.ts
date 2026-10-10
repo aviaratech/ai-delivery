@@ -8,7 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 import { createIssue, updateIssue, canonicalIssueBody, type DeliveryContext } from './issue.js';
-import { startTrackedIssue } from './dispatch.js';
+import { executeTool, startTrackedIssue } from './dispatch.js';
 import { digestValue } from './delivery/common.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import { IssueFields, ReadyIssue, renderIssueBody, parseIssueBody, ISSUE_BODY_MARKER } from './issueContract.js';
@@ -51,13 +51,21 @@ function fixture() {
     wrongCreateRepo: false,
     driftAfterHistory: false,
     created: true,
+    blockers: false,
+    trackingParent: false,
+    livePoints: 2,
   };
   const branchWrites: Record<string, unknown>[] = [];
   const branches: { name: string; sha: string }[] = [];
   let points = 2;
   let status = 'Queued';
   const values = () => [
-    { issue_field_id: 101, issue_field_name: 'Estimate', data_type: 'single_select', value: String(points) },
+    {
+      issue_field_id: 101,
+      issue_field_name: 'Estimate',
+      data_type: 'single_select',
+      value: String(controls.livePoints),
+    },
   ];
   const context = {
     root: '/synthetic-non-git',
@@ -86,6 +94,7 @@ function fixture() {
       authenticatedAuthor: async () => ({ actorLogin: 'operator', credentialIdentity: 'user:1' }),
       rest: {
         issues: {
+          listSubIssues: async () => ({ data: controls.trackingParent ? [{ number: 18 }] : [] }),
           get: async () => ({ data: { ...live } }),
           listForRepo: async () => ({ data: controls.created ? [{ ...live }] : [] }),
           create: async (input: Record<string, unknown>) => {
@@ -148,6 +157,7 @@ function fixture() {
           if (route.startsWith('POST ')) {
             const fields = input.issue_field_values as { field_id: number; value: string }[];
             points = Number(fields.find((f) => f.field_id === 101)?.value ?? points);
+            controls.livePoints = points;
             return { data: values() };
           }
           if (route.startsWith('GET ')) return { data: values() };
@@ -181,7 +191,23 @@ function fixture() {
         if (query.includes('blockedBy(first:'))
           return {
             repository: {
-              issue: { parent: null, blockedBy: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
+              issue: {
+                parent: null,
+                blockedBy: {
+                  nodes: controls.blockers
+                    ? [
+                        {
+                          id: 'ISSUE18',
+                          number: 18,
+                          title: 'Resolve prerequisite',
+                          state: 'OPEN',
+                          repository: { nameWithOwner: 'example/widget' },
+                        },
+                      ]
+                    : [],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
             },
           };
         if (query.includes('ProjectDeliveryItems'))
@@ -389,6 +415,87 @@ test('a history rewrite refuses to republish secret-bearing prior text', async (
   );
   assert.equal(f.comments.length, 0);
   assert.equal(f.writes.length, 0);
+});
+
+test('ordinary start checks typed Draft, Points and live eligibility before branch or journal mutation', async () => {
+  for (const [expected, change] of [
+    [
+      'draft',
+      (f: ReturnType<typeof fixture>) => {
+        f.live.body = renderIssueBody({ ...ready(), draft: true });
+      },
+    ],
+    [
+      'points.sync',
+      (f: ReturnType<typeof fixture>) => {
+        f.controls.livePoints = 4;
+      },
+    ],
+    [
+      'blocked',
+      (f: ReturnType<typeof fixture>) => {
+        f.controls.blockers = true;
+      },
+    ],
+    [
+      'tracking-parent',
+      (f: ReturnType<typeof fixture>) => {
+        f.controls.trackingParent = true;
+      },
+    ],
+  ] as const) {
+    const f = fixture();
+    change(f);
+    await assert.rejects(startTrackedIssue(f.context, { issueNumber: 17 }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      const diagnostics = JSON.parse(error.message) as { failures: { code: string; field: string; fixHint: string }[] };
+      assert(diagnostics.failures.some((failure) => failure.code === expected && failure.field && failure.fixHint));
+      return true;
+    });
+    assert.equal(f.branchWrites.length, 0);
+    assert.equal(f.comments.length, 0);
+    assert.equal(f.writes.length, 0);
+  }
+  const f = fixture();
+  f.live.body = renderIssueBody({ ...ready(), outcome: 'Retain the Todo label when validation passes.' });
+  const first = await startTrackedIssue(f.context, { issueNumber: 17 });
+  assert.ok('reused' in first && first.reused === false);
+  assert.ok('reused' in (await startTrackedIssue(f.context, { issueNumber: 17 })));
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(f.comments.length, 1);
+});
+
+test('joined MCP start modes preserve ordinary input and reject mixed investigation or foreign repository calls before configuration', async () => {
+  const schema = getAiDeliveryMcpTool('issue_start')!.inputSchema;
+  assert(schema.safeParse({ issueNumber: 17, repo: 'example/widget' }).success);
+  assert(
+    schema.safeParse({ body: renderIssueBody(ready()), title: ready().title, points: 2, issueType: 'Task' }).success,
+  );
+  for (const arguments_ of [
+    { issueNumber: 17, expectedHeadSha: 'a'.repeat(40) },
+    {
+      issueNumber: 17,
+      investigationWorktree: '/fictional/issue-17',
+      expectedHeadSha: 'a'.repeat(40),
+      body: renderIssueBody(ready()),
+    },
+  ])
+    assert.equal(schema.safeParse(arguments_).success, false);
+  await assert.rejects(
+    executeTool(
+      'issue_start',
+      { repo: 'foreign/widget', issueNumber: 17 },
+      { repo: 'example/widget', repoRoot: '/synthetic-non-git' },
+    ),
+    /selectors disagree/u,
+  );
+  const finish = getAiDeliveryMcpTool('issue_finish')!.inputSchema;
+  assert(finish.safeParse({ issueNumber: 17, prNumber: 23 }).success);
+  assert.equal(finish.safeParse({ issueNumber: 17 }).success, false);
+  assert.equal(
+    finish.safeParse({ issueNumber: 17, investigation: true, resultPath: '/fictional/result', prNumber: 23 }).success,
+    false,
+  );
 });
 
 test('actual compiled stdio MCP returns every Ready diagnostic before credentials and refuses a foreign caller repo', async () => {
