@@ -198,6 +198,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
     inputSchema: z.strictObject({
       repo: Repo,
       issueNumber: Positive,
+      prNumber: Positive.optional(),
+      nonClosing: z.boolean().optional(),
       body: z.string().min(1).optional(),
       draft: z.boolean().optional(),
       dryRun: z.boolean().optional(),
@@ -209,7 +211,12 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_pr_info',
     commandName: 'pr:info',
     description: 'Inspect a PR by number or its GitHub-linked issue branch',
-    inputSchema: z.strictObject({ repo: Repo, issueNumber: Positive.optional(), prNumber: Positive.optional() }),
+    inputSchema: z.strictObject({
+      repo: Repo,
+      issueNumber: Positive.optional(),
+      prNumber: Positive.optional(),
+      nonClosing: z.boolean().optional(),
+    }),
   },
   {
     name: 'issue_pr_review',
@@ -219,6 +226,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       repo: Repo,
       issueNumber: Positive,
       prNumber: Positive,
+      nonClosing: z.boolean().optional(),
       artifact: z.string().min(1),
       identity: z.string().min(1).optional(),
       dryRun: z.boolean().optional(),
@@ -232,6 +240,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       repo: Repo,
       issueNumber: Positive,
       prNumber: Positive,
+      nonClosing: z.boolean().optional(),
       reviewedHeadSha: z
         .string()
         .regex(/^[a-f0-9]{40}$/u)
@@ -248,6 +257,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       repo: Repo,
       issueNumber: Positive,
       prNumber: Positive,
+      nonClosing: z.boolean().optional(),
       reviewedHeadSha: z
         .string()
         .regex(/^[a-f0-9]{40}$/u)

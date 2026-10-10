@@ -197,6 +197,8 @@ export async function executeTool(
   const definition = getAiDeliveryMcpTool(name);
   if (!definition) throw new DeliveryError(`Unknown ai-delivery tool ${name}.`);
   const { repo: selected, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
+  if (name === 'issue_finish' && input.nonClosing === true)
+    throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
     throw new DeliveryError('Tool and execution repository selectors disagree.');
   const repo = typeof selected === 'string' ? selected : execution.repo;
@@ -250,7 +252,9 @@ export async function executeTool(
       return readyCheck(context, requiredNumber(input, 'issueNumber'));
     case 'issue_pr_create':
       return publishPr(context, {
+        ...(input.prNumber === undefined ? {} : { prNumber: requiredNumber(input, 'prNumber') }),
         issueNumber: requiredNumber(input, 'issueNumber'),
+        ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),
         ...(input.body === undefined ? {} : { body: requireString(input, 'body') }),
         ...(input.title === undefined ? {} : { title: requireString(input, 'title') }),
         ...(input.headBranch === undefined ? {} : { headBranch: requireString(input, 'headBranch') }),
@@ -258,11 +262,12 @@ export async function executeTool(
         dryRun: input.dryRun === true,
       });
     case 'issue_pr_info':
-      return prInfo(context, input as { issueNumber?: number; prNumber?: number });
+      return prInfo(context, input as { issueNumber?: number; prNumber?: number; nonClosing?: boolean });
     case 'issue_pr_review':
       return submitFormalReview(context, {
         artifact: requireString(input, 'artifact'),
         issueNumber: requiredNumber(input, 'issueNumber'),
+        ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),
         prNumber: requiredNumber(input, 'prNumber'),
         dryRun: input.dryRun === true,
       });
@@ -270,6 +275,7 @@ export async function executeTool(
     case 'issue_finish': {
       const merge = {
         issueNumber: requiredNumber(input, 'issueNumber'),
+        ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),
         prNumber: requiredNumber(input, 'prNumber'),
         ...(input.strategy === undefined ? {} : { strategy: input.strategy as 'merge' | 'squash' | 'rebase' }),
         ...(input.reviewedHeadSha === undefined ? {} : { reviewedHeadSha: requireString(input, 'reviewedHeadSha') }),
