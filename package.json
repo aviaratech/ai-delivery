@@ -46,17 +46,20 @@
     "access": "public"
   },
   "scripts": {
-    "format": "oxfmt src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "format:check": "oxfmt --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "lint": "oxlint",
+    "format": "oxfmt --threads=1 src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "format:check": "oxfmt --threads=1 --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "lint": "oxlint --threads=1",
     "typecheck": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json && node scripts/build-plugin.mjs",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "test": "npm run build && vitest run",
-    "checks": "npm run format:check && npm run lint && npm run typecheck && npm test"
+    "checks": "node scripts/current-qualification.mjs",
+    "checks:fast": "node scripts/checks.mjs --fast",
+    "checks:producer": "node scripts/current-qualification.mjs --producer-only",
+    "checks:resume": "node scripts/current-qualification.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@octokit/auth-app": "^8.2.0",
     "@octokit/graphql": "^9.0.3",
     "@octokit/rest": "^22.0.1",
