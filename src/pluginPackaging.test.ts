@@ -127,6 +127,8 @@ import {syntheticDiscoveryClients} from ${JSON.stringify(discoveryFixture)};
 const configuration=${JSON.stringify(syntheticDiscoveryConfig)};
 const requests=[];
 const comments=[];
+const fields=[configuration.native.points,configuration.native.priority].map(field=>({id:Number(field.databaseId),name:field.name,data_type:'single_select',options:field.values.map(name=>({name:String(name)}))}));
+let fieldValues=[];
 let issue={id:117,number:17,node_id:'ISSUE17',title:'Widget',body:'',state:'open',labels:[],html_url:'https://github.com/example/b/issues/17'};
 const page=nodes=>({nodes,pageInfo:{hasNextPage:false,endCursor:null}});
 globalThis.fetch=async(url,init)=>{
@@ -151,7 +153,11 @@ globalThis.fetch=async(url,init)=>{
   }
   else if(path.includes('/issues/comments/'))data=comments.find(comment=>comment.id===Number(path.split('/').at(-1)));
   else if(path.endsWith('/labels'))data=[{name:'enhancement'},{name:'bug'}];
-  else if(path.endsWith('/issue-field-values'))data=[];
+  else if(path.endsWith('/issue-fields'))data=fields;
+  else if(path.endsWith('/issue-field-values')){
+    if(method==='POST')fieldValues=json.issue_field_values.map(entry=>({issue_field_id:entry.field_id,issue_field_name:fields.find(field=>field.id===entry.field_id).name,data_type:'single_select',value:entry.value}));
+    data=fieldValues;
+  }
   else if(path.endsWith('/issues')&&method==='POST'){issue={...issue,...json};data=issue;}
   else if(path.endsWith('/issues/17')){if(method==='PATCH')issue={...issue,...json};data=issue;}
   else throw new Error('Unexpected synthetic request '+method+' '+path);
@@ -176,9 +182,23 @@ globalThis.fetch=async(url,init)=>{
     const client = new Client({ name: 'actual-launch-routing', version: '1' });
     try {
       await client.connect(transport, { timeout: 30000 });
+      const readyInput = {
+        repo: 'example/b',
+        title: 'Validate widget launch routing across repositories',
+        points: 2,
+        problem: 'A launcher can bind a widget issue to the checkout repository instead of the explicit caller.',
+        outcome: 'Create and update the issue only in explicitly selected repository B.',
+        acceptanceCriteria: [
+          {
+            behavior: 'Create, update and journal requests address repository B with zero repository A requests.',
+            verifiedBy: 'Packaged stdio client results and captured REST path assertions.',
+          },
+        ],
+        outOfScope: ['Live authentication and host configuration.'],
+      };
       const created = await client.callTool({
         name: 'issue_create',
-        arguments: { repo: 'example/b', title: 'Widget', labels: ['enhancement'] },
+        arguments: { ...readyInput, labels: ['enhancement'] },
       });
       assert.equal(created.isError, undefined, JSON.stringify(created));
       const updated = await client.callTool({
@@ -251,7 +271,7 @@ globalThis.fetch=async(url,init)=>{
       );
       const unknown = await client.callTool({
         name: 'issue_create',
-        arguments: { repo: 'example/b', title: 'Unknown', labels: ['missing-label'] },
+        arguments: { ...readyInput, labels: ['missing-label'] },
       });
       assert.equal(unknown.isError, true);
       assert.match(JSON.stringify(unknown), /Unknown repository label.*missing-label/u);
