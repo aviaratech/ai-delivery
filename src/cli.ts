@@ -347,15 +347,28 @@ program
   .command('pr:create')
   .description('Create a PR from a linked issue branch, or promote an existing associated PR with --head and --ready.')
   .requiredOption('--issue <number>')
+  .option('--pr <number>', 'Exact existing PR selector; never creates a replacement')
+  .option('--non-closing', 'Retain the issue OPEN using native non-closing reference proof')
   .option('--title <title>')
   .option('--body-file <path>')
   .option('--head <branch>', 'Explicit remote head; existing PR promotion verifies its native issue association')
   .option('--ready', 'Publish ready, or promote the author-owned PR selected by --head')
   .option('--dry-run')
   .action(
-    async (o: { issue: string; title?: string; bodyFile?: string; head?: string; ready?: boolean; dryRun?: boolean }) =>
+    async (o: {
+      issue: string;
+      pr?: string;
+      nonClosing?: boolean;
+      title?: string;
+      bodyFile?: string;
+      head?: string;
+      ready?: boolean;
+      dryRun?: boolean;
+    }) =>
       run('issue_pr_create', {
         issueNumber: int(o.issue),
+        prNumber: int(o.pr),
+        nonClosing: o.nonClosing,
         title: o.title,
         body: body(undefined, o.bodyFile),
         headBranch: o.head,
@@ -366,10 +379,11 @@ program
 program
   .command('pr:info')
   .description('Inspect an exact PR; combine --issue and --pr to verify its native closing-issue association.')
+  .option('--non-closing', 'Verify an exact native non-closing PR-to-issue reference')
   .option('--issue <number>', 'Issue to verify; issue-only lookup requires a GitHub-linked branch')
   .option('--pr <number>', 'Exact PR number; include --issue after issue branch links are replaced on publication')
-  .action(async (o: { issue?: string; pr?: string }) =>
-    run('issue_pr_info', { issueNumber: int(o.issue), prNumber: int(o.pr) }),
+  .action(async (o: { issue?: string; pr?: string; nonClosing?: boolean }) =>
+    run('issue_pr_info', { issueNumber: int(o.issue), prNumber: int(o.pr), nonClosing: o.nonClosing }),
   );
 program
   .command('pr:list')
@@ -391,13 +405,15 @@ program
   .requiredOption('--issue <number>')
   .requiredOption('--pr <number>')
   .requiredOption('--artifact <path>', 'Path to a UTF-8 JSON review artifact file (not inline JSON)')
+  .option('--non-closing', 'Retain the referenced issue OPEN; finish refuses this mode')
   .option('--dry-run')
-  .action(async (o: { issue: string; pr: string; artifact: string; dryRun?: boolean }) =>
+  .action(async (o: { issue: string; pr: string; artifact: string; dryRun?: boolean; nonClosing?: boolean }) =>
     run('issue_pr_review', {
       issueNumber: int(o.issue),
       prNumber: int(o.pr),
       artifact: readFileSync(o.artifact, 'utf8'),
       dryRun: o.dryRun === true,
+      nonClosing: o.nonClosing,
     }),
   );
 for (const [command, tool] of [
@@ -410,15 +426,25 @@ for (const [command, tool] of [
     .requiredOption('--pr <number>')
     .option('--strategy <method>')
     .option('--reviewed-head <sha>')
+    .option('--non-closing', 'Retain the referenced issue OPEN; finish refuses this mode')
     .option('--dry-run')
-    .action(async (o: { issue: string; pr: string; strategy?: string; reviewedHead?: string; dryRun?: boolean }) =>
-      run(tool, {
-        issueNumber: int(o.issue),
-        prNumber: int(o.pr),
-        strategy: o.strategy,
-        reviewedHeadSha: o.reviewedHead,
-        dryRun: o.dryRun === true,
-      }),
+    .action(
+      async (o: {
+        issue: string;
+        pr: string;
+        strategy?: string;
+        reviewedHead?: string;
+        dryRun?: boolean;
+        nonClosing?: boolean;
+      }) =>
+        run(tool, {
+          issueNumber: int(o.issue),
+          prNumber: int(o.pr),
+          strategy: o.strategy,
+          reviewedHeadSha: o.reviewedHead,
+          dryRun: o.dryRun === true,
+          nonClosing: o.nonClosing,
+        }),
     );
 }
 program

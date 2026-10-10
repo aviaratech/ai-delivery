@@ -11,6 +11,10 @@ function fixture(
   state: string | null = 'clean',
   option: {
     baseMoved?: boolean;
+    nonClosing?: boolean;
+    commitMessage?: string;
+    retainedIssueDrift?: boolean;
+    mergeAckLost?: boolean;
     reviewMoved?: boolean;
     headMoved?: boolean;
     reviewDecision?: string;
@@ -33,6 +37,9 @@ function fixture(
 ) {
   let merged = false;
   let closes = 0;
+  let publicationBody: string | undefined;
+  let publicationTitle: string | undefined;
+  let publicationDraft: boolean | undefined;
   const merges: Record<string, unknown>[] = [];
   const artifactContent = {
     authorIdentity: option.reviewBinding === 'wrong-role' ? 'collaborator' : 'author',
@@ -69,11 +76,11 @@ function fixture(
     number: 23,
     node_id: 'PR23',
     changed_files: 1,
-    title: 'Improve widget',
-    body: 'Closes #17',
+    title: publicationTitle ?? 'Improve widget',
+    body: publicationBody ?? (option.nonClosing ? 'References example/widget#17\n\nImprove widget.' : 'Closes #17'),
     html_url: 'https://github.com/example/widget/pull/23',
     state: merged ? 'closed' : 'open',
-    draft: false,
+    draft: publicationDraft ?? false,
     merged,
     merge_commit_sha: merged ? merge : null,
     mergeable: state === 'clean',
@@ -84,7 +91,7 @@ function fixture(
   });
   const rest = {
     request: async () => ({ data: [] }),
-    repos: { get: async () => ({ data: { default_branch: 'main', full_name: 'example/widget' } }) },
+    repos: { get: async () => ({ data: { node_id: 'REPO', default_branch: 'main', full_name: 'example/widget' } }) },
     git: {
       getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
       getRef: async ({ ref }: { ref: string }) => ({
@@ -103,6 +110,11 @@ function fixture(
       listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
       create: async (input: Record<string, unknown>) => {
         assert.equal(input.body, 'Plain explanation\n\nCloses #17');
+        assert.equal(typeof input.title, 'string');
+        assert.equal(typeof input.draft, 'boolean');
+        publicationBody = input.body as string;
+        publicationTitle = input.title as string;
+        publicationDraft = input.draft as boolean;
         return { data: pr() };
       },
       getReview: async () => ({
@@ -129,12 +141,20 @@ function fixture(
       merge: async (input: Record<string, unknown>) => {
         merges.push(input);
         merged = true;
+        if (option.mergeAckLost) throw new Error('Merge acknowledgement lost');
         return { data: { merged: true, sha: merge } };
       },
     },
     issues: {
       get: async () => ({
-        data: { number: 17, state: closes ? 'closed' : 'open', node_id: 'ISSUE', title: 'Improve widget', body: '' },
+        data: {
+          number: 17,
+          state: closes ? 'closed' : 'open',
+          node_id: 'ISSUE',
+          title: 'Improve widget',
+          body: merged && option.retainedIssueDrift ? 'Changed criteria' : 'Retained criteria',
+          html_url: 'https://github.com/example/widget/issues/17',
+        },
       }),
       update: async (input: Record<string, unknown>) => {
         assert.equal(input.state, 'closed');
@@ -148,6 +168,71 @@ function fixture(
     },
   };
   const graphql = async (query: string) => {
+    if (query.includes('DeliveryNonClosingReferences'))
+      return {
+        repository: {
+          id: 'REPO',
+          nameWithOwner: 'example/widget',
+          issue: {
+            id: 'ISSUE',
+            number: 17,
+            state: 'OPEN',
+            timelineItems: {
+              nodes: [
+                {
+                  id: 'REFERENCE',
+                  actor: { login: 'author' },
+                  isCrossRepository: false,
+                  willCloseTarget: false,
+                  source: {
+                    __typename: 'PullRequest',
+                    id: 'PR23',
+                    number: 23,
+                    repository: { id: 'REPO', nameWithOwner: 'example/widget' },
+                  },
+                  target: {
+                    __typename: 'Issue',
+                    id: 'ISSUE',
+                    number: 17,
+                    repository: { id: 'REPO', nameWithOwner: 'example/widget' },
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
+    if (query.includes('DeliveryNonClosingCommits'))
+      return {
+        repository: {
+          nameWithOwner: 'example/widget',
+          pullRequest: {
+            id: 'PR23',
+            number: 23,
+            headRefOid: head,
+            baseRefOid: 'c'.repeat(40),
+            baseRefName: 'main',
+            commits: {
+              totalCount: 1,
+              nodes: [
+                {
+                  commit: {
+                    oid: head,
+                    message: option.commitMessage ?? 'Improve widget',
+                    parents: {
+                      totalCount: 1,
+                      nodes: [{ oid: 'c'.repeat(40) }],
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                    },
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
     if (query.includes('DeliveryReviewAccess'))
       return {
         repository: {
@@ -173,9 +258,12 @@ function fixture(
         repository: {
           nameWithOwner: 'example/widget',
           pullRequest: {
+            id: 'PR23',
             number: 23,
             closingIssuesReferences: {
-              nodes: [{ number: option.wrongClosingIssue ? 18 : 17, repository: { nameWithOwner: 'example/widget' } }],
+              nodes: option.nonClosing
+                ? []
+                : [{ number: option.wrongClosingIssue ? 18 : 17, repository: { nameWithOwner: 'example/widget' } }],
               pageInfo: { hasNextPage: false, endCursor: null },
             },
           },
@@ -353,6 +441,73 @@ describe('remote GitHub lifecycle', () => {
     const { context, closes, merges } = fixture('clean', { wrongClosingIssue: true });
     await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
     assert.equal(merges.length, 0);
+    assert.equal(closes(), 0);
+  });
+});
+
+describe('retained issue guarded squash delivery', () => {
+  const input = { issueNumber: 17, prNumber: 23, reviewedHeadSha: head, nonClosing: true };
+  it('sends explicit safe squash messages at the approved SHA and reuses merged readback without closing', async () => {
+    const { context, merges, closes } = fixture('clean', { nonClosing: true });
+    const preview = await mergePr(context, { ...input, dryRun: true });
+    assert.ok('commit_title' in preview && 'commit_message' in preview);
+    assert.equal(preview.commit_title, 'Improve widget');
+    assert.equal(preview.commit_message, 'References example/widget#17\n\nDelivered by PR #23.');
+    assert.equal(merges.length, 0);
+    const result = await mergePr(context, input);
+    assert.equal(result.mergeSha, merge);
+    assert.equal(merges[0]!.sha, head);
+    assert.equal(merges[0]!.merge_method, 'squash');
+    assert.equal(merges[0]!.commit_title, preview.commit_title);
+    assert.equal(merges[0]!.commit_message, preview.commit_message);
+    assert.equal((await mergePr(context, input)).reused, true);
+    assert.equal(merges.length, 1);
+    assert.equal(closes(), 0);
+  });
+
+  for (const strategy of ['merge', 'rebase'] as const) {
+    it(`refuses ${strategy} before any lifecycle mutation`, async () => {
+      const { context, merges, closes } = fixture('clean', { nonClosing: true });
+      await assert.rejects(mergePr(context, { ...input, strategy }), /squash/u);
+      assert.equal(merges.length, 0);
+      assert.equal(closes(), 0);
+    });
+  }
+  it('refuses finish before even reading or merging the PR', async () => {
+    const { context, merges, closes } = fixture('clean', { nonClosing: true });
+    context.clients.rest.pulls.get = (() => {
+      throw new Error('No lifecycle call allowed');
+    }) as unknown as typeof context.clients.rest.pulls.get;
+    await assert.rejects(finishIssue(context, input), /cannot finish/u);
+    assert.equal(merges.length, 0);
+    assert.equal(closes(), 0);
+  });
+  for (const option of [
+    { reviewCannotPush: true },
+    { reviewAccessUnknown: true },
+    { reviewDecision: 'REVIEW_REQUIRED' },
+    { baseMoved: true },
+    { headMoved: true },
+    { commitMessage: 'Fixes: other/repo#5' },
+  ]) {
+    it(`preserves fail-closed merge guards: ${JSON.stringify(option)}`, async () => {
+      const { context, merges, closes } = fixture('clean', { ...option, nonClosing: true });
+      await assert.rejects(mergePr(context, input));
+      assert.equal(merges.length, 0);
+      assert.equal(closes(), 0);
+    });
+  }
+  it('reports post-merge issue criteria drift without reopening or replaying the merge', async () => {
+    const { context, merges, closes } = fixture('clean', { nonClosing: true, retainedIssueDrift: true });
+    await assert.rejects(mergePr(context, input), /criteria drifted/u);
+    assert.equal(merges.length, 1);
+    assert.equal(closes(), 0);
+  });
+  it('reconciles an uncertain merge acknowledgement through authoritative merged readback', async () => {
+    const { context, merges, closes } = fixture('clean', { nonClosing: true, mergeAckLost: true });
+    await assert.rejects(mergePr(context, input), /acknowledgement lost/u);
+    assert.equal((await mergePr(context, input)).reused, true);
+    assert.equal(merges.length, 1);
     assert.equal(closes(), 0);
   });
 });
