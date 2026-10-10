@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { test } from 'vitest';
@@ -59,8 +59,40 @@ test('README and delivery skill CLI examples name supported commands and require
 });
 
 for (const launchCheckout of [false, true]) {
-  test(`the bundled launcher creates and updates repository B from ${launchCheckout ? 'checkout A' : 'a non-Git directory'} without an identity environment`, async () => {
+  test(`the ${launchCheckout ? 'bundled' : 'packed'} launcher creates, updates and journals repository B from ${launchCheckout ? 'checkout A' : 'a non-Git directory'} without an identity environment`, async () => {
     const directory = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-launch-routing-')));
+    let selectedPluginRoot = pluginRoot;
+    let discoveryFixture = new URL('./fixtures/discovery.js', import.meta.url).href;
+    if (!launchCheckout) {
+      try {
+        const packed = JSON.parse(
+          execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', directory], {
+            cwd: packageRoot,
+            encoding: 'utf8',
+            maxBuffer: 1024 * 1024,
+            env: {
+              PATH: process.env.PATH ?? '',
+              TMPDIR: tmpdir(),
+              HOME: directory,
+              npm_config_cache: join(directory, 'npm-cache'),
+            },
+          }),
+        ) as { filename: string }[];
+        assert.equal(packed.length, 1);
+        const unpacked = join(directory, 'unpacked');
+        mkdirSync(unpacked);
+        execFileSync('tar', ['-xzf', join(directory, packed[0]!.filename), '-C', unpacked]);
+        selectedPluginRoot = join(directory, 'plugin-cache');
+        // Detach the packed native plugin so the launcher uses its bundled runtime,
+        // rather than the package-local CLI whose npm dependencies are not installed here.
+        cpSync(join(unpacked, 'package', 'plugins', 'ai-delivery'), selectedPluginRoot, { recursive: true });
+        discoveryFixture = pathToFileURL(join(unpacked, 'package', 'dist', 'fixtures', 'discovery.js')).href;
+        assert.equal(existsSync(join(selectedPluginRoot, 'runtime', 'dist', 'cli.js')), true);
+      } catch (error) {
+        rmSync(directory, { recursive: true, force: true });
+        throw error;
+      }
+    }
     if (launchCheckout) {
       execFileSync('git', ['init', '-q', directory]);
       execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/a.git'], { cwd: directory });
@@ -91,9 +123,10 @@ for (const launchCheckout of [false, true]) {
       preload,
       `
 import {writeFileSync} from 'node:fs';
-import {syntheticDiscoveryClients} from ${JSON.stringify(new URL('./fixtures/discovery.js', import.meta.url).href)};
+import {syntheticDiscoveryClients} from ${JSON.stringify(discoveryFixture)};
 const configuration=${JSON.stringify(syntheticDiscoveryConfig)};
 const requests=[];
+const comments=[];
 let issue={id:117,number:17,node_id:'ISSUE17',title:'Widget',body:'',state:'open',labels:[],html_url:'https://github.com/example/b/issues/17'};
 const page=nodes=>({nodes,pageInfo:{hasNextPage:false,endCursor:null}});
 globalThis.fetch=async(url,init)=>{
@@ -108,7 +141,16 @@ globalThis.fetch=async(url,init)=>{
     else data=await syntheticDiscoveryClients({...configuration,repository:'example/'+(json.variables?.repo??'b')}).graphql(query,json.variables);
     return new Response(JSON.stringify({data}),{status:200,headers:{'content-type':'application/json'}});
   }
-  if(path.endsWith('/labels'))data=[{name:'enhancement'},{name:'bug'}];
+  if(path==='/user')data={id:1,login:'operator'};
+  else if(path.endsWith('/issues/17/comments')){
+    if(method==='POST'){
+      const id=91+comments.length;
+      data={id,body:json.body,html_url:'https://github.com/example/b/issues/17#issuecomment-'+id,issue_url:'https://api.github.com/repos/example/b/issues/17',user:{login:'operator'}};
+      comments.push(data);
+    }else data=comments;
+  }
+  else if(path.includes('/issues/comments/'))data=comments.find(comment=>comment.id===Number(path.split('/').at(-1)));
+  else if(path.endsWith('/labels'))data=[{name:'enhancement'},{name:'bug'}];
   else if(path.endsWith('/issue-field-values'))data=[];
   else if(path.endsWith('/issues')&&method==='POST'){issue={...issue,...json};data=issue;}
   else if(path.endsWith('/issues/17')){if(method==='PATCH')issue={...issue,...json};data=issue;}
@@ -119,11 +161,12 @@ globalThis.fetch=async(url,init)=>{
     );
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [join(pluginRoot, 'dist', 'mcp-launcher.js')],
+      args: [join(selectedPluginRoot, 'dist', 'mcp-launcher.js')],
       cwd: directory,
       env: {
         PATH: process.env.PATH ?? '',
         TMPDIR: tmpdir(),
+        HOME: directory,
         AI_DELIVERY_CONFIG: settings,
         SYNTHETIC_TOKEN: 'inert-personal-token',
         NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
@@ -143,6 +186,69 @@ globalThis.fetch=async(url,init)=>{
         arguments: { repo: 'example/b', issueNumber: 17, labels: ['bug'] },
       });
       assert.equal(updated.isError, undefined, JSON.stringify(updated));
+      const common = {
+        repo: 'example/b',
+        issueNumber: 17,
+        summary: 'Packed journal validation works.',
+        status: 'In progress',
+        nextStep: 'Independent review',
+        nextDate: '2026-10-09',
+        keyNumbers: ['5 journal kinds'],
+        evidence: ['https://github.com/example/b/issues/17'],
+      };
+      const journals = [
+        { ...common, kind: 'start', outcome: 'Deliver strict validation' },
+        { ...common, kind: 'progress', done: ['Added regression'], decisionNeeded: 'None' },
+        { ...common, kind: 'decision', decision: 'Keep variants strict', rationale: 'Preserve the contract' },
+        { ...common, kind: 'blocker', blocker: 'Review pending', resolution: 'Independent acceptance' },
+        {
+          ...common,
+          kind: 'closeout',
+          acceptance: [{ criterion: 'Explicit repo works', evidence: common.evidence[0] }],
+          followUps: [],
+        },
+      ];
+      const decoded = (response: unknown) =>
+        JSON.parse((response as { content: { text: string }[] }).content[0]!.text) as {
+          commentId: number;
+          url: string;
+          body: string;
+          reused: boolean;
+        };
+      for (const [index, journal] of journals.entries()) {
+        const response = await client.callTool({ name: 'issue_comment', arguments: journal });
+        assert.equal(response.isError, undefined, JSON.stringify(response));
+        const readback = decoded(response);
+        assert.equal(readback.commentId, 91 + index);
+        assert.equal(readback.url, `https://github.com/example/b/issues/17#issuecomment-${String(91 + index)}`);
+        assert.equal(readback.body.split('\n')[0], common.summary);
+        assert.ok(readback.body.includes(`**Kind:** ${journal.kind}.`));
+        assert.match(readback.body, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
+        assert.equal(readback.reused, false);
+      }
+      const retried = await client.callTool({ name: 'issue_comment', arguments: journals[1]! });
+      assert.equal(retried.isError, undefined, JSON.stringify(retried));
+      assert.equal(decoded(retried).commentId, 92);
+      assert.equal(decoded(retried).reused, true);
+      const beforeInvalidRequests = (JSON.parse(readFileSync(calls, 'utf8')) as unknown[]).length;
+      for (const invalid of [
+        { ...journals[1], unknown: true },
+        { ...journals[1], outcome: 'Wrong variant' },
+        { ...journals[1], kind: 'unsupported' },
+        { ...journals[1], nextDate: '2026-02-30' },
+        { ...journals[1], repo: 'invalid' },
+      ]) {
+        const refused = await client.callTool({ name: 'issue_comment', arguments: invalid }).then(
+          (result) => result.isError === true,
+          () => true,
+        );
+        assert.equal(refused, true);
+      }
+      assert.equal(
+        (JSON.parse(readFileSync(calls, 'utf8')) as unknown[]).length,
+        beforeInvalidRequests,
+        'invalid packed journals never reach configuration discovery, author authentication or writes',
+      );
       const unknown = await client.callTool({
         name: 'issue_create',
         arguments: { repo: 'example/b', title: 'Unknown', labels: ['missing-label'] },
@@ -150,7 +256,16 @@ globalThis.fetch=async(url,init)=>{
       assert.equal(unknown.isError, true);
       assert.match(JSON.stringify(unknown), /Unknown repository label.*missing-label/u);
       const requests = JSON.parse(readFileSync(calls, 'utf8')) as Array<{ path: string; method: string }>;
+      assert.equal(
+        requests.some((call) => call.path.startsWith('/repos/example/a/')),
+        false,
+      );
       assert.equal(requests.filter((call) => call.path.endsWith('/issues') && call.method === 'POST').length, 1);
+      assert.equal(
+        requests.filter((call) => call.path.endsWith('/issues/17/comments') && call.method === 'POST').length,
+        5,
+        'five authored journals read back; retry adds no sixth write',
+      );
       assert.equal(existsSync(join(directory, '.issue-cli')), false);
     } finally {
       await client.close();

@@ -512,7 +512,12 @@ async function inventory(
   const value: unknown = JSON.parse(
     await command(
       target.tool,
-      ['plugin', 'list', ...(input.host === 'codex' ? ['--available'] : []), '--json'],
+      [
+        'plugin',
+        'list',
+        ...(input.host === 'codex' ? ['--marketplace', target.marketplace, '--available'] : []),
+        '--json',
+      ],
       target.projectRoot,
       signal,
       publish,
@@ -865,7 +870,8 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
             installedPath = z.object({ installedPath: z.string() }).parse(JSON.parse(installed)).installedPath;
         }
         const after = await inventory(input, target, controller.signal, publish);
-        registration(input, target, after);
+        if (!registration(input, target, after) && version)
+          throw new Error('Native marketplace registration is missing.');
         const readback = nativeEntry(input, target, after);
         if (version ? readback?.version !== version : readback !== undefined)
           throw new Error('Native installation readback does not match the selected version.');
