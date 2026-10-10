@@ -237,7 +237,17 @@ export interface CreateIssueInput extends Partial<IssueFieldsInput> {
 
 function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; park?: true }, current?: IssueInfo) {
   const title = input.title ?? current?.title ?? '';
-  const prior = input.body ?? current?.body;
+  const source = input.body ?? current?.body;
+  const prior = current?.body ?? source;
+  const currentParsed =
+    current === undefined
+      ? undefined
+      : parseIssueBody(current.body, {
+          title: current.title,
+          ...(current.points === undefined ? {} : { points: current.points }),
+          ...(current.issueType === null ? {} : { issueType: current.issueType }),
+        });
+  const currentLegacy = currentParsed?.legacy === true;
   const points = input.points ?? current?.points;
   const issueType = input.issueType ?? current?.issueType ?? undefined;
   const metadata = {
@@ -246,7 +256,14 @@ function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; p
     ...(issueType === undefined ? {} : { issueType }),
   };
   const parsed =
-    prior === undefined ? { issue: IssueFields.parse({ title }), legacy: false } : parseIssueBody(prior, metadata);
+    source === undefined ? { issue: IssueFields.parse({ title }), legacy: false } : parseIssueBody(source, metadata);
+  let legacyBody = currentParsed?.issue.legacyBody ?? parsed.issue.legacyBody;
+  if (
+    parsed.issue.legacyBody !== undefined &&
+    legacyBody !== undefined &&
+    !legacyBody.includes(parsed.issue.legacyBody)
+  )
+    legacyBody += '\n\n' + parsed.issue.legacyBody;
   const fields = Object.fromEntries(
     Object.keys(IssueWriteFields).flatMap((key) => {
       const value = input[key as keyof IssueFieldsInput];
@@ -258,14 +275,15 @@ function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; p
     ...metadata,
     ...fields,
     title,
+    ...(legacyBody === undefined ? {} : { legacyBody }),
     ...(input.park ? { draft: true } : {}),
   });
-  const body = renderIssueBody(issue) + (prior === undefined || parsed.legacy ? '' : issueStartFooter(prior));
+  const body = renderIssueBody(issue) + (source === undefined || parsed.legacy ? '' : issueStartFooter(source));
   return {
     issue,
     body,
     warnings: issueWarnings(issue),
-    ...(parsed.legacy && prior !== undefined
+    ...((currentLegacy || parsed.legacy) && prior !== undefined
       ? { conversion: { priorBody: prior, canonicalBody: body, diff: issueBodyDiff(prior, body) } }
       : {}),
   };

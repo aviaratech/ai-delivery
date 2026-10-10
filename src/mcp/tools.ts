@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { JournalInputSchema } from '../issueJournal.js';
-import { IssueFields, IssueWriteFields, ISSUE_JSON_SCHEMAS } from '../issueContract.js';
+import { IssueFields, IssueWriteFields, ISSUE_JSON_SCHEMAS, issueInputSchema } from '../issueContract.js';
 
 const Positive = z.number().int().positive();
 const Labels = z.array(z.string().trim().min(1));
@@ -119,7 +119,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'create',
     description: 'Create a native GitHub tracking issue with configured metadata and relationships',
     issueContract: ISSUE_JSON_SCHEMAS,
-    inputSchema: z.strictObject({ ...Tracking, ...IssueWriteFields, title: IssueFields.shape.title }),
+    inputSchema: issueInputSchema(z.strictObject({ ...Tracking, ...IssueWriteFields, title: IssueFields.shape.title })),
   },
   {
     name: 'issue_start',
@@ -157,30 +157,32 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_update',
     commandName: 'update',
     description: 'Update native issue fields and exact relationship sets with readback',
-    inputSchema: z
-      .strictObject({
-        ...IssueWriteFields,
-        repo: Repo,
-        blockedBy: z.array(Positive).optional(),
-        body: z.string().optional(),
-        issueNumber: Positive,
-        issueType: IssueWriteFields.issueType,
-        labels: Labels.optional(),
-        milestone: Positive.nullable().optional(),
-        parentIssueNumber: Positive.nullable().optional(),
-        park: z.literal(true).optional(),
-        points: IssueWriteFields.points,
-        priority: z.string().min(1).optional(),
-        state: z.enum(['open', 'closed']).optional(),
-        preserveHistory: z.boolean().optional(),
-        closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
-        supersededBy: Positive.optional(),
-        title: IssueWriteFields.title,
-      })
-      .refine(
-        (input) => (input.closeReason === undefined && input.supersededBy === undefined) || input.state === 'closed',
-        'Closure details require state closed',
-      ),
+    inputSchema: issueInputSchema(
+      z
+        .strictObject({
+          ...IssueWriteFields,
+          repo: Repo,
+          blockedBy: z.array(Positive).optional(),
+          body: z.string().optional(),
+          issueNumber: Positive,
+          issueType: IssueWriteFields.issueType,
+          labels: Labels.optional(),
+          milestone: Positive.nullable().optional(),
+          parentIssueNumber: Positive.nullable().optional(),
+          park: z.literal(true).optional(),
+          points: IssueWriteFields.points,
+          priority: z.string().min(1).optional(),
+          state: z.enum(['open', 'closed']).optional(),
+          preserveHistory: z.boolean().optional(),
+          closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
+          supersededBy: Positive.optional(),
+          title: IssueWriteFields.title,
+        })
+        .refine(
+          (input) => (input.closeReason === undefined && input.supersededBy === undefined) || input.state === 'closed',
+          'Closure details require state closed',
+        ),
+    ),
   },
   {
     name: 'issue_info',

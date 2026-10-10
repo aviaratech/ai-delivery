@@ -84,6 +84,32 @@ test('portable JSON Schema snapshot carries Ready bounds and distinguishes incom
   assert.ok(!ISSUE_JSON_SCHEMAS.draft.required?.includes('points'));
 });
 
+test('concrete domain wording remains Ready while generic completion claims fail', () => {
+  for (const behavior of [
+    'The independently reviewed head SHA is sent as the merge guard.',
+    'A failed request leaves the Project Done column unchanged.',
+    'A verified token grants access only to its repository.',
+    'The adapter works with a missing local checkout and returns the selected repository.',
+  ]) {
+    const issue = validIssue();
+    issue.acceptanceCriteria[0]!.behavior = behavior;
+    assert.deepEqual(validateIssue(issue).failures, [], behavior);
+  }
+  for (const behavior of [
+    'The widget works correctly.',
+    'The change is reviewed.',
+    'The request is done.',
+    'The interface is user friendly.',
+  ]) {
+    const issue = validIssue();
+    issue.acceptanceCriteria[0]!.behavior = behavior;
+    assert.ok(
+      validateIssue(issue).failures.some((f) => f.code === 'acceptance-criteria.vague'),
+      behavior,
+    );
+  }
+});
+
 test('canonical bodies round trip every typed field, multiline markup and comment delimiters', () => {
   const issue = validIssue();
   issue.context.evidence.push('Observed <!-- text -->\n## nested heading\n`code`');

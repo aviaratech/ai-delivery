@@ -8,6 +8,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 import { createIssue, updateIssue, canonicalIssueBody, type DeliveryContext } from './issue.js';
+import { startTrackedIssue } from './dispatch.js';
+import { digestValue } from './delivery/common.js';
+import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import { IssueFields, ReadyIssue, renderIssueBody, parseIssueBody, ISSUE_BODY_MARKER } from './issueContract.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 
@@ -36,12 +39,21 @@ function fixture() {
     title: ready().title,
     body: renderIssueBody(ready()),
     state: 'open',
+    created_at: '2026-01-01T00:00:00Z',
     type: { name: 'Task' },
     html_url: 'https://github.com/example/widget/issues/17',
   };
   const writes: Record<string, unknown>[] = [];
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
-  const controls = { role: 'author', ignoreBody: false, wrongCreateRepo: false, driftAfterHistory: false };
+  const controls = {
+    role: 'author',
+    ignoreBody: false,
+    wrongCreateRepo: false,
+    driftAfterHistory: false,
+    created: true,
+  };
+  const branchWrites: Record<string, unknown>[] = [];
+  const branches: { name: string; sha: string }[] = [];
   let points = 2;
   let status = 'Queued';
   const values = () => [
@@ -75,8 +87,10 @@ function fixture() {
       rest: {
         issues: {
           get: async () => ({ data: { ...live } }),
+          listForRepo: async () => ({ data: controls.created ? [{ ...live }] : [] }),
           create: async (input: Record<string, unknown>) => {
             writes.push(input);
+            controls.created = true;
             live.title = String(input.title);
             live.body = String(input.body);
             live.type = { name: String(input.type) };
@@ -111,6 +125,8 @@ function fixture() {
             return { data: comments.find((c) => c.id === input.comment_id) };
           },
         },
+        repos: { get: async () => ({ data: { default_branch: 'main', node_id: 'REPOSITORY' } }) },
+        git: { getRef: async () => ({ data: { object: { sha: 'a'.repeat(40) } } }) },
         request: async (route: string, input: Record<string, unknown>) => {
           if (route === 'GET /orgs/{org}/issue-fields')
             return {
@@ -139,6 +155,29 @@ function fixture() {
         },
       },
       graphql: async (query: string, input: Record<string, unknown>) => {
+        if (query.includes('DeliveryIssueBranches'))
+          return {
+            repository: {
+              issue: {
+                linkedBranches: {
+                  nodes: branches.map((branch) => ({
+                    ref: {
+                      name: branch.name,
+                      target: { oid: branch.sha },
+                      repository: { nameWithOwner: 'example/widget' },
+                    },
+                  })),
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          };
+        if (query.includes('DeliveryStartBranch')) {
+          const fields = input.input as Record<string, unknown>;
+          branchWrites.push(fields);
+          branches.push({ name: String(fields.name), sha: String(fields.oid) });
+          return { createLinkedBranch: { linkedBranch: { ref: { name: fields.name, target: { oid: fields.oid } } } } };
+        }
         if (query.includes('blockedBy(first:'))
           return {
             repository: {
@@ -181,7 +220,7 @@ function fixture() {
       },
     },
   } as unknown as DeliveryContext;
-  return { context, live, writes, comments, controls, getStatus: () => status };
+  return { context, live, writes, comments, controls, branchWrites, getStatus: () => status };
 }
 
 test('native create validates first, writes canonical fields, reads back metadata and returns warnings', async () => {
@@ -231,6 +270,30 @@ test('first legacy update retains exact history and full diff, then typed patche
   assert.equal(f.comments.length, 2);
 });
 
+test('legacy replacement updates preserve the actual previous body and diff for canonical and handwritten input', async () => {
+  const original = 'Original native legacy bytes, including unclassified operator context.\n';
+  for (const replacement of [renderIssueBody(ready()), 'Replacement handwritten context.\n']) {
+    const f = fixture();
+    f.live.body = original;
+    const result = await updateIssue(f.context, { issueNumber: 17, body: replacement, ...ready() });
+    assert.equal(f.comments.length, 1);
+    assert.ok(f.comments[0]!.body.includes(original));
+    assert.equal(result.conversion?.priorBody, original);
+    assert.ok(result.conversion!.diff.includes('-' + original.trim()));
+    const preserved = parseIssueBody(result.body, { title: result.title }).issue.legacyBody;
+    assert.ok(preserved?.includes(original));
+    if (!replacement.startsWith(ISSUE_BODY_MARKER)) assert.ok(preserved?.includes(replacement));
+    assert.equal(result.conversion?.canonicalBody, result.body);
+    const patch = await updateIssue(f.context, {
+      issueNumber: 17,
+      outcome: 'Reject invalid input before persistence.',
+    });
+    assert.equal(patch.conversion, undefined);
+    assert.equal(f.comments.length, 1);
+    assert.equal(parseIssueBody(patch.body, { title: patch.title }).issue.legacyBody, preserved);
+  }
+});
+
 test('validation, history drift and corrupted native update readback fail without a fabricated success', async () => {
   const f = fixture();
   await assert.rejects(
@@ -261,7 +324,11 @@ test('normal-start canonical retry body keeps exact intent markers through creat
   const issue = ready();
   const canonical = canonicalIssueBody(issue);
   const footer =
-    '\n\n<!-- ai-delivery-start-intent: ' + 'a'.repeat(64) + ' -->\n<!-- ai-delivery-start: ' + 'b'.repeat(64) + ' -->';
+    '\n\n<!-- ai-delivery-start-intent: ' +
+    digestValue({ intent: 'fixture' }) +
+    ' -->\n<!-- ai-delivery-start: ' +
+    digestValue({ request: 'fixture' }) +
+    ' -->';
   const result = await createIssue(fixture().context, {
     title: issue.title,
     body: canonical + footer,
@@ -270,6 +337,47 @@ test('normal-start canonical retry body keeps exact intent markers through creat
   });
   assert.equal(result.body, canonical + footer);
   assert.deepEqual(parseIssueBody(result.body, { title: issue.title }).issue, issue);
+});
+
+test('actual normal-start creation and retry reuse the exact canonical body, branch and authored journal', async () => {
+  const f = fixture();
+  f.controls.created = false;
+  const request = getAiDeliveryMcpTool('issue_start')!.inputSchema.parse({
+    title: ready().title,
+    body: renderIssueBody(ready()),
+    issueType: 'Task',
+    points: 2,
+    requestId: 'issue68-normal-start',
+  });
+  const first = await startTrackedIssue(f.context, request);
+  assert.ok('issueNumber' in first);
+  assert.equal(first.issueNumber, 17);
+  assert.ok('reused' in first && first.reused === false);
+  const body = f.live.body;
+  assert.match(body, /ai-delivery-start-intent: sha256:[a-f0-9]{64}/u);
+  assert.match(body, /ai-delivery-start: sha256:[a-f0-9]{64}/u);
+  assert.deepEqual(parseIssueBody(body, { title: f.live.title }).issue, ready());
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(
+    f.branchWrites[0]?.clientMutationId,
+    digestValue({ repository: 'example/widget', issueNumber: 17, name: 'issue/17', base: 'a'.repeat(40) }),
+  );
+  assert.equal(f.comments.length, 1);
+  const retry = await startTrackedIssue(f.context, request);
+  assert.ok('reused' in retry && retry.reused === true);
+  assert.equal(retry.issueNumber, 17);
+  assert.equal(f.writes.filter((input) => !('issue_number' in input)).length, 1);
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.live.body, body);
+  await assert.rejects(
+    startTrackedIssue(f.context, {
+      ...request,
+      body: renderIssueBody({ ...ready(), outcome: 'A conflicting new outcome.' }),
+    }),
+    /conflicts/u,
+  );
+  assert.equal(f.branchWrites.length, 1);
 });
 
 test('a history rewrite refuses to republish secret-bearing prior text', async () => {
@@ -325,6 +433,31 @@ test('actual compiled stdio MCP returns every Ready diagnostic before credential
       .parse(JSON.parse(content[0]!.text) as unknown);
     assert.deepEqual(diagnostic.failures.map((f) => f.code).sort(), ['open-questions', 'points']);
     assert.ok(diagnostic.failures.every((f) => f.field && f.fixHint));
+    for (const name of ['issue_create', 'issue_update']) {
+      const malformed = await client.callTool({
+        name,
+        arguments: {
+          ...ready(),
+          ...(name === 'issue_update' ? { issueNumber: 17 } : {}),
+          acceptanceCriteria: [{ behavior: ready().acceptanceCriteria[0]!.behavior }],
+          context: { components: 9 },
+        },
+      });
+      assert.equal(malformed.isError, true);
+      const blocks = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(malformed.content);
+      const failure = z
+        .object({
+          contract: z.literal('ai-delivery.issue@1'),
+          failures: z.array(z.object({ code: z.string(), field: z.string(), fixHint: z.string() })),
+        })
+        .parse(JSON.parse(blocks[0]!.text) as unknown);
+      assert.deepEqual(failure.failures.map((f) => f.field).sort(), [
+        'acceptanceCriteria.0.verifiedBy',
+        'context.components',
+      ]);
+      assert.ok(failure.failures.every((f) => f.code && f.fixHint));
+      assert.doesNotMatch(blocks[0]!.text, /missing-config/u);
+    }
     const foreign = await client.callTool({ name: 'issue_create', arguments: { ...ready(), repo: 'other/widget' } });
     assert.equal(foreign.isError, true);
     assert.match(JSON.stringify(foreign.content), /repository selectors disagree/u);

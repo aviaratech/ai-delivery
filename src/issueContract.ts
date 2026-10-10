@@ -4,7 +4,8 @@ import { DeliveryError } from './errors.js';
 export const ISSUE_CONTRACT_VERSION = 'ai-delivery.issue@1' as const;
 export const ISSUE_BODY_MARKER = '<!-- ai-delivery:issue@1 -->';
 const DATA_PREFIX = '<!-- ai-delivery:issue-data@1 ';
-const START_FOOTER = /\n\n<!-- ai-delivery-start-intent: [a-f0-9]{64} -->\n<!-- ai-delivery-start: [a-f0-9]{64} -->$/u;
+const START_FOOTER =
+  /\n\n<!-- ai-delivery-start-intent: sha256:[a-f0-9]{64} -->\n<!-- ai-delivery-start: sha256:[a-f0-9]{64} -->$/u;
 export function issueStartFooter(body: string): string {
   return START_FOOTER.exec(body)?.[0] ?? '';
 }
@@ -103,7 +104,7 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
         'Provide both behavior and verifiedBy for this criterion.',
       );
     if (
-      /\b(?:works(?:\s+(?:correctly|as expected|well))?|properly|as expected|user[- ]friendly|robust|seamless|appropriate|done|verified|reviewed)\b/iu.test(
+      /^(?:.{1,100}\s)?(?:works(?:\s+(?:correctly|as expected|well|properly))?|(?:is|are)\s+(?:done|verified|reviewed|robust|seamless|appropriate|user[- ]friendly))[\s.!]*$/iu.test(
         ac.behavior,
       ) ||
       ac.behavior.trim().length < 12
@@ -167,45 +168,59 @@ export const IssueWriteFields = {
 };
 export const IssueWriteSchema = z.strictObject(IssueWriteFields);
 
+/** Keep advertised structural schemas while returning domain diagnostics before SDK error wrapping. */
+export function issueInputSchema<T extends z.ZodObject>(schema: T): T {
+  return schema.refine(
+    (value) => {
+      const parsed = schema.safeParse(value);
+      if (!parsed.success) throw new IssueValidationError(issueDiagnostics(parsed.error.issues));
+      return true;
+    },
+    { when: () => true },
+  );
+}
+
+function issueDiagnostics(issues: readonly z.core.$ZodIssue[]): IssueDiagnostic[] {
+  const seen = new Set<string>();
+  return issues
+    .map((issue) => {
+      const field = issue.path.map(String).join('.') || 'issue';
+      const code =
+        issue.code === 'custom' && typeof issue.params?.issueCode === 'string'
+          ? issue.params.issueCode
+          : field === 'points'
+            ? 'points'
+            : field === 'title'
+              ? 'title.length'
+              : field === 'outOfScope'
+                ? 'out-of-scope'
+                : field === 'openQuestions'
+                  ? 'open-questions'
+                  : field === 'acceptanceCriteria'
+                    ? 'acceptance-criteria'
+                    : field === 'draft'
+                      ? 'draft'
+                      : 'field.type';
+      return hint(
+        code,
+        field,
+        code === 'points' ? 'Choose Points from 1 through 8; split a 13-point issue into sub-issues.' : issue.message,
+      );
+    })
+    .filter((issue) => {
+      const key = issue.code + ':' + issue.field;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 export function validateIssue(value: unknown, ready = true): { issue?: DraftIssueData; failures: IssueDiagnostic[] } {
   const parsed = (ready ? ReadyIssue : DraftIssue).safeParse(value);
   if (parsed.success) return { issue: parsed.data, failures: [] };
   const semantic = ready ? ReadySemantics.safeParse(value) : undefined;
   const issues = [...(semantic?.success === false ? semantic.error.issues : []), ...parsed.error.issues];
-  const seen = new Set<string>();
-  return {
-    failures: issues
-      .map((issue) => {
-        const field = issue.path.map(String).join('.') || 'issue';
-        const code =
-          issue.code === 'custom' && typeof issue.params?.issueCode === 'string'
-            ? issue.params.issueCode
-            : field === 'points'
-              ? 'points'
-              : field === 'title'
-                ? 'title.length'
-                : field === 'outOfScope'
-                  ? 'out-of-scope'
-                  : field === 'openQuestions'
-                    ? 'open-questions'
-                    : field === 'acceptanceCriteria'
-                      ? 'acceptance-criteria'
-                      : field === 'draft'
-                        ? 'draft'
-                        : 'field.type';
-        return hint(
-          code,
-          field,
-          code === 'points' ? 'Choose Points from 1 through 8; split a 13-point issue into sub-issues.' : issue.message,
-        );
-      })
-      .filter((issue) => {
-        const key = issue.code + ':' + issue.field;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      }),
-  };
+  return { failures: issueDiagnostics(issues) };
 }
 
 export class IssueValidationError extends DeliveryError {

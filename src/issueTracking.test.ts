@@ -191,7 +191,8 @@ test('history preserves exact prior content before a rewrite and retries a faile
     fixture.controls.failUpdate = false;
     const result = await issue.updateIssue(fixture.context, input);
     assert.equal(result.title, 'New title');
-    assert.equal(result.conversion?.priorBody, 'New body');
+    assert.equal(result.conversion?.priorBody, oldBody);
+    assert.ok(oldBody.split('\n').every((line) => result.conversion?.diff.includes('-' + line)));
     assert.match(result.body, /ai-delivery:issue@1/u);
     assert.equal(fixture.comments.length, 1);
     assert.equal((result as unknown as { historyComment: { reused: boolean } }).historyComment.reused, true);
@@ -505,7 +506,10 @@ test('update accepts history and reasoned closure while rejecting incoherent req
     tool.inputSchema.safeParse({ issueNumber: 17, state: 'closed', closeReason: 'duplicate', supersededBy: 9 }).success,
     true,
   );
-  assert.equal(tool.inputSchema.safeParse({ issueNumber: 17, state: 'open', closeReason: 'completed' }).success, false);
+  assert.throws(
+    () => tool.inputSchema.safeParse({ issueNumber: 17, state: 'open', closeReason: 'completed' }),
+    /Closure details require state closed/u,
+  );
 });
 
 test('local filters retain pagination when the current GitHub page has no matching issue', async () => {
