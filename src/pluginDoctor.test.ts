@@ -542,7 +542,9 @@ test.each(['codex', 'claude-code'])(
     file(fixture.config, JSON.stringify(settings));
     vi.stubEnv('GH_TOKEN', undefined);
     vi.stubEnv('HOME', fixture.home);
-    // The ordinary verification wrapper contains only these language selectors.
+    // Own optional language selectors instead of assuming the verification wrapper supplies them.
+    vi.stubEnv('LANG', 'C');
+    vi.stubEnv('LC_ALL', 'C');
     vi.stubEnv('USER', undefined);
     vi.stubEnv('LOGNAME', undefined);
     const bin = join(fixture.home, 'bin');
