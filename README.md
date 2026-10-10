@@ -115,7 +115,27 @@ the managed version units for recovery and uses Claude Code's `--keep-data`.
 Every command supports `--dry-run` and `--json`. Dry-run reports the target
 without fetching an archive, running a native command, or writing configuration.
 Doctor reports managed installation and source integrity, skills, and a direct
-stdio startup check of the selected bundled MCP server. Restart the native host
+credential-free stdio startup check of the selected bundled MCP server. Startup
+means that the server initialized and listed its tools; it does not validate
+user settings, receive GitHub credentials, or authenticate either delivery role.
+For an opt-in authentication check, select a repository explicitly:
+
+```sh
+ai-delivery --repo example/widget plugin doctor --host codex --scope user --check-auth --json
+```
+
+This checks settings and named process references before running the verified,
+enabled plugin's selected CLI `config:resolve`. It reports authenticated actors,
+repository access and visible review rules separately. Only configured credential
+names and required runtime selectors reach that subprocess; unrelated tokens and
+legacy personal overrides do not. Missing or invalid inputs stop before key
+access or network authentication. Dry-run performs none of these checks.
+The readback is labelled `selected_runtime_cli`; it does not prove GUI credential
+propagation or counted exact-head approval. `config:resolve` remains available
+for direct CLI readback; check an actual native tool call separately. The
+[credential and readiness guide](plugins/ai-delivery/README.md#credentials-and-readiness)
+explains the environment boundary and the evidence to retain without secrets.
+Restart the native host
 after changing a plugin so it reloads that selection. Installing a plugin does not admit a consumer controller. Ordinary remote GitHub delivery uses user configuration; explicit controller staging and admission remain separate operations.
 
 First read `config:resolve` with the configured author, then stage a reviewed
@@ -222,12 +242,12 @@ operator's machine. Validation requires HTTPS with a DNS hostname; it rejects
 file paths, credential-bearing URLs, IP literals, localhost and `.local` names.
 It does not probe remote reachability. Each kind also requires these fields:
 
-| Kind | Required fields |
-| --- | --- |
-| `start` | `outcome` |
-| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link |
-| `decision` | `decision`, `rationale` |
-| `blocker` | `blocker`, `resolution` |
+| Kind       | Required fields                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------- |
+| `start`    | `outcome`                                                                                 |
+| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link                      |
+| `decision` | `decision`, `rationale`                                                                   |
+| `blocker`  | `blocker`, `resolution`                                                                   |
 | `closeout` | `acceptance` (nonempty `{criterion, evidence}` list), `followUps` (list; empty when none) |
 
 Optional `details` adds supporting prose. `lengthCap` (600–10,000 characters,
