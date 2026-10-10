@@ -155,7 +155,10 @@ function extractInlineCode(body: string): string[] {
 
 function extractScopePaths(body: string): string[] {
   const section = extractSection(body, 'Scope');
-  return Array.from(section.matchAll(/`([^`\r\n]+)`/gu), (match) => match[1]?.trim() ?? '').filter(Boolean);
+  // Exclude complete monetary literals only; every other inline value remains a path candidate.
+  return extractInlineCode(section).filter(
+    (candidate) => !/^\$\d+(?:,\d{3})*(?:\.\d{1,2})?(?:\s*[/–-]\s*\$\d+(?:,\d{3})*(?:\.\d{1,2})?)*$/u.test(candidate),
+  );
 }
 
 function extractSection(body: string, heading: string): string {

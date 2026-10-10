@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   existsSync,
+  cpSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -28,8 +29,9 @@ type ObservedState = {
 const fixture = vi.hoisted(() => ({
   home: '',
   commands: [] as string[],
+  commandArguments: [] as string[][],
   realCommands: false,
-  responses: [] as string[],
+  responses: [] as (string | ((args: string[]) => string))[],
   packArchive: '',
 }));
 vi.mock('node:child_process', async (original) => {
@@ -40,13 +42,16 @@ vi.mock('node:child_process', async (original) => {
       if (fixture.realCommands) return actual.spawn(...parameters);
       const [binary, args] = parameters;
       fixture.commands.push(binary === '/bin/sh' ? args![3]! : binary);
+      const commandArguments = binary === '/bin/sh' ? args!.slice(3) : [binary, ...(args ?? [])];
+      fixture.commandArguments.push(commandArguments);
       const child = Object.assign(new EventEmitter(), {
         stdin: new PassThrough(),
         stdout: new PassThrough(),
         stderr: new PassThrough(),
         kill: () => true,
       });
-      let response = fixture.responses.shift();
+      const queued = fixture.responses.shift();
+      let response = typeof queued === 'function' ? queued(commandArguments) : queued;
       if (binary === '/bin/sh' && args?.[3] === 'npm' && fixture.packArchive) {
         const destination = args[args.indexOf('--pack-destination') + 1]!;
         const filename = 'aviaratech-ai-delivery-0.3.22.tgz';
@@ -74,7 +79,10 @@ const { managePlugin } = await import('./pluginInstaller.js');
 
 beforeEach(() => {
   fixture.home = mkdtempSync(join(tmpdir(), 'ai-delivery-installer-'));
+  vi.stubEnv('CODEX_HOME', join(fixture.home, '.codex'));
+  vi.stubEnv('CLAUDE_CONFIG_DIR', join(fixture.home, '.claude'));
   fixture.commands = [];
+  fixture.commandArguments = [];
   fixture.realCommands = false;
   fixture.responses = [];
   fixture.packArchive = '';
@@ -83,6 +91,14 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   rmSync(fixture.home, { recursive: true, force: true });
+  for (const args of fixture.commandArguments)
+    if (args[1] === 'plugin' && args[2] === 'list')
+      assert.deepEqual(
+        args,
+        args[0] === 'codex'
+          ? ['codex', 'plugin', 'list', '--marketplace', 'ai-delivery-user', '--available', '--json']
+          : ['claude', 'plugin', 'list', '--json'],
+      );
 });
 
 function pendingState(action: string, version: string | null) {
@@ -201,6 +217,263 @@ function doctorFixture(enabled: boolean, host = 'codex') {
   }
   return cache;
 }
+
+function nativeArchiveFixture(): void {
+  const root = join(fixture.home, 'synthetic-package'),
+    version = '0.3.22';
+  const files = {
+    'package.json': JSON.stringify({ name: '@aviaratech/ai-delivery', version }),
+    'plugins/ai-delivery/plugin.json': JSON.stringify({ name: 'ai-delivery', version }),
+    'plugins/ai-delivery/.claude-plugin/plugin.json': JSON.stringify({
+      name: 'ai-delivery',
+      version,
+      packageVersion: version,
+      deliveryCapabilityVersion: 2,
+    }),
+    'plugins/ai-delivery/runtime/package.json': JSON.stringify({ name: '@aviaratech/ai-delivery', version }),
+    'plugins/ai-delivery/runtime/dist/cli.js': `process.stdout.write('${version}\\n');`,
+    'plugins/ai-delivery/skills/intake/SKILL.md': 'synthetic released skill bytes',
+  };
+  for (const [name, bytes] of Object.entries(files)) {
+    const path = join(root, name);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, bytes, { mode: 0o600 });
+  }
+  const configuration = join(fixture.home, 'empty.npmrc'),
+    globalConfiguration = join(fixture.home, 'global.npmrc');
+  writeFileSync(configuration, '', { mode: 0o600 });
+  writeFileSync(globalConfiguration, '', { mode: 0o600 });
+  const packed = JSON.parse(
+    execFileSync(
+      'npm',
+      [
+        'pack',
+        '--ignore-scripts',
+        '--json',
+        '--logs-max',
+        '0',
+        '--cache',
+        join(fixture.home, 'npm-cache'),
+        '--userconfig',
+        configuration,
+        '--globalconfig',
+        globalConfiguration,
+        '--pack-destination',
+        fixture.home,
+      ],
+      { cwd: root, encoding: 'utf8' },
+    ),
+  ) as { filename: string }[];
+  fixture.packArchive = join(fixture.home, packed[0]!.filename);
+}
+
+function oversizedCatalogue(entries: Record<string, unknown>[]): (args: string[]) => string {
+  const filtered = JSON.stringify({ installed: entries, available: [] });
+  const unfiltered = JSON.stringify({
+    installed: entries,
+    available: [{ pluginId: 'unrelated@remote', description: 'x'.repeat(1024 * 1024) }],
+  });
+  assert.ok(Buffer.byteLength(unfiltered) > 1024 * 1024);
+  assert.ok(Buffer.byteLength(filtered) < 1024 * 1024);
+  return (args) => (args[args.indexOf('--marketplace') + 1] === 'ai-delivery-user' ? filtered : unfiltered);
+}
+
+function installationFixture(
+  action: 'install' | 'update',
+  readback: (entry: Record<string, unknown>) => Record<string, unknown>[] = (entry) => [entry],
+) {
+  let previous: Record<string, unknown>[] = [];
+  if (action === 'update') {
+    doctorFixture(true);
+    const response = fixture.responses.shift();
+    assert.ok(typeof response === 'string');
+    previous = (JSON.parse(response) as { installed: Record<string, unknown>[] }).installed;
+  }
+  nativeArchiveFixture();
+  const catalog = join(fixture.home, '.cache/ai-delivery/plugins/codex/user/marketplace'),
+    source = join(catalog, 'versions/0.3.22/plugins/ai-delivery'),
+    cache = join(fixture.home, '.codex/plugins/cache/ai-delivery-user/ai-delivery/0.3.22');
+  const entry = {
+    pluginId: 'ai-delivery@ai-delivery-user',
+    marketplaceName: 'ai-delivery-user',
+    version: '0.3.22',
+    enabled: true,
+    source: { source: 'local', path: source },
+    marketplaceSource: { sourceType: 'local', source: catalog },
+  };
+  fixture.responses.push(
+    'codex-cli 0.153.0',
+    oversizedCatalogue(previous),
+    '',
+    '0.3.22',
+    '{}',
+    (args) => {
+      assert.deepEqual(args, ['codex', 'plugin', 'add', 'ai-delivery@ai-delivery-user', '--json']);
+      mkdirSync(dirname(cache), { recursive: true, mode: 0o700 });
+      cpSync(source, cache, { recursive: true });
+      return JSON.stringify({ installedPath: cache });
+    },
+    oversizedCatalogue(readback(entry)),
+  );
+  return { entry, cache, catalog, source };
+}
+
+for (const action of ['install', 'update'] as const)
+  test(`${action} reads back its managed version without capturing an unrelated catalogue over 1 MiB`, async () => {
+    const { entry, cache, catalog } = installationFixture(action);
+    const data = join(fixture.home, 'unrelated-native-data');
+    writeFileSync(data, 'preserve native data');
+    const result = await managePlugin({ ...input(), action, version: '0.3.22' });
+    assert.equal(result.installed, true);
+    assert.equal(result.changed, true);
+    assert.equal(result.version, '0.3.22');
+    assert.equal(result.nativePluginRoot, cache);
+    assert.equal(readFileSync(join(cache, 'skills/intake/SKILL.md'), 'utf8'), 'synthetic released skill bytes');
+    const state = JSON.parse(readFileSync(join(dirname(catalog), 'state.json'), 'utf8')) as {
+      pending?: unknown;
+      currentVersion: string;
+      previousVersion: string | null;
+    };
+    assert.equal(state.pending, undefined);
+    assert.equal(state.currentVersion, '0.3.22');
+    assert.equal(state.previousVersion, action === 'update' ? '0.3.21' : null);
+    const mutation = fixture.commandArguments.find(
+      (args) => args[2] === (action === 'install' ? 'marketplace' : 'remove'),
+    );
+    assert.deepEqual(
+      mutation,
+      action === 'install'
+        ? ['codex', 'plugin', 'marketplace', 'add', catalog, '--json']
+        : ['codex', 'plugin', 'remove', 'ai-delivery@ai-delivery-user', '--json'],
+    );
+    fixture.responses.push(oversizedCatalogue([{ ...entry, enabled: false }]));
+    const doctor = await managePlugin({ ...input(), action: 'doctor', version: undefined });
+    assert.equal(doctor.installed, true);
+    assert.equal(doctor.sourceIntegrity, true);
+    assert.deepEqual(doctor.mcp, { configuration: 'disabled', startup: 'not_checked' });
+    assert.equal(readFileSync(data, 'utf8'), 'preserve native data');
+    assert.equal(fixture.commandArguments.filter((args) => args[2] === 'list').length, 3);
+  });
+
+test('the filtered managed catalogue still enforces the 1 MiB capture ceiling', async () => {
+  doctorFixture(false);
+  fixture.responses[0] = JSON.stringify({ installed: [], available: [{ description: 'x'.repeat(1024 * 1024) }] });
+  await assert.rejects(
+    managePlugin({ ...input(), action: 'doctor', version: undefined }),
+    /captured output exceeded 1048576 bytes/u,
+  );
+});
+
+for (const [name, readback, error] of [
+  [
+    'missing registration',
+    (entry: Record<string, unknown>) => [{ ...entry, marketplaceName: 'unrelated' }],
+    /registration is missing/u,
+  ],
+  [
+    'wrong marketplace source',
+    (entry: Record<string, unknown>) => [
+      { ...entry, marketplaceSource: { sourceType: 'local', source: join(fixture.home, 'unmanaged') } },
+    ],
+    /unmanaged source/u,
+  ],
+  [
+    'wrong version source',
+    (entry: Record<string, unknown>) => [
+      { ...entry, source: { source: 'local', path: join(fixture.home, 'unmanaged') } },
+    ],
+    /source differs/u,
+  ],
+  ['duplicate native selection', (entry: Record<string, unknown>) => [entry, entry], /ambiguous/u],
+  [
+    'disabled native selection',
+    (entry: Record<string, unknown>) => [{ ...entry, enabled: false }],
+    /selection is disabled/u,
+  ],
+] as const)
+  test(`filtered installation refuses ${name} and retains its interrupted intent`, async () => {
+    const { catalog } = installationFixture('install', readback);
+    await assert.rejects(managePlugin({ ...input(), version: '0.3.22' }), error);
+    const state = JSON.parse(readFileSync(join(dirname(catalog), 'state.json'), 'utf8')) as {
+      currentVersion: string | null;
+      pending: { targetVersion: string };
+    };
+    assert.equal(state.currentVersion, null);
+    assert.equal(state.pending.targetVersion, '0.3.22');
+  });
+
+test('filtered readback refuses changed native bytes without adopting the selected version', async () => {
+  const { cache, catalog } = installationFixture('install');
+  const add = fixture.responses[5]!;
+  assert.ok(typeof add === 'function');
+  fixture.responses[5] = (args) => {
+    const result = add(args);
+    writeFileSync(join(cache, 'skills/intake/SKILL.md'), 'unexpected native bytes');
+    return result;
+  };
+  await assert.rejects(managePlugin({ ...input(), version: '0.3.22' }), /native plugin bytes/u);
+  const state = JSON.parse(readFileSync(join(dirname(catalog), 'state.json'), 'utf8')) as {
+    currentVersion: null;
+    pending: unknown;
+  };
+  assert.equal(state.currentVersion, null);
+  assert.ok(state.pending);
+  assert.equal(readFileSync(join(cache, 'skills/intake/SKILL.md'), 'utf8'), 'unexpected native bytes');
+});
+
+test('interrupted filtered readback resumes the original install without fetching or losing native data', async () => {
+  const { entry, cache, catalog } = installationFixture('install');
+  fixture.responses.pop();
+  await assert.rejects(managePlugin({ ...input(), version: '0.3.22' }), /Native fixture intentionally unavailable/u);
+  const statePath = join(dirname(catalog), 'state.json');
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as { pending: { owner: { pid: number; birth: string } } };
+  state.pending.owner = { pid: 2_000_000_000, birth: 'terminated fixture owner' };
+  writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 });
+  const before = readFileSync(join(cache, 'skills/intake/SKILL.md'));
+  fixture.responses.push(
+    'codex-cli 0.153.0',
+    oversizedCatalogue([entry]),
+    JSON.stringify({ installedPath: cache }),
+    oversizedCatalogue([entry]),
+  );
+  const result = await managePlugin({ ...input(), version: '0.3.22' });
+  assert.equal(result.installed, true);
+  assert.equal(result.version, '0.3.22');
+  assert.equal((JSON.parse(readFileSync(statePath, 'utf8')) as { pending?: unknown }).pending, undefined);
+  assert.deepEqual(readFileSync(join(cache, 'skills/intake/SKILL.md')), before);
+  assert.equal(fixture.commands.filter((command) => command === 'npm').length, 1);
+});
+
+test('filtered inventory does not adopt a manual install even when its marketplace source matches', async () => {
+  const cache = doctorFixture(true);
+  const response = fixture.responses.shift()!;
+  assert.ok(typeof response === 'string');
+  const directory = join(fixture.home, '.cache/ai-delivery/plugins/codex/user');
+  rmSync(directory, { recursive: true });
+  const before = readFileSync(join(cache, 'skills/intake/SKILL.md'));
+  fixture.responses.push('codex-cli 0.153.0', response);
+  await assert.rejects(managePlugin(input()), /not owned by managed state/u);
+  assert.deepEqual(fixture.commands, ['codex', 'codex']);
+  const state = JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')) as {
+    currentVersion: null;
+    installedPath: null;
+    pending?: unknown;
+  };
+  assert.equal(state.currentVersion, null);
+  assert.equal(state.installedPath, null);
+  assert.equal(state.pending, undefined);
+  assert.deepEqual(readFileSync(join(cache, 'skills/intake/SKILL.md')), before);
+});
+
+test('Claude doctor retains its unfiltered native inventory and disabled selection readback', async () => {
+  doctorFixture(false, 'claude-code');
+  const result = await managePlugin({ ...input(), host: 'claude-code', action: 'doctor', version: undefined });
+  assert.equal(result.installed, true);
+  assert.equal(result.enabled, false);
+  assert.equal(result.sourceIntegrity, true);
+  assert.deepEqual(result.mcp, { configuration: 'disabled', startup: 'not_checked' });
+  assert.deepEqual(fixture.commandArguments, [['claude', 'plugin', 'list', '--json']]);
+});
 
 test('doctor refuses a same-version native cache with changed skill bytes before starting MCP', async () => {
   const cache = doctorFixture(true);
