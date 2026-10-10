@@ -100,6 +100,7 @@ export async function startTrackedIssue(
 ) {
   let number = input.issueNumber === undefined ? undefined : requiredNumber(input, 'issueNumber');
   let created: { number: number; title: string; url: string } | undefined;
+  let createdBody: string | undefined;
   const registration = (phase: string, error: unknown) => ({
     status: 'created-not-started',
     repository: context.config.repository,
@@ -107,7 +108,13 @@ export async function startTrackedIssue(
     failure: { phase, message: error instanceof Error ? error.message : String(error) },
     safeResume: {
       tool: 'issue_start',
-      arguments: { ...input, repo: context.config.repository, issueNumber: number, resumeCreated: true },
+      arguments: {
+        ...input,
+        ...(createdBody === undefined ? {} : { body: createdBody }),
+        repo: context.config.repository,
+        issueNumber: number,
+        resumeCreated: true,
+      },
     },
   });
   if (number === undefined) {
@@ -137,6 +144,7 @@ export async function startTrackedIssue(
     const requestKey = optionalString(input, 'requestId') ?? intent;
     const marker = `<!-- ai-delivery-start: ${digestValue({ repository: context.config.repository.toLowerCase(), requestKey })} -->`;
     tracking.body = `${tracking.body}\n\n<!-- ai-delivery-start-intent: ${intent} -->\n${marker}`;
+    createdBody = tracking.body;
     let completed = false;
     const matches: Awaited<ReturnType<typeof context.clients.rest.issues.listForRepo>>['data'] = [];
     for (let page = 1; page <= 20; page++) {

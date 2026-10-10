@@ -498,6 +498,41 @@ test('joined MCP start modes preserve ordinary input and reject mixed investigat
   );
 });
 
+test('created readiness refusal returns exact retry markers through safe resume and original request retry', async () => {
+  const f = fixture();
+  f.controls.created = false;
+  f.controls.trackingParent = true;
+  const schema = getAiDeliveryMcpTool('issue_start')!.inputSchema;
+  const request = schema.parse({
+    title: ready().title,
+    body: renderIssueBody(ready()),
+    issueType: 'Task',
+    points: 2,
+    requestId: 'issue68-readiness-recovery',
+  });
+  const interrupted = await startTrackedIssue(f.context, request);
+  if (!('status' in interrupted)) assert.fail('Expected a known-created readiness refusal.');
+  assert.equal(interrupted.status, 'created-not-started');
+  const nativeBody = f.live.body;
+  assert.match(nativeBody, /ai-delivery-start-intent: sha256:[a-f0-9]{64}/u);
+  assert.match(nativeBody, /ai-delivery-start: sha256:[a-f0-9]{64}/u);
+  assert.equal(interrupted.safeResume.arguments.body, nativeBody);
+  assert.equal(f.branchWrites.length, 0);
+  assert.equal(f.comments.length, 0);
+  assert.equal(f.writes.filter((write) => !('issue_number' in write)).length, 1);
+
+  f.controls.trackingParent = false;
+  const resumed = await startTrackedIssue(f.context, schema.parse(interrupted.safeResume.arguments));
+  assert.ok('reused' in resumed && resumed.reused === false);
+  assert.equal(f.live.body, nativeBody);
+  const retry = await startTrackedIssue(f.context, request);
+  assert.ok('reused' in retry && retry.reused === true);
+  assert.equal(f.live.body, nativeBody);
+  assert.equal(f.writes.filter((write) => !('issue_number' in write)).length, 1);
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(f.comments.length, 1);
+});
+
 test('actual compiled stdio MCP returns every Ready diagnostic before credentials and refuses a foreign caller repo', async () => {
   const root = mkdtempSync(join(tmpdir(), 'issue-contract-stdio-'));
   const transport = new StdioClientTransport({
