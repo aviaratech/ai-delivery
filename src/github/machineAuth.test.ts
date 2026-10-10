@@ -50,7 +50,7 @@ function stub(input: { hosts?: unknown; statusRaw?: string; token?: string; fail
     `#!${process.execPath}
 import { appendFileSync } from 'node:fs';
 const args=process.argv.slice(2);
-appendFileSync(${JSON.stringify(join(home, 'calls.jsonl'))},JSON.stringify({args,environmentNames:Object.keys(process.env).sort()})+'\\n');
+appendFileSync(${JSON.stringify(join(home, 'calls.jsonl'))},JSON.stringify({args,environmentNames:Object.keys(process.env).sort(),containsFictionalCredential:Object.values(process.env).includes(${JSON.stringify(token)}),coverageMatchesParent:process.env.NODE_V8_COVERAGE===${JSON.stringify(process.env.NODE_V8_COVERAGE)}})+'\\n');
 if(args[0]!=='auth')process.exit(91);
 if(args[1]===${JSON.stringify(input.fail ?? '')}){process.stderr.write('fictional_error_token_private_key_path_header');process.exit(1);}
 if(args[1]==='status'){
@@ -64,12 +64,25 @@ if(args[1]==='status'){
     { mode: 0o755 },
   );
 }
-function calls(): { args: string[]; environmentNames: string[] }[] {
+function calls(): {
+  args: string[];
+  environmentNames: string[];
+  containsFictionalCredential: boolean;
+  coverageMatchesParent: boolean;
+}[] {
   try {
     return readFileSync(join(home, 'calls.jsonl'), 'utf8')
       .trim()
       .split('\n')
-      .map((line) => JSON.parse(line) as { args: string[]; environmentNames: string[] });
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            args: string[];
+            environmentNames: string[];
+            containsFictionalCredential: boolean;
+            coverageMatchesParent: boolean;
+          },
+      );
   } catch {
     return [];
   }
@@ -261,15 +274,24 @@ test('only non-secret supported selectors reach gh; ambient tokens, injection an
     GITHUB_ENTERPRISE_TOKEN: token,
     UNRELATED_TOKEN: token,
     NODE_OPTIONS: token,
+    NODE_V8_COVERAGE: token,
     GH_DEBUG: 'api',
     DEBUG: '1',
     GH_REPO: 'enterprise.example/other/repo',
   });
-  for (const call of calls())
-    // The Darwin Node stub observed this additional runtime/platform name.
-    // Its cause/value is not asserted; the resolver does not supply it.
+  for (const call of calls()) {
+    assert.equal(call.containsFictionalCredential, false);
+    assert.equal(call.coverageMatchesParent, true);
+    // Node propagates its parent's coverage selector even with an explicit
+    // child environment. Preserve canonical instrumentation, while proving
+    // the supplied fictional selector/credential never reaches the child.
+    // Darwin's additional platform name remains observed but unattributed.
     assert.deepEqual(
-      call.environmentNames.filter((name) => process.platform !== 'darwin' || name !== '__CF_USER_TEXT_ENCODING'),
+      call.environmentNames.filter(
+        (name) =>
+          !(process.platform === 'darwin' && name === '__CF_USER_TEXT_ENCODING') &&
+          !(process.env.NODE_V8_COVERAGE !== undefined && name === 'NODE_V8_COVERAGE'),
+      ),
       [
         'GH_HOST',
         'GH_NO_EXTENSION_UPDATE_NOTIFIER',
@@ -280,6 +302,7 @@ test('only non-secret supported selectors reach gh; ambient tokens, injection an
         'PATH',
       ],
     );
+  }
 });
 test('repository read and simulated write permission refusal preserve status and never switch actors or leak upstream data', async () => {
   identity();
