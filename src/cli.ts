@@ -11,6 +11,7 @@ import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
 import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
+import { IssueWriteSchema } from './issueContract.js';
 
 const program = new Command();
 program
@@ -62,6 +63,13 @@ function ints(value: string | undefined): number[] | undefined {
 function body(value: string | undefined, file: string | undefined): string | undefined {
   if (value !== undefined && file !== undefined) throw new Error('Pass either --body or --body-file.');
   return file === undefined ? value : readFileSync(file, 'utf8');
+}
+function fields(file: string | undefined, overrides: Record<string, unknown>): Record<string, unknown> {
+  const value: unknown = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
+  return {
+    ...IssueWriteSchema.parse(value),
+    ...Object.fromEntries(Object.entries(overrides).filter(([, item]) => item !== undefined)),
+  };
 }
 function run(name: AiDeliveryMcpToolName, input: Record<string, unknown>): Promise<void> {
   return executeTool(name, input, execution()).then((value) => printCommandResult(name, value));
@@ -173,6 +181,8 @@ program
 program
   .command('create')
   .requiredOption('--title <title>')
+  .option('--fields-file <path>', 'UTF-8 JSON typed fields; explicit CLI fields take precedence')
+  .option('--draft', 'Explicitly write an incomplete parked draft')
   .option('--body <markdown>')
   .option('--body-file <path>')
   .option('--type <type>')
@@ -182,18 +192,22 @@ program
   .option('--blocked-by <numbers>')
   .option('--milestone <number>')
   .option('--parent <number>')
-  .action(async (o: Record<string, string>) =>
-    run('issue_create', {
-      title: o.title,
-      body: body(o.body, o.bodyFile),
-      issueType: o.type,
-      points: int(o.points),
-      priority: o.priority,
-      labels: list(o.labels),
-      blockedBy: ints(o.blockedBy),
-      milestone: int(o.milestone),
-      parentIssueNumber: int(o.parent),
-    }),
+  .action(async (o: Record<string, string> & { draft?: boolean }) =>
+    run(
+      'issue_create',
+      fields(o.fieldsFile, {
+        title: o.title,
+        body: body(o.body, o.bodyFile),
+        issueType: o.type,
+        points: int(o.points),
+        priority: o.priority,
+        labels: list(o.labels),
+        blockedBy: ints(o.blockedBy),
+        milestone: int(o.milestone),
+        parentIssueNumber: int(o.parent),
+        ...(o.draft === true ? { draft: true } : {}),
+      }),
+    ),
   );
 
 program
@@ -262,6 +276,8 @@ for (const name of ['list', 'search'] as const) {
 program
   .command('update')
   .requiredOption('--issue <number>')
+  .option('--fields-file <path>', 'UTF-8 JSON typed issue field patch')
+  .option('--draft', 'Explicitly write an incomplete parked draft')
   .option('--title <title>')
   .option('--body <markdown>')
   .option('--body-file <path>')
@@ -277,24 +293,28 @@ program
   .option('--close-reason <reason>')
   .option('--superseded-by <number>')
   .option('--park', 'Park execution while retaining the issue worktree')
-  .action(async (o: Record<string, string> & { park?: boolean; preserveHistory?: boolean }) =>
-    run('issue_update', {
-      issueNumber: int(o.issue),
-      title: o.title,
-      body: body(o.body, o.bodyFile),
-      issueType: o.type,
-      points: int(o.points),
-      priority: o.priority,
-      labels: list(o.labels),
-      blockedBy: ints(o.blockedBy),
-      milestone: int(o.milestone),
-      parentIssueNumber: int(o.parent),
-      state: o.state,
-      preserveHistory: o.preserveHistory === true ? true : undefined,
-      closeReason: o.closeReason,
-      supersededBy: int(o.supersededBy),
-      park: o.park === true ? true : undefined,
-    }),
+  .action(async (o: Record<string, string> & { park?: boolean; preserveHistory?: boolean; draft?: boolean }) =>
+    run(
+      'issue_update',
+      fields(o.fieldsFile, {
+        issueNumber: int(o.issue),
+        title: o.title,
+        ...(o.draft === true ? { draft: true } : {}),
+        body: body(o.body, o.bodyFile),
+        issueType: o.type,
+        points: int(o.points),
+        priority: o.priority,
+        labels: list(o.labels),
+        blockedBy: ints(o.blockedBy),
+        milestone: int(o.milestone),
+        parentIssueNumber: int(o.parent),
+        state: o.state,
+        preserveHistory: o.preserveHistory === true ? true : undefined,
+        closeReason: o.closeReason,
+        supersededBy: int(o.supersededBy),
+        park: o.park === true ? true : undefined,
+      }),
+    ),
   );
 
 program

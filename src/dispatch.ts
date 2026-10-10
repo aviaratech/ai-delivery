@@ -6,6 +6,7 @@ import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js
 import {
   CreatedTrackingIssueError,
   createIssue,
+  canonicalIssueBody,
   commentIssue,
   issueInfo,
   listIssues,
@@ -107,6 +108,7 @@ export async function startTrackedIssue(
       title,
       body: optionalString(input, 'body') ?? optionalString(input, 'request') ?? title,
     } as unknown as CreateIssueInput;
+    tracking.body = canonicalIssueBody(tracking);
     const intent = digestValue(
       Object.fromEntries(
         Object.entries({
@@ -201,6 +203,8 @@ export async function executeTool(
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
     throw new DeliveryError('Tool and execution repository selectors disagree.');
+  // Ready diagnostics need no repository checkout, configuration or credential lookup.
+  if (name === 'issue_create') canonicalIssueBody(input as unknown as CreateIssueInput);
   const repo = typeof selected === 'string' ? selected : execution.repo;
   const selectedExecution = { ...execution, ...(repo === undefined ? {} : { repo }) };
   const local = name === 'runtime_stage' || name === 'runtime_admit' || name.startsWith('issue_worktree_transition_');
