@@ -7,7 +7,7 @@ import { git } from '../git.js';
 
 import { DeliveryError } from '../errors.js';
 import { digestValue } from '../delivery/common.js';
-import { createDeliveryGitHubClients } from '../github/client.js';
+import { createDeliveryGitHubClients, retainMachineAuthorForConfiguration } from '../github/client.js';
 import { resolveRepoFromRemote } from '../github/repo.js';
 import { discoverDeliveryRouting, type DiscoveryClients, type DeliveryRouting } from '../github/discovery.js';
 
@@ -374,6 +374,7 @@ export async function loadDeliveryConfig(
       repositorySelected: options.repository !== undefined,
     });
   } catch (error) {
+    if (error instanceof DeliveryError) throw error;
     if (
       options.clients === undefined &&
       settings.roles.author.authSource === 'personal' &&
@@ -388,6 +389,12 @@ export async function loadDeliveryConfig(
     roles: settings.roles,
     native: routing.native,
   };
+  if (options.clients === undefined)
+    retainMachineAuthorForConfiguration(
+      config,
+      clients as Awaited<ReturnType<typeof createDeliveryGitHubClients>>,
+      options.signal,
+    );
   return {
     config,
     configDigest: digestValue({ sourceDigest: settings.sourceDigest, routing, roles: config.roles }),

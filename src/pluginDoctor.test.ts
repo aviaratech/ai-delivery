@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, test, vi } from 'vitest';
@@ -17,6 +17,8 @@ const fixture = vi.hoisted(() => ({
   enabled: true,
   mode: 'success',
   authCalls: 0,
+  machine: false,
+  ghCalls: [] as string[][],
   keyReads: 0,
   settingsReads: 0,
   requestErrorLogs: [] as string[],
@@ -141,24 +143,73 @@ vi.mock('node:child_process', async (original) => ({
   execFile: (
     binary: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; cwd: string; timeout: number; maxBuffer: number },
+    options: { env: NodeJS.ProcessEnv; cwd: string; timeout?: number; maxBuffer: number },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => {
+    if (args[0] === 'auth') {
+      assert.equal(fixture.machine, true);
+      assert.equal(binary, realpathSync(join(fixture.home, 'bin', 'gh')));
+      assert.equal(options.maxBuffer, 64 * 1024);
+      for (const name of [
+        'GH_TOKEN',
+        'GITHUB_TOKEN',
+        'DELIVERY_REVIEW_APP_ID',
+        'DELIVERY_REVIEW_INSTALLATION_ID',
+        'DELIVERY_REVIEW_KEY_PATH',
+        'NODE_OPTIONS',
+        'GH_DEBUG',
+        'UNRELATED_SERVICE_TOKEN',
+      ])
+        assert.equal(options.env[name], undefined);
+      fixture.ghCalls.push(args);
+      if (args[1] === 'status')
+        callback(
+          null,
+          JSON.stringify({
+            hosts: {
+              'github.com': [{ active: true, host: 'github.com', login: 'fixture-author-login', state: 'success' }],
+            },
+          }),
+          'fictional-opaque-stderr',
+        );
+      else {
+        assert.deepEqual(args, ['auth', 'token', '--hostname', 'github.com', '--user', 'fixture-author-login']);
+        callback(null, 'fictional_machine_author_value', 'fictional-opaque-stderr');
+      }
+      return;
+    }
     assert.equal(binary, process.execPath);
     assert.deepEqual(args, [join(fixture.root, 'runtime/dist/cli.js'), '--repo', args[2], 'config:resolve']);
     assert.equal(options.timeout, 30000);
     assert.equal(options.maxBuffer, 1024 * 1024);
     const forwarded = Object.keys(options.env).sort();
-    assert.deepEqual(forwarded, [
-      'AI_DELIVERY_CONFIG',
-      'DELIVERY_AUTHOR_TOKEN',
-      'DELIVERY_REVIEW_APP_ID',
-      'DELIVERY_REVIEW_INSTALLATION_ID',
-      'DELIVERY_REVIEW_KEY_PATH',
-      'DISABLE_AUTOUPDATER',
-      'NODE_OPTIONS',
-      'PATH',
-    ]);
+    assert.deepEqual(
+      forwarded,
+      (fixture.machine
+        ? [
+            'AI_DELIVERY_CONFIG',
+            'DELIVERY_REVIEW_APP_ID',
+            'DELIVERY_REVIEW_INSTALLATION_ID',
+            'DELIVERY_REVIEW_KEY_PATH',
+            'DISABLE_AUTOUPDATER',
+            'HOME',
+            'LANG',
+            'LC_ALL',
+            'NODE_OPTIONS',
+            'PATH',
+          ]
+        : [
+            'AI_DELIVERY_CONFIG',
+            'DELIVERY_AUTHOR_TOKEN',
+            'DELIVERY_REVIEW_APP_ID',
+            'DELIVERY_REVIEW_INSTALLATION_ID',
+            'DELIVERY_REVIEW_KEY_PATH',
+            'DISABLE_AUTOUPDATER',
+            'NODE_OPTIONS',
+            'PATH',
+          ]
+      ).sort(),
+    );
     fixture.authCalls++;
     const run = async () => {
       if (fixture.mode === 'raw_failure') {
@@ -276,6 +327,8 @@ beforeEach(() => {
   fixture.enabled = true;
   fixture.mode = 'success';
   fixture.authCalls = 0;
+  fixture.machine = false;
+  fixture.ghCalls = [];
   fixture.keyReads = 0;
   fixture.settingsReads = 0;
   fixture.requestErrorLogs = [];
@@ -361,7 +414,7 @@ function http() {
     if (path === '/user')
       return fixture.mode === 'expired'
         ? json({ message: 'fictional-author-value' }, 401)
-        : json({ id: 42, login: 'fixture-author-login' });
+        : json({ id: 42, login: 'fixture-author-login', type: 'User' });
     if (path === '/app') return json({ id: 654321, slug: 'fixture-reviewer' });
     if (/^\/repos\/example\/(widget|service)$/u.test(path)) {
       if (fixture.mode === 'denied' && new Headers(init?.headers).get('authorization')?.includes('ghs_'))
@@ -479,6 +532,54 @@ test('all missing selected references gate both roles; unrelated legacy credenti
   assert.equal(fixture.keyReads, 0);
   assert.equal(fixture.authCalls, 0);
   assert.ok(!JSON.stringify(result.authProbe).includes('fictional-unrelated-value'));
+});
+test.each(['codex', 'claude-code'])(
+  '%s doctor may explicitly resolve an absent default reference through the selected machine session',
+  async (host) => {
+    native(host);
+    fixture.machine = true;
+    settings.roles.author.credentialEnv = { token: 'GH_TOKEN' };
+    file(fixture.config, JSON.stringify(settings));
+    vi.stubEnv('GH_TOKEN', undefined);
+    vi.stubEnv('HOME', fixture.home);
+    // The ordinary verification wrapper contains only these language selectors.
+    vi.stubEnv('USER', undefined);
+    vi.stubEnv('LOGNAME', undefined);
+    const bin = join(fixture.home, 'bin');
+    mkdirSync(bin);
+    file(join(bin, 'gh'), 'fictional CLI; execution simulated');
+    chmodSync(join(bin, 'gh'), 0o755);
+    vi.stubEnv('PATH', bin);
+    http();
+    for (const repo of ['example/widget', 'example/service', 'example/widget']) {
+      const result = await doctor(repo);
+      assert.equal(result.authProbe?.outcome, 'readback_complete');
+      assert.equal(result.authProbe?.processReferences.status, 'complete');
+      assert.ok(!result.authProbe?.processReferences.requiredNames.includes('GH_TOKEN'));
+      assert.equal(
+        result.authProbe?.authentication.author?.credentialSource,
+        `gh:github.com:${realpathSync(join(bin, 'gh'))}`,
+      );
+      assert.equal(result.authProbe?.nativeGuiPropagation, 'unverified');
+      assert.ok(!JSON.stringify(result).includes('fictional_machine_author_value'));
+    }
+    assert.equal(
+      fixture.ghCalls.length,
+      6,
+      'One status/token selection per command, retained across routing and operation',
+    );
+  },
+);
+test('absent default author input still gates missing reviewer references before machine/session/key access', async () => {
+  settings.roles.author.credentialEnv = { token: 'GH_TOKEN' };
+  file(fixture.config, JSON.stringify(settings));
+  vi.stubEnv('GH_TOKEN', undefined);
+  vi.stubEnv('DELIVERY_REVIEW_APP_ID', undefined);
+  const result = await doctor();
+  assert.deepEqual(result.authProbe?.processReferences.missingNames, ['DELIVERY_REVIEW_APP_ID']);
+  assert.equal(fixture.authCalls, 0);
+  assert.equal(fixture.ghCalls.length, 0);
+  assert.equal(fixture.keyReads, 0);
 });
 test('invalid App references and reserved runtime credential names stop before key/network access', async () => {
   vi.stubEnv('DELIVERY_REVIEW_INSTALLATION_ID', 'not-an-id');

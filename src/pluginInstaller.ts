@@ -23,6 +23,7 @@ import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from '@modelcontextp
 import { z } from 'zod';
 
 import { loadDeliverySettings, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
+import { assertSupportedAuthorHost, machineAuthorEligible, MACHINE_AUTH_ENV_NAMES } from './github/machineAuth.js';
 import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 import { withLock } from './utils/lockfile.js';
 import {
@@ -132,7 +133,7 @@ export interface PluginAuthProbe {
   };
   authentication: {
     status: 'not_checked' | 'verified' | 'failed' | 'unverified';
-    author?: { actorLogin: string; authSource: 'app' | 'personal' };
+    author?: { actorLogin: string; authSource: 'app' | 'personal'; credentialSource?: string };
     reviewer?: { actorLogin: string; authSource: 'app' };
   };
   repositoryAccess: { repository: string; status: 'not_checked' | 'verified' | 'denied' | 'unverified' };
@@ -172,6 +173,7 @@ const AuthReadback = z.object({
         .regex(/^[A-Za-z0-9-]+(?:\[bot\])?$/u)
         .max(200),
       authSource: z.enum(['app', 'personal']),
+      credentialSource: z.string().optional(),
       identity: z.string(),
     }),
     reviewer: z.object({
@@ -202,8 +204,12 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     return;
   }
   const names = Object.values(settings.roles).flatMap((role) => Object.values(role.credentialEnv));
-  probe.processReferences.requiredNames = names;
-  const missing = names.filter((name) => !process.env[name]?.trim());
+  const author = settings.roles.author;
+  const machineSession =
+    author.authSource === 'personal' && machineAuthorEligible(author.credentialEnv.token, process.env);
+  const requiredNames = machineSession ? names.filter((name) => name !== 'GH_TOKEN') : names;
+  probe.processReferences.requiredNames = requiredNames;
+  const missing = requiredNames.filter((name) => !process.env[name]?.trim());
   probe.processReferences.missingNames = missing;
   if (missing.length > 0) {
     probe.processReferences.status = 'missing';
@@ -218,6 +224,7 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
       (name) =>
         /^(?:NODE_|NPM_|GIT_)/u.test(name) ||
         [
+          ...MACHINE_AUTH_ENV_NAMES,
           'PATH',
           'HOME',
           'CODEX_HOME',
@@ -239,8 +246,11 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     NODE_OPTIONS: '--max-old-space-size=512 --v8-pool-size=1',
     DISABLE_AUTOUPDATER: '1',
   };
-  for (const name of names) env[name] = process.env[name]!.trim();
+  for (const name of names) if (process.env[name] !== undefined) env[name] = process.env[name]!.trim();
+  if (machineSession)
+    for (const name of MACHINE_AUTH_ENV_NAMES) if (process.env[name] !== undefined) env[name] = process.env[name];
   try {
+    if (author.authSource === 'personal') assertSupportedAuthorHost(process.env);
     for (const role of ['author', 'reviewer'] as const)
       if (settings.roles[role].authSource !== 'personal')
         resolveDeliveryRoleCredentials({ config: settings, role, env });
@@ -276,7 +286,10 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     // only that exact final line; all surrounding opaque output stays withheld.
     const diagnostic = captured.stderr.trimEnd().split(/\r?\n/u).at(-1);
     if (
-      diagnostic === 'ai-delivery: Configured personal author token is invalid or expired; refresh the selected token.'
+      diagnostic ===
+        'ai-delivery: Configured personal author token is invalid or expired; refresh the selected token.' ||
+      diagnostic ===
+        'ai-delivery: Machine GitHub session is invalid or expired; verify the selected github.com account.'
     ) {
       probe.authentication.status = 'failed';
       probe.reason = 'authentication_failed';
@@ -303,11 +316,20 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     )
       throw new Error('Inconsistent readback');
     const projected = {
-      author: { actorLogin: route.author.actorLogin, authSource: route.author.authSource },
+      author: {
+        actorLogin: route.author.actorLogin,
+        authSource: route.author.authSource,
+        ...(machineSession && route.author.credentialSource !== undefined
+          ? { credentialSource: route.author.credentialSource }
+          : {}),
+      },
       reviewer: { actorLogin: route.reviewer.actorLogin, authSource: 'app' as const },
     };
     // Even a syntactically valid actor must not reproduce a supplied credential.
-    if (names.some((name) => JSON.stringify(projected).includes(env[name]!))) throw new Error('Unsafe readback');
+    if (machineSession && !route.author.credentialSource?.startsWith('gh:github.com:'))
+      throw new Error('Missing session route');
+    if (names.some((name) => env[name] !== undefined && JSON.stringify(projected).includes(env[name]!)))
+      throw new Error('Unsafe readback');
     probe.authentication = { status: 'verified', ...projected };
     probe.repositoryAccess.status = 'verified';
     probe.reviewRules = { ...route.rules, approvalEligibility: route.approvalEligibility };

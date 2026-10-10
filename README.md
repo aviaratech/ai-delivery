@@ -22,7 +22,7 @@ Create `~/.config/aviaratech-ai/ai-delivery.json`, or set `AI_DELIVERY_CONFIG` t
     "author": {
       "identity": "host-author",
       "authSource": "personal",
-      "credentialEnv": { "token": "DELIVERY_AUTHOR_TOKEN" }
+      "credentialEnv": { "token": "GH_TOKEN" }
     },
     "reviewer": {
       "identity": "delivery-reviewer",
@@ -38,7 +38,11 @@ Create `~/.config/aviaratech-ai/ai-delivery.json`, or set `AI_DELIVERY_CONFIG` t
 }
 ```
 
-An App author uses the same `credentialEnv` shape as the reviewer. Roles and credential environment names must be distinct. Credential values and private keys remain outside source control. A configured personal author uses only its named token variable. The optional `--identity` or `AI_DELIVERY_IDENTITY` override must select the command's configured role; neither is needed for normal operation. The explicit legacy `--identity personal --personal-auth` override is limited to development access diagnosis under an App author configuration; publication requires the configured author.
+An App author uses the same `credentialEnv` shape as the reviewer. Roles and credential environment names must be distinct. Credential values and private keys remain outside source control. A configured personal author uses its named token variable. With the conventional `GH_TOKEN` reference **absent**, it instead uses the existing active personal account from GitHub CLI `gh` for `github.com`. A present empty, malformed or expired token fails without switching accounts. A custom reference such as `DELIVERY_AUTHOR_TOKEN` always requires that exact value; its absence does not select a machine session. Unrelated `GITHUB_TOKEN` values do not satisfy either configured reference. The optional `--identity` or `AI_DELIVERY_IDENTITY` override must select the command's configured role; neither is needed for normal operation. The explicit legacy `--identity personal --personal-auth` override is limited to development access diagnosis under an App author configuration; it requires an explicit token and does not use a missing-token machine fallback. Publication requires the configured author.
+
+The machine route uses `gh auth status --hostname github.com --active --json hosts`, validates the selected account's state, then privately obtains that exact user's credential through `gh auth token --hostname github.com --user <active-user>`. An actual authenticated user read must match the selection. Repository discovery and command execution retain that account; failed identity/access never selects another account. Inactive accounts with errors do not invalidate a healthy active user. Only required non-secret home/PATH/gh configuration selectors reach `gh`; token overrides, debug flags and unrelated credentials are excluded. No login, switch, refresh, credential-store scraping or persistent configuration change occurs. The reviewer still uses its distinct configured App, with no personal-session fallback.
+
+`gh` must be executable on the running process's PATH and able to access its existing session. A terminal login does not prove that a Codex or Claude GUI process can find `gh` or use its keyring. `config:resolve` reports the selected route/executable and authenticated actor, or a safe actionable refusal. Default plugin doctor does not inspect or authenticate the session. This package currently supports `github.com` repositories; enterprise URLs or a conflicting `GH_HOST` refuse rather than silently using another host. No write probe or permission grant is performed, and a successful identity/repository read does not guarantee every later write or counted App approval.
 
 The explicit organization Project number selects a compatible writable Project. Optional `pointsField`, `priorityField`, `statusField`, four `statuses` names (`todo`, `inProgress`, `blocked`, `done`), and `issueTypes` customize discovered metadata. Defaults are Points, Priority, Status and Todo/In Progress/Blocked/Done. IDs, option catalogs and issue types come from GitHub. This runtime supports github.com organization repositories and native organization single-select Points/Priority fields bound into the selected Project.
 
@@ -124,12 +128,15 @@ For an opt-in authentication check, select a repository explicitly:
 ai-delivery --repo example/widget plugin doctor --host codex --scope user --check-auth --json
 ```
 
-This checks settings and named process references before running the verified,
+This checks settings and required process references before running the verified,
 enabled plugin's selected CLI `config:resolve`. It reports authenticated actors,
 repository access and visible review rules separately. Only configured credential
-names and required runtime selectors reach that subprocess; unrelated tokens and
+names and required runtime selectors reach that subprocess; an absent default
+`GH_TOKEN` may use the selected machine session. Unrelated tokens and
 legacy personal overrides do not. Missing or invalid inputs stop before key
-access or network authentication. Dry-run performs none of these checks.
+access or network authentication. An eligible machine route is explicitly
+authenticated through `gh` and the selected client after those gates. Dry-run
+performs none of these checks.
 The readback is labelled `selected_runtime_cli`; it does not prove GUI credential
 propagation or counted exact-head approval. `config:resolve` remains available
 for direct CLI readback; check an actual native tool call separately. The

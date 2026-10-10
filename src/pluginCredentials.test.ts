@@ -63,6 +63,21 @@ afterEach(() => {
 });
 
 describe('synthetic native-plugin credential contract', () => {
+  it('an absent conventional reference selects machine-session resolution without accepting ambient legacy credentials', async () => {
+    const fixture = settings(home);
+    fixture.roles.author = { authSource: 'personal', identity: 'fixture-author', credentialEnv: { token: 'GH_TOKEN' } };
+    writeFileSync(configPath, JSON.stringify(fixture));
+    const loaded = await loadDeliverySettings();
+    await assert.rejects(
+      createDeliveryGitHubClients({
+        config: loaded,
+        identity: 'fixture-author',
+        role: 'author',
+        env: { HOME: home, PATH: join(home, 'missing-cli'), GITHUB_TOKEN: 'fictional_legacy_token' },
+      }),
+      /gh is unavailable on this process PATH/u,
+    );
+  });
   it.each(['codex', 'claude-code'])(
     '%s fixture uses one operator configuration outside Git and across repositories',
     async (host) => {

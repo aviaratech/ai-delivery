@@ -4,13 +4,18 @@ Self-contained host plugin for `@aviaratech/ai-delivery`. Its built launcher sta
 
 The bundled skills cover issue intake, host-owned worktree development, and pull request handoff. Use `ai-delivery plugin install --host codex --scope user --version <published-version>` or select `--host claude-code` with a native `user`, `project`, or `local` scope. The same command group provides `doctor`, explicit-version `update`, `rollback` to the recorded previous version, and `remove`, with `--dry-run` and `--json` on each. The [package guide](../../README.md) describes managed version retention, read-only diagnostics, and data preservation. Restart the host after changing its plugin selection.
 
-Configure operator-owned JSON at `~/.config/aviaratech-ai/ai-delivery.json` and set its author/reviewer credential environment references outside source control. Every remote tool accepts an explicit `repo` and works without a checkout or repository policy files; one launched MCP server can switch repositories. The launcher needs no `AI_DELIVERY_IDENTITY`: command roles default from user settings. `issue_pr_create` with `dryRun: true` reports configured actors and rule visibility. Hosts own worktrees, contributor checks, commits and pushes. Explicit `runtime:stage` / `runtime:admit` remain separate controller operations; installing the plugin does not activate or alter a private runtime or adopt historical custody.
+Configure operator-owned JSON at `~/.config/aviaratech-ai/ai-delivery.json` and provide its selected author/reviewer credential references outside source control. A personal author naming `GH_TOKEN` can use the machine's existing active `gh` session when that variable is absent. Every remote tool accepts an explicit `repo` and works without a checkout or repository policy files; one launched MCP server can switch repositories. The launcher needs no `AI_DELIVERY_IDENTITY`: command roles default from user settings. `issue_pr_create` with `dryRun: true` reports configured actors and rule visibility. Hosts own worktrees, contributor checks, commits and pushes. Explicit `runtime:stage` / `runtime:admit` remain separate controller operations; installing the plugin does not activate or alter a private runtime or adopt historical custody.
 
 ## Credentials and readiness
 
 User JSON names credential variables; it does not provide their values. For the
 fictional configuration in the [package guide](../../README.md#user-configuration),
-the selected personal author needs `DELIVERY_AUTHOR_TOKEN`. The reviewer App
+the selected personal author names `GH_TOKEN`. When it is absent, the existing
+active personal `github.com` session from `gh` is selected. A supplied value takes
+precedence; empty, malformed, expired or denied explicit credentials fail without
+switching actors. A custom reference such as `DELIVERY_AUTHOR_TOKEN` always
+requires its value and has no missing-variable fallback. Ambient `GITHUB_TOKEN`
+or unrelated credentials do not replace a configured reference. The reviewer App
 needs `DELIVERY_REVIEWER_APP_ID`, `DELIVERY_REVIEWER_INSTALLATION_ID`, and
 `DELIVERY_REVIEWER_KEY_PATH`; the last value names an absolute private-key file.
 An App author needs its own three references. Role identities, reference names,
@@ -22,6 +27,35 @@ does not automatically read a shell profile, `.env` file, repository configurati
 or secret manager. A variable exported in a terminal may be absent from an
 already-running GUI application. Supplying variables to a separate CLI command
 does not change the native host's running MCP process.
+
+The author resolver finds `gh` on that actual process PATH, with no hardcoded
+installation path, shell-profile launch or current-directory search. It uses
+supported `gh auth status --hostname github.com --active --json hosts` and
+privately captures `gh auth token --hostname github.com --user <active-user>`.
+Status JSON can exit zero despite authentication errors: the selected active
+state and actual authenticated user must both pass and match. Inactive account
+errors do not invalidate a healthy selected user. Missing/ambiguous/expired
+sessions, identity mismatch or unavailable keyring refuse without another
+account, login/switch/refresh or a permission grant. Only necessary non-secret
+home/PATH/gh configuration selectors reach this child; credentials, debug flags,
+injection flags and unrelated environment variables are excluded. The token and
+raw stdout/stderr stay private to the selected auth client; no released files,
+logs, settings or native diagnostic output receive them.
+
+The package currently supports `github.com` only. An enterprise repository or
+conflicting `GH_HOST` fails safely instead of substituting `github.com`.
+`GH_CONFIG_DIR` / `XDG_CONFIG_HOME`, when supplied, retain their selected gh
+configuration location rather than falling back to another profile. The role's
+configured identity is a label; Git author metadata is not authentication.
+Actual user/repository readback remains required. Read access does not prove a
+future write is allowed or that a reviewer App approval will count.
+
+Shell `gh` availability and a healthy keyring session do not prove native GUI
+PATH/keyring visibility. After adopting the exact qualified package in each
+host, retain an actual read-only native selected-user/repository readback, or
+its actionable missing-gh/session refusal. A selected-runtime CLI pass does not
+establish Codex/Claude GUI propagation. Author fallback never substitutes for
+the reviewer App's configured credentials or identity.
 
 Use an operator-controlled, host-supported environment mechanism for the selected
 server and the configured reference names. [Codex's stdio configuration](https://developers.openai.com/codex/mcp)
@@ -48,14 +82,14 @@ hide a missing-variable failure.
 
 Treat each readiness layer separately:
 
-| Layer                                   | Evidence                                                                                         | What remains unproved                                    |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
-| Installed bytes                         | Selected version and matching source integrity                                                   | Server startup and credentials                           |
-| Startup                                 | Default `plugin doctor` initializes the bundled server and lists tools without credentials       | Settings validity and GitHub use                         |
-| User settings                           | The operator JSON validates its schema, role identities, reference names, and paths              | Reference availability and authentication                |
-| Reference availability                  | Named variables are present and valid for the selected roles; report missing names only          | A token or key may still be invalid or inaccessible      |
-| Supplied-environment CLI authentication | Explicit `config:resolve` returns the selected repository, author, reviewer, and rule visibility | The native GUI/CLI host process received the same inputs |
-| Native authentication                   | A read-only tool call succeeds through the selected host's actual MCP process                    | Reviewer approval counts on a later exact PR head        |
+| Layer                                   | Evidence                                                                                             | What remains unproved                                    |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Installed bytes                         | Selected version and matching source integrity                                                       | Server startup and credentials                           |
+| Startup                                 | Default `plugin doctor` initializes the bundled server and lists tools without credentials           | Settings validity and GitHub use                         |
+| User settings                           | The operator JSON validates its schema, role identities, reference names, and paths                  | Reference availability and authentication                |
+| Reference availability                  | Required variables are present; an absent conventional author reference may select the machine route | Token/key/session authentication remains separate        |
+| Supplied-environment CLI authentication | Explicit `config:resolve` returns the selected repository, author, reviewer, and rule visibility     | The native GUI/CLI host process received the same inputs |
+| Native authentication                   | A read-only tool call succeeds through the selected host's actual MCP process                        | Reviewer approval counts on a later exact PR head        |
 
 Default doctor is credential-free and does not contact GitHub or read user
 settings, selected credential variables or keys. To opt in, run from the intended
@@ -68,18 +102,22 @@ ai-delivery --repo example/widget plugin doctor --host codex --scope user --chec
 Use `--host claude-code` for the corresponding managed native selection. The
 diagnostic refuses absent, disabled, modified or failed-startup selections. It
 then validates settings and reports required/missing variable names without
-values. Missing or invalid references stop before any key read or authentication
+values. Eligible absent `GH_TOKEN` is not reported as a required supplied token.
+Missing reviewer/custom references or invalid explicit inputs stop before key read or authentication
 request. Credential names must not overlap runtime selectors (`PATH`, `HOME`,
 host/configuration selectors or Node/npm/Git environment controls).
 
 The verified selected runtime's existing `config:resolve` owns the readback.
-Only configured references and necessary selectors are forwarded; unrelated
+Only configured references and necessary selectors are forwarded; an eligible
+machine route also retains the process's supported gh home/PATH/config selectors. Unrelated
 variables, legacy personal overrides and caller Node injection flags are excluded.
 Output separates settings, process references, authenticated author/reviewer,
 repository access and visible rules. Authentication/discovery failure can leave
 both identity and repository access unverified; a generic failure is not a
 permission diagnosis. Raw errors, upstream bodies/headers and private-key paths
 are withheld. Rule visibility or App permissions never imply counted approval.
+The machine author diagnostic includes its safe route/resolved executable. It
+does not expose a token or claim a missing variable became present.
 The invocation context is `selected_runtime_cli`, and native GUI propagation
 remains `unverified`. Dry-run does not validate settings or authenticate.
 
