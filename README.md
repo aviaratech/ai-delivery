@@ -247,12 +247,12 @@ operator's machine. Validation requires HTTPS with a DNS hostname; it rejects
 file paths, credential-bearing URLs, IP literals, localhost and `.local` names.
 It does not probe remote reachability. Each kind also requires these fields:
 
-| Kind | Required fields |
-| --- | --- |
-| `start` | `outcome` |
-| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link |
-| `decision` | `decision`, `rationale` |
-| `blocker` | `blocker`, `resolution` |
+| Kind       | Required fields                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------- |
+| `start`    | `outcome`                                                                                 |
+| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link                      |
+| `decision` | `decision`, `rationale`                                                                   |
+| `blocker`  | `blocker`, `resolution`                                                                   |
 | `closeout` | `acceptance` (nonempty `{criterion, evidence}` list), `followUps` (list; empty when none) |
 
 Optional `details` adds supporting prose. `lengthCap` (600–10,000 characters,
