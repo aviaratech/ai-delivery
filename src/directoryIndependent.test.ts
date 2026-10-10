@@ -200,9 +200,12 @@ describe('per-call repository selection', () => {
     }
   });
 
-  it('routes direct dispatch and one MCP server A → B → A without launch Git or identity environment', async () => {
+  it('routes PRs and journals through one MCP server A → B → A without launch Git or identity environment', async () => {
     const root = mkdtempSync(join(tmpdir(), 'delivery-mcp-routing-'));
     const visited: string[] = [];
+    const journalTargets: string[] = [];
+    const stored: { id: number; body: string; html_url: string; issue_url: string; user: { login: string } }[] = [];
+    let authorCalls = 0;
     vi.stubEnv('AI_DELIVERY_CONFIG', join(root, 'user.json'));
     vi.stubEnv('AI_DELIVERY_IDENTITY', '');
     writeFileSync(process.env.AI_DELIVERY_CONFIG!, JSON.stringify(userSettings));
@@ -217,6 +220,10 @@ describe('per-call repository selection', () => {
         ({
           role: input.role,
           authSource: 'personal',
+          authenticatedAuthor: async () => {
+            authorCalls += 1;
+            return { actorLogin: 'operator', credentialIdentity: 'user:1' };
+          },
           graphql: (async (query: string, variables: Record<string, unknown>) => {
             const repo = typeof variables.repo === 'string' ? variables.repo : 'a';
             return syntheticDiscoveryClients({ ...syntheticDiscoveryConfig, repository: `example/${repo}` }).graphql(
@@ -225,6 +232,38 @@ describe('per-call repository selection', () => {
             );
           }) as githubClients.GitHubClients['graphql'],
           rest: {
+            issues: {
+              get: async (input: { owner: string; repo: string; issue_number: number }) => {
+                journalTargets.push(`${input.owner}/${input.repo}`);
+                return { data: { number: input.issue_number } };
+              },
+              listComments: async (input: { owner: string; repo: string; issue_number: number }) => ({
+                data: stored.filter(
+                  (comment) =>
+                    comment.issue_url ===
+                    `https://api.github.com/repos/${input.owner}/${input.repo}/issues/${String(input.issue_number)}`,
+                ),
+              }),
+              createComment: async (input: { owner: string; repo: string; issue_number: number; body: string }) => {
+                const id = 101 + stored.length;
+                const data = {
+                  id,
+                  body: input.body,
+                  html_url: `https://github.com/${input.owner}/${input.repo}/issues/${String(input.issue_number)}#issuecomment-${String(id)}`,
+                  issue_url: `https://api.github.com/repos/${input.owner}/${input.repo}/issues/${String(input.issue_number)}`,
+                  user: { login: 'operator' },
+                };
+                stored.push(data);
+                return { data };
+              },
+              getComment: async (input: { owner: string; repo: string; comment_id: number }) => ({
+                data: stored.find(
+                  (comment) =>
+                    comment.id === input.comment_id &&
+                    comment.issue_url === `https://api.github.com/repos/${input.owner}/${input.repo}/issues/17`,
+                ),
+              }),
+            },
             pulls: {
               get: async (input: { owner: string; repo: string; pull_number: number }) => {
                 visited.push(`${input.owner}/${input.repo}`);
@@ -247,15 +286,80 @@ describe('per-call repository selection', () => {
     const server = createAiDeliveryMcpServer({ repoRoot: root });
     const client = new Client({ name: 'directory-fixture', version: '1' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const journal = {
+      issueNumber: 17,
+      kind: 'progress',
+      summary: 'Validation is implemented.',
+      status: 'In progress',
+      done: ['Added validation'],
+      decisionNeeded: 'None',
+      keyNumbers: [],
+      evidence: ['https://github.com/example/widget/pull/23'],
+      nextStep: 'Review',
+      nextDate: '2026-10-09',
+    };
     try {
       await server.connect(serverTransport);
       await client.connect(clientTransport);
       for (const repo of ['example/a', 'example/b', 'example/a']) {
         const response = await client.callTool({ name: 'issue_pr_info', arguments: { repo, prNumber: 23 } });
         assert.equal(response.isError, undefined);
+        const comment = await client.callTool({ name: 'issue_comment', arguments: { ...journal, repo } });
+        assert.equal(comment.isError, undefined, JSON.stringify(comment));
+        assert.match(
+          JSON.stringify(comment),
+          new RegExp(`https://github.com/${repo}/issues/17#issuecomment-10[12]`, 'u'),
+        );
       }
       await executeTool('issue_pr_info', { repo: 'example/b', prNumber: 23 }, { repoRoot: root });
       assert.deepEqual(visited, ['example/a', 'example/b', 'example/a', 'example/b']);
+      assert.deepEqual(journalTargets, ['example/a', 'example/b', 'example/a']);
+      assert.equal(stored.length, 2, 'A retry reuses its own journal, without leaking repository B');
+      const beforeInvalid = vi.mocked(githubClients.createDeliveryGitHubClients).mock.calls.length;
+      const beforeInvalidAuthor = authorCalls;
+      for (const invalid of [
+        { ...journal, repo: 'example/a', unknown: true },
+        { ...journal, repo: 'example/a', outcome: 'Wrong variant' },
+        { ...journal, repo: 'example/a', kind: 'unsupported' },
+        { ...journal, repo: 'example/a', nextDate: '2026-02-30' },
+        { ...journal, repo: 'invalid' },
+      ]) {
+        const refused = await client.callTool({ name: 'issue_comment', arguments: invalid }).then(
+          (result) => result.isError === true,
+          () => true,
+        );
+        assert.equal(refused, true);
+      }
+      const fixedServer = createAiDeliveryMcpServer({ repoRoot: root, repo: 'example/a' });
+      const fixedClient = new Client({ name: 'fixed-repository-fixture', version: '1' });
+      const [fixedClientTransport, fixedServerTransport] = InMemoryTransport.createLinkedPair();
+      try {
+        await fixedServer.connect(fixedServerTransport);
+        await fixedClient.connect(fixedClientTransport);
+        const conflict = await fixedClient.callTool({
+          name: 'issue_comment',
+          arguments: { ...journal, repo: 'example/b' },
+        });
+        assert.equal(conflict.isError, true);
+        assert.match(JSON.stringify(conflict), /selectors disagree/u);
+        assert.equal(vi.mocked(githubClients.createDeliveryGitHubClients).mock.calls.length, beforeInvalid);
+        assert.equal(authorCalls, beforeInvalidAuthor, 'refusals precede authentication');
+        assert.equal(stored.length, 2, 'refusals do not write');
+        assert.deepEqual(journalTargets, ['example/a', 'example/b', 'example/a'], 'refusals do not read a target');
+        const inherited = await fixedClient.callTool({ name: 'issue_comment', arguments: journal });
+        assert.equal(inherited.isError, undefined, JSON.stringify(inherited));
+        const readback = JSON.parse((inherited.content as { text: string }[])[0]!.text) as {
+          url: string;
+          reused: boolean;
+        };
+        assert.equal(readback.url, 'https://github.com/example/a/issues/17#issuecomment-101');
+        assert.equal(readback.reused, true, 'omitting repo uses the fixed server selector');
+      } finally {
+        await fixedClient.close();
+        await fixedServer.close();
+      }
+      assert.equal(stored.length, 2, 'inheriting the server selector reuses repository A');
+      assert.deepEqual(journalTargets, ['example/a', 'example/b', 'example/a', 'example/a']);
       assert.equal(vi.mocked(repository.resolveRepoFromRemote).mock.calls.length, 0);
       const names = AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name as string);
       for (const removed of ['issue_develop', 'issue_verify', 'issue_worktree_create'])
