@@ -82,6 +82,16 @@ export function investigationSourceIdentity(
     { path: target, branch, issueNumber, type: 'issue', status: 'active', createdAt: '', updatedAt: '' },
     root,
   );
+  // Lowercase tags hide assume-unchanged entries; S/s hides skip-worktree entries.
+  // Do not let Git's own cleanliness checks turn hidden working bytes into removal authority.
+  if (
+    git(target, 'ls-files', '-v', '-z')
+      .split('\0')
+      .some((entry) => /^(?:[a-z]|S) /u.test(entry))
+  )
+    throw new DeliveryError(
+      'Investigation source has assume-unchanged or skip-worktree index entries; preserve hidden local data.',
+    );
   assertClean(target);
   if (git(target, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z') !== '')
     throw new DeliveryError('Investigation source contains ignored files; preserve them before completion.');

@@ -682,6 +682,50 @@ test('MCP investigation lifecycle resolves the selected checkout and completes t
     }
   }));
 
+for (const flag of ['--assume-unchanged', '--skip-worktree'] as const) {
+  test(`registration refuses ${flag} without recording prospective custody`, async () =>
+    fixture(async (f) => {
+      git(f.target, 'update-index', flag, '--', 'source.txt');
+      writeFileSync(join(f.target, 'source.txt'), 'hidden private bytes before registration\n');
+      assert.equal(git(f.target, 'status', '--porcelain', '--untracked-files=all'), '');
+      await assert.rejects(f.prepare(), /index entries/u);
+      assert.equal(readFileSync(join(f.target, 'source.txt'), 'utf8'), 'hidden private bytes before registration\n');
+      assert.equal(readInvestigationPreparation(f.root, 17), undefined);
+      assert.deepEqual(f.registry().worktrees, [f.unrelated]);
+    }));
+  test(`completion refuses ${flag} and preserves hidden bytes, administration and registry`, async () =>
+    fixture(async (f) => {
+      const p = await f.prepare();
+      f.accept(p);
+      git(f.target, 'update-index', flag, '--', 'source.txt');
+      writeFileSync(join(f.target, 'source.txt'), 'hidden private bytes after registration\n');
+      assert.equal(git(f.target, 'status', '--porcelain', '--untracked-files=all'), '');
+      const before = readFileSync(join(f.root, '.issue-cli', 'worktrees.json'));
+      await assert.rejects(f.finish(), /index entries/u);
+      assert.equal(readFileSync(join(f.target, 'source.txt'), 'utf8'), 'hidden private bytes after registration\n');
+      assert(existsSync(p.physical.gitDirectory));
+      assert(readFileSync(join(f.root, '.issue-cli', 'worktrees.json')).equals(before));
+      assert.equal(git(f.target, 'rev-parse', 'HEAD'), f.head);
+      assert.equal(existsSync(join(f.evidence, 'intent.json')), false);
+    }));
+  test(`interrupted resume refuses ${flag} without retiring hidden bytes or changing its intent`, async () =>
+    fixture(async (f) => {
+      const p = await f.prepare();
+      f.accept(p);
+      native.fault = 'intent';
+      await assert.rejects(f.finish(), /Fixture interruption/u);
+      const intent = readFileSync(join(f.evidence, 'intent.json'));
+      git(f.target, 'update-index', flag, '--', 'source.txt');
+      writeFileSync(join(f.target, 'source.txt'), 'hidden private bytes during recovery\n');
+      assert.equal(git(f.target, 'status', '--porcelain', '--untracked-files=all'), '');
+      await assert.rejects(f.finish(), /index entries/u);
+      assert.equal(readFileSync(join(f.target, 'source.txt'), 'utf8'), 'hidden private bytes during recovery\n');
+      assert(readFileSync(join(f.evidence, 'intent.json')).equals(intent));
+      assert(existsSync(p.physical.gitDirectory));
+      assert.deepEqual(f.registry().worktrees, [f.unrelated, p.row]);
+    }));
+}
+
 for (const [mode, args, refusal] of [
   [
     'start',
