@@ -315,7 +315,7 @@ test('repository discovery and subsequent command construction retain one select
     assert.equal(await createDeliveryGitHubClients({ config, identity: 'fixture-author', role: 'author' }), clients);
     assert.equal(calls().length, 2);
     const explicit = await createDeliveryGitHubClients({
-      config,
+      config: structuredClone(config),
       identity: 'fixture-author',
       role: 'author',
       env: { GH_TOKEN: 'fictional_override' },
@@ -374,6 +374,57 @@ test('the existing delivery context uses one central machine account across actu
     process.env = original;
   }
 });
+test.each(['GH_TOKEN', 'GH_CONFIG_DIR'] as const)(
+  'a %s change during actual repository discovery cannot replace the selected machine author',
+  async (selector) => {
+    const settingsPath = join(home, 'user.json');
+    const alternateProfile = join(home, 'alternate-profile');
+    mkdirSync(alternateProfile);
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        schemaVersion: 'ai-delivery.user@1',
+        roles: config.roles,
+        project: 1,
+        checkoutRoots: [],
+        pointsField: 'Estimate',
+        priorityField: 'Urgency',
+        statusField: 'Flow',
+        statuses: syntheticDiscoveryConfig.native.project.statuses,
+      }),
+    );
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requests.push(url);
+      if (url === 'https://api.github.com/user')
+        return new Response(JSON.stringify({ id: 42, login: 'fixture-user', type: 'User' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      assert.equal(url, 'https://api.github.com/graphql');
+      assert.equal(typeof init?.body, 'string');
+      const body = JSON.parse(init!.body as string) as { query: string };
+      assert.ok(!body.query.includes('mutation'));
+      process.env[selector] = selector === 'GH_TOKEN' ? 'fictional_alternate_author_token' : alternateProfile;
+      return new Response(JSON.stringify({ data: await syntheticDiscoveryClients().graphql(body.query) }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const original = process.env;
+    process.env = { ...env, AI_DELIVERY_CONFIG: settingsPath };
+    try {
+      await safeFailure(
+        contextFor({ repoRoot: home, repo: 'example/widget' }, 'config:resolve'),
+        /environment changed after repository selection/u,
+      );
+      assert.equal(requests.filter((url) => url === 'https://api.github.com/user').length, 1);
+      assert.ok(requests.includes('https://api.github.com/graphql'));
+      assert.equal(calls().length, 2);
+    } finally {
+      process.env = original;
+    }
+  },
+);
 test('reviewer and App author missing credentials never inherit the personal session', async () => {
   for (const role of ['author', 'reviewer'] as const)
     await safeFailure(

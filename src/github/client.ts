@@ -27,15 +27,13 @@ export interface GitHubClients {
 }
 
 const authorGitTokens = new WeakMap<GitHubClients, string>();
-const resolvedMachineAuthors = new WeakMap<
-  DeliveryConfig['roles'],
-  {
-    clients: GitHubClients;
-    env: NodeJS.ProcessEnv;
-    signal: AbortSignal | undefined;
-    selectors: string;
-  }
->();
+interface MachineSelection {
+  env: NodeJS.ProcessEnv;
+  signal: AbortSignal | undefined;
+  selectors: string;
+}
+const machineAuthorSelections = new WeakMap<GitHubClients, MachineSelection>();
+const resolvedMachineAuthors = new WeakMap<DeliveryConfig['roles'], MachineSelection & { clients: GitHubClients }>();
 
 /** Keep repository discovery and command execution on one resolved account. */
 export function retainMachineAuthorForConfiguration(
@@ -43,13 +41,12 @@ export function retainMachineAuthorForConfiguration(
   clients: GitHubClients,
   signal?: AbortSignal,
 ): void {
-  if (clients.role === 'author' && clients.credentialSource?.startsWith('gh:github.com:'))
-    resolvedMachineAuthors.set(config.roles, {
-      clients,
-      env: process.env,
-      signal,
-      selectors: sessionSelectors(process.env),
-    });
+  const selection = machineAuthorSelections.get(clients);
+  if (selection !== undefined) {
+    if (selection.signal !== signal)
+      throw new DeliveryError('Machine GitHub session command context changed; resolve the command again.');
+    resolvedMachineAuthors.set(config.roles, { clients, ...selection });
+  }
 }
 
 function sessionSelectors(env: NodeJS.ProcessEnv): string {
@@ -103,23 +100,35 @@ export async function createDeliveryGitHubClients(input: {
   input.signal?.throwIfAborted();
   const env = input.env ?? process.env;
   const selected = input.config.roles[input.role];
+  const retained = input.role === 'author' ? resolvedMachineAuthors.get(input.config.roles) : undefined;
+  if (retained !== undefined) {
+    // A command that discovered its repository as account A must not acquire
+    // a newly supplied token/profile and then operate as account B.
+    if (
+      selected.authSource !== 'personal' ||
+      input.identity.trim().toLowerCase() !== selected.identity.toLowerCase() ||
+      !machineAuthorEligible(selected.credentialEnv.token, env) ||
+      retained.env !== env ||
+      retained.signal !== input.signal ||
+      retained.selectors !== sessionSelectors(env)
+    )
+      throw new DeliveryError(
+        'Machine GitHub session environment changed after repository selection; resolve the command again.',
+      );
+    assertSupportedAuthorHost(env);
+    return retained.clients;
+  }
   if (selected.authSource === 'personal') {
     if (input.role !== 'author' || input.identity.trim().toLowerCase() !== selected.identity.toLowerCase()) {
       throw new DeliveryError('Personal author operation requires the configured author identity.');
     }
     assertSupportedAuthorHost(env);
     if (machineAuthorEligible(selected.credentialEnv.token, env)) {
-      const retained = resolvedMachineAuthors.get(input.config.roles);
-      if (retained?.env === env && retained.signal === input.signal) {
-        if (retained.selectors !== sessionSelectors(env))
-          throw new DeliveryError(
-            'Machine GitHub session environment changed after repository selection; resolve the command again.',
-          );
-        return retained.clients;
-      }
+      const selection: MachineSelection = { env, signal: input.signal, selectors: sessionSelectors(env) };
       return withMachineAuthorCredential(env, input.signal, async (token, session) => {
         const clients = personalClients(token, `gh:github.com:${session.executable}`, input.signal, session.login);
         await clients.authenticatedAuthor!(input.signal);
+        machineAuthorSelections.set(clients, selection);
         return clients;
       });
     }
