@@ -7,6 +7,7 @@ import { afterEach, describe, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import * as settings from './config/deliveryConfig.js';
+import * as github from './github/client.js';
 import { digestValue } from './delivery/common.js';
 import { executeTool } from './dispatch.js';
 import * as issues from './issue.js';
@@ -20,9 +21,25 @@ const base = 'b'.repeat(40);
 const tree = 'c'.repeat(40);
 const pageInfo = { hasNextPage: false, endCursor: null };
 
-function fixture(published = true) {
+function fixture(published = true, nonClosing = false) {
   const state = {
     published,
+    nonClosing,
+    body: nonClosing ? `References ${repo}#17\n\nImprove widget.` : 'Closes #17',
+    title: 'Improve widget',
+    issueBody: 'Four retained criteria',
+    issueState: 'open',
+    referenceReadback: undefined as unknown,
+    referencePages: [] as unknown[],
+    referencePageIndex: 0,
+    commitReadback: undefined as unknown,
+    comparisonReadback: undefined as unknown,
+    commitMessage: 'Improve widget',
+    referenceActor: 'author',
+    referenceCloses: false as unknown,
+    updates: 0,
+    failCreateAck: false,
+    failUpdateAck: false,
     linked: false,
     remoteHead: published ? head : base,
     headSha: head,
@@ -70,8 +87,8 @@ function fixture(published = true) {
     number: 23,
     node_id: state.nodeId,
     changed_files: 1,
-    title: 'Improve widget',
-    body: 'Closes #17',
+    title: state.title,
+    body: state.body,
     html_url: `https://github.com/${repo}/pull/23`,
     state: state.prState,
     draft: state.draft,
@@ -82,8 +99,30 @@ function fixture(published = true) {
   });
   const rest = {
     request: async () => ({ data: [] }),
-    repos: { get: async () => ({ data: { node_id: 'REPO', full_name: repo, default_branch: 'main' } }) },
-    issues: { get: async () => ({ data: { node_id: 'ISSUE17', number: 17, state: 'open', title: 'Improve widget' } }) },
+    repos: {
+      get: async () => ({ data: { node_id: 'REPO', full_name: repo, default_branch: 'main' } }),
+      compareCommitsWithBasehead: async () => ({
+        data: state.comparisonReadback ?? {
+          base_commit: { sha: base },
+          merge_base_commit: { sha: base },
+          status: 'ahead',
+          total_commits: 1,
+          commits: [{ sha: head, commit: { message: state.commitMessage }, parents: [{ sha: base }] }],
+        },
+      }),
+    },
+    issues: {
+      get: async () => ({
+        data: {
+          node_id: 'ISSUE17',
+          number: 17,
+          state: state.issueState,
+          title: 'Improve widget',
+          body: state.issueBody,
+          html_url: `https://github.com/${repo}/issues/17`,
+        },
+      }),
+    },
     git: {
       getRef: async (input: { owner: string; repo: string; ref: string }) => {
         assert.equal(`${input.owner}/${input.repo}`, repo);
@@ -104,14 +143,26 @@ function fixture(published = true) {
         return { data: pr() };
       },
       list: async () => ({ data: state.matchReadback ?? (state.published ? [{ number: 23 }] : []) }),
-      create: async (input: { draft: boolean; head: string }) => {
+      create: async (input: { draft: boolean; head: string; body: string }) => {
         assert.equal(input.draft, state.expectedCreationDraft);
         assert.equal(input.head, 'issue/17');
         state.creations++;
+        state.body = input.body;
+        if (state.failCreateAck) {
+          state.published = true;
+          throw new Error('Transport lost after creation');
+        }
         state.draft = input.draft;
         state.published = true;
         state.linked = false;
         state.events.push('draft-publication-replaces-branch-link');
+        return { data: pr() };
+      },
+      update: async (input: { body: string }) => {
+        state.updates++;
+        state.body = input.body;
+        state.nonClosing = true;
+        if (state.failUpdateAck) throw new Error('Transport lost after body update');
         return { data: pr() };
       },
       listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
@@ -135,6 +186,73 @@ function fixture(published = true) {
     },
   };
   const graphql = async (query: string) => {
+    if (query.includes('DeliveryNonClosingReferences')) {
+      if (state.referencePages.length) return state.referencePages[state.referencePageIndex++];
+      return (
+        state.referenceReadback ?? {
+          repository: {
+            id: 'REPO',
+            nameWithOwner: repo,
+            issue: {
+              id: 'ISSUE17',
+              number: 17,
+              state: 'OPEN',
+              timelineItems: {
+                nodes: [
+                  {
+                    id: 'REFERENCE',
+                    actor: { login: state.referenceActor },
+                    isCrossRepository: false,
+                    willCloseTarget: state.referenceCloses,
+                    source: {
+                      __typename: 'PullRequest',
+                      id: 'PR23',
+                      number: 23,
+                      repository: { id: 'REPO', nameWithOwner: repo },
+                    },
+                    target: {
+                      __typename: 'Issue',
+                      id: 'ISSUE17',
+                      number: 17,
+                      repository: { id: 'REPO', nameWithOwner: repo },
+                    },
+                  },
+                ],
+                pageInfo,
+              },
+            },
+          },
+        }
+      );
+    }
+    if (query.includes('DeliveryNonClosingCommits'))
+      return (
+        state.commitReadback ?? {
+          repository: {
+            nameWithOwner: repo,
+            pullRequest: {
+              id: 'PR23',
+              number: 23,
+              headRefOid: head,
+              baseRefOid: base,
+              baseRefName: 'main',
+              commits: {
+                totalCount: 1,
+                nodes: [
+                  {
+                    commit: {
+                      oid: head,
+                      message: state.commitMessage,
+                      parents: { totalCount: 1, nodes: [{ oid: base }], pageInfo },
+                    },
+                  },
+                ],
+                pageInfo,
+              },
+            },
+          },
+        }
+      );
     if (query.includes('DeliveryStartBranch')) {
       state.linked = true;
       state.events.push('native-start');
@@ -171,9 +289,19 @@ function fixture(published = true) {
           repository: {
             nameWithOwner: state.associationRepo,
             pullRequest: {
+              id: state.nodeId,
               number: state.associationPr,
               closingIssuesReferences: {
-                nodes: [{ number: state.issueNumber, repository: { nameWithOwner: repo } }],
+                nodes: state.nonClosing
+                  ? []
+                  : [
+                      {
+                        __typename: 'Issue',
+                        id: 'ISSUE17',
+                        number: state.issueNumber,
+                        repository: { id: 'REPO', nameWithOwner: repo },
+                      },
+                    ],
                 pageInfo,
               },
             },
@@ -753,8 +881,581 @@ describe('directory-independent exact-PR contract', () => {
       }).replace(/\s+/gu, ' ');
       assert.match(creationHelp, /promote an existing associated PR with --head and --ready/u);
       assert.match(creationHelp, /Explicit remote head/u);
+      assert.match(creationHelp, /--pr <number>/u);
+      for (const command of ['pr:create', 'pr:info', 'pr:review', 'pr:merge', 'finish']) {
+        const modeHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), command, '--help'], {
+          cwd: root,
+          env: { HOME: root, PATH: process.env.PATH },
+          encoding: 'utf8',
+        });
+        assert.match(modeHelp, /--non-closing/u);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('explicit native non-closing reference delivery', () => {
+  const input = { issueNumber: 17, prNumber: 23, nonClosing: true };
+
+  it('accepts the exact native historical reference with empty branch/closing connections', async () => {
+    const { context, state } = fixture(true, true);
+    assert.equal((await prInfo(context, input)).headSha, head);
+    const preview = await publishPr(context, { ...input, draft: false, dryRun: true });
+    assert.equal(preview.prNumber, 23);
+    assert.equal(preview.nonClosing, true);
+    await publishPr(context, { ...input, draft: false });
+    await publishPr(context, { ...input, draft: false });
+    assert.equal(state.promotions, 1);
+    assert.equal(state.updates, 0);
+    assert.equal(state.creations, 0);
+    assert.equal(state.issueState, 'open');
+    assert.equal(state.issueBody, 'Four retained criteria');
+  });
+
+  it('transitions only an exact selected author PR, then reuses the verified body without another update', async () => {
+    const { context, state } = fixture();
+    const transition = { ...input, body: 'Deliver widget while retaining its issue.' };
+    const preview = await publishPr(context, { ...transition, dryRun: true });
+    assert.ok('bodyTransition' in preview);
+    assert.equal(preview.bodyTransition, true);
+    assert.equal(state.updates, 0);
+    await publishPr(context, transition);
+    await publishPr(context, transition);
+    assert.equal(state.body, `References ${repo}#17\n\nDeliver widget while retaining its issue.`);
+    assert.equal(state.updates, 1);
+    assert.equal(state.creations, 0);
+  });
+
+  it('keeps new PR publication behind native start/branch linkage and checks introduced messages first', async () => {
+    const { context, state } = fixture(false, true);
+    await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /branch/u);
+    state.linked = true;
+    state.remoteHead = head;
+    state.commitMessage = 'Fixes: example/widget#99';
+    await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /closing directives/u);
+    assert.equal(state.creations, 0);
+    state.commitMessage = 'Improve widget';
+    await publishPr(context, { issueNumber: 17, nonClosing: true });
+    assert.equal(state.creations, 1);
+    assert.equal(state.linked, false);
+    assert.equal(state.issueState, 'open');
+  });
+
+  it('uses the independent reviewer route for dry-run, submission and authoritative idempotence', async () => {
+    const { context, reviewerContext, state, artifact } = fixture(true, true);
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
+    assert.equal(state.submissions, 0);
+    await submitFormalReview(reviewerContext, { ...input, artifact });
+    await submitFormalReview(reviewerContext, { ...input, artifact });
+    assert.equal(state.submissions, 1);
+    assert.equal(state.issueState, 'open');
+  });
+
+  for (const directive of [
+    'Closes #17',
+    'CLOSE: #17, #18',
+    'closed example/widget#17',
+    'Fixes: other_owner/other_repo#9',
+    'fixed https://github.com/example/widget/issues/17',
+    'Resolves: https://github.com/example/widget/pull/23',
+    'Resolved **#17**',
+    'Fixes [the issue](https://github.com/example/widget/issues/17)',
+    'Closes \\#17',
+  ]) {
+    it(`refuses closure syntax in introduced messages: ${directive}`, async () => {
+      const { context, state } = fixture(true, true);
+      state.commitMessage = directive;
+      await assert.rejects(publishPr(context, { ...input, draft: false }), /closing directives/u);
+      assert.equal(state.promotions, 0);
+      assert.equal(state.updates, 0);
+    });
+  }
+
+  for (const [name, change] of [
+    [
+      'removed current intent',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.body = 'Improve widget';
+      },
+    ],
+    [
+      'changed intended issue',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.body = `References ${repo}#18`;
+      },
+    ],
+    [
+      'conflicting intent declarations',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.body += `\nReferences ${repo}#18`;
+      },
+    ],
+    [
+      'body closure',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.body += '\nFixes #18';
+      },
+    ],
+    [
+      'title closure',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.title = 'Fixes #17';
+      },
+    ],
+    [
+      'closing native event',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.referenceCloses = true;
+      },
+    ],
+    [
+      'unknown native event intent',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.referenceCloses = null;
+      },
+    ],
+    [
+      'unauthorized reference actor',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.referenceActor = 'collaborator';
+      },
+    ],
+    [
+      'wrong PR author',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.prAuthor = 'collaborator';
+      },
+    ],
+    [
+      'closed issue',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.issueState = 'closed';
+      },
+    ],
+    [
+      'foreign PR repository',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.headRepo = 'other/widget';
+      },
+    ],
+    [
+      'moved default base',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.baseSha = 'd'.repeat(40);
+      },
+    ],
+    [
+      'incomplete commits',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.commitReadback = { repository: null };
+      },
+    ],
+    [
+      'missing native reference',
+      (state: ReturnType<typeof fixture>['state']) => {
+        state.referenceReadback = {
+          repository: {
+            id: 'REPO',
+            nameWithOwner: repo,
+            issue: { id: 'ISSUE17', number: 17, state: 'OPEN', timelineItems: { nodes: [], pageInfo } },
+          },
+        };
+      },
+    ],
+  ] as const) {
+    it(`refuses ${name} without mutation`, async () => {
+      const { context, state } = fixture(true, true);
+      change(state);
+      await assert.rejects(publishPr(context, { ...input, draft: false }));
+      assert.equal(state.promotions + state.creations + state.updates, 0);
+    });
+  }
+
+  it('requires complete empty closing associations including later pages', async () => {
+    const { context, state } = fixture(true, true);
+    state.closingPages = [
+      {
+        repository: {
+          nameWithOwner: repo,
+          pullRequest: {
+            id: 'PR23',
+            number: 23,
+            closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'NEXT' } },
+          },
+        },
+      },
+      {
+        repository: {
+          nameWithOwner: repo,
+          pullRequest: {
+            id: 'PR23',
+            number: 23,
+            closingIssuesReferences: { nodes: [{ number: 99, repository: { nameWithOwner: repo } }], pageInfo },
+          },
+        },
+      },
+    ];
+    await assert.rejects(publishPr(context, { ...input, draft: false }), /closing association/u);
+    assert.equal(state.promotions, 0);
+  });
+
+  it('accepts equivalent duplicate native events without duplicating authority, but refuses conflicts', async () => {
+    const { context, state } = fixture(true, true);
+    const native = (await context.clients.graphql('DeliveryNonClosingReferences', {})) as {
+      repository: { issue: { timelineItems: { nodes: Array<{ willCloseTarget: boolean }> } } };
+    };
+    const event = native.repository.issue.timelineItems.nodes[0]!;
+    native.repository.issue.timelineItems.nodes.push({ ...event });
+    state.referenceReadback = native;
+    await prInfo(context, input);
+    native.repository.issue.timelineItems.nodes[1]!.willCloseTarget = true;
+    await assert.rejects(prInfo(context, input), /Conflicting/u);
+  });
+
+  it('refuses incomplete reference pagination after a matching observation', async () => {
+    const { context, state } = fixture(true, true);
+    const native = (await context.clients.graphql('DeliveryNonClosingReferences', {})) as {
+      repository: { issue: { timelineItems: { pageInfo: { hasNextPage: boolean; endCursor: string | null } } } };
+    };
+    native.repository.issue.timelineItems.pageInfo = { hasNextPage: true, endCursor: 'NEXT' };
+    state.referencePages = [native, { repository: null }];
+    await assert.rejects(publishPr(context, { ...input, draft: false }), /Incomplete/u);
+    assert.equal(state.promotions, 0);
+  });
+
+  it('does not create again after a server-created draft fails association verification', async () => {
+    const { context, state } = fixture(false);
+    state.linked = true;
+    state.remoteHead = head;
+    state.closingReadback = { repository: null };
+    await assert.rejects(
+      publishPr(context, { issueNumber: 17 }),
+      /created PR #23.*post-publication association\/identity verification is unresolved/u,
+    );
+    assert.equal((await prInfo(context, { prNumber: 23 })).prNumber, 23);
+    await assert.rejects(publishPr(context, { issueNumber: 17 }));
+    assert.equal(state.creations, 1);
+    assert.equal(state.published, true);
+  });
+
+  it('preserves uncertain create/update acknowledgements and reconciles without another mutation', async () => {
+    const { context, state } = fixture(false);
+    state.linked = true;
+    state.remoteHead = head;
+    state.failCreateAck = true;
+    await assert.rejects(publishPr(context, { issueNumber: 17 }), /acknowledgement is uncertain/u);
+    assert.equal((await prInfo(context, { prNumber: 23 })).prNumber, 23);
+    state.failCreateAck = false;
+    await publishPr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(state.creations, 1);
+    state.failUpdateAck = true;
+    const transition = { ...input, body: 'Keep the issue open.' };
+    await assert.rejects(publishPr(context, transition), /Transport lost after body update/u);
+    state.failUpdateAck = false;
+    await publishPr(context, transition);
+    assert.equal(state.updates, 1);
+  });
+
+  it('refuses explicit ambiguity and requires exact numbers for non-closing inspection', async () => {
+    const { context, state } = fixture(true, true);
+    await assert.rejects(prInfo(context, { issueNumber: 17, nonClosing: true }), /explicit/u);
+    state.matchReadback = [{ number: 23 }, { number: 24 }];
+    await assert.rejects(publishPr(context, { ...input, draft: false }), /conflicting/u);
+    assert.equal(state.promotions, 0);
+  });
+});
+
+describe('non-closing complete native graph and mutation drift', () => {
+  const input = { issueNumber: 17, prNumber: 23, nonClosing: true };
+  it('checks earlier introduced commits rather than only the safe head message', async () => {
+    const { context, state } = fixture(true, true);
+    const graph = (await context.clients.graphql('DeliveryNonClosingCommits', {})) as {
+      repository: {
+        pullRequest: {
+          commits: {
+            totalCount: number;
+            nodes: Array<{
+              commit: {
+                oid: string;
+                message: string;
+                parents: { totalCount: number; nodes: Array<{ oid: string }>; pageInfo: typeof pageInfo };
+              };
+            }>;
+          };
+        };
+      };
+    };
+    graph.repository.pullRequest.commits.totalCount = 2;
+    graph.repository.pullRequest.commits.nodes.unshift({
+      commit: {
+        oid: 'e'.repeat(40),
+        message: 'Closes: #999',
+        parents: { totalCount: 1, nodes: [{ oid: base }], pageInfo },
+      },
+    });
+    state.commitReadback = graph;
+    await assert.rejects(publishPr(context, { ...input, draft: false }), /closing directives/u);
+    assert.equal(state.promotions, 0);
+    graph.repository.pullRequest.commits.nodes[0]!.commit.message = 'Earlier improvement';
+    await prInfo(context, input);
+    graph.repository.pullRequest.commits.totalCount = 3;
+    await assert.rejects(prInfo(context, input), /count\/head is incomplete/u);
+  });
+
+  for (const kind of [
+    'source-node',
+    'source-number',
+    'source-repository',
+    'source-type',
+    'target-node',
+    'target-number',
+    'target-repository',
+    'cross-repository',
+    'missing-actor',
+    'wrong-pr-node',
+  ] as const) {
+    it(`refuses conflicting native identity ${kind}`, async () => {
+      const { context, state } = fixture(true, true);
+      type Subject = {
+        __typename: string;
+        id: string;
+        number: number;
+        repository: { id: string; nameWithOwner: string };
+      };
+      const native = (await context.clients.graphql('DeliveryNonClosingReferences', {})) as {
+        repository: {
+          issue: {
+            timelineItems: {
+              nodes: Array<{
+                source: Subject;
+                target: Subject;
+                isCrossRepository: boolean;
+                actor: { login: string } | null;
+              }>;
+            };
+          };
+        };
+      };
+      const event = native.repository.issue.timelineItems.nodes[0]!;
+      if (kind === 'source-node') event.source.id = 'PROTHER';
+      if (kind === 'source-number') event.source.number = 24;
+      if (kind === 'source-repository') event.source.repository.nameWithOwner = 'other/widget';
+      if (kind === 'source-type') event.source.__typename = 'Issue';
+      if (kind === 'target-node') event.target.id = 'ISSUEOTHER';
+      if (kind === 'target-number') event.target.number = 18;
+      if (kind === 'target-repository') event.target.repository.id = 'OTHER';
+      if (kind === 'cross-repository') event.isCrossRepository = true;
+      if (kind === 'missing-actor') event.actor = null;
+      if (kind === 'wrong-pr-node') state.nodeId = 'OTHER';
+      state.referenceReadback = native;
+      await assert.rejects(publishPr(context, { ...input, draft: false }));
+      assert.equal(state.promotions + state.creations + state.updates, 0);
+    });
+  }
+
+  it('refuses changed issue criteria on promotion readback without another ready mutation', async () => {
+    const { context, state } = fixture(true, true);
+    state.readHook = () => {
+      if (state.promotions) state.issueBody = 'External changed criteria';
+    };
+    await assert.rejects(publishPr(context, { ...input, draft: false }), /criteria drifted/u);
+    assert.equal(state.promotions, 1);
+    assert.equal(state.issueState, 'open');
+  });
+
+  it('refuses changed body during formal review readback without a duplicate review', async () => {
+    const { context, reviewerContext, state, artifact } = fixture(true, true);
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    state.readHook = () => {
+      if (state.submissions) state.body = 'External removed reference';
+    };
+    await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }), /References line/u);
+    assert.equal(state.submissions, 1);
+    assert.equal(state.issueState, 'open');
+  });
+});
+
+describe('exact created intent and native reader bounds', () => {
+  for (const drift of ['body', 'title', 'draft', 'closed', 'base'] as const) {
+    it(`reports created identity but refuses post-publication ${drift} drift without a replacement`, async () => {
+      const { context, state } = fixture(false, true);
+      state.linked = true;
+      state.remoteHead = head;
+      state.readHook = () => {
+        if (!state.creations) return;
+        if (drift === 'body') state.body = `References ${repo}#17\n\nOther safe intent`;
+        if (drift === 'title') state.title = 'Other safe title';
+        if (drift === 'draft') state.draft = false;
+        if (drift === 'closed') state.prState = 'closed';
+        if (drift === 'base') state.baseSha = 'd'.repeat(40);
+      };
+      await assert.rejects(
+        publishPr(context, { issueNumber: 17, nonClosing: true }),
+        /created PR #23.*differs from publication intent/u,
+      );
+      assert.equal(state.creations, 1);
+      await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }));
+      assert.equal(state.creations, 1);
+    });
+  }
+  for (const id of [1, true, {}, null, '', ' ']) {
+    it(`refuses malformed native event ID ${JSON.stringify(id)} before ready`, async () => {
+      const { context, state } = fixture(true, true);
+      const native = (await context.clients.graphql('DeliveryNonClosingReferences', {})) as {
+        repository: { issue: { timelineItems: { nodes: Array<{ id: unknown }> } } };
+      };
+      native.repository.issue.timelineItems.nodes[0]!.id = id;
+      state.referenceReadback = native;
+      await assert.rejects(
+        publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true, draft: false }),
+        /event identity/u,
+      );
+      assert.equal(state.promotions + state.updates + state.creations, 0);
+    });
+  }
+  it('refuses an oversized reference page despite equivalent observations', async () => {
+    const { context, state } = fixture(true, true);
+    const native = (await context.clients.graphql('DeliveryNonClosingReferences', {})) as {
+      repository: { issue: { timelineItems: { nodes: unknown[] } } };
+    };
+    native.repository.issue.timelineItems.nodes = Array.from(
+      { length: 101 },
+      () => native.repository.issue.timelineItems.nodes[0],
+    );
+    state.referenceReadback = native;
+    await assert.rejects(
+      publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true, draft: false }),
+      /Incomplete/u,
+    );
+    assert.equal(state.promotions, 0);
+  });
+  it('refuses oversized introduced commit and parent pages', async () => {
+    for (const kind of ['commits', 'parents']) {
+      const { context, state } = fixture(true, true);
+      type Commit = { oid: string; parents: { nodes: Array<{ oid: string }>; totalCount: number } };
+      const native = (await context.clients.graphql('DeliveryNonClosingCommits', {})) as {
+        repository: { pullRequest: { commits: { nodes: Array<{ commit: Commit }>; totalCount: number } } };
+      };
+      const commits = native.repository.pullRequest.commits;
+      if (kind === 'commits') {
+        commits.nodes = Array.from({ length: 101 }, () => commits.nodes[0]!);
+        commits.totalCount = 101;
+      } else {
+        commits.nodes[0]!.commit.parents.nodes = Array.from({ length: 101 }, () => ({ oid: base }));
+        commits.nodes[0]!.commit.parents.totalCount = 101;
+      }
+      state.commitReadback = native;
+      await assert.rejects(
+        publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true, draft: false }),
+        /Incomplete/u,
+      );
+      assert.equal(state.promotions, 0);
+    }
+  });
+  it('refuses body-transition draft drift before promotion, with no second body mutation', async () => {
+    const { context, state } = fixture();
+    state.readHook = () => {
+      if (state.updates) state.draft = false;
+    };
+    await assert.rejects(
+      publishPr(context, {
+        issueNumber: 17,
+        prNumber: 23,
+        nonClosing: true,
+        body: 'Safe partial intent',
+        draft: false,
+      }),
+      /drifted/u,
+    );
+    assert.equal(state.updates, 1);
+    assert.equal(state.promotions, 0);
+    assert.equal(state.creations, 0);
+  });
+  it('does not use the closing-transition exception for stale body with empty closing associations', async () => {
+    const { context, state } = fixture(true, true);
+    state.body = 'Stale intent with removed References line';
+    await assert.rejects(
+      publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true, body: 'New safe intent' }),
+      /closing-issue association/u,
+    );
+    assert.equal(state.updates + state.creations + state.promotions, 0);
+  });
+});
+
+describe('explicit metadata transition typed authority', () => {
+  for (const closing of [
+    { number: 17, repository: { nameWithOwner: repo } },
+    { __typename: 'PullRequest', id: 'ISSUE17', number: 17, repository: { id: 'REPO', nameWithOwner: repo } },
+    { __typename: 'Issue', id: 'OTHER', number: 17, repository: { id: 'REPO', nameWithOwner: repo } },
+    { __typename: 'Issue', id: 'ISSUE17', number: 17, repository: { id: 'OTHER', nameWithOwner: repo } },
+  ]) {
+    it(`refuses incomplete/foreign typed closing identity ${JSON.stringify(closing)}`, async () => {
+      const { context, state } = fixture();
+      state.closingReadback = {
+        repository: {
+          nameWithOwner: repo,
+          pullRequest: { id: 'PR23', number: 23, closingIssuesReferences: { nodes: [closing], pageInfo } },
+        },
+      };
+      await assert.rejects(
+        publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true, body: 'Safe partial intent' }),
+        /typed closing/u,
+      );
+      assert.equal(state.updates + state.creations + state.promotions, 0);
+    });
+  }
+});
+
+describe('later-read publication and pre-creation parent bound', () => {
+  for (const drift of ['body', 'title', 'draft', 'closed', 'merged', 'base'] as const) {
+    it(`refuses later ${drift} drift after the first correct created PR read`, async () => {
+      const { context, state } = fixture(false, true);
+      state.linked = true;
+      state.remoteHead = head;
+      state.readHook = (count) => {
+        if (!state.creations || count < 2) return;
+        if (drift === 'body') state.body = `References ${repo}#17\n\nOther safe intent`;
+        if (drift === 'title') state.title = 'Other safe title';
+        if (drift === 'draft') state.draft = false;
+        if (drift === 'closed') state.prState = 'closed';
+        if (drift === 'merged') {
+          state.prState = 'closed';
+          state.merged = true;
+        }
+        if (drift === 'base') state.baseSha = 'd'.repeat(40);
+      };
+      await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /created PR #23.*unresolved/u);
+      assert.equal(state.creations, 1);
+    });
+  }
+  it('rejects state drift observed only by the verifier final internal PR read', async () => {
+    const { context, state } = fixture(true, true);
+    state.readHook = (count) => {
+      if (count === 3) state.draft = false;
+    };
+    await assert.rejects(
+      publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true }),
+      /state\/draft\/merged/u,
+    );
+    assert.equal(state.updates + state.promotions + state.creations, 0);
+  });
+  it('refuses oversized REST parent arrays before creating any PR', async () => {
+    const { context, state } = fixture(false, true);
+    state.linked = true;
+    state.remoteHead = head;
+    state.comparisonReadback = {
+      base_commit: { sha: base },
+      merge_base_commit: { sha: base },
+      status: 'ahead',
+      total_commits: 1,
+      commits: [
+        { sha: head, commit: { message: 'Safe message' }, parents: Array.from({ length: 101 }, () => ({ sha: base })) },
+      ],
+    };
+    await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /Incomplete/u);
+    assert.equal(state.creations, 0);
   });
 });
