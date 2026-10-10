@@ -1,12 +1,16 @@
-import { existsSync, realpathSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 
 import { resolveGitRemoteName } from './github/repo.js';
 
 import { DeliveryError } from './errors.js';
 import type { WorktreeTransitionPlan } from './worktreeTransition.js';
 import { assertClean, defaultBaseRef, git, gitCommonDir, gitExitCode, gitRoot, primaryGitRoot } from './git.js';
-import { assertIssueWorktreeTransitionAdmission, type WorktreeEntry } from './services/worktreeRegistry.js';
+import {
+  assertIssueWorktreeTransitionAdmission,
+  type WorktreeEntry,
+  type InvestigationPreparation,
+} from './services/worktreeRegistry.js';
 
 function assertSafePath(root: string, target: string): void {
   const rel = relative(join(root, '.worktrees'), target);
@@ -48,6 +52,108 @@ export async function prepareIssueWorktree(input: {
   throw new DeliveryError(
     'Issue worktree preparation was removed; prepare a host-owned worktree from the GitHub-linked branch.',
   );
+}
+
+function investigationGitRows(root: string): string[][] {
+  return git(root, 'worktree', 'list', '--porcelain')
+    .split('\n\n')
+    .filter(Boolean)
+    .map((block) => block.split('\n'));
+}
+function investigationPathPresent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/** Observe a host-created, restricted worktree; registration never creates or adopts legacy source. */
+export function investigationSourceIdentity(
+  root: string,
+  issueNumber: number,
+): Pick<InvestigationPreparation, 'head' | 'physical'> {
+  assertIssueNumber(issueNumber);
+  const target = join(root, '.worktrees', `issue-${String(issueNumber)}`);
+  const branch = `issue/${String(issueNumber)}`;
+  assertIssueWorktreeLocation(
+    { path: target, branch, issueNumber, type: 'issue', status: 'active', createdAt: '', updatedAt: '' },
+    root,
+  );
+  assertClean(target);
+  if (git(target, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z') !== '')
+    throw new DeliveryError('Investigation source contains ignored files; preserve them before completion.');
+  const rows = investigationGitRows(root).filter(
+    (row) => row.includes(`worktree ${target}`) || row.includes(`branch refs/heads/${branch}`),
+  );
+  if (rows.length !== 1 || rows[0]!.some((line) => /^(?:locked|prunable)(?: |$)/u.test(line)))
+    throw new DeliveryError('Investigation Git worktree custody is ambiguous or locked.');
+  const directory = realpathSync(resolve(target, git(target, 'rev-parse', '--git-dir')));
+  const metadata = lstatSync(target);
+  const administration = lstatSync(directory);
+  return {
+    head: { sha: git(target, 'rev-parse', 'HEAD'), tree: git(target, 'rev-parse', 'HEAD^{tree}') },
+    physical: {
+      device: metadata.dev,
+      inode: metadata.ino,
+      gitDirectory: directory,
+      gitDevice: administration.dev,
+      gitInode: administration.ino,
+    },
+  };
+}
+
+/** Commit equality refuses new same-tree commits as well as source changes and unpushed history. */
+export function assertInvestigationSource(
+  preparation: InvestigationPreparation,
+  launchDirectory: string,
+  allowAbsent = false,
+): void {
+  const { repoRoot: root, row, head } = preparation;
+  assertSafePath(root, row.path);
+  if (
+    row.path !== join(root, '.worktrees', `issue-${String(row.issueNumber)}`) ||
+    row.branch !== `issue/${String(row.issueNumber)}`
+  )
+    throw new DeliveryError('Investigation path or branch disagrees.');
+  if (row.path === primaryGitRoot(root) || row.path === gitRoot(launchDirectory))
+    throw new DeliveryError('Investigation completion refuses the primary or current worktree.');
+  // --repo-root must not hide an invocation launched inside the removable worktree.
+  const currentRelative = relative(row.path, realpathSync(process.cwd()));
+  if (currentRelative === '' || (!currentRelative.startsWith('..') && !currentRelative.startsWith('/')))
+    throw new DeliveryError('Investigation completion refuses the current worktree.');
+  if (git(root, 'rev-parse', `refs/heads/${row.branch}`) !== head.sha)
+    throw new DeliveryError('Investigation retaining branch has new or unpushed commits.');
+  const rows = investigationGitRows(root).filter(
+    (candidate) => candidate.includes(`worktree ${row.path}`) || candidate.includes(`branch refs/heads/${row.branch}`),
+  );
+  if (!investigationPathPresent(row.path)) {
+    // Git removal must have completed both disk and administration before row retirement.
+    if (!allowAbsent || rows.length !== 0 || investigationPathPresent(preparation.physical.gitDirectory))
+      throw new DeliveryError('Investigation source is missing without exact completed Git removal.');
+    return;
+  }
+  const observed = investigationSourceIdentity(root, row.issueNumber);
+  if (
+    JSON.stringify(observed.head) !== JSON.stringify(head) ||
+    JSON.stringify(observed.physical) !== JSON.stringify(preparation.physical)
+  )
+    throw new DeliveryError('Investigation source commit, tree or physical identity changed.');
+}
+
+export function removeInvestigationSource(preparation: InvestigationPreparation, launchDirectory: string): void {
+  assertInvestigationSource(preparation, launchDirectory, true);
+  if (investigationPathPresent(preparation.row.path))
+    git(preparation.repoRoot, 'worktree', 'remove', preparation.row.path);
+  if (
+    investigationPathPresent(preparation.row.path) ||
+    investigationPathPresent(preparation.physical.gitDirectory) ||
+    investigationGitRows(preparation.repoRoot).some((row) => row.includes(`worktree ${preparation.row.path}`))
+  )
+    throw new DeliveryError('Investigation removal disk/Git readback is incomplete.');
+  assertInvestigationSource(preparation, launchDirectory, true);
 }
 
 export interface MergeCleanupAttestation {
