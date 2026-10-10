@@ -227,8 +227,19 @@ program
   .option('--parent <number>')
   .option('--branch <branch>')
   .option('--resume-created')
-  .action(async (o: Record<string, string | boolean>) =>
-    run('issue_start', {
+  .option('--investigation-worktree <path>', 'Prospectively register an already linked host-created investigation')
+  .option('--expected-head <sha>', 'Exact unchanged initial commit for investigation registration')
+  .action(async (o: Record<string, string | boolean>) => {
+    if (o.investigationWorktree !== undefined || o.expectedHead !== undefined) {
+      if (Object.keys(o).some((key) => !['issue', 'investigationWorktree', 'expectedHead'].includes(key)))
+        throw new Error('Investigation registration cannot create or change issue/branch metadata.');
+      return run('issue_start', {
+        issueNumber: int(o.issue as string),
+        investigationWorktree: o.investigationWorktree,
+        expectedHeadSha: o.expectedHead,
+      });
+    }
+    return run('issue_start', {
       issueNumber: int(o.issue as string),
       request: o.request,
       requestId: o.requestId,
@@ -243,8 +254,8 @@ program
       parentIssueNumber: int(o.parent as string),
       branch: o.branch,
       resumeCreated: o.resumeCreated === true,
-    }),
-  );
+    });
+  });
 
 for (const name of ['list', 'search'] as const) {
   program
@@ -425,32 +436,62 @@ for (const [command, tool] of [
   ['pr:merge', 'issue_pr_merge'],
   ['finish', 'issue_finish'],
 ] as const) {
-  program
-    .command(command)
-    .requiredOption('--issue <number>')
-    .requiredOption('--pr <number>')
+  const mergeCommand = program.command(command).requiredOption('--issue <number>');
+  if (command === 'pr:merge') mergeCommand.requiredOption('--pr <number>');
+  else mergeCommand.option('--pr <number>');
+  mergeCommand
     .option('--strategy <method>')
     .option('--reviewed-head <sha>')
     .option('--non-closing', 'Retain the referenced issue OPEN; finish refuses this mode')
-    .option('--dry-run')
-    .action(
-      async (o: {
-        issue: string;
-        pr: string;
-        strategy?: string;
-        reviewedHead?: string;
-        dryRun?: boolean;
-        nonClosing?: boolean;
-      }) =>
-        run(tool, {
+    .option('--dry-run');
+  if (command === 'finish')
+    mergeCommand
+      .option('--investigation', 'Complete an unchanged prospectively registered investigation')
+      .option('--result <path>', 'Durable independently reviewed result outside the removable worktree')
+      .option('--authority-comment <number>', 'Exact native operator removal authority comment')
+      .option('--acceptance-comment <number>', 'Exact configured-App result acceptance comment');
+  mergeCommand.action(
+    async (o: {
+      issue: string;
+      pr?: string;
+      strategy?: string;
+      reviewedHead?: string;
+      dryRun?: boolean;
+      nonClosing?: boolean;
+      investigation?: boolean;
+      result?: string;
+      authorityComment?: string;
+      acceptanceComment?: string;
+    }) => {
+      if (o.investigation === true) {
+        if (
+          o.pr !== undefined ||
+          o.strategy !== undefined ||
+          o.reviewedHead !== undefined ||
+          o.nonClosing !== undefined
+        )
+          throw new Error('Investigation completion cannot accept PR or merge options.');
+        return run(tool, {
           issueNumber: int(o.issue),
-          prNumber: int(o.pr),
-          strategy: o.strategy,
-          reviewedHeadSha: o.reviewedHead,
+          investigation: true,
+          resultPath: o.result,
+          authorityCommentId: int(o.authorityComment),
+          acceptanceCommentId: int(o.acceptanceComment),
           dryRun: o.dryRun === true,
-          nonClosing: o.nonClosing,
-        }),
-    );
+        });
+      }
+      if (o.result !== undefined || o.authorityComment !== undefined || o.acceptanceComment !== undefined)
+        throw new Error('Investigation evidence requires --investigation.');
+      return run(tool, {
+        issueNumber: int(o.issue),
+        prNumber: int(o.pr),
+        strategy: o.strategy,
+        reviewedHeadSha: o.reviewedHead,
+        dryRun: o.dryRun === true,
+        nonClosing: o.nonClosing,
+      });
+    },
+  );
 }
 program
   .command('worktree:transition:inspect')

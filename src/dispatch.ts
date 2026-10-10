@@ -21,7 +21,15 @@ import {
   type UpdateIssueInput,
 } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import { finishIssue, mergePr, prInfo, publishPr, submitFormalReview } from './pr.js';
+import {
+  finishInvestigation,
+  finishIssue,
+  mergePr,
+  prInfo,
+  publishPr,
+  registerInvestigation,
+  submitFormalReview,
+} from './pr.js';
 import {
   applyWorktreeTransition,
   inspectWorktreeTransition,
@@ -207,7 +215,12 @@ export async function executeTool(
   if (name === 'issue_create') canonicalIssueBody(input as unknown as CreateIssueInput);
   const repo = typeof selected === 'string' ? selected : execution.repo;
   const selectedExecution = { ...execution, ...(repo === undefined ? {} : { repo }) };
-  const local = name === 'runtime_stage' || name === 'runtime_admit' || name.startsWith('issue_worktree_transition_');
+  const local =
+    name === 'runtime_stage' ||
+    name === 'runtime_admit' ||
+    name.startsWith('issue_worktree_transition_') ||
+    (name === 'issue_start' && input.investigationWorktree !== undefined) ||
+    (name === 'issue_finish' && input.investigation === true);
   let root = execution.repoRoot;
   if (local) {
     const settings = await loadDeliverySettings();
@@ -244,6 +257,12 @@ export async function executeTool(
     case 'issue_create':
       return createIssue(context, input as unknown as CreateIssueInput);
     case 'issue_start':
+      if (input.investigationWorktree !== undefined)
+        return registerInvestigation(context, {
+          issueNumber: requiredNumber(input, 'issueNumber'),
+          investigationWorktree: requireString(input, 'investigationWorktree'),
+          expectedHeadSha: requireString(input, 'expectedHeadSha'),
+        });
       return startTrackedIssue(context, input);
     case 'issue_update':
       return updateIssue(context, input as unknown as UpdateIssueInput);
@@ -277,6 +296,18 @@ export async function executeTool(
       });
     case 'issue_pr_merge':
     case 'issue_finish': {
+      if (name === 'issue_finish' && input.investigation === true)
+        return finishInvestigation(context, {
+          issueNumber: requiredNumber(input, 'issueNumber'),
+          resultPath: requireString(input, 'resultPath'),
+          ...(input.authorityCommentId === undefined
+            ? {}
+            : { authorityCommentId: requiredNumber(input, 'authorityCommentId') }),
+          ...(input.acceptanceCommentId === undefined
+            ? {}
+            : { acceptanceCommentId: requiredNumber(input, 'acceptanceCommentId') }),
+          dryRun: input.dryRun === true,
+        });
       const merge = {
         issueNumber: requiredNumber(input, 'issueNumber'),
         ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),

@@ -6,6 +6,7 @@ import {
   assertPrivateFile,
   CoordinateSchema,
   DigestSchema,
+  RepositorySchema,
   digestBytes,
   stableJson,
   writeCreateOnly,
@@ -279,6 +280,7 @@ function assertNoIncompleteWorktreeTransition(entry: WorktreeEntry, root: string
 
 /** An immutable witness separates new rows from legacy rows in the same canonical registry. */
 export function assertAiDeliveryWorktreeOwner(entry: WorktreeEntry, root: string): void {
+  if (entry.issueNumber !== undefined) assertNoInvestigationCompletion(entry.issueNumber, root);
   assertNoIncompleteWorktreeTransition(entry, root);
   if (entry.issueNumber !== undefined && pendingCommittedContinuation(entry.issueNumber, root))
     throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
@@ -305,6 +307,7 @@ export function assertIssueWorktreeTransitionAdmission(
   root: string,
   committedRecovery = false,
 ): void {
+  assertNoInvestigationCompletion(issueNumber, root);
   if (pendingCommittedContinuation(issueNumber, root) && !committedRecovery)
     throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
   const path = join(
@@ -1236,4 +1239,281 @@ function saveRegistryStrict(root: string, registry: WorktreeRegistry): void {
   } catch (error: unknown) {
     throw new Error(`Unable to save worktree registry: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/** Current, prospective custody is separate from legacy producer/policy transitions. */
+export const InvestigationPreparationSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.investigation-preparation@1'),
+    preparationId: DigestSchema,
+    repository: RepositorySchema,
+    repoRoot: z.string().min(1),
+    row: ContinuationRowSchema,
+    head: CoordinateSchema,
+    physical: z.strictObject({
+      device: z.number().int().nonnegative().safe(),
+      inode: z.number().int().nonnegative().safe(),
+      gitDirectory: z.string().min(1),
+      gitDevice: z.number().int().nonnegative().safe(),
+      gitInode: z.number().int().nonnegative().safe(),
+    }),
+    operator: z.strictObject({
+      actorLogin: z.string().min(1),
+      credentialIdentity: z.string().regex(/^user:[1-9]\d*$/u),
+    }),
+    reviewerActor: z.string().min(1),
+  })
+  .superRefine(({ preparationId, ...content }, ctx) => {
+    if (
+      preparationId !== digestValue(content) ||
+      content.row.status !== 'active' ||
+      content.row.prNumber !== undefined ||
+      content.row.branch !== `issue/${String(content.row.issueNumber)}` ||
+      content.row.path !== join(content.repoRoot, '.worktrees', `issue-${String(content.row.issueNumber)}`) ||
+      content.operator.actorLogin.toLowerCase() === content.reviewerActor.toLowerCase()
+    )
+      ctx.addIssue({ code: 'custom', message: 'Investigation preparation identity is invalid.' });
+  });
+export type InvestigationPreparation = z.infer<typeof InvestigationPreparationSchema>;
+
+const InvestigationIntentSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.investigation-completion-intent@1'),
+    intentId: DigestSchema,
+    preparationId: DigestSchema,
+    resultDigest: DigestSchema,
+    authorityCommentId: z.number().int().positive().safe(),
+    acceptanceCommentId: z.number().int().positive().safe(),
+    registryBeforeimage: DigestSchema,
+    authorityDigest: DigestSchema,
+  })
+  .superRefine(({ intentId, ...content }, ctx) => {
+    if (intentId !== digestValue(content))
+      ctx.addIssue({ code: 'custom', message: 'Investigation intent is corrupt.' });
+  });
+const InvestigationCompletionSchema = z
+  .strictObject({
+    schemaVersion: z.literal('ai-delivery.investigation-completion@1'),
+    completionId: DigestSchema,
+    intentId: DigestSchema,
+    preparationId: DigestSchema,
+    completed: z.literal(true),
+  })
+  .superRefine(({ completionId, ...content }, ctx) => {
+    if (completionId !== digestValue(content))
+      ctx.addIssue({ code: 'custom', message: 'Investigation completion is corrupt.' });
+  });
+function investigationDirectory(root: string, issueNumber: number): string {
+  return join(gitCommonDir(root), 'ai-delivery', 'investigations', String(issueNumber));
+}
+function assertNoInvestigationCompletion(issueNumber: number, root: string): void {
+  const path = join(investigationDirectory(root, issueNumber), 'intent.json');
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error('Investigation completion is pending or terminal; resume only its exact completion.');
+}
+function readInvestigationJson(path: string): unknown {
+  return JSON.parse(assertPrivateFile(path, { maxBytes: 1024 * 1024 }).toString('utf8')) as unknown;
+}
+export function readInvestigationPreparation(root: string, issueNumber: number): InvestigationPreparation | undefined {
+  const path = join(investigationDirectory(root, issueNumber), 'preparation.json');
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const preparation = InvestigationPreparationSchema.parse(readInvestigationJson(path));
+  if (preparation.repoRoot !== root || preparation.row.issueNumber !== issueNumber)
+    throw new Error('Investigation preparation belongs to another repository or issue.');
+  return preparation;
+}
+export function readInvestigationAcknowledgement(root: string, issueNumber: number) {
+  return z
+    .strictObject({ commentId: z.number().int().positive().safe(), url: z.url(), body: z.string().min(1) })
+    .parse(readInvestigationJson(join(investigationDirectory(root, issueNumber), 'acknowledgement.json')));
+}
+function prepareInvestigationDirectory(root: string, issueNumber: number): string {
+  const directory = investigationDirectory(root, issueNumber);
+  const common = gitCommonDir(root);
+  for (const path of [join(common, 'ai-delivery'), join(common, 'ai-delivery', 'investigations'), directory]) {
+    try {
+      const metadata = lstatSync(path);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink())
+        throw new Error('Investigation custody directory is unsafe.');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  ensurePrivateDirectoryDurably(directory);
+  return directory;
+}
+function assertInvestigationRegistry(root: string): void {
+  const directory = join(root, ISSUE_CLI_DATA_DIR);
+  const metadata = lstatSync(directory);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('Canonical registry directory is unsafe.');
+  const path = join(root, REGISTRY_PATH);
+  if (existsSync(path)) {
+    const file = lstatSync(path);
+    if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1)
+      throw new Error('Canonical registry file is unsafe.');
+  }
+}
+function investigationRow(
+  registry: WorktreeRegistry,
+  preparation: InvestigationPreparation,
+): WorktreeEntry | undefined {
+  const matches = registry.worktrees.filter((entry) => registryIdentitiesOverlap(entry, preparation.row));
+  if (matches.length > 1 || (matches[0] !== undefined && stableJson(matches[0]) !== stableJson(preparation.row)))
+    throw new Error('Investigation conflicts with canonical registry custody.');
+  return matches[0];
+}
+
+/** Explicit prospective registration; never adopts a legacy row or replaces its baseline. */
+export async function registerInvestigationCustody(
+  raw: InvestigationPreparation,
+  acknowledge: () => Promise<unknown>,
+): Promise<void> {
+  const preparation = InvestigationPreparationSchema.parse(raw);
+  const root = preparation.repoRoot;
+  const issueNumber = preparation.row.issueNumber;
+  assertIssueWorktreeTransitionAdmission(issueNumber, root);
+  ensureRegistryDirectory(root);
+  assertInvestigationRegistry(root);
+  await withLock(REGISTRY_PATH, {
+    projectRoot: root,
+    timeout: 5000,
+    operation: async () => {
+      assertIssueWorktreeTransitionAdmission(issueNumber, root);
+      const registry = loadRegistryStrict(root);
+      const prior = readInvestigationPreparation(root, issueNumber);
+      if (prior === undefined && registry.worktrees.some((entry) => registryIdentitiesOverlap(entry, preparation.row)))
+        throw new Error('Legacy custody cannot be adopted as a current investigation.');
+      const row = investigationRow(registry, preparation);
+      if (prior !== undefined && stableJson(prior) !== stableJson(preparation))
+        throw new Error('Investigation baseline cannot be replaced.');
+      const directory = prepareInvestigationDirectory(root, issueNumber);
+      writeCreateOnly(join(directory, 'preparation.json'), Buffer.from(stableJson(preparation)));
+      const acknowledgement = await acknowledge();
+      writeCreateOnly(join(directory, 'acknowledgement.json'), Buffer.from(stableJson(acknowledgement)));
+      writeWorktreeOwner(preparation.row, root);
+      if (row === undefined) {
+        registry.worktrees.push(preparation.row);
+        saveRegistryStrict(root, registry);
+      }
+      if (investigationRow(loadRegistryStrict(root), preparation) === undefined)
+        throw new Error('Investigation registration readback is missing.');
+    },
+  });
+}
+
+/** The same canonical lock owns evidence preservation, non-force removal, and row commit. */
+export async function completeInvestigationCustody(input: {
+  preparation: InvestigationPreparation;
+  result: Buffer;
+  authorityCommentId: number;
+  acceptanceCommentId: number;
+  dryRun: boolean;
+  authorize: () => Promise<unknown>;
+  assertSource: (allowAbsent: boolean) => void;
+  removeSource: () => void;
+}): Promise<{ completed: boolean; replayed: boolean; receiptPath?: string }> {
+  const preparation = InvestigationPreparationSchema.parse(input.preparation);
+  const root = preparation.repoRoot;
+  const issueNumber = preparation.row.issueNumber;
+  ensureRegistryDirectory(root);
+  assertInvestigationRegistry(root);
+  return withLock(REGISTRY_PATH, {
+    projectRoot: root,
+    timeout: 5000,
+    operation: async () => {
+      if (stableJson(readInvestigationPreparation(root, issueNumber)) !== stableJson(preparation))
+        throw new Error('Investigation preparation drifted.');
+      // Legacy transition/continuation custody remains a separate mandatory fence.
+      assertNoIncompleteWorktreeTransition(preparation.row, root);
+      if (pendingCommittedContinuation(issueNumber, root)) throw new Error('Committed continuation is incomplete.');
+      assertOwnerWitness(preparation.row, root);
+      const directory = investigationDirectory(root, issueNumber);
+      const intentPath = join(directory, 'intent.json');
+      const completionPath = join(directory, 'completion.json');
+      const intent = existsSync(intentPath)
+        ? InvestigationIntentSchema.parse(readInvestigationJson(intentPath))
+        : undefined;
+      const completion = existsSync(completionPath)
+        ? InvestigationCompletionSchema.parse(readInvestigationJson(completionPath))
+        : undefined;
+      const registry = loadRegistryStrict(root);
+      const row = investigationRow(registry, preparation);
+      if (row === undefined && intent === undefined)
+        throw new Error('Investigation row disappeared without a removal intent.');
+      if (
+        completion !== undefined &&
+        (intent === undefined ||
+          row !== undefined ||
+          completion.intentId !== intent.intentId ||
+          completion.preparationId !== preparation.preparationId)
+      )
+        throw new Error('Investigation completion custody is inconsistent.');
+      const resultDigest = digestBytes(input.result);
+      if (
+        intent !== undefined &&
+        (intent.preparationId !== preparation.preparationId ||
+          intent.resultDigest !== resultDigest ||
+          intent.authorityCommentId !== input.authorityCommentId ||
+          intent.acceptanceCommentId !== input.acceptanceCommentId)
+      )
+        throw new Error('Resume requires the same exact investigation intent and evidence.');
+      if (intent !== undefined)
+        for (const digest of [intent.resultDigest, intent.registryBeforeimage, intent.authorityDigest])
+          if (digestBytes(assertPrivateFile(join(directory, `${digest.slice(7)}.bin`))) !== digest)
+            throw new Error('Preserved investigation evidence changed.');
+      input.assertSource(intent !== undefined);
+      const authority = await input.authorize();
+      input.assertSource(intent !== undefined);
+      if (input.dryRun) return { completed: false, replayed: intent !== undefined };
+      if (completion !== undefined) return { completed: true, replayed: true, receiptPath: completionPath };
+      let accepted = intent;
+      if (accepted === undefined) {
+        const registryBytes = readFileSync(join(root, REGISTRY_PATH));
+        const authorityBytes = Buffer.from(stableJson(authority));
+        for (const bytes of [input.result, registryBytes, authorityBytes]) {
+          const digest = digestBytes(bytes);
+          writeCreateOnly(join(directory, `${digest.slice(7)}.bin`), bytes, digest);
+        }
+        const content = {
+          schemaVersion: 'ai-delivery.investigation-completion-intent@1' as const,
+          preparationId: preparation.preparationId,
+          resultDigest,
+          authorityCommentId: input.authorityCommentId,
+          acceptanceCommentId: input.acceptanceCommentId,
+          registryBeforeimage: digestBytes(registryBytes),
+          authorityDigest: digestBytes(authorityBytes),
+        };
+        accepted = InvestigationIntentSchema.parse({ ...content, intentId: digestValue(content) });
+        writeCreateOnly(intentPath, Buffer.from(stableJson(accepted)));
+      }
+      // A fresh intent never turns unexplained absence into authorized recovery.
+      input.assertSource(intent !== undefined);
+      input.removeSource();
+      input.assertSource(true);
+      if (row !== undefined) {
+        registry.worktrees.splice(registry.worktrees.indexOf(row), 1);
+        saveRegistryStrict(root, registry);
+      }
+      if (investigationRow(loadRegistryStrict(root), preparation) !== undefined)
+        throw new Error('Investigation registry removal readback failed.');
+      const content = {
+        schemaVersion: 'ai-delivery.investigation-completion@1' as const,
+        intentId: accepted.intentId,
+        preparationId: preparation.preparationId,
+        completed: true as const,
+      };
+      writeCreateOnly(completionPath, Buffer.from(stableJson({ ...content, completionId: digestValue(content) })));
+      return { completed: true, replayed: intent !== undefined, receiptPath: completionPath };
+    },
+  });
 }

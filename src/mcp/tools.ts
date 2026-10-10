@@ -24,6 +24,47 @@ const Tracking = {
     .optional(),
   title: z.string().trim().min(1).max(256),
 };
+const InvestigationStart = z.strictObject({
+  repo: Repo,
+  issueNumber: Positive,
+  investigationWorktree: z.string().min(1),
+  expectedHeadSha: z.string().regex(/^[a-f0-9]{40}$/u),
+});
+const NormalStart = z.strictObject({
+  ...Tracking,
+  title: Tracking.title.optional(),
+  issueNumber: Positive.optional(),
+  request: z.string().min(1).optional(),
+  requestId: z.string().trim().min(1).max(256).optional(),
+  resumeCreated: z.boolean().optional(),
+  branch: z.string().min(1).optional(),
+});
+const NormalFinish = z.strictObject({
+  repo: Repo,
+  issueNumber: Positive,
+  prNumber: Positive,
+  nonClosing: z.boolean().optional(),
+  reviewedHeadSha: z
+    .string()
+    .regex(/^[a-f0-9]{40}$/u)
+    .optional(),
+  strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
+  dryRun: z.boolean().optional(),
+});
+const InvestigationFinish = z.strictObject({
+  repo: Repo,
+  issueNumber: Positive,
+  investigation: z.literal(true),
+  resultPath: z.string().min(1),
+  authorityCommentId: Positive.optional(),
+  acceptanceCommentId: Positive.optional(),
+  dryRun: z.boolean().optional(),
+});
+
+function validateMode(schema: z.ZodType, input: unknown, context: z.RefinementCtx): void {
+  const result = schema.safeParse(input);
+  if (!result.success) context.addIssue({ code: 'custom', message: result.error.message });
+}
 
 const IssueListing = {
   repo: Repo,
@@ -124,22 +165,19 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_start',
     commandName: 'start',
-    description: 'Create or resume a tracked issue and its GitHub-linked branch',
-    inputSchema: z.strictObject({
-      ...Tracking,
-      body: Tracking.body.optional(),
-      issueType: Tracking.issueType.optional(),
-      points: Tracking.points.optional(),
-      priority: Tracking.priority.optional(),
-      title: Tracking.title.optional(),
-      issueNumber: Positive.optional(),
-      request: z.string().min(1).optional(),
-      requestId: z.string().trim().min(1).max(256).optional(),
-
-      resumeCreated: z.boolean().optional(),
-
-      branch: z.string().min(1).optional(),
-    }),
+    description: 'Start a linked issue, or prospectively register an unchanged host-created investigation worktree',
+    inputSchema: NormalStart.extend({
+      investigationWorktree: z.string().optional(),
+      expectedHeadSha: z.string().optional(),
+    }).superRefine((input, context) =>
+      validateMode(
+        input.investigationWorktree !== undefined || input.expectedHeadSha !== undefined
+          ? InvestigationStart
+          : NormalStart,
+        input,
+        context,
+      ),
+    ),
   },
   {
     name: 'issue_list',
@@ -262,19 +300,17 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_finish',
     commandName: 'finish',
-    description: 'Resume a guarded merge and close its issue after merged-PR readback',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      issueNumber: Positive,
-      prNumber: Positive,
-      nonClosing: z.boolean().optional(),
-      reviewedHeadSha: z
-        .string()
-        .regex(/^[a-f0-9]{40}$/u)
-        .optional(),
-      strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
-      dryRun: z.boolean().optional(),
-    }),
+    description:
+      'Finish merged delivery, or remove a prospectively registered unchanged investigation with native acceptance',
+    inputSchema: NormalFinish.extend({
+      prNumber: Positive.optional(),
+      investigation: z.literal(true).optional(),
+      resultPath: z.string().optional(),
+      authorityCommentId: Positive.optional(),
+      acceptanceCommentId: Positive.optional(),
+    }).superRefine((input, context) =>
+      validateMode(input.investigation === true ? InvestigationFinish : NormalFinish, input, context),
+    ),
   },
   {
     name: 'issue_worktree_transition_inspect',
