@@ -226,7 +226,7 @@ function interruptedApply(
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
   });
-  assert.equal(child.status, 73, child.stderr);
+  assert.equal(child.status, 73, `Fictional transition event=${event}; expected interruption=73.\n${child.stderr}`);
   // The child is confirmed exited. Advance only its synthetic fixture lock mtimes to exercise stale-lock recovery promptly.
   const common = gitCommonDir(f.root);
   for (const lock of [

@@ -1458,7 +1458,11 @@ for (const native of [false, true]) {
       process.kill(ownedPid, 0);
       writeFileSync(snapshot, 'interrupted incomplete snapshot');
       rmSync(join(f.base, 'wait'));
-      const recovered = await api.stageRuntime(f.input);
+      const recovered = await api.stageRuntime(f.input).catch((error: unknown) => {
+        if (error instanceof Error)
+          error.message += ` Fictional setup interruption phase=orphan-recovery; native=${native}.`;
+        throw error;
+      });
       assert.equal(recovered.reused, false);
       assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
       assert.equal(existsSync(writerPath), false);
