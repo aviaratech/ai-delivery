@@ -39,7 +39,7 @@ const { FULL_GATES, SKIP_ALLOWLIST, treeIdentity } =
 /** @typedef {{schemaVersion:string,boundary:string,status:string,qualified:boolean,sourceCommit?:string,
  * sourceTree?:string,archiveSha256:string,inventorySha256:string,inventory:InventoryMember[],packageVersion:string,
  * scriptsDisabled:boolean,sourceManifestSha256:string,sourceLockSha256:string,archiveManifestSha256:string,sourceIdentityVerified:boolean,networkBoundary:string,phases:Record<string,unknown>[],cleanup:Record<string,unknown>|null,
- * producerJoin?:Record<string,unknown>,productionClosure?:Record<string,unknown>,reason?:string,failure?:Record<string,unknown>,mcp?:Record<string,unknown>,skills?:unknown[],resolutions?:unknown[]}} Receipt */
+ * producerJoin?:Record<string,unknown>,productionClosure?:Record<string,unknown>,publicExports?:Record<string,unknown>[],reason?:string,failure?:Record<string,unknown>,mcp?:Record<string,unknown>,skills?:unknown[],resolutions?:unknown[]}} Receipt */
 
 /** @param {unknown} value @param {string} [code] @returns {Record<string,unknown>} */
 function record(value, code = 'package-identity') {
@@ -772,13 +772,16 @@ registerHooks({resolve(specifier,context,next){
 }
 
 const EXPORT_PROBE = `import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';import {createHash} from 'node:crypto';import {fileURLToPath} from 'node:url';
 const root=await import('@aviaratech/ai-delivery');const agent=await import('@aviaratech/ai-delivery/agent');
 const delivery=await import('@aviaratech/ai-delivery/delivery');const mcp=await import('@aviaratech/ai-delivery/mcp');
 assert.equal(typeof root.withVerificationFilesystemFixture,'function');
 assert.equal(root.withVerificationFilesystemFixture,agent.withVerificationFilesystemFixture);
 assert.equal(typeof agent.verifyIssue,'undefined');assert.equal(typeof delivery.loadValidRepositoryDeliveryEvidence,'undefined');
 assert.equal(typeof mcp.createAiDeliveryMcpServer,'function');
-console.log(JSON.stringify({runtime:process.version,exports:['.','./agent','./delivery','./mcp']}));`;
+assert.equal(typeof agent.deliveryHealth,'function');
+const entryUrl=import.meta.resolve('@aviaratech/ai-delivery/agent');
+console.log(JSON.stringify({runtime:process.version,exports:['.','./agent','./delivery','./mcp'],deliveryHealth:{module:'./agent',exportName:'deliveryHealth',type:typeof agent.deliveryHealth,entryUrl,entrySha256:createHash('sha256').update(readFileSync(fileURLToPath(entryUrl))).digest('hex')}}));`;
 
 export const MCP_PROBE = `import assert from 'node:assert/strict';import {spawn} from 'node:child_process';
 import {createRequire} from 'node:module';import {fileURLToPath} from 'node:url';
@@ -1047,11 +1050,21 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
         ];
         for (const [phase, executable, version] of exportChecks) {
           const proof = record(parseJsonOutput(await run(phase, executable, [exportsPath], probeEnv)));
+          const health = record(proof.deliveryHealth, 'schema');
+          const agentMember = candidate.inventory.find((member) => member.path === 'dist/agent.js');
           requireProof(
-            proof.runtime === version && JSON.stringify(proof.exports) === JSON.stringify(EXPORTS),
+            proof.runtime === version &&
+              JSON.stringify(proof.exports) === JSON.stringify(EXPORTS) &&
+              health.module === './agent' &&
+              health.exportName === 'deliveryHealth' &&
+              health.type === 'function' &&
+              fileURLToPath(string(health.entryUrl, 'schema')) === join(installed, 'dist/agent.js') &&
+              agentMember !== undefined &&
+              health.entrySha256 === agentMember.sha256,
             'schema',
             'Public export proof differs',
           );
+          (receipt.publicExports ??= []).push({ phase, ...proof });
         }
         const mcpPath = join(consumer, 'owned-mcp.mjs');
         writeFileSync(mcpPath, MCP_PROBE);

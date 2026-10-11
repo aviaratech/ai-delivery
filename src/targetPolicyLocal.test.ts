@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'vitest';
+
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import { digestBytes, digestValue } from './delivery/common.js';
 import { investigationAcceptanceBody, investigationAuthorityBody } from './pr.js';
@@ -13,6 +14,7 @@ import { fixtureGit, inertTarget, type PolicyState } from './fixtures/inertTarge
 type Fixture = ReturnType<typeof inertTarget>;
 type Connection = Awaited<ReturnType<Fixture['connect']>>;
 async function runtimeFixture(f: Fixture) {
+  f.signal.throwIfAborted();
   const packageRoot = join(f.base, 'archive', 'package');
   const lifecycleSentinel = join(f.base, 'lifecycle-executed');
   const files = {
@@ -45,6 +47,7 @@ async function runtimeFixture(f: Fixture) {
   });
   const loaded = await loadDeliveryConfig(f.root, {
     repository: 'example/widget',
+    signal: f.signal,
     clients: { graphql: f.graphql } as never,
   });
   const runtimeDirectory = join(f.base, 'runtime');
@@ -70,6 +73,90 @@ async function runtimeFixture(f: Fixture) {
   };
 }
 
+test('fixture cancellation drains the real MCP handler before releasing global ownership', async ({ signal }) => {
+  const cancellation = new AbortController();
+  const f = inertTarget(AbortSignal.any([signal, cancellation.signal]));
+  let connection: Connection | undefined;
+  let next: Fixture | undefined;
+  let nextConnection: Connection | undefined;
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const reached = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const get = f.rest.issues.get;
+  let portSettled = false;
+  f.rest.issues.get = async (input) => {
+    entered();
+    await held;
+    portSettled = true;
+    return get(input);
+  };
+  try {
+    f.policy('tracked');
+    connection = await f.connect();
+    const pending = connection.call('issue_info', { issueNumber: 17 });
+    const rejected = assert.rejects(pending, /Controlled fixture cancellation/u);
+    await reached;
+    cancellation.abort(new Error('Controlled fixture cancellation'));
+    const disposal = f.dispose(connection);
+    assert.equal(f.dispose(connection), disposal, 'All disposal callers must join the same promise');
+    let disposed = false;
+    void disposal.then(() => {
+      disposed = true;
+    });
+    await rejected;
+    assert.equal(portSettled, false);
+    assert.equal(disposed, false, 'Transport cancellation must not be treated as handler settlement');
+    assert.equal(existsSync(f.root), true, 'Files remain owned until the handler settles');
+    assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
+    release();
+    await disposal;
+    assert.equal(portSettled, true);
+    assert.equal(existsSync(f.base), false);
+
+    next = inertTarget(signal);
+    next.policy('tracked');
+    nextConnection = await next.connect();
+    await f.dispose(connection);
+    const result = await nextConnection.call('issue_info', { issueNumber: 17 });
+    assert.notEqual(result.response.isError, true, result.text);
+    assert.ok(next.calls.some((call) => call.name === 'issues.get'));
+  } finally {
+    release();
+    try {
+      await f.dispose(connection);
+    } finally {
+      await next?.dispose(nextConnection);
+    }
+  }
+}, 5_000);
+
+test('fixture disposal closes a cancelled MCP connection', async ({ signal }) => {
+  const f = inertTarget(signal);
+  const cancellation = new AbortController();
+  cancellation.abort(new Error('Controlled connection cancellation'));
+  try {
+    await assert.rejects(f.connect({ signal: cancellation.signal }), /Controlled connection cancellation/u);
+  } finally {
+    await f.dispose(undefined);
+  }
+  assert.equal(existsSync(f.base), false);
+  const next = inertTarget(signal);
+  try {
+    const loaded = await loadDeliveryConfig(next.root, {
+      repository: 'example/widget',
+      clients: { graphql: next.graphql } as never,
+    });
+    assert.ok(loaded.configDigest);
+  } finally {
+    await next.dispose(undefined);
+  }
+}, 5_000);
+
 async function stageAndAdmit(f: Fixture, c: Connection) {
   const runtime = await runtimeFixture(f);
   const staged = await c.call('runtime_stage', runtime.stage);
@@ -85,8 +172,10 @@ async function stageAndAdmit(f: Fixture, c: Connection) {
 }
 
 for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
-  test(`public MCP runtime_stage ${kind === 'tracked' ? 'installs offline without lifecycle scripts' : 'refuses primary source edits'} and leaves ${kind} policy inert`, async () => {
-    const f = inertTarget();
+  test(`public MCP runtime_stage ${kind === 'tracked' ? 'installs offline without lifecycle scripts' : 'refuses primary source edits'} and leaves ${kind} policy inert`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let c: Connection | undefined;
     try {
       const runtime = await runtimeFixture(f);
@@ -111,6 +200,7 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
         assert.equal(reused.value!.stageId, result.value!.stageId);
         assert.equal(reused.value!.reused, true);
         // Same archive, real npm and same environment; explicitly enabled scripts establish the lifecycle control.
+        f.signal.throwIfAborted();
         execFileSync(
           'npm',
           [
@@ -140,8 +230,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 15_000);
 
-  test(`public MCP runtime_admit ${kind === 'tracked' ? 'binds and reuses exact stage bytes' : 'refuses primary source edits'} and leaves ${kind} policy inert`, async () => {
-    const f = inertTarget();
+  test(`public MCP runtime_admit ${kind === 'tracked' ? 'binds and reuses exact stage bytes' : 'refuses primary source edits'} and leaves ${kind} policy inert`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let c: Connection | undefined;
     try {
       const runtime = await runtimeFixture(f);
@@ -178,8 +270,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 15_000);
 
-  test(`public MCP investigation start ${kind === 'tracked' ? 'registers exact selected source' : 'refuses selected worktree edits'} with ${kind} policy`, async () => {
-    const f = inertTarget();
+  test(`public MCP investigation start ${kind === 'tracked' ? 'registers exact selected source' : 'refuses selected worktree edits'} with ${kind} policy`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let c: Connection | undefined;
     try {
       f.worktree();
@@ -208,8 +302,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 15_000);
 
-  test(`public MCP investigation finish ${kind === 'tracked' ? 'removes only acknowledged selected custody' : 'refuses selected worktree edits'} with ${kind} policy`, async () => {
-    const f = inertTarget();
+  test(`public MCP investigation finish ${kind === 'tracked' ? 'removes only acknowledged selected custody' : 'refuses selected worktree edits'} with ${kind} policy`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let c: Connection | undefined;
     try {
       f.worktree();
@@ -262,8 +358,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 15_000);
 
-  test(`public MCP transition inspect inventories legacy custody and names reached guard with ${kind} policy`, async () => {
-    const f = inertTarget();
+  test(`public MCP transition inspect inventories legacy custody and names reached guard with ${kind} policy`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let c: Connection | undefined;
     try {
       f.worktree();
@@ -307,8 +405,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 15_000);
 
-  test(`public MCP transition apply reaches unsupported historical binding without loading ${kind} policy`, async () => {
-    const f = inertTarget();
+  test(`public MCP transition apply reaches unsupported historical binding without loading ${kind} policy`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let c: Connection | undefined;
     try {
       f.worktree();
