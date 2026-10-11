@@ -196,14 +196,14 @@ function readGateClaim(gate: OutputGate, path: string): GateClaim {
   return claim;
 }
 
-function gateScanRequests(gate: OutputGate): string[] {
+function gateScanRequests(gate: OutputGate, snapshot?: Map<number, ObservedProcess>): string[] {
   const directory = join(gate.directory, 'requests');
   assertGateDirectory(directory);
   const requests = readdirSync(directory);
   if (requests.length > 1024 || requests.some((name) => !/^[a-f0-9-]{36}\.json$/u.test(name)))
     throw new DeliveryError('Filesystem observation gate scan requests are invalid.');
   const live: string[] = [];
-  const snapshot = processSnapshot();
+  const currentSnapshot = snapshot ?? processSnapshot();
   for (const name of requests) {
     let claim: GateClaim;
     try {
@@ -212,7 +212,7 @@ function gateScanRequests(gate: OutputGate): string[] {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw error;
     }
-    if (claim.kind !== 'scan' || name !== claim.id + '.json' || !gateOwnerAlive(claim.owner, snapshot))
+    if (claim.kind !== 'scan' || name !== claim.id + '.json' || !gateOwnerAlive(claim.owner, currentSnapshot))
       throw new DeliveryError('Filesystem observation gate scan request was abandoned.');
     live.push(name);
   }
@@ -260,8 +260,8 @@ async function withOutputGateLock<T>(
   try {
     for (;;) {
       if (signal?.aborted) throw new DeliveryError('Filesystem observation gate wait cancelled.');
-      assertOutputGate(gate);
-      const requests = gateScanRequests(gate);
+      const currentSnapshot = assertOutputGate(gate);
+      const requests = gateScanRequests(gate, currentSnapshot);
       if (kind === 'scan' || requests.length === 0) {
         let created = false;
         try {
