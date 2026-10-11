@@ -246,6 +246,49 @@ Legacy transitions remain explicit preservation operations. Inspection returns e
 
 The remote contract is `ai-delivery.mcp@2`. CLI and MCP call the same owners. Issue listing/search preserve native filters, pagination, literal search boundaries and repository-qualified relationships. Issue updates preserve typed journals, history-before-rewrite and native reasoned closure. `issue_info.worktree` is null. Offline `migrate:legacy-issues --input-file` remains a read-only plan. Public exports expose remote delivery, metadata, digest utilities and explicit setup; removed executable policy/stage/evidence APIs are not exported.
 
+## Blocker overrides and delivery health
+
+`create`, `start` and `update` accept `--blocks <issue-numbers>` to add the
+selected issue as a native blocker of named dependents. This preserves those
+dependents' other blockers. `--blocked-by` retains its exact-set replacement
+semantics. The corresponding MCP inputs are `blocks` and `blockedBy`.
+
+A genuinely new blocker on configured-Project **In Progress** work requires
+`--override-reason <reason>` / `overrideReason` (1–2,000 trimmed characters).
+The configured author must authenticate, and an author-verified comment must
+precede the native edge. Existing edges and removals require no override.
+Unresolved dependent status refuses additions. Creation preflights existing
+dependents before creating the new issue. A retry reuses the same verified
+comment for the same native removal episode; a later remove/re-add records a
+new episode. Comments record intent, not successful dependency writes.
+
+GitHub does not atomically lock status, comments and relationships. Every actual
+addition is rechecked at its write boundary. A later failure can follow earlier
+writes; inspect native state and resume the known issue rather than recreate it.
+If creation partially succeeds, the existing known-created recovery identifies
+that issue. Low-level exported relationship primitives remain available to
+callers that own their own policy; the guard applies to canonical issue writes.
+
+```sh
+ai-delivery --repo example/widget update --issue 17 --blocked-by 18 --override-reason 'Await prerequisite validation'
+ai-delivery --repo example/widget health --from 2026-10-01T00:00:00Z --to 2026-10-08T00:00:00Z
+```
+
+`delivery_health` / `health` requires an explicit repository and UTC `[from,to)`
+window. It reports distinct issues opened and closed, current open In Progress
+work in that repository lane of the configured Project, oldest active issues by
+creation time, and distinct native blocker additions classified by proven
+historical Project membership and status. Reopen/reclose counts one closed issue
+per window. Unknown history is separate and never a violation verdict. Age is
+since issue creation, not time spent in progress.
+
+The window must end at or before collection time. The read-only snapshot is non-atomic and records collection timestamps. Defaults
+are 200 issues, five timeline pages per issue, five Project item pages per
+status read and ten oldest issues; bounds are 500 issues, 20 pages per read
+and 20 oldest issues. `--max-project-pages` bounds Project status collection. Limits and read failures
+produce explicit partial **observed** counts, not complete zeroes. Issues whose
+current Project status cannot be resolved have a separate unknown count.
+
 ## Typed issue journals
 
 `issue_comment` posts a typed journal through the configured author role. The public

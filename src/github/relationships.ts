@@ -33,6 +33,13 @@ interface IssueNodeParams {
 }
 
 interface LinkBlockedByParams extends RelationshipContext {
+  /** Canonical writers may authorize each actual addition immediately before mutation. */
+  beforeAdd?: (edge: {
+    issueNumber: number;
+    issueNodeId: string;
+    blocker: number;
+    blockerNodeId: string;
+  }) => Promise<void | boolean>;
   blockerNodeIds?: ReadonlyMap<number, string>;
   blockers: number[];
   existingBlockers?: readonly number[];
@@ -300,6 +307,7 @@ export async function hasNativeSubIssues({
 }
 
 export async function linkBlockedBy({
+  beforeAdd,
   blockerNodeIds,
   blockers,
   existingBlockers = [],
@@ -319,6 +327,8 @@ export async function linkBlockedBy({
     for (const blocker of blockersToAdd) {
       const blockerNodeId =
         blockerNodeIds?.get(blocker) ?? (await issueNumberToNode({ issueNumber: blocker, repo, rest }));
+
+      if ((await beforeAdd?.({ issueNumber, issueNodeId, blocker, blockerNodeId })) === false) continue;
 
       await graphql(
         `
@@ -390,6 +400,7 @@ export async function linkSubIssue({
 
 /** Replace, rather than append to, the native blocked-by edge set. */
 export async function replaceBlockedBy({
+  beforeAdd,
   blockers,
   graphql,
   issueNumber,
@@ -417,6 +428,7 @@ export async function replaceBlockedBy({
   const existing = new Set(before.blockers.map((blocker) => blocker.number));
   for (const blocker of requested.filter((candidate) => !existing.has(candidate))) {
     const blockerNodeId = await issueNumberToNode({ issueNumber: blocker, repo, rest });
+    if ((await beforeAdd?.({ issueNumber, issueNodeId, blocker, blockerNodeId })) === false) continue;
     await graphql(
       `
         mutation ($issue: ID!, $blocking: ID!) {

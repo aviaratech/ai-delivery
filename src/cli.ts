@@ -205,6 +205,8 @@ program
   .option('--priority <priority>')
   .option('--labels <labels>')
   .option('--blocked-by <numbers>')
+  .option('--blocks <numbers>', 'Add this issue as a blocker of these dependents')
+  .option('--override-reason <reason>', 'Required explanation when adding a blocker to active work')
   .option('--milestone <number>')
   .option('--parent <number>')
   .action(async (o: Record<string, string> & { draft?: boolean }) =>
@@ -218,6 +220,8 @@ program
         priority: o.priority,
         labels: list(o.labels),
         blockedBy: ints(o.blockedBy),
+        blocks: ints(o.blocks),
+        overrideReason: o.overrideReason,
         milestone: int(o.milestone),
         parentIssueNumber: int(o.parent),
         ...(o.draft === true ? { draft: true } : {}),
@@ -238,6 +242,8 @@ program
   .option('--priority <priority>')
   .option('--labels <labels>')
   .option('--blocked-by <numbers>')
+  .option('--blocks <numbers>', 'Add this issue as a blocker of these dependents')
+  .option('--override-reason <reason>', 'Required explanation when adding a blocker to active work')
   .option('--milestone <number>')
   .option('--parent <number>')
   .option('--branch <branch>')
@@ -265,6 +271,8 @@ program
       priority: o.priority,
       labels: list(o.labels as string),
       blockedBy: ints(o.blockedBy as string),
+      blocks: ints(o.blocks as string),
+      overrideReason: o.overrideReason,
       milestone: int(o.milestone as string),
       parentIssueNumber: int(o.parent as string),
       branch: o.branch,
@@ -312,6 +320,8 @@ program
   .option('--priority <priority>')
   .option('--labels <labels>')
   .option('--blocked-by <numbers>')
+  .option('--blocks <numbers>', 'Add this issue as a blocker of these dependents')
+  .option('--override-reason <reason>', 'Required explanation when adding a blocker to active work')
   .option('--milestone <number>')
   .option('--parent <number>')
   .option('--state <state>')
@@ -332,6 +342,8 @@ program
         priority: o.priority,
         labels: list(o.labels),
         blockedBy: ints(o.blockedBy),
+        blocks: ints(o.blocks),
+        overrideReason: o.overrideReason,
         milestone: int(o.milestone),
         parentIssueNumber: int(o.parent),
         state: o.state,
@@ -343,6 +355,25 @@ program
     ),
   );
 
+program
+  .command('health')
+  .requiredOption('--from <utc>', 'Inclusive UTC ISO timestamp')
+  .requiredOption('--to <utc>', 'Exclusive UTC ISO timestamp')
+  .option('--max-issues <number>')
+  .option('--max-timeline-pages <number>')
+  .option('--max-project-pages <number>')
+  .option('--oldest-limit <number>')
+  .action(async (o: Record<string, string>) =>
+    run('delivery_health', {
+      repo: execution().repo,
+      from: o.from,
+      to: o.to,
+      maxIssues: int(o.maxIssues),
+      maxTimelinePages: int(o.maxTimelinePages),
+      maxProjectPages: int(o.maxProjectPages),
+      oldestLimit: int(o.oldestLimit),
+    }),
+  );
 program
   .command('info')
   .requiredOption('--issue <number>')
