@@ -136,8 +136,8 @@ const GateClaimSchema = z.strictObject({
 type OutputGate = z.infer<typeof OutputGateSchema>;
 type GateClaim = z.infer<typeof GateClaimSchema>;
 
-function gateOwner(): z.infer<typeof GateOwnerSchema> {
-  const owner = processSnapshot().get(process.pid);
+function gateOwner(snapshot = processSnapshot()): z.infer<typeof GateOwnerSchema> {
+  const owner = snapshot.get(process.pid);
   if (!owner) throw new DeliveryError('Filesystem observation gate owner is unavailable.');
   return { pid: owner.pid, identity: owner.identity };
 }
@@ -166,7 +166,7 @@ function gateOwnerAlive(owner: z.infer<typeof GateOwnerSchema>, snapshot = proce
   return current?.identity === owner.identity && !current.status.startsWith('Z');
 }
 
-function assertOutputGate(gate: OutputGate, abandoned = false): void {
+function assertOutputGate(gate: OutputGate, abandoned = false): Map<number, ObservedProcess> {
   assertGateDirectory(gate.directory);
   const manifest = OutputGateSchema.parse(
     JSON.parse(assertPrivateFile(join(gate.directory, 'gate.json')).toString('utf8')) as unknown,
@@ -187,6 +187,7 @@ function assertOutputGate(gate: OutputGate, abandoned = false): void {
     throw new DeliveryError(
       'Filesystem observation gate ownership changed, was abandoned or is not an inherited ancestor.',
     );
+  return snapshot;
 }
 
 function readGateClaim(gate: OutputGate, path: string): GateClaim {
@@ -231,8 +232,9 @@ async function withOutputGateLock<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   if (!gate) return operation();
-  assertOutputGate(gate);
-  const claim: GateClaim = { gateId: gate.id, id: randomUUID(), kind, owner: gateOwner() };
+  // Self identity belongs to this same synchronous ownership check, before any claim publication.
+  const ownerSnapshot = assertOutputGate(gate);
+  const claim: GateClaim = { gateId: gate.id, id: randomUUID(), kind, owner: gateOwner(ownerSnapshot) };
   const request = kind === 'scan' ? join(gate.directory, 'requests', claim.id + '.json') : undefined;
   const lock = join(gate.directory, 'held');
   const holder = join(lock, 'owner.json');
