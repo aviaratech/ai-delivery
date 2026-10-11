@@ -12,6 +12,7 @@ import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import type { GitHubClients } from './github/client.js';
 import { replaceParentIssue } from './github/relationships.js';
 import type { DeliveryContext } from './issue.js';
+import { IssueFields, renderIssueBody } from './issueContract.js';
 import {
   CLIError,
   handleCommandError,
@@ -45,6 +46,24 @@ afterEach(() => {
   setLogsSuppressed(false);
 });
 
+const readyBody = renderIssueBody(
+  IssueFields.parse({
+    title: 'Synthetic change',
+    issueType: 'Task',
+    points: 2,
+    problem: 'Parent-link diagnostics can corrupt the CLI JSON result.',
+    outcome: 'Return one parseable JSON result after parent linking or branch failure.',
+    acceptanceCriteria: [
+      {
+        behavior: 'Parent linking leaves stdout as one JSON result and diagnostics on stderr.',
+        verifiedBy: 'Byte-level CLI stream assertions.',
+      },
+    ],
+    outOfScope: ['Live GitHub access and host configuration.'],
+    context: { files: ['artifact.txt'] },
+  }),
+);
+
 function fixture(developmentFails = false): { context: DeliveryContext; cleanup: () => void } {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-stdout-')));
   const git = (...args: string[]): string => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -63,7 +82,7 @@ function fixture(developmentFails = false): { context: DeliveryContext; cleanup:
     number: 17,
     node_id: 'ISSUE-17',
     title: 'Synthetic change',
-    body: '## Outcome\nDeliver a verified synthetic change to the local repository.\n\n## Scope\n- `artifact.txt`\n\n## Acceptance Criteria\n- [ ] Change works\n- [ ] Review passes\n\n## Verification\nRun `node --version`.',
+    body: readyBody,
     state: 'open',
     html_url: 'https://github.com/example/widget/issues/17',
     labels: [],
@@ -77,16 +96,29 @@ function fixture(developmentFails = false): { context: DeliveryContext; cleanup:
           ? { ...issue, state: developmentFails ? 'closed' : 'open' }
           : { ...issue, number: issue_number, id: issue_number * 10, node_id: `ISSUE-${String(issue_number)}` },
     }),
-    create: async () => ({ data: issue }),
+    create: async (input: { title: string; body: string }) => {
+      issue.title = input.title;
+      issue.body = input.body;
+      return { data: issue };
+    },
     listForRepo: async () => ({ data: [] }),
-    update: async () => ({ data: issue }),
-    listSubIssues: async () => ({ data: parent === null ? [] : [issue] }),
+    update: async (input: { title?: string; body?: string }) => {
+      if (input.title !== undefined) issue.title = input.title;
+      if (input.body !== undefined) issue.body = input.body;
+      return { data: issue };
+    },
+    listSubIssues: async ({ issue_number }: { issue_number: number }) => ({
+      data: parent === issue_number ? [issue] : [],
+    }),
     addSubIssue: async ({ issue_number }: { issue_number: number }) => {
       parent = issue_number;
       return { data: issue };
     },
   });
-  Object.assign(rest, { paginate: async () => (parent === null ? [] : [issue]) });
+  Object.assign(rest, {
+    paginate: async (_route: unknown, { issue_number }: { issue_number: number }) =>
+      parent === issue_number ? [issue] : [],
+  });
   const clients: GitHubClients = {
     authSource: 'personal',
     role: 'author',
@@ -291,7 +323,7 @@ test('failed remote branch start after parent linking preserves parseable CLI re
       '--title',
       'Synthetic change',
       '--body',
-      '## Outcome\nDeliver a verified synthetic change to the local repository.\n\n## Scope\n- `artifact.txt`\n\n## Acceptance Criteria\n- [ ] Change works\n- [ ] Review passes\n\n## Verification\nRun `node --version`.',
+      readyBody,
       '--parent',
       '5',
     ]);

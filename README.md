@@ -64,6 +64,31 @@ ai-delivery --repo example/widget finish --issue 17 --pr 23 --reviewed-head <rev
 
 `start` creates or reuses a GitHub-linked branch from the repository's default branch. It can create a tracking issue first, or resume a known partially created issue with `--resume-created`; recovery returns the exact known issue and safe arguments without creating another issue. Hosts own local worktree preparation and cleanup. PR creation accepts any non-empty body, appends the issue closing reference when absent, and reuses the matching remote branch/PR. Merged completion uses GitHub issue association even after branch deletion. Existing repository labels are accepted; an unknown label is refused before issue mutation.
 
+For a new read-only investigation, the host first creates the linked `issue/N` worktree at the matching clone's exact `.worktrees/issue-N` path. Before investigating, explicitly register its unchanged current default commit:
+
+```sh
+ai-delivery --repo example/widget --repo-root /clone start --issue 17 \
+  --investigation-worktree /clone/.worktrees/issue-17 --expected-head <initial-sha>
+```
+
+This author operation records prospective commit/tree, physical worktree identity, canonical registry custody and a native preparation acknowledgement. It creates no branch or worktree and refuses existing legacy custody. Historical investigations without this preparation cannot be adopted retrospectively.
+
+After independently reviewing the complete result, preserve it in a private regular file outside the worktree. The issue must already be closed with reason `completed`, with no PR associated with its linked branch. Inspection prints the exact operator authority body and, when its comment ID is supplied, the configured-App acceptance body:
+
+```sh
+ai-delivery --repo example/widget --repo-root /clone finish --issue 17 \
+  --investigation --result /retained/result.txt --dry-run
+ai-delivery --repo example/widget --repo-root /clone finish --issue 17 \
+  --investigation --result /retained/result.txt --authority-comment <operator-comment> --dry-run
+ai-delivery --repo example/widget --repo-root /clone finish --issue 17 \
+  --investigation --result /retained/result.txt \
+  --authority-comment <operator-comment> --acceptance-comment <app-comment>
+```
+
+Completion consumes existing whole native comments from the configured personal operator and distinct configured reviewer App. These bind the preparation, exact result bytes, unchanged commit/tree and removal scope, including producer quiescence and continued exclusion of writers. This path supplies no non-PR App acceptance writer; unavailable authentic acceptance is a refusal, never a local approval substitute. Keep the result, native acceptance and producer exclusion available through interruption and resume.
+
+Run completion from outside the investigation worktree. Dirty, untracked or ignored files, `assume-unchanged` or `skip-worktree` index entries, new commits (including same-tree commits), changed native refs, ambiguous or foreign custody and retained verification writers refuse removal. PR/merge options are incompatible with investigation mode. A durable intent preserves the result, native authority and exact registry beforeimage before non-force Git removal. Resume the same command and evidence after an interruption; unexplained absence or recreated worktrees refuse. Exact disk/Git/registry postconditions seal completion. The branch, private evidence and unrelated registry entries remain retained; ordinary source delivery still requires its full merged-PR proof.
+
 Use explicit `--non-closing` on each PR command when delivering a partial fix while its issue remains OPEN. The default closing lifecycle above is unchanged. A non-closing body begins with exactly `References owner/repository#number` on its first line. Creation adds this line to the supplied body; inspection, review, promotion and merge require it to remain unchanged in meaning.
 
 ```sh
@@ -222,12 +247,12 @@ operator's machine. Validation requires HTTPS with a DNS hostname; it rejects
 file paths, credential-bearing URLs, IP literals, localhost and `.local` names.
 It does not probe remote reachability. Each kind also requires these fields:
 
-| Kind | Required fields |
-| --- | --- |
-| `start` | `outcome` |
-| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link |
-| `decision` | `decision`, `rationale` |
-| `blocker` | `blocker`, `resolution` |
+| Kind       | Required fields                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------- |
+| `start`    | `outcome`                                                                                 |
+| `progress` | `done` (nonempty list), `decisionNeeded`; at least one evidence link                      |
+| `decision` | `decision`, `rationale`                                                                   |
+| `blocker`  | `blocker`, `resolution`                                                                   |
 | `closeout` | `acceptance` (nonempty `{criterion, evidence}` list), `followUps` (list; empty when none) |
 
 Optional `details` adds supporting prose. `lengthCap` (600–10,000 characters,

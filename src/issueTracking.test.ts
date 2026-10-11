@@ -135,7 +135,7 @@ function updateFixture() {
                       content: { id: 'ISSUE17' },
                       fieldValueByName: {
                         name: projectStatus,
-                        optionId: projectStatus === 'Active' ? 'ACTIVE' : 'DONE',
+                        optionId: projectStatus === 'Active' ? 'ACTIVE' : projectStatus === 'Queued' ? 'TODO' : 'DONE',
                       },
                     },
                   ],
@@ -145,7 +145,8 @@ function updateFixture() {
             },
           };
         if (query.includes('UpdateProjectDeliveryStatus')) {
-          projectStatus = variables.optionId === 'DONE' ? 'Shipped' : 'Active';
+          projectStatus =
+            variables.optionId === 'DONE' ? 'Shipped' : variables.optionId === 'TODO' ? 'Queued' : 'Active';
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
         }
         if (query.includes('ProjectDeliveryItemReadback'))
@@ -155,7 +156,10 @@ function updateFixture() {
               isArchived: false,
               project: { id: 'PROJECT', number: 1 },
               content: { id: 'ISSUE17' },
-              fieldValueByName: { name: projectStatus, optionId: projectStatus === 'Active' ? 'ACTIVE' : 'DONE' },
+              fieldValueByName: {
+                name: projectStatus,
+                optionId: projectStatus === 'Active' ? 'ACTIVE' : projectStatus === 'Queued' ? 'TODO' : 'DONE',
+              },
             },
           };
         throw new Error(`Unexpected update fixture query: ${query}`);
@@ -179,7 +183,7 @@ test('history preserves exact prior content before a rewrite and retries a faile
     const oldTitle = fixture.live.title;
     const oldBody = fixture.live.body;
     fixture.controls.failUpdate = true;
-    const input = { issueNumber: 17, title: 'New title', body: 'New body', preserveHistory: true };
+    const input = { issueNumber: 17, title: 'New title', body: 'New body', draft: true, preserveHistory: true };
     await assert.rejects(issue.updateIssue(fixture.context, input), /Update unavailable/u);
     assert.equal(fixture.comments.length, 1);
     assert.equal(fixture.comments[0]!.body, issue.renderIssueHistory(oldTitle, oldBody));
@@ -187,7 +191,9 @@ test('history preserves exact prior content before a rewrite and retries a faile
     fixture.controls.failUpdate = false;
     const result = await issue.updateIssue(fixture.context, input);
     assert.equal(result.title, 'New title');
-    assert.equal(result.body, 'New body');
+    assert.equal(result.conversion?.priorBody, oldBody);
+    assert.ok(oldBody.split('\n').every((line) => result.conversion?.diff.includes('-' + line)));
+    assert.match(result.body, /ai-delivery:issue@1/u);
     assert.equal(fixture.comments.length, 1);
     assert.equal((result as unknown as { historyComment: { reused: boolean } }).historyComment.reused, true);
     await issue.updateIssue(fixture.context, input);
@@ -209,6 +215,7 @@ test('history overflow, invalid metadata, failed comment readback and concurrent
         issue.updateIssue(fixture.context, {
           issueNumber: 17,
           body: 'Replacement',
+          draft: true,
           preserveHistory: true,
           ...(failure === 'labels' ? { labels: ['invalid'] } : {}),
         }),
@@ -227,7 +234,7 @@ test('reasoned closure records supersession and verifies native reason and dupli
   for (const closeReason of ['completed', 'not_planned', 'duplicate'] as const) {
     const fixture = updateFixture();
     try {
-      const input = { issueNumber: 17, state: 'closed' as const, closeReason, supersededBy: 18 };
+      const input = { issueNumber: 17, state: 'closed' as const, draft: true, closeReason, supersededBy: 18 };
       const result = await issue.updateIssue(fixture.context, input);
       const closure = (
         result as unknown as {
@@ -244,7 +251,7 @@ test('reasoned closure records supersession and verifies native reason and dupli
         assert.deepEqual(closure.duplicateOf, { number: 18, repository: 'example/widget' });
       }
       await issue.updateIssue(fixture.context, input);
-      assert.equal(fixture.comments.length, 1, 'closure retries reuse authoritative comments');
+      assert.equal(fixture.comments.length, 2, 'closure retries reuse authoritative comments');
       await assert.rejects(
         issue.updateIssue(fixture.context, {
           ...input,
@@ -273,6 +280,7 @@ test('invalid superseding issues and contradictory native closure fail closed', 
         issue.updateIssue(fixture.context, {
           issueNumber: 17,
           state: 'closed',
+          draft: true,
           closeReason: failure === 'duplicate' ? 'duplicate' : 'completed',
           supersededBy: failure === 'self' ? 17 : 18,
         }),
@@ -498,7 +506,10 @@ test('update accepts history and reasoned closure while rejecting incoherent req
     tool.inputSchema.safeParse({ issueNumber: 17, state: 'closed', closeReason: 'duplicate', supersededBy: 9 }).success,
     true,
   );
-  assert.equal(tool.inputSchema.safeParse({ issueNumber: 17, state: 'open', closeReason: 'completed' }).success, false);
+  assert.throws(
+    () => tool.inputSchema.safeParse({ issueNumber: 17, state: 'open', closeReason: 'completed' }),
+    /Closure details require state closed/u,
+  );
 });
 
 test('local filters retain pagination when the current GitHub page has no matching issue', async () => {
