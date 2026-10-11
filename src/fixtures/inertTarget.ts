@@ -536,7 +536,12 @@ export function inertTarget() {
       execFileSync(process.execPath, [control], { env: process.env, timeout: 5_000, maxBuffer: 64 * 1024 });
       const readback = JSON.parse(readFileSync(sentinel, 'utf8')) as { marker: string; module: string };
       assert.deepEqual(readback, { marker: name, module: pathToFileURL(control).href });
-      observations.push({ control: name, module: control, payloadDigest: digestBytes(bytes!), passed: true });
+      observations.push({
+        control: name,
+        module: control,
+        payloadDigest: digestBytes(Buffer.from(bytes!)),
+        passed: true,
+      });
       unlinkSync(sentinel);
     }
     if (kind === 'edited') writeFileSync(join(selected, 'ai-delivery.policy.mjs'), edited);
@@ -544,9 +549,9 @@ export function inertTarget() {
     observations.push({
       policyState: kind,
       selected,
-      indexedDigest: digestBytes(tracked),
-      headDigest: digestBytes(tracked),
-      worktreeDigest: digestBytes(kind === 'edited' ? edited : tracked),
+      indexedDigest: digestBytes(Buffer.from(tracked)),
+      headDigest: digestBytes(Buffer.from(tracked)),
+      worktreeDigest: digestBytes(Buffer.from(kind === 'edited' ? edited : tracked)),
     });
   };
   const assertInert = () => assert.equal(existsSync(sentinel), false, 'A public route imported consumer policy');
