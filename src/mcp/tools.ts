@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { DeliveryHealthInput } from '../services/deliveryHealthService.js';
+import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema } from '../issueJournal.js';
 import { IssueFields, IssueWriteFields, ISSUE_JSON_SCHEMAS, issueInputSchema } from '../issueContract.js';
 
@@ -11,6 +13,8 @@ const Repo = z
 export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@2' as const;
 const Tracking = {
   blockedBy: z.array(Positive).optional(),
+  blocks: z.array(Positive).optional(),
+  overrideReason: OverrideReason.optional(),
   body: z.string().optional(),
   issueType: z.string().min(1).optional(),
   labels: Labels.optional(),
@@ -100,6 +104,12 @@ const RuntimeController = {
 };
 
 export const AI_DELIVERY_MCP_TOOLS = [
+  {
+    name: 'delivery_health',
+    commandName: 'health',
+    description: 'Read bounded native delivery health for an explicit repository and UTC window',
+    inputSchema: DeliveryHealthInput,
+  },
   {
     name: 'issue_comment',
     commandName: 'comment',
@@ -201,6 +211,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
           ...IssueWriteFields,
           repo: Repo,
           blockedBy: z.array(Positive).optional(),
+          blocks: z.array(Positive).optional(),
+          overrideReason: OverrideReason.optional(),
           body: z.string().optional(),
           issueNumber: Positive,
           issueType: IssueWriteFields.issueType,

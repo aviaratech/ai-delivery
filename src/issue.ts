@@ -26,10 +26,12 @@ import {
 import {
   getNativeBlockerRelationships,
   hasNativeSubIssues,
+  linkBlockedBy,
   replaceBlockedBy,
   replaceParentIssue,
   resolveNativeRelationshipTargets,
 } from './github/relationships.js';
+import { prepareBlockerGuard } from './services/blockerGuardService.js';
 import { type RepoCoordinates } from './github/repo.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
 import { JournalInputSchema, renderJournal, type JournalInput } from './issueJournal.js';
@@ -225,6 +227,9 @@ async function labels(context: DeliveryContext, input: readonly string[] | undef
 
 export interface CreateIssueInput extends Partial<IssueFieldsInput> {
   blockedBy?: number[];
+  /** Add this issue as a blocker of these dependents without replacing their other blockers. */
+  blocks?: number[];
+  overrideReason?: string;
   body?: string;
   issueType?: string | undefined;
   labels?: string[];
@@ -339,6 +344,15 @@ export async function createIssue(
     repo,
     rest: clients.rest,
   });
+  const beforeAdd =
+    (input.blocks?.length ?? 0) > 0 || (input.blockedBy?.length ?? 0) > 0
+      ? await prepareBlockerGuard(
+          context,
+          (input.blocks ?? []).map((dependent) => ({ dependent, blockers: [], pendingBlocker: true })),
+          input.overrideReason,
+          input.blockedBy ?? [],
+        )
+      : async () => {};
   const created = await clients.rest.issues.create({
     body: input.body ?? '',
     labels: await labels(context, input.labels),
@@ -391,14 +405,6 @@ export async function createIssue(
         rest: clients.rest,
         settings: nativeIssueSettingsFromDeliveryConfig(config),
       });
-    if ((input.blockedBy?.length ?? 0) > 0)
-      await replaceBlockedBy({
-        blockers: input.blockedBy ?? [],
-        graphql: clients.graphql,
-        issueNumber,
-        repo,
-        rest: clients.rest,
-      });
     await syncIssueProjectStatus({
       graphql: clients.graphql,
       issueNodeId: created.data.node_id,
@@ -407,6 +413,24 @@ export async function createIssue(
       settings: projectSettingsFromDeliveryConfig(config),
       status: targets.unresolvedBlockers.length > 0 ? 'Blocked' : 'Todo',
     });
+    if ((input.blockedBy?.length ?? 0) > 0)
+      await replaceBlockedBy({
+        beforeAdd,
+        blockers: input.blockedBy ?? [],
+        graphql: clients.graphql,
+        issueNumber,
+        repo,
+        rest: clients.rest,
+      });
+    for (const dependent of new Set(input.blocks ?? []))
+      await linkBlockedBy({
+        beforeAdd,
+        blockers: [issueNumber],
+        graphql: clients.graphql,
+        issueNumber: dependent,
+        repo,
+        rest: clients.rest,
+      });
     const readback = await issueInfo(context, issueNumber);
     if (
       readback.title !== input.title ||
@@ -756,6 +780,9 @@ export async function readIssueClosure(context: DeliveryContext, issueNumber: nu
 
 export interface UpdateIssueInput extends Partial<IssueFieldsInput> {
   blockedBy?: number[];
+  /** Add this issue as a blocker of these dependents without replacing their other blockers. */
+  blocks?: number[];
+  overrideReason?: string;
   body?: string;
   issueNumber: number;
   issueType?: string | undefined;
@@ -835,6 +862,17 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
       rest: clients.rest,
     });
   }
+  const beforeAdd =
+    input.blockedBy !== undefined || input.blocks !== undefined
+      ? await prepareBlockerGuard(
+          context,
+          [
+            ...(input.blockedBy === undefined ? [] : [{ dependent: input.issueNumber, blockers: input.blockedBy }]),
+            ...(input.blocks ?? []).map((dependent) => ({ dependent, blockers: [input.issueNumber] })),
+          ],
+          input.overrideReason,
+        )
+      : undefined;
   const closeReason = input.closeReason ?? (input.supersededBy === undefined ? undefined : 'completed');
   let supersedingIssueId: number | undefined;
   if (input.supersededBy !== undefined) {
@@ -960,14 +998,30 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
       rest: clients.rest,
       settings: nativeIssueSettingsFromDeliveryConfig(config),
     });
-  if (input.blockedBy !== undefined)
-    await replaceBlockedBy({
-      blockers: input.blockedBy,
-      graphql: clients.graphql,
-      issueNumber: input.issueNumber,
-      repo,
-      rest: clients.rest,
-    });
+  try {
+    if (input.blockedBy !== undefined)
+      await replaceBlockedBy({
+        ...(beforeAdd === undefined ? {} : { beforeAdd }),
+        blockers: input.blockedBy,
+        graphql: clients.graphql,
+        issueNumber: input.issueNumber,
+        repo,
+        rest: clients.rest,
+      });
+    for (const dependent of new Set(input.blocks ?? []))
+      await linkBlockedBy({
+        ...(beforeAdd === undefined ? {} : { beforeAdd }),
+        blockers: [input.issueNumber],
+        graphql: clients.graphql,
+        issueNumber: dependent,
+        repo,
+        rest: clients.rest,
+      });
+  } catch (error) {
+    throw new DeliveryError(
+      `Issue #${input.issueNumber} content or metadata may have changed, but dependency tracking did not complete: ${error instanceof Error ? error.message : String(error)}. Inspect native state and resume this existing issue.`,
+    );
+  }
   const info = await issueInfo(context, input.issueNumber);
   const status =
     info.state === 'closed' || info.projectStatus === 'Done'

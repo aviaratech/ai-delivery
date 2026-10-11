@@ -1,3 +1,4 @@
+import { deliveryHealth, type DeliveryHealthRequest } from './services/deliveryHealthService.js';
 import { loadDeliverySettings } from './config/deliveryConfig.js';
 import { resolveCheckout, resolveRepoFromRemote } from './github/repo.js';
 import { DeliveryError } from './errors.js';
@@ -135,6 +136,8 @@ export async function startTrackedIssue(
           priority: tracking.priority,
           labels: tracking.labels,
           blockedBy: tracking.blockedBy,
+          blocks: tracking.blocks,
+          overrideReason: tracking.overrideReason,
           parentIssueNumber: tracking.parentIssueNumber,
           milestone: tracking.milestone,
           branch: input.branch,
@@ -263,6 +266,8 @@ export async function executeTool(
   );
   if (local) context.root = root;
   switch (name) {
+    case 'delivery_health':
+      return deliveryHealth(context, { ...input, repo: repo! } as DeliveryHealthRequest);
     case 'issue_comment':
       return commentIssue(context, input as JournalInput);
     case 'issue_create':
