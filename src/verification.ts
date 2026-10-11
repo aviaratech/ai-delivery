@@ -353,6 +353,17 @@ function retireOutputGate(gate: OutputGate, abandoned = false): void {
   rmdirSync(gate.directory);
 }
 
+function retireOutputGateAfterOperation(gate: OutputGate, operationCompleted: boolean): void {
+  try {
+    retireOutputGate(gate);
+  } catch (error) {
+    if (error instanceof ProcessSnapshotError)
+      error.message += ` Output-gate retirement: wrappedOperation=${operationCompleted ? 'completed' : 'failed'}.`;
+    // Keep the original retirement error and its precedence over any operation error.
+    throw error;
+  }
+}
+
 async function withOutputObservationGate<T>(
   root: string,
   enabled: boolean,
@@ -380,10 +391,13 @@ async function withOutputObservationGate<T>(
   ensurePrivateDirectoryDurably(join(directory, 'requests'));
   const gate: OutputGate = { directory, id, owner: gateOwner() };
   writePrivateJsonFileAtomically(join(directory, 'gate.json'), gate);
+  let operationCompleted = false;
   try {
-    return await operation(gate);
+    const value = await operation(gate);
+    operationCompleted = true;
+    return value;
   } finally {
-    retireOutputGate(gate);
+    retireOutputGateAfterOperation(gate, operationCompleted);
   }
 }
 
@@ -679,6 +693,8 @@ export interface OwnedProcessState {
   tracked: Map<number, ObservedProcess>;
 }
 
+class ProcessSnapshotError extends DeliveryError {}
+
 export function processSnapshot(): Map<number, ObservedProcess> {
   const psPath = existsSync('/usr/bin/ps') ? '/usr/bin/ps' : '/bin/ps';
   const result = spawnSync(psPath, ['-A', '-o', 'pid=,ppid=,pgid=,rss=,stat=,lstart='], {
@@ -688,7 +704,29 @@ export function processSnapshot(): Map<number, ObservedProcess> {
     timeout: 1_000,
   });
   if (result.status !== 0 || result.error || result.signal || !result.stdout.endsWith('\n')) {
-    throw new DeliveryError('Owned process resource observation failed.');
+    const code = (result.error as NodeJS.ErrnoException | undefined)?.code;
+    const signal = result.signal;
+    // Only fixed labels, bounded numbers and completeness flags leave this observation.
+    const metadata = {
+      status: Number.isSafeInteger(result.status) ? result.status : null,
+      errorCode:
+        code === undefined
+          ? null
+          : ['EACCES', 'EPERM', 'ETIMEDOUT', 'ENOENT', 'ENOBUFS', 'EAGAIN', 'ENOMEM', 'EIO', 'EINVAL'].includes(code)
+            ? code
+            : 'other',
+      signal:
+        signal === null
+          ? null
+          : ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGHUP', 'SIGQUIT', 'SIGPIPE'].includes(
+                signal,
+              )
+            ? signal
+            : 'other',
+      stdoutPresent: typeof result.stdout === 'string',
+      stdoutTerminated: typeof result.stdout === 'string' && result.stdout.endsWith('\n'),
+    };
+    throw new ProcessSnapshotError(`Owned process resource observation failed. ${JSON.stringify(metadata)}`);
   }
   const snapshot = new Map<number, ObservedProcess>();
   for (const line of result.stdout.trim().split('\n')) {

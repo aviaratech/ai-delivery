@@ -10,7 +10,7 @@ import {
   type DeliveryContext,
 } from './issue.js';
 import { existsSync, lstatSync, realpathSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { assertPrivateFile, digestBytes, digestValue, stableJson } from './delivery/common.js';
 import { gitCommonDir, primaryGitRoot } from './git.js';
 import { ensurePrivateDirectoryDurably } from './utils/atomicJson.js';
@@ -1517,11 +1517,8 @@ export async function finishInvestigation(
     throw new DeliveryError('No prospective investigation preparation; historical custody cannot be reconstructed.');
   const resultPath = resolve(input.resultPath);
   const resultRelative = relative(preparation.row.path, resultPath);
-  if (
-    realpathSync(resultPath) !== resultPath ||
-    resultRelative === '' ||
-    (!resultRelative.startsWith('..') && !resultRelative.startsWith('/'))
-  )
+  const resultOutside = resultRelative === '..' || resultRelative.startsWith(`..${sep}`) || isAbsolute(resultRelative);
+  if (realpathSync(resultPath) !== resultPath || !resultOutside)
     throw new DeliveryError('Durable investigation result must be canonical and outside the removable worktree.');
   const result = assertPrivateFile(resultPath, { maxBytes: 512 * 1024 });
   if (result.length === 0) throw new DeliveryError('Investigation result must contain durable evidence.');

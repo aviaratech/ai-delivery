@@ -113,28 +113,30 @@ export function validateRuntimeAdmission(
     const packageManifestPath = join(dirname(distPath), 'package.json');
     const packageManifest = manifest(packageManifestPath);
     const pluginManifest = manifest(pluginManifestPath);
-    if (
-      cliPath !== admission.cliPath ||
-      launcherPath !== admission.mcpLauncherPath ||
-      pluginManifestPath !== admission.pluginManifestPath ||
-      realpathSync(join(dirname(dirname(launcherPath)), '.claude-plugin', 'plugin.json')) !== pluginManifestPath ||
-      fileDigest(cliPath) !== admission.cliSha256 ||
-      fileDigest(launcherPath) !== admission.mcpLauncherSha256 ||
-      fileDigest(pluginManifestPath) !== admission.pluginManifestSha256 ||
-      fileDigest(packageManifestPath) !== admission.packageManifestSha256 ||
-      directoryDigest(distPath) !== admission.packageDistSha256 ||
-      admission.configDigest !== loaded.configDigest ||
-      admission.repository !== loaded.config.repository ||
-      admission.capability.cli !== CAPABILITY ||
-      admission.capability.mcp !== CAPABILITY ||
-      packageManifest.name !== '@aviaratech/ai-delivery' ||
-      packageManifest.version !== admission.packageVersion ||
-      pluginManifest.name !== 'ai-delivery' ||
-      pluginManifest.packageVersion !== admission.packageVersion ||
-      pluginManifest.deliveryCapabilityVersion !== CAPABILITY
-    ) {
+    // Preserve the original short-circuit order and refusal; expose only the first predicate's fixed name.
+    const failedPredicate =
+      (cliPath !== admission.cliPath && 'cliPath') ||
+      (launcherPath !== admission.mcpLauncherPath && 'mcpLauncherPath') ||
+      (pluginManifestPath !== admission.pluginManifestPath && 'pluginManifestPath') ||
+      (realpathSync(join(dirname(dirname(launcherPath)), '.claude-plugin', 'plugin.json')) !== pluginManifestPath &&
+        'launcherPluginManifestPath') ||
+      (fileDigest(cliPath) !== admission.cliSha256 && 'cliSha256') ||
+      (fileDigest(launcherPath) !== admission.mcpLauncherSha256 && 'mcpLauncherSha256') ||
+      (fileDigest(pluginManifestPath) !== admission.pluginManifestSha256 && 'pluginManifestSha256') ||
+      (fileDigest(packageManifestPath) !== admission.packageManifestSha256 && 'packageManifestSha256') ||
+      (directoryDigest(distPath) !== admission.packageDistSha256 && 'packageDistSha256') ||
+      (admission.configDigest !== loaded.configDigest && 'configDigest') ||
+      (admission.repository !== loaded.config.repository && 'repository') ||
+      (admission.capability.cli !== CAPABILITY && 'cliCapability') ||
+      (admission.capability.mcp !== CAPABILITY && 'mcpCapability') ||
+      (packageManifest.name !== '@aviaratech/ai-delivery' && 'packageName') ||
+      (packageManifest.version !== admission.packageVersion && 'packageVersion') ||
+      (pluginManifest.name !== 'ai-delivery' && 'pluginName') ||
+      (pluginManifest.packageVersion !== admission.packageVersion && 'pluginPackageVersion') ||
+      (pluginManifest.deliveryCapabilityVersion !== CAPABILITY && 'pluginCapability');
+    if (failedPredicate) {
       throw new DeliveryError(
-        'Installed CLI/MCP source, capability or repository admission disagrees with the running delivery contract.',
+        `Installed CLI/MCP source, capability or repository admission disagrees with the running delivery contract. Failed predicate: ${failedPredicate}.`,
       );
     }
   } catch (error) {

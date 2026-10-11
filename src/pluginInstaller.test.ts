@@ -853,6 +853,43 @@ test('compiled plugin CLI consumes its local version and emits the promised JSON
   assert.ok(!existsSync(join(fixture.home, '.cache')));
 });
 
+test('compiled doctor CLI requires explicit repository for auth and keeps dry-run credential-free', () => {
+  const cli = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
+  const invoke = (prefix: string[], suffix: string[]) =>
+    spawnSync(
+      process.execPath,
+      [
+        '--import',
+        fixturePreload(),
+        cli,
+        '--repo-root',
+        fixture.home,
+        ...prefix,
+        'plugin',
+        'doctor',
+        '--host',
+        'codex',
+        ...suffix,
+      ],
+      { encoding: 'utf8', maxBuffer: 1024 * 1024 },
+    );
+  const missing = invoke([], ['--check-auth', '--dry-run', '--json']);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /requires explicit --repo owner\/name/u);
+  const selected = invoke(['--repo', 'example/widget'], ['--check-auth', '--dry-run', '--json']);
+  assert.equal(selected.status, 0, selected.stderr);
+  const value = JSON.parse(selected.stdout) as {
+    authProbe: { settings: string; reason: string; repositoryAccess: { repository: string } };
+  };
+  assert.equal(value.authProbe.settings, 'not_checked');
+  assert.equal(value.authProbe.reason, 'dry_run');
+  assert.equal(value.authProbe.repositoryAccess.repository, 'example/widget');
+  const defaultDoctor = invoke([], ['--dry-run', '--json']);
+  assert.equal(defaultDoctor.status, 0, defaultDoctor.stderr);
+  assert.equal((JSON.parse(defaultDoctor.stdout) as { authProbe?: unknown }).authProbe, undefined);
+  assert.ok(!existsSync(join(fixture.home, '.cache')));
+});
+
 test('plugin management rejects unsupported native scopes and nonliteral versions before writing', async () => {
   for (const value of [
     { ...input(), scope: 'project' },

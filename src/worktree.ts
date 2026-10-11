@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, realpathSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { resolveGitRemoteName } from './github/repo.js';
 
@@ -132,8 +132,9 @@ export function assertInvestigationSource(
     throw new DeliveryError('Investigation completion refuses the primary or current worktree.');
   // --repo-root must not hide an invocation launched inside the removable worktree.
   const currentRelative = relative(row.path, realpathSync(process.cwd()));
-  if (currentRelative === '' || (!currentRelative.startsWith('..') && !currentRelative.startsWith('/')))
-    throw new DeliveryError('Investigation completion refuses the current worktree.');
+  const currentOutside =
+    currentRelative === '..' || currentRelative.startsWith(`..${sep}`) || isAbsolute(currentRelative);
+  if (!currentOutside) throw new DeliveryError('Investigation completion refuses the current worktree.');
   if (git(root, 'rev-parse', `refs/heads/${row.branch}`) !== head.sha)
     throw new DeliveryError('Investigation retaining branch has new or unpushed commits.');
   const rows = investigationGitRows(root).filter(
