@@ -48,3 +48,6 @@ export type { DeliveryOverrides, DeliveryPolicySettings, LoadedDeliverySettings 
 
 export { stageRuntime, admitRuntime, RuntimeAdmissionCommitUnknownError } from './setup.js';
 export type { StageRuntimeInput, AdmitRuntimeInput, RuntimeStageResult } from './setup.js';
+
+export { deliveryHealth } from './services/deliveryHealthService.js';
+export type { DeliveryHealthRequest } from './services/deliveryHealthService.js';
