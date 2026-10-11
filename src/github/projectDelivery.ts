@@ -44,6 +44,8 @@ export interface ProjectDeliveryStatusReadback {
 }
 
 interface ProjectDeliveryInput {
+  /** Optional finite item-read budget for bounded reports; existing callers retain their behavior. */
+  maxPages?: number;
   configuration?: ProjectDeliveryConfiguration;
   graphql: typeof GraphQLType;
   issueNodeId: string;
@@ -514,8 +516,14 @@ async function findIssueProjectItem(
   let cursor: null | string = null;
   let hasNextPage = true;
   const seenCursors = new Set<string>();
+  let pages = 0;
+  if (input.maxPages !== undefined && (!Number.isSafeInteger(input.maxPages) || input.maxPages <= 0))
+    throw new DeliveryError('Project item page budget must be positive.');
 
   while (hasNextPage) {
+    if (input.maxPages !== undefined && pages >= input.maxPages)
+      throw new DeliveryError('Project item page limit reached; status evidence is incomplete.');
+    pages++;
     const response: unknown = await input.graphql(
       `
         query ProjectDeliveryItems($org: String!, $number: Int!, $cursor: String, $statusField: String!) {
