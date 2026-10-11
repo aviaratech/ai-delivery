@@ -71,7 +71,10 @@ export function fixtureGit(root: string, ...args: string[]): string {
 let fixtureOwner: symbol | undefined;
 
 /** Only these external HTTP/authentication ports are replaced. No resolver or owner is mocked. */
-export function inertTarget(signal?: AbortSignal) {
+export function inertTarget(
+  signal?: AbortSignal,
+  registerDisposal: (cleanup: () => Promise<void>) => void = (cleanup) => onTestFinished(cleanup),
+) {
   assert.equal(fixtureOwner, undefined, 'The previous fixture must finish disposal before another owns global ports');
   signal?.throwIfAborted();
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-inert-target-')));
@@ -699,7 +702,7 @@ export function inertTarget(signal?: AbortSignal) {
       })();
       return disposal;
     };
-    onTestFinished(() => dispose(undefined));
+    registerDisposal(() => dispose(undefined));
     return {
       signal: fixtureSignal,
       base,
