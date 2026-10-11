@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -110,8 +111,11 @@ function git(root: string, ...args: string[]): string {
     },
   ).trim();
 }
-async function fixture(run: (f: Awaited<ReturnType<typeof createFixture>>) => Promise<void>) {
-  const f = createFixture();
+async function fixture(
+  run: (f: Awaited<ReturnType<typeof createFixture>>) => Promise<void>,
+  trackedChildResult = false,
+) {
+  const f = createFixture(trackedChildResult);
   try {
     await run(f);
   } finally {
@@ -128,7 +132,7 @@ async function fixture(run: (f: Awaited<ReturnType<typeof createFixture>>) => Pr
     assert.equal(existsSync(f.directory), false);
   }
 }
-function createFixture() {
+function createFixture(trackedChildResult = false) {
   native.comments.clear();
   native.reviewer = 'reviewer[bot]';
   native.fault = '';
@@ -139,6 +143,14 @@ function createFixture() {
   git(root, 'init', '--initial-branch=main');
   writeFileSync(join(root, '.gitignore'), '.worktrees/\n.issue-cli/\nignored/\n');
   writeFileSync(join(root, 'source.txt'), 'unchanged fictional source\n');
+  if (trackedChildResult) {
+    mkdirSync(join(root, '..notes'));
+    writeFileSync(
+      join(root, '..notes', 'result.txt'),
+      'Fictional independently reviewed investigation: no change needed; all producers stopped.\n',
+      { mode: 0o600 },
+    );
+  }
   git(root, 'add', '.');
   git(root, 'commit', '-m', 'Fictional initial source');
   git(root, 'remote', 'add', 'origin', 'https://github.com/example/widget.git');
@@ -230,12 +242,13 @@ function createFixture() {
       },
     },
   } as unknown as DeliveryContext;
-  const resultPath = join(directory, 'durable-result.txt');
+  const resultPath = trackedChildResult ? join(target, '..notes', 'result.txt') : join(directory, 'durable-result.txt');
   writeFileSync(
     resultPath,
     'Fictional independently reviewed investigation: no change needed; all producers stopped.\n',
     { mode: 0o600 },
   );
+  if (trackedChildResult) chmodSync(resultPath, 0o600);
   const registry = () =>
     JSON.parse(readFileSync(join(root, '.issue-cli', 'worktrees.json'), 'utf8')) as { worktrees: unknown[] };
   const prepare = async () =>
@@ -522,6 +535,32 @@ test('result inside worktree is preserved and refused before removal', async () 
     await assert.rejects(f.finish({ resultPath: path }), /outside/u);
     assert.equal(readFileSync(path, 'utf8'), 'retain');
   }));
+test('a clean tracked result under a ..-prefixed child is not external durable evidence', async () =>
+  fixture(async (f) => {
+    assert.equal(git(f.target, 'status', '--porcelain', '--untracked-files=all'), '');
+    assert.match(git(f.target, 'ls-tree', f.head, '--', '..notes/result.txt'), /^100644 blob /u);
+    assert.equal(lstatSync(f.resultPath).mode & 0o777, 0o600);
+    const p = await f.prepare();
+    assert.equal(p.head.sha, f.head);
+    f.accept(p);
+    const bytes = readFileSync(f.resultPath);
+    const registry = readFileSync(join(f.root, '.issue-cli', 'worktrees.json'));
+    const comments = [...native.comments.entries()];
+    const authority = vi.spyOn(f.context.clients.rest.issues, 'get');
+    try {
+      await assert.rejects(f.finish(), /canonical and outside/u);
+      assert.equal(authority.mock.calls.length, 0);
+    } finally {
+      authority.mockRestore();
+    }
+    assert(readFileSync(f.resultPath).equals(bytes));
+    assert(existsSync(f.target));
+    assert(existsSync(p.physical.gitDirectory));
+    assert(readFileSync(join(f.root, '.issue-cli', 'worktrees.json')).equals(registry));
+    assert.deepEqual([...native.comments.entries()], comments);
+    assert.equal(existsSync(join(f.evidence, 'intent.json')), false);
+    assert.equal(git(f.target, 'status', '--porcelain', '--untracked-files=all'), '');
+  }, true));
 test('registration requires exact canonical path and authoritative initial default head', async () =>
   fixture(async (f) => {
     await assert.rejects(
@@ -581,6 +620,29 @@ test('an explicit repo-root cannot hide the physical current worktree', async ()
       process.chdir(original);
     }
     assert(existsSync(f.target));
+    assert.equal(existsSync(join(f.evidence, 'intent.json')), false);
+  }));
+test('an explicit repo-root cannot hide an empty ..-prefixed physical current-worktree child', async () =>
+  fixture(async (f) => {
+    const p = await f.prepare();
+    f.accept(p);
+    const directory = join(f.target, '..notes');
+    mkdirSync(directory);
+    assert.equal(readdirSync(directory).length, 0);
+    assert.equal(git(f.target, 'status', '--porcelain', '--untracked-files=all'), '');
+    assert.equal(f.context.root, f.root);
+    const registry = readFileSync(join(f.root, '.issue-cli', 'worktrees.json'));
+    const original = process.cwd();
+    try {
+      process.chdir(directory);
+      await assert.rejects(f.finish(), /current worktree/u);
+    } finally {
+      process.chdir(original);
+    }
+    assert(existsSync(directory));
+    assert(existsSync(f.target));
+    assert(existsSync(p.physical.gitDirectory));
+    assert(readFileSync(join(f.root, '.issue-cli', 'worktrees.json')).equals(registry));
     assert.equal(existsSync(join(f.evidence, 'intent.json')), false);
   }));
 test('primary worktree registration is refused without touching its source', async () =>
