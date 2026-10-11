@@ -116,6 +116,10 @@ repository access and visible rules. Authentication/discovery failure can leave
 both identity and repository access unverified; a generic failure is not a
 permission diagnosis. Raw errors, upstream bodies/headers and private-key paths
 are withheld. Rule visibility or App permissions never imply counted approval.
+The authentication probe supervises the selected CLI and its children. Its
+30-second timeout and host cancellation await owned-process cleanup while
+keeping captured output private. If cleanup cannot be confirmed, the result is
+`probe_cleanup_unverified` and authentication remains unverified.
 The machine author diagnostic includes its safe route/resolved executable. It
 does not expose a token or claim a missing variable became present.
 The invocation context is `selected_runtime_cli`, and native GUI propagation

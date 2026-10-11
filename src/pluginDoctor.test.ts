@@ -88,7 +88,7 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
 }));
 vi.mock('./verification.js', async (original) => ({
   ...(await original<typeof import('./verification.js')>()),
-  runStageCommand: (
+  runStageCommand: async (
     _root: string,
     args: string[],
     _signal: AbortSignal,
@@ -96,9 +96,36 @@ vi.mock('./verification.js', async (original) => ({
     _b: unknown,
     _c: unknown,
     _d: unknown,
-    _e: unknown,
-    options: { environment: Record<string, string | undefined> },
+    writer: { idle(): void } | undefined,
+    options: {
+      environment: Record<string, string | undefined>;
+      cwd?: string;
+      maxCapturedOutputBytes?: number;
+      failedOutput?(bytes: Buffer): string;
+    },
   ) => {
+    if (args[0] === process.execPath) {
+      const { execFile } = await import('node:child_process');
+      return new Promise<Buffer>((resolve, reject) => {
+        execFile(
+          process.execPath,
+          args.slice(1),
+          {
+            env: options.environment,
+            cwd: options.cwd ?? _root,
+            maxBuffer: options.maxCapturedOutputBytes ?? 1024 * 1024,
+            encoding: 'utf8',
+          },
+          (error, stdout, stderr) => {
+            writer?.idle();
+            if (error) {
+              options.failedOutput?.(Buffer.from(stdout + stderr));
+              reject(new Error('Synthetic selected CLI failed; output withheld.'));
+            } else resolve(Buffer.from(stdout));
+          },
+        );
+      });
+    }
     fixture.commands.push({ args, environment: options.environment });
     assert.deepEqual(
       args,
@@ -180,7 +207,7 @@ vi.mock('node:child_process', async (original) => ({
     }
     assert.equal(binary, process.execPath);
     assert.deepEqual(args, [join(fixture.root, 'runtime/dist/cli.js'), '--repo', args[2], 'config:resolve']);
-    assert.equal(options.timeout, 30000);
+    assert.equal(options.timeout, undefined);
     assert.equal(options.maxBuffer, 1024 * 1024);
     const forwarded = Object.keys(options.env).sort();
     assert.deepEqual(

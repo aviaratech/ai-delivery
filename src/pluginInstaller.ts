@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
 import {
   existsSync,
   closeSync,
@@ -23,6 +22,7 @@ import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from '@modelcontextp
 import { z } from 'zod';
 
 import { loadDeliverySettings, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
+import { captureAuthenticationProbe } from './pluginAuthProbe.js';
 import { assertSupportedAuthorHost, machineAuthorEligible, MACHINE_AUTH_ENV_NAMES } from './github/machineAuth.js';
 import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 import { withLock } from './utils/lockfile.js';
@@ -152,6 +152,7 @@ export interface PluginAuthProbe {
     | 'authentication_failed'
     | 'repository_denied'
     | 'probe_failed'
+    | 'probe_cleanup_unverified'
     | 'invalid_readback';
 }
 
@@ -261,30 +262,28 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     return;
   }
   probe.processReferences.status = 'complete';
-  // Capture only in bounded memory. Never send authentication stdout/stderr to
-  // the installer stage logger, argv, a file, or the caller. The selected CLI
-  // owns settings, contextFor, discovery and preflightReviewRoute.
-  const captured = await new Promise<{ failed: boolean; stdout: string; stderr: string }>((finish) => {
-    execFile(
-      process.execPath,
-      [join(root, 'runtime/dist/cli.js'), '--repo', input.repo!, 'config:resolve'],
-      {
-        cwd: input.repoRoot,
-        env,
-        encoding: 'utf8',
-        maxBuffer: 1024 * 1024,
-        timeout: 30000,
-      },
-      (error, stdout, stderr) => finish({ failed: error !== null, stdout, stderr }),
-    );
-  });
+  // Supervise the selected CLI and its descendants with the existing owned
+  // process runner. Timeout and host cancellation await identity-checked
+  // cleanup; authentication output stays in bounded memory, never a stage log.
+  const captured = await captureAuthenticationProbe(
+    input.repoRoot,
+    [process.execPath, join(root, 'runtime/dist/cli.js'), '--repo', input.repo!, 'config:resolve'],
+    env,
+  );
+  if (!captured.cleanupConfirmed) {
+    probe.outcome = 'failed';
+    probe.authentication.status = 'unverified';
+    probe.repositoryAccess.status = 'unverified';
+    probe.reason = 'probe_cleanup_unverified';
+    return;
+  }
   if (captured.failed) {
     probe.outcome = 'failed';
     probe.authentication.status = 'unverified';
     probe.repositoryAccess.status = 'unverified';
     // REST request logging can precede the CLI-owned final diagnostic. Classify
     // only that exact final line; all surrounding opaque output stays withheld.
-    const diagnostic = captured.stderr.trimEnd().split(/\r?\n/u).at(-1);
+    const diagnostic = captured.diagnostic;
     if (
       diagnostic ===
         'ai-delivery: Configured personal author token is invalid or expired; refresh the selected token.' ||
