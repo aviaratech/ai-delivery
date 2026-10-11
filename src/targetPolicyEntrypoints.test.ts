@@ -196,13 +196,32 @@ for (const kind of ['tracked', 'edited'] as const satisfies readonly EntrypointP
           assert.ok(existsSync(request.report), 'Missing complete child observation');
           const observation: unknown = JSON.parse(readFileSync(request.report, 'utf8'));
           assert.ok(observation && typeof observation === 'object' && !Array.isArray(observation));
+          assert.ok('pid' in observation && typeof observation.pid === 'number');
+          assert.ok('mode' in observation && typeof observation.mode === 'string');
+          assert.ok('calls' in observation && Array.isArray(observation.calls));
+          const calls = observation.calls.map((call: unknown) => {
+            assert.ok(call && typeof call === 'object' && 'name' in call && typeof call.name === 'string');
+            assert.ok('input' in call);
+            return { name: call.name, input: call.input };
+          });
+          assert.ok(
+            'interpreter' in observation && observation.interpreter && typeof observation.interpreter === 'object',
+          );
+          const interpreter = observation.interpreter;
+          assert.ok('version' in interpreter && typeof interpreter.version === 'string');
+          assert.ok('executable' in interpreter && typeof interpreter.executable === 'string');
+          assert.ok('fixtureDriver' in observation && typeof observation.fixtureDriver === 'string');
           const value: unknown = request.mode === 'control' ? null : JSON.parse(stdout);
           assert.ok(value === null || (typeof value === 'object' && !Array.isArray(value)));
           return {
-            ...observation,
-            value,
+            pid: observation.pid,
+            mode: observation.mode,
+            calls,
+            interpreter: { version: interpreter.version, executable: interpreter.executable },
+            fixtureDriver: observation.fixtureDriver,
+            value: value as Record<string, unknown> | null,
             entrypointOutputBytes: Buffer.byteLength(stdout),
-          } as Observation;
+          };
         };
         for (const [index, bytes] of (kind === 'tracked' ? [f.tracked] : [f.tracked, f.selected]).entries()) {
           writeFileSync(f.policy, bytes);
