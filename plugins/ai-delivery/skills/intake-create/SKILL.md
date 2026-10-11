@@ -1,49 +1,64 @@
 ---
-name: "ai-delivery:intake-create"
-description: Create or inspect a GitHub tracking issue and check whether it is ready for development.
+name: 'ai-delivery:intake-create'
+description: Create or inspect a native GitHub issue validated by the ai-delivery.issue@1 contract.
 ---
 
 # Issue intake
 
-Use the native GitHub issue as the source of truth for its details and relationships. Keep one current contract in its title and body: the problem and evidence, outcome, scope, concise necessary non-goals, acceptance criteria, and relevant verification. Each criterion should name a result an owner or reviewer can observe and the proof that will demonstrate it. A generic "done", "verified", or "reviewed" checkbox, or an unrelated executable command, is insufficient even when `issue_ready_check` reports ready. That check establishes structural readiness; the owner and reviewer still assess whether the criteria and proof establish the requested outcome.
+Use the complete native GitHub issue and its live relationships as the current contract. Select the intended repository explicitly and use its configured author identity; Git commit authors are not authentication. Inspect the current title, body, Issue Type, Points, Project status, parent and blockers before updating an existing issue. Preserve every agreed requirement and original history when correcting intake.
 
-When an authorized requirement changes, use `issue_update` to revise the current outcome, scope, criteria, and verification in place. Retire conflicting requirements from the active body, retain the reason for the change in native issue history or a comment, and update actual parent, child, or blocked-by relationships if the revision changes dependencies. Read the issue back before development to confirm the contract and relationships agree. Open a fresh ticket and owner context only when the objective has materially changed or inherited context obstructs delivery; age, commit count, and context compaction alone do not require replacement.
+Gather the concrete problem, intended outcome, affected components/files, and portable evidence. Write each acceptance criterion as `behavior` plus `verifiedBy`: observable input/result plus the proof that establishes it. Include failure or edge behavior, and a regression test for a Bug. State at least one non-goal. Resolve `openQuestions` before proceeding. For Bugs gather ordered steps, expected and actual results, reproducibility and environment. Keep credentials and private keys out of every public field.
 
-For example, suppose a synthetic CLI issue originally required JSON as the default status output. If the authorized requirement becomes opt-in JSON while the default stays text, replace the old criterion rather than append another one. The current issue could say:
+Choose native Points from the configured values within 1–8. Split a 13-point issue into executable children. Native Issue Type and Points remain authoritative; changing relationships must preserve the intended endpoints and native Project tracking. Tracking parents and issues with open blockers cannot start autonomously.
 
-```markdown
-## Outcome
-Add opt-in JSON status output while preserving the text default.
+## Typed MCP workflow
 
-## Scope
-- `src/cli.ts`
-- `src/cli.test.ts`
+1. Call `issue_create` or `issue_update` with typed problem/outcome/acceptanceCriteria/outOfScope/openQuestions/context/bug fields, title, configured Issue Type and Points. Ready is the default. Each blocking diagnostic includes `code`, `field`, and `fixHint`: fix every reported field and retry only the rejected write. Do not retry an uncertain native mutation without authoritative readback.
+2. Use `draft: true` only for explicitly parked, incomplete work. It produces a Draft status; resolve fields and set `draft: false` to resume Ready intake. Drafts still reject secrets. Existing `park` also retains execution as a draft.
+3. Inspect the native readback and warnings. More than seven criteria, absent edge/regression/context, only machine-local evidence or a body over about 3,000 characters warn without blocking. Consider a smaller scope or better proof.
+4. Read `issue_info` and `issue_ready_check` before `issue_start`. Readiness validates the typed contract and live Points/blockers/tracking/draft state, without local path checks or a runnable-command requirement. Mentioning the Project Todo column is ordinary prose; unresolved decisions belong in `openQuestions`.
+5. Bodies use `<!-- ai-delivery:issue@1 -->` with a generated Status block and canonical field data. Update typed fields rather than editing only one generated copy. Legacy handwritten bodies convert leniently on update, preserving the complete original in history and the body, and returning the prior/canonical body diff. Missing proof is reported, never invented. Review that diff and exact native readback.
 
-## Acceptance Criteria
-- [ ] `sample-cli status --format json` emits parseable JSON with a `state` field; a CLI test parses and asserts the field.
-- [ ] `sample-cli status` still emits the documented text form; a CLI test asserts the default output.
+The Draft/Ready structural JSON Schemas ship on the existing exported `AI_DELIVERY_MCP_TOOLS` issue-create definition as `issueContract`. Zod runtime validation also enforces semantic refinements (specific wording, bug evidence and secrets); portable structural JSON Schema alone does not prove readiness.
 
-## Verification
-Run `npm test -- src/cli.test.ts` to check both commands.
+## Worked example
+
+Save this UTF-8 typed field object as `/owned/issue.json` in your task-owned directory:
+
+```json
+{
+  "title": "Reject invalid widget identifiers before persistence",
+  "issueType": "Task",
+  "points": 2,
+  "problem": "Malformed identifiers currently reach widget persistence.",
+  "outcome": "Reject malformed identifiers before any persistence call.",
+  "acceptanceCriteria": [
+    {
+      "behavior": "An invalid identifier returns a typed error without a persistence call.",
+      "verifiedBy": "A synthetic persistence regression asserts the error and zero calls."
+    }
+  ],
+  "outOfScope": ["Changing the storage engine."],
+  "openQuestions": [],
+  "context": {
+    "components": ["widget intake"],
+    "files": ["src/widget.ts"],
+    "evidence": ["A portable synthetic malformed identifier fixture."]
+  },
+  "draft": false
+}
 ```
-
-The earlier default-JSON requirement remains in issue history, not in the active criteria. "Change is verified" and `node --version` would meet neither criterion's proof, regardless of a structural ready result.
-
-## MCP tools first
-
-1. Use `issue_create` to create one coherent tracking issue with the applicable native issue metadata and relationships.
-2. Use `issue_info` to inspect a known issue and `issue_update` for authoritative metadata, relationship, or lifecycle changes.
-3. Run `issue_ready_check` before development. Resolve any reported gaps in the issue before proceeding.
-4. Continue with `issue_start` and an explicit repository when the issue is ready; prepare its worktree through the host.
 
 ## CLI fallback
 
-When MCP is unavailable, use the installed `ai-delivery` command:
+Use the installed CLI when MCP is unavailable. Substitute your configured author identity, intended repository, owned JSON path and actual issue number. Explicit CLI values override the corresponding field-file values; omitted flags preserve them. `--fields-file` accepts the same typed field patch used by MCP. These commands perform real native operations only under your already authorized lifecycle:
 
 ```bash
-ai-delivery create
-ai-delivery info --issue <number>
-ai-delivery update --issue <number> --body-file <current-issue.md>
-ai-delivery ready:check --issue <number>
-ai-delivery develop --issue <number>
+ai-delivery --identity host-author --repo example/widget create --title 'Reject invalid widget identifiers before persistence' --fields-file /owned/issue.json
+ai-delivery --identity host-author --repo example/widget info --issue 17
+ai-delivery --identity host-author --repo example/widget update --issue 17 --fields-file /owned/issue.json --preserve-history
+ai-delivery --identity host-author --repo example/widget ready:check --issue 17
+ai-delivery --identity host-author --repo example/widget start --issue 17
 ```
+
+A rejected validation writes nothing. A partial creation reports the already-created native issue; reconcile it and resume that issue rather than creating another. Do not treat a structural pass, directory publication, or draft state as independent review, merged delivery or native consumer adoption.

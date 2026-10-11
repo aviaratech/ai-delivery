@@ -6,6 +6,7 @@ import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js
 import {
   CreatedTrackingIssueError,
   createIssue,
+  canonicalIssueBody,
   commentIssue,
   issueInfo,
   listIssues,
@@ -20,7 +21,15 @@ import {
   type UpdateIssueInput,
 } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import { finishIssue, mergePr, prInfo, publishPr, submitFormalReview } from './pr.js';
+import {
+  finishInvestigation,
+  finishIssue,
+  mergePr,
+  prInfo,
+  publishPr,
+  registerInvestigation,
+  submitFormalReview,
+} from './pr.js';
 import {
   applyWorktreeTransition,
   inspectWorktreeTransition,
@@ -28,6 +37,7 @@ import {
 } from './worktreeTransition.js';
 import { stageRuntime, admitRuntime, type StageRuntimeInput, type AdmitRuntimeInput } from './setup.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
+import { IssueValidationError } from './issueContract.js';
 
 export interface ExecutionContext {
   identity?: string;
@@ -90,6 +100,7 @@ export async function startTrackedIssue(
 ) {
   let number = input.issueNumber === undefined ? undefined : requiredNumber(input, 'issueNumber');
   let created: { number: number; title: string; url: string } | undefined;
+  let createdBody: string | undefined;
   const registration = (phase: string, error: unknown) => ({
     status: 'created-not-started',
     repository: context.config.repository,
@@ -97,7 +108,13 @@ export async function startTrackedIssue(
     failure: { phase, message: error instanceof Error ? error.message : String(error) },
     safeResume: {
       tool: 'issue_start',
-      arguments: { ...input, repo: context.config.repository, issueNumber: number, resumeCreated: true },
+      arguments: {
+        ...input,
+        ...(createdBody === undefined ? {} : { body: createdBody }),
+        repo: context.config.repository,
+        issueNumber: number,
+        resumeCreated: true,
+      },
     },
   });
   if (number === undefined) {
@@ -107,6 +124,7 @@ export async function startTrackedIssue(
       title,
       body: optionalString(input, 'body') ?? optionalString(input, 'request') ?? title,
     } as unknown as CreateIssueInput;
+    tracking.body = canonicalIssueBody(tracking);
     const intent = digestValue(
       Object.fromEntries(
         Object.entries({
@@ -126,6 +144,7 @@ export async function startTrackedIssue(
     const requestKey = optionalString(input, 'requestId') ?? intent;
     const marker = `<!-- ai-delivery-start: ${digestValue({ repository: context.config.repository.toLowerCase(), requestKey })} -->`;
     tracking.body = `${tracking.body}\n\n<!-- ai-delivery-start-intent: ${intent} -->\n${marker}`;
+    createdBody = tracking.body;
     let completed = false;
     const matches: Awaited<ReturnType<typeof context.clients.rest.issues.listForRepo>>['data'] = [];
     for (let page = 1; page <= 20; page++) {
@@ -174,6 +193,8 @@ export async function startTrackedIssue(
     }
   }
   try {
+    const readiness = await readyCheck(context, number);
+    if (!readiness.ready) throw new IssueValidationError(readiness.failures);
     const branch = await startIssueBranch(context, number, optionalString(input, 'branch'));
     await journalIssueStart(context, number);
     return {
@@ -201,9 +222,16 @@ export async function executeTool(
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
     throw new DeliveryError('Tool and execution repository selectors disagree.');
+  // Ready diagnostics need no repository checkout, configuration or credential lookup.
+  if (name === 'issue_create') canonicalIssueBody(input as unknown as CreateIssueInput);
   const repo = typeof selected === 'string' ? selected : execution.repo;
   const selectedExecution = { ...execution, ...(repo === undefined ? {} : { repo }) };
-  const local = name === 'runtime_stage' || name === 'runtime_admit' || name.startsWith('issue_worktree_transition_');
+  const local =
+    name === 'runtime_stage' ||
+    name === 'runtime_admit' ||
+    name.startsWith('issue_worktree_transition_') ||
+    (name === 'issue_start' && input.investigationWorktree !== undefined) ||
+    (name === 'issue_finish' && input.investigation === true);
   let root = execution.repoRoot;
   if (local) {
     const settings = await loadDeliverySettings();
@@ -240,6 +268,12 @@ export async function executeTool(
     case 'issue_create':
       return createIssue(context, input as unknown as CreateIssueInput);
     case 'issue_start':
+      if (input.investigationWorktree !== undefined)
+        return registerInvestigation(context, {
+          issueNumber: requiredNumber(input, 'issueNumber'),
+          investigationWorktree: requireString(input, 'investigationWorktree'),
+          expectedHeadSha: requireString(input, 'expectedHeadSha'),
+        });
       return startTrackedIssue(context, input);
     case 'issue_update':
       return updateIssue(context, input as unknown as UpdateIssueInput);
@@ -273,6 +307,18 @@ export async function executeTool(
       });
     case 'issue_pr_merge':
     case 'issue_finish': {
+      if (name === 'issue_finish' && input.investigation === true)
+        return finishInvestigation(context, {
+          issueNumber: requiredNumber(input, 'issueNumber'),
+          resultPath: requireString(input, 'resultPath'),
+          ...(input.authorityCommentId === undefined
+            ? {}
+            : { authorityCommentId: requiredNumber(input, 'authorityCommentId') }),
+          ...(input.acceptanceCommentId === undefined
+            ? {}
+            : { acceptanceCommentId: requiredNumber(input, 'acceptanceCommentId') }),
+          dryRun: input.dryRun === true,
+        });
       const merge = {
         issueNumber: requiredNumber(input, 'issueNumber'),
         ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),

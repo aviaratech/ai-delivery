@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { afterEach, it, vi } from 'vitest';
 import * as issue from './issue.js';
 import { startTrackedIssue } from './dispatch.js';
+import { IssueFields, renderIssueBody, parseIssueBody } from './issueContract.js';
 
 afterEach(() => vi.restoreAllMocks());
 it('recovers an unknown issue-create outcome by its remote request marker without another issue', async () => {
@@ -30,16 +31,41 @@ it('recovers an unknown issue-create outcome by its remote request marker withou
     reused: true,
   });
   vi.spyOn(issue, 'journalIssueStart').mockResolvedValue({} as Awaited<ReturnType<typeof issue.journalIssueStart>>);
-  await assert.rejects(
-    startTrackedIssue(context, { title: 'Improve widget', requestId: 'request-17' }),
-    /Lost create response/u,
-  );
-  const result = await startTrackedIssue(context, { title: 'Improve widget', requestId: 'request-17' });
+  vi.spyOn(issue, 'readyCheck').mockResolvedValue({ ready: true, failures: [], warnings: [] });
+  const request = {
+    title: 'Recover widget creation after a lost response',
+    requestId: 'request-17',
+    points: 2,
+    body: renderIssueBody(
+      IssueFields.parse({
+        title: 'Recover widget creation after a lost response',
+        points: 2,
+        problem: 'A lost create response can duplicate the tracked widget issue.',
+        outcome: 'Recover the original widget issue using its remote request marker.',
+        acceptanceCriteria: [
+          {
+            behavior: 'Retry reuses issue 17 with one create call.',
+            verifiedBy: 'Remote marker and mutation-count assertions.',
+          },
+        ],
+        outOfScope: ['Live GitHub access.'],
+      }),
+    ),
+  };
+  await assert.rejects(startTrackedIssue(context, request), /Lost create response/u);
+  const result = await startTrackedIssue(context, request);
   assert.ok('issueNumber' in result);
   assert.equal(result.issueNumber, 17);
   assert.equal(create.mock.calls.length, 1);
   await assert.rejects(
-    startTrackedIssue(context, { title: 'Conflicting intent', requestId: 'request-17' }),
+    startTrackedIssue(context, {
+      ...request,
+      title: 'Conflicting intent',
+      body: renderIssueBody({
+        ...parseIssueBody(request.body, { title: request.title, points: request.points }).issue,
+        title: 'Conflicting intent',
+      }),
+    }),
     /conflict/u,
   );
   assert.equal(create.mock.calls.length, 1);

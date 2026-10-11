@@ -33,6 +33,20 @@ import {
 import { type RepoCoordinates } from './github/repo.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
 import { JournalInputSchema, renderJournal, type JournalInput } from './issueJournal.js';
+import {
+  IssueFields,
+  IssueWriteFields,
+  parseIssueBody,
+  requireIssue,
+  renderIssueBody,
+  issueWarnings,
+  issueBodyDiff,
+  issueStartFooter,
+  validateIssue,
+  IssueValidationError,
+  type IssueFieldsInput,
+  type IssueDiagnostic,
+} from './issueContract.js';
 
 export interface IssueCommentReadback {
   commentId: number;
@@ -209,16 +223,74 @@ async function labels(context: DeliveryContext, input: readonly string[] | undef
   throw new DeliveryError('Repository label listing exceeds the bounded readback window.');
 }
 
-export interface CreateIssueInput {
+export interface CreateIssueInput extends Partial<IssueFieldsInput> {
   blockedBy?: number[];
   body?: string;
-  issueType?: string;
+  issueType?: string | undefined;
   labels?: string[];
   milestone?: number;
   parentIssueNumber?: number;
-  points?: number;
+  points?: number | undefined;
   priority?: string;
   title: string;
+}
+
+function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; park?: true }, current?: IssueInfo) {
+  const title = input.title ?? current?.title ?? '';
+  const source = input.body ?? current?.body;
+  const prior = current?.body ?? source;
+  const currentParsed =
+    current === undefined
+      ? undefined
+      : parseIssueBody(current.body, {
+          title: current.title,
+          ...(current.points === undefined ? {} : { points: current.points }),
+          ...(current.issueType === null ? {} : { issueType: current.issueType }),
+        });
+  const currentLegacy = currentParsed?.legacy === true;
+  const points = input.points ?? current?.points;
+  const issueType = input.issueType ?? current?.issueType ?? undefined;
+  const metadata = {
+    title: input.body === undefined && current ? current.title : title,
+    ...(points === undefined ? {} : { points }),
+    ...(issueType === undefined ? {} : { issueType }),
+  };
+  const parsed =
+    source === undefined ? { issue: IssueFields.parse({ title }), legacy: false } : parseIssueBody(source, metadata);
+  let legacyBody = currentParsed?.issue.legacyBody ?? parsed.issue.legacyBody;
+  if (
+    parsed.issue.legacyBody !== undefined &&
+    legacyBody !== undefined &&
+    !legacyBody.includes(parsed.issue.legacyBody)
+  )
+    legacyBody += '\n\n' + parsed.issue.legacyBody;
+  const fields = Object.fromEntries(
+    Object.keys(IssueWriteFields).flatMap((key) => {
+      const value = input[key as keyof IssueFieldsInput];
+      return value === undefined ? [] : [[key, value]];
+    }),
+  );
+  const issue = requireIssue({
+    ...parsed.issue,
+    ...metadata,
+    ...fields,
+    title,
+    ...(legacyBody === undefined ? {} : { legacyBody }),
+    ...(input.park ? { draft: true } : {}),
+  });
+  const body = renderIssueBody(issue) + (source === undefined || parsed.legacy ? '' : issueStartFooter(source));
+  return {
+    issue,
+    body,
+    warnings: issueWarnings(issue),
+    ...((currentLegacy || parsed.legacy) && prior !== undefined
+      ? { conversion: { priorBody: prior, canonicalBody: body, diff: issueBodyDiff(prior, body) } }
+      : {}),
+  };
+}
+/** The normal start route computes its retry intent from the same accepted canonical write. */
+export function canonicalIssueBody(input: CreateIssueInput): string {
+  return prepareIssueWrite(input).body;
 }
 
 export class CreatedTrackingIssueError extends DeliveryError {
@@ -239,7 +311,17 @@ export async function createIssue(
   body: string;
   created: { number: number; title: string; url: string };
   routing?: LoadedDeliveryConfig['routing'];
+  warnings: IssueDiagnostic[];
 }> {
+  if (context.clients.role !== 'author') throw new DeliveryError('Issue writes require the configured author role.');
+  const prepared = prepareIssueWrite(input);
+  input = {
+    ...input,
+    title: prepared.issue.title,
+    body: prepared.body,
+    ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
+    ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
+  };
   if (!input.title.trim()) throw new DeliveryError('Issue title is required.');
   if (input.issueType !== undefined && !context.config.native.issueTypes.includes(input.issueType)) {
     throw new DeliveryError('Unsupported configured Issue Type.');
@@ -268,6 +350,17 @@ export async function createIssue(
   });
   const issueNumber = created.data.number;
   try {
+    if (
+      created.data.title !== input.title ||
+      (created.data.body ?? '') !== input.body ||
+      !Number.isSafeInteger(issueNumber) ||
+      issueNumber <= 0 ||
+      new URL(created.data.html_url).pathname.toLowerCase() !==
+        `/${repo.owner}/${repo.repo}/issues/${String(issueNumber)}`.toLowerCase()
+    )
+      throw new DeliveryError(
+        'Created issue content or repository identity readback disagrees; reconcile this existing issue before retrying.',
+      );
     if (input.points !== undefined || input.priority !== undefined)
       await setConfiguredNativeIssueMetadata({
         issueNumber,
@@ -314,6 +407,14 @@ export async function createIssue(
       settings: projectSettingsFromDeliveryConfig(config),
       status: targets.unresolvedBlockers.length > 0 ? 'Blocked' : 'Todo',
     });
+    const readback = await issueInfo(context, issueNumber);
+    if (
+      readback.title !== input.title ||
+      readback.body !== input.body ||
+      (input.points !== undefined && readback.points !== input.points) ||
+      (input.issueType !== undefined && readback.issueType !== input.issueType)
+    )
+      throw new DeliveryError('Created issue native content or metadata readback disagrees; resume this known issue.');
   } catch (error) {
     throw new CreatedTrackingIssueError(
       { number: issueNumber, title: created.data.title, url: created.data.html_url },
@@ -324,6 +425,7 @@ export async function createIssue(
     ...(context.configuration ? { routing: context.configuration.routing } : {}),
     body: created.data.body ?? input.body ?? '',
     created: { number: issueNumber, title: created.data.title, url: created.data.html_url },
+    warnings: prepared.warnings,
   };
 }
 
@@ -652,16 +754,16 @@ export async function readIssueClosure(context: DeliveryContext, issueNumber: nu
   };
 }
 
-export interface UpdateIssueInput {
+export interface UpdateIssueInput extends Partial<IssueFieldsInput> {
   blockedBy?: number[];
   body?: string;
   issueNumber: number;
-  issueType?: string;
+  issueType?: string | undefined;
   labels?: string[];
   milestone?: number | null;
   parentIssueNumber?: number | null;
   park?: true;
-  points?: number;
+  points?: number | undefined;
   priority?: string;
   state?: 'open' | 'closed';
   preserveHistory?: boolean;
@@ -671,11 +773,14 @@ export interface UpdateIssueInput {
 }
 
 export interface UpdateIssueResult extends IssueInfo {
+  warnings: IssueDiagnostic[];
+  conversion?: { priorBody: string; canonicalBody: string; diff: string };
   historyComment?: IssueCommentReadback;
   closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
 }
 
 export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
+  if (context.clients.role !== 'author') throw new DeliveryError('Issue writes require the configured author role.');
   if (
     (input.closeReason !== undefined && !['completed', 'not_planned', 'duplicate'].includes(input.closeReason)) ||
     ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
@@ -687,6 +792,17 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
   )
     throw new DeliveryError('A superseding issue must be a different positive issue number.');
   const { clients, config, repo } = context;
+  const currentContent = await issueInfo(context, input.issueNumber);
+  const prepared = prepareIssueWrite(input, currentContent);
+  input = {
+    ...input,
+    title: prepared.issue.title,
+    body: prepared.body,
+    ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
+    ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
+    ...(prepared.conversion === undefined ? {} : { preserveHistory: true }),
+    ...(prepared.issue.draft ? { park: true } : {}),
+  };
   const acceptedLabels = input.labels === undefined ? undefined : await labels(context, input.labels);
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
     throw new DeliveryError('Unsupported configured Issue Type.');
@@ -767,6 +883,8 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
       (input.body !== undefined && input.body !== prior.body)
     ) {
       const body = renderIssueHistory(prior.title, prior.body);
+      const publicHistory = validateIssue({ title: prior.title, legacyBody: prior.body, draft: true }, false);
+      if (publicHistory.failures.length) throw new IssueValidationError(publicHistory.failures);
       if (body.length > ISSUE_COMMENT_BODY_LIMIT)
         throw new DeliveryError(
           'Complete issue history exceeds the supported comment body limit; issue was not rewritten.',
@@ -872,14 +990,17 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
   });
   const readback = await issueInfo(context, input.issueNumber);
   if (
-    (input.preserveHistory === true || closeReason !== undefined) &&
-    ((input.title !== undefined && readback.title !== input.title) ||
-      (input.body !== undefined && readback.body !== input.body) ||
-      (input.state !== undefined && readback.state !== input.state))
+    (input.title !== undefined && readback.title !== input.title) ||
+    (input.body !== undefined && readback.body !== input.body) ||
+    (input.state !== undefined && readback.state !== input.state) ||
+    (input.points !== undefined && readback.points !== input.points) ||
+    (input.issueType !== undefined && readback.issueType !== input.issueType)
   )
     throw new DeliveryError('Issue update readback disagrees with the requested content or state.');
   return {
     ...readback,
+    warnings: prepared.warnings,
+    ...(prepared.conversion === undefined ? {} : { conversion: prepared.conversion }),
     ...(historyComment === undefined ? {} : { historyComment }),
     ...(closure === undefined || closureComment === undefined
       ? {}
@@ -967,6 +1088,7 @@ export async function readyCheck(context: DeliveryContext, issueNumber: number):
     ...(info.points === undefined ? {} : { points: info.points }),
     repoRoot: undefined,
     title: info.title,
+    ...(info.issueType === null ? {} : { issueType: info.issueType }),
     trackingParent,
   });
 }

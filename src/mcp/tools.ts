@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { JournalInputSchema } from '../issueJournal.js';
+import { IssueFields, IssueWriteFields, ISSUE_JSON_SCHEMAS, issueInputSchema } from '../issueContract.js';
 
 const Positive = z.number().int().positive();
 const Labels = z.array(z.string().trim().min(1));
@@ -23,6 +24,47 @@ const Tracking = {
     .optional(),
   title: z.string().trim().min(1).max(256),
 };
+const InvestigationStart = z.strictObject({
+  repo: Repo,
+  issueNumber: Positive,
+  investigationWorktree: z.string().min(1),
+  expectedHeadSha: z.string().regex(/^[a-f0-9]{40}$/u),
+});
+const NormalStart = z.strictObject({
+  ...Tracking,
+  title: Tracking.title.optional(),
+  issueNumber: Positive.optional(),
+  request: z.string().min(1).optional(),
+  requestId: z.string().trim().min(1).max(256).optional(),
+  resumeCreated: z.boolean().optional(),
+  branch: z.string().min(1).optional(),
+});
+const NormalFinish = z.strictObject({
+  repo: Repo,
+  issueNumber: Positive,
+  prNumber: Positive,
+  nonClosing: z.boolean().optional(),
+  reviewedHeadSha: z
+    .string()
+    .regex(/^[a-f0-9]{40}$/u)
+    .optional(),
+  strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
+  dryRun: z.boolean().optional(),
+});
+const InvestigationFinish = z.strictObject({
+  repo: Repo,
+  issueNumber: Positive,
+  investigation: z.literal(true),
+  resultPath: z.string().min(1),
+  authorityCommentId: Positive.optional(),
+  acceptanceCommentId: Positive.optional(),
+  dryRun: z.boolean().optional(),
+});
+
+function validateMode(schema: z.ZodType, input: unknown, context: z.RefinementCtx): void {
+  const result = schema.safeParse(input);
+  if (!result.success) context.addIssue({ code: 'custom', message: result.error.message });
+}
 
 const IssueListing = {
   repo: Repo,
@@ -117,27 +159,25 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_create',
     commandName: 'create',
     description: 'Create a native GitHub tracking issue with configured metadata and relationships',
-    inputSchema: z.strictObject(Tracking),
+    issueContract: ISSUE_JSON_SCHEMAS,
+    inputSchema: issueInputSchema(z.strictObject({ ...Tracking, ...IssueWriteFields, title: IssueFields.shape.title })),
   },
   {
     name: 'issue_start',
     commandName: 'start',
-    description: 'Create or resume a tracked issue and its GitHub-linked branch',
-    inputSchema: z.strictObject({
-      ...Tracking,
-      body: Tracking.body.optional(),
-      issueType: Tracking.issueType.optional(),
-      points: Tracking.points.optional(),
-      priority: Tracking.priority.optional(),
-      title: Tracking.title.optional(),
-      issueNumber: Positive.optional(),
-      request: z.string().min(1).optional(),
-      requestId: z.string().trim().min(1).max(256).optional(),
-
-      resumeCreated: z.boolean().optional(),
-
-      branch: z.string().min(1).optional(),
-    }),
+    description: 'Start a linked issue, or prospectively register an unchanged host-created investigation worktree',
+    inputSchema: NormalStart.extend({
+      investigationWorktree: z.string().optional(),
+      expectedHeadSha: z.string().optional(),
+    }).superRefine((input, context) =>
+      validateMode(
+        input.investigationWorktree !== undefined || input.expectedHeadSha !== undefined
+          ? InvestigationStart
+          : NormalStart,
+        input,
+        context,
+      ),
+    ),
   },
   {
     name: 'issue_list',
@@ -155,29 +195,37 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_update',
     commandName: 'update',
     description: 'Update native issue fields and exact relationship sets with readback',
-    inputSchema: z
-      .strictObject({
-        repo: Repo,
-        blockedBy: z.array(Positive).optional(),
-        body: z.string().optional(),
-        issueNumber: Positive,
-        issueType: z.string().min(1).optional(),
-        labels: Labels.optional(),
-        milestone: Positive.nullable().optional(),
-        parentIssueNumber: Positive.nullable().optional(),
-        park: z.literal(true).optional(),
-        points: Positive.optional(),
-        priority: z.string().min(1).optional(),
-        state: z.enum(['open', 'closed']).optional(),
-        preserveHistory: z.boolean().optional(),
-        closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
-        supersededBy: Positive.optional(),
-        title: z.string().trim().min(1).max(256).optional(),
-      })
-      .refine(
-        (input) => (input.closeReason === undefined && input.supersededBy === undefined) || input.state === 'closed',
-        'Closure details require state closed',
-      ),
+    inputSchema: issueInputSchema(
+      z
+        .strictObject({
+          ...IssueWriteFields,
+          repo: Repo,
+          blockedBy: z.array(Positive).optional(),
+          body: z.string().optional(),
+          issueNumber: Positive,
+          issueType: IssueWriteFields.issueType,
+          labels: Labels.optional(),
+          milestone: Positive.nullable().optional(),
+          parentIssueNumber: Positive.nullable().optional(),
+          park: z.literal(true).optional(),
+          points: IssueWriteFields.points,
+          priority: z.string().min(1).optional(),
+          state: z.enum(['open', 'closed']).optional(),
+          preserveHistory: z.boolean().optional(),
+          closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
+          supersededBy: Positive.optional(),
+          title: IssueWriteFields.title,
+        })
+        .superRefine((input, ctx) => {
+          if ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
+            ctx.addIssue({
+              code: 'custom',
+              path: ['state'],
+              message: 'Closure details require state closed',
+              params: { issueCode: 'closure.state' },
+            });
+        }),
+    ),
   },
   {
     name: 'issue_info',
@@ -252,19 +300,17 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_finish',
     commandName: 'finish',
-    description: 'Resume a guarded merge and close its issue after merged-PR readback',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      issueNumber: Positive,
-      prNumber: Positive,
-      nonClosing: z.boolean().optional(),
-      reviewedHeadSha: z
-        .string()
-        .regex(/^[a-f0-9]{40}$/u)
-        .optional(),
-      strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
-      dryRun: z.boolean().optional(),
-    }),
+    description:
+      'Finish merged delivery, or remove a prospectively registered unchanged investigation with native acceptance',
+    inputSchema: NormalFinish.extend({
+      prNumber: Positive.optional(),
+      investigation: z.literal(true).optional(),
+      resultPath: z.string().optional(),
+      authorityCommentId: Positive.optional(),
+      acceptanceCommentId: Positive.optional(),
+    }).superRefine((input, context) =>
+      validateMode(input.investigation === true ? InvestigationFinish : NormalFinish, input, context),
+    ),
   },
   {
     name: 'issue_worktree_transition_inspect',
