@@ -694,6 +694,18 @@ function requiredApprovalCount(value: unknown): number | null {
   return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null;
 }
 
+/** Absence is proved only by an empty successful first page with no continuation evidence. */
+function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
+  return (
+    response.status === 200 &&
+    Array.isArray(response.data) &&
+    response.data.length === 0 &&
+    response.headers !== undefined &&
+    response.headers !== null &&
+    (response.headers.link === undefined || response.headers.link === '')
+  );
+}
+
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
 export async function preflightReviewRoute(
   context: DeliveryContext,
@@ -784,6 +796,57 @@ export async function preflightReviewRoute(
     }),
   ]);
   await check();
+  let confirmedUnprotected = false;
+  const protectionError =
+    protectionResult.status === 'rejected'
+      ? (protectionResult.reason as {
+          status?: unknown;
+          response?: { status?: unknown; data?: { message?: unknown } };
+        } | null)
+      : null;
+  if (
+    rulesetResult.status === 'fulfilled' &&
+    emptyRulePage(rulesetResult.value) &&
+    protectionError?.status === 404 &&
+    protectionError.response?.status === 404 &&
+    protectionError.response.data?.message === 'Branch not protected'
+  ) {
+    // A generic/permission 404 is never absence. Corroborate the named branch,
+    // selected author's write access, and all repository/parent rulesets.
+    const parameters = { ...context.repo, ...(control === undefined ? {} : { request: { signal: control.signal } }) };
+    const [repository, branch, rulesets] = await Promise.allSettled([
+      context.clients.rest.request('GET /repos/{owner}/{repo}', parameters),
+      context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}', { ...parameters, branch: base }),
+      context.clients.rest.request('GET /repos/{owner}/{repo}/rulesets', {
+        ...parameters,
+        includes_parents: true,
+        per_page: 100,
+        page: 1,
+      }),
+    ]);
+    await check();
+    if (repository.status === 'fulfilled' && branch.status === 'fulfilled' && rulesets.status === 'fulfilled') {
+      const repoData = repository.value.data as {
+        full_name?: string;
+        permissions?: { push?: boolean; admin?: boolean };
+      } | null;
+      const branchData = branch.value.data as {
+        name?: string;
+        protected?: boolean;
+        protection?: { enabled?: boolean };
+      } | null;
+      confirmedUnprotected =
+        repository.value.status === 200 &&
+        branch.value.status === 200 &&
+        typeof repoData?.full_name === 'string' &&
+        repoData.full_name.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase() &&
+        (repoData.permissions?.push === true || repoData.permissions?.admin === true) &&
+        branchData?.name === base &&
+        branchData.protected === false &&
+        branchData.protection?.enabled === false &&
+        emptyRulePage(rulesets.value);
+    }
+  }
   const counts: number[] = [];
   if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
     for (const rule of rulesetResult.value.data) {
@@ -798,9 +861,13 @@ export async function preflightReviewRoute(
     const count = requiredApprovalCount(protection.required_pull_request_reviews);
     if (count !== null) counts.push(count);
   }
-  const visible = Number(rulesetResult.status === 'fulfilled') + Number(protectionResult.status === 'fulfilled');
+  const rulesVisible =
+    rulesetResult.status === 'fulfilled' &&
+    Array.isArray(rulesetResult.value.data) &&
+    (rulesetResult.value.headers?.link === undefined || rulesetResult.value.headers.link === '');
+  const visible = Number(rulesVisible) + Number(protectionResult.status === 'fulfilled' || confirmedUnprotected);
   const visibility = visible === 2 ? 'complete' : visible === 1 ? 'partial' : 'unknown';
-  const observedRequiredApprovals = counts.length > 0 ? Math.max(...counts) : null;
+  const observedRequiredApprovals = counts.length > 0 ? Math.max(...counts) : confirmedUnprotected ? 0 : null;
   const insufficientPermission =
     observedRequiredApprovals !== null &&
     observedRequiredApprovals > 0 &&

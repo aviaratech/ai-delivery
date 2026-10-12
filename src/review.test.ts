@@ -299,6 +299,138 @@ test('post-review readback reports exact App review push access without overridi
   assert.equal(satisfied.submittedReviewAuthorCanPushToRepository, false);
 });
 
+function unprotectedRouteFixture() {
+  const state = {
+    deniedRoute: '',
+    protectionError: { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } } as unknown,
+    rules: { status: 200, headers: {}, data: [] } as unknown,
+    rulesets: { status: 200, headers: {}, data: [] } as unknown,
+    branch: { status: 200, data: { name: 'main', protected: false, protection: { enabled: false } } } as unknown,
+    repository: {
+      status: 200,
+      data: { full_name: 'example/repo', permissions: { push: true, admin: true } },
+    } as unknown,
+  };
+  const reviewer = {
+    authSource: 'app',
+    role: 'reviewer',
+    effectiveContentsPermission: 'read',
+    appActorLogin: async () => 'reviewer-app[bot]',
+    rest: { repos: { get: async () => ({ data: { full_name: 'example/repo' } }) } },
+  };
+  const context = {
+    repo: { owner: 'example', repo: 'repo' },
+    config: { roles: { author: { authSource: 'personal', identity: 'author' }, reviewer: { identity: 'reviewer' } } },
+    clients: {
+      authSource: 'personal',
+      role: 'author',
+      authenticatedAuthor: async () => ({ actorLogin: 'host-user', credentialIdentity: 'user:37' }),
+      rest: {
+        request: async (route: string, input: Record<string, unknown>) => {
+          assert.equal(input.owner, 'example');
+          assert.equal(input.repo, 'repo');
+          if (route === state.deniedRoute) throw Object.assign(new Error('Denied'), { status: 403 });
+          if (route.endsWith('/rules/branches/{branch}')) return state.rules;
+          if (route.endsWith('/branches/{branch}/protection')) throw state.protectionError;
+          if (route.endsWith('/branches/{branch}')) {
+            assert.equal(input.branch, 'main');
+            return state.branch;
+          }
+          if (route.endsWith('/rulesets')) {
+            assert.equal(input.includes_parents, true);
+            assert.equal(input.page, 1);
+            assert.equal(input.per_page, 100);
+            return state.rulesets;
+          }
+          if (route === 'GET /repos/{owner}/{repo}') return state.repository;
+          throw new Error(`Unexpected fictional route ${route}`);
+        },
+      },
+    },
+  } as unknown as DeliveryContext;
+  return { state, read: () => preflightReviewRoute(context, 'main', reviewer as never) };
+}
+
+test('confirmed unprotected branch has complete visibility without asserting reviewer eligibility', async () => {
+  const { read } = unprotectedRouteFixture();
+  const route = await read();
+  assert.deepEqual(route.rules, { visibility: 'complete', observedRequiredApprovals: 0 });
+  assert.equal(route.approvalEligibility, 'unknown');
+  assert.equal(route.reviewer.actorLogin, 'reviewer-app[bot]');
+});
+
+for (const [name, change] of [
+  ['generic 404', { protectionError: { status: 404, response: { status: 404, data: { message: 'Not Found' } } } }],
+  [
+    'permission denial',
+    { protectionError: { status: 403, response: { status: 403, data: { message: 'Branch not protected' } } } },
+  ],
+  ['unstructured error', { protectionError: Object.assign(new Error('Branch not protected'), { status: 404 }) }],
+  [
+    'conflicting error status',
+    { protectionError: { status: 404, response: { status: 403, data: { message: 'Branch not protected' } } } },
+  ],
+  [
+    'incomplete applicable rules',
+    { rules: { status: 200, data: [], headers: { link: '<https://api.github.com/next>; rel="next"' } } },
+  ],
+  [
+    'incomplete rulesets',
+    { rulesets: { status: 200, data: [], headers: { link: '<https://api.github.com/next>; rel="next"' } } },
+  ],
+  [
+    'inherited ruleset',
+    { rulesets: { status: 200, headers: {}, data: [{ source_type: 'Organization', enforcement: 'active' }] } },
+  ],
+  [
+    'inherited active rule',
+    {
+      rules: {
+        status: 200,
+        headers: {},
+        data: [{ type: 'pull_request', parameters: { required_approving_review_count: 1 } }],
+      },
+    },
+  ],
+  ['malformed rules', { rules: { status: 200, headers: {}, data: {} } }],
+  ['malformed rulesets', { rulesets: { status: 200, headers: {}, data: null } }],
+  ['missing pagination headers', { rulesets: { status: 200, data: [] } }],
+  ['null pagination headers', { rulesets: { status: 200, headers: null, data: [] } }],
+  [
+    'malformed repository identity',
+    { repository: { status: 200, data: { full_name: 37, permissions: { push: true } } } },
+  ],
+  ['denied branch read', { deniedRoute: 'GET /repos/{owner}/{repo}/branches/{branch}' }],
+  ['denied repository read', { deniedRoute: 'GET /repos/{owner}/{repo}' }],
+  ['denied ruleset read', { deniedRoute: 'GET /repos/{owner}/{repo}/rulesets' }],
+  [
+    'no write permission',
+    { repository: { status: 200, data: { full_name: 'example/repo', permissions: { push: false, admin: false } } } },
+  ],
+  [
+    'foreign repository',
+    { repository: { status: 200, data: { full_name: 'other/repo', permissions: { admin: true } } } },
+  ],
+  [
+    'protected branch',
+    { branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } } },
+  ],
+  [
+    'enabled protection',
+    { branch: { status: 200, data: { name: 'main', protected: false, protection: { enabled: true } } } },
+  ],
+  [
+    'foreign branch',
+    { branch: { status: 200, data: { name: 'other', protected: false, protection: { enabled: false } } } },
+  ],
+] as const) {
+  test(`unprotected classification refuses ${name}`, async () => {
+    const { state, read } = unprotectedRouteFixture();
+    Object.assign(state, change);
+    assert.notEqual((await read()).rules.visibility, 'complete');
+  });
+}
+
 test('prepublication review route reports selected actors and unknown approval eligibility', async () => {
   const author = {
     authSource: 'personal',
