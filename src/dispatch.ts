@@ -114,12 +114,15 @@ export async function startTrackedIssue(
     safeResume: {
       tool: 'issue_start',
       arguments: {
-        ...input,
-        ...(createdBody === undefined ? {} : { body: createdBody }),
+        // Replay tracking only when that phase is incomplete; later recovery preserves native edits/parking.
+        ...(phase === 'tracking'
+          ? { ...input, ...(createdBody === undefined ? {} : { body: createdBody }), resumeCreated: true }
+          : {}),
         repo: context.config.repository,
         issueNumber: number,
-        resumeCreated: true,
-        ...(branch === undefined ? {} : { branch: branch.branch }),
+        ...((branch?.branch ?? optionalString(input, 'branch')) === undefined
+          ? {}
+          : { branch: branch?.branch ?? optionalString(input, 'branch') }),
       },
     },
   });

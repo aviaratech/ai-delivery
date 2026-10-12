@@ -70,7 +70,7 @@ ai-delivery --repo example/widget finish --issue 17 --pr 23 --reviewed-head <rev
 
 It can create a tracking issue first, or resume a known partially created issue with `--resume-created`; recovery returns the exact known issue and safe arguments without creating another issue.
 
-If an existing issue's branch, Project status or journal operation fails or its response is uncertain, `start-incomplete` returns the known issue, failure phase and `safeResume.arguments`; CLI exits nonzero. Retry those arguments through `issue_start` (or `start --issue <number> --branch <branch>` when returned). Recovery rechecks current readiness, linked branches, Project membership/status and the authored journal before continuing, without creating another issue, branch or journal. Newly created issues retain `created-not-started` recovery and `resumeCreated: true`.
+If an existing issue's branch, Project status or journal operation fails or its response is uncertain, `start-incomplete` returns the known issue, failure phase and `safeResume.arguments`; CLI exits nonzero. Retry those arguments through `issue_start` (or `start --issue <number> --branch <branch>` when returned). Recovery rechecks current readiness, linked branches, Project membership/status and the authored journal before continuing, without creating another issue, branch or journal. Newly created issues retain `created-not-started` recovery. Only incomplete tracking returns `resumeCreated: true` with tracking fields; later start-stage recovery selects the known issue/branch and preserves subsequent native edits and parking.
 
 Hosts own local worktree preparation and cleanup. PR creation accepts any non-empty body, appends the issue closing reference when absent, and reuses the matching remote branch/PR. Merged completion uses GitHub issue association even after branch deletion. Existing repository labels are accepted; an unknown label is refused before issue mutation.
 
@@ -363,10 +363,10 @@ original start or exact-merge closeout even after a lost response or worktree
 cleanup. Markers from another author never establish reuse. Operations from the
 same local controller serialize their comment writes; independently configured
 controllers still require one issue owner. A failed journal write/readback is
-reported and the same lifecycle call can recover it. Creation-only start failures
-return the created issue identity and `safeResume.arguments` with
-`resumeCreated: true` and `develop: false`, so recovery never creates another
-issue or starts development. Historical comments are
+reported and the same lifecycle call can recover it. Created-issue failures
+return the exact issue identity and `safeResume.arguments`. Incomplete tracking
+uses `resumeCreated: true`; later start recovery preserves the current native
+body and eligibility without replaying the original tracking fields. Historical comments are
 preserved. Generated issue Status blocks and general readability warnings are
 owned by the separate issue-contract work.
 

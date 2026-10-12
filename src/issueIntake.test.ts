@@ -575,7 +575,8 @@ test('created readiness refusal returns exact retry markers through safe resume 
   const nativeBody = f.live.body;
   assert.match(nativeBody, /ai-delivery-start-intent: sha256:[a-f0-9]{64}/u);
   assert.match(nativeBody, /ai-delivery-start: sha256:[a-f0-9]{64}/u);
-  assert.equal(interrupted.safeResume.arguments.body, nativeBody);
+  assert.equal(interrupted.safeResume.arguments.resumeCreated, undefined);
+  assert.equal('body' in interrupted.safeResume.arguments, false);
   assert.equal(f.branchWrites.length, 0);
   assert.equal(f.comments.length, 0);
   assert.equal(f.writes.filter((write) => !('issue_number' in write)).length, 1);
@@ -1005,4 +1006,74 @@ test('info and unrelated body edits never imply explicit activation', async () =
   assert.equal(f.statusWrites.length, 0);
   assert.equal(f.branchWrites.length, 0);
   assert.equal(f.comments.length, 0);
+});
+
+test.each(['project-status', 'journal'] as const)(
+  'created recovery after %s preserves a subsequent native park',
+  async (phase) => {
+    const f = fixture();
+    f.controls.created = false;
+    f.controls.projectFailure = phase === 'project-status' ? 'before' : '';
+    f.controls.journalFailure = phase === 'journal';
+    const result = await startTrackedIssue(f.context, {
+      title: ready().title,
+      body: renderIssueBody(ready()),
+      issueType: 'Task',
+      points: 2,
+      requestId: 'parked-created-' + phase,
+    });
+    if (result.status !== 'created-not-started') assert.fail('Expected known-created recovery');
+    assert.equal(result.failure.phase, phase);
+    f.controls.projectFailure = '';
+    f.controls.journalFailure = false;
+    await updateIssue(f.context, { issueNumber: 17, park: true });
+    const parkedBody = f.live.body;
+    const writesBeforeRetry = f.writes.length;
+    const statusWritesBeforeRetry = f.statusWrites.length;
+    const commentsBeforeRetry = f.comments.length;
+    const retry = await startTrackedIssue(
+      f.context,
+      getAiDeliveryMcpTool('issue_start')!.inputSchema.parse(result.safeResume.arguments),
+    ).catch((error: unknown) => {
+      assert.ok(error instanceof Error);
+      return undefined;
+    });
+    assert.equal(f.live.body, parkedBody);
+    assert.equal(parseIssueBody(f.live.body, { title: f.live.title }).issue.draft, true);
+    assert.equal(f.getStatus(), 'Queued');
+    assert.ok(retry === undefined || retry.status !== undefined, 'Parked recovery must not succeed');
+    assert.equal(f.writes.length, writesBeforeRetry);
+    assert.equal(f.statusWrites.length, statusWritesBeforeRetry);
+    assert.equal(f.comments.length, commentsBeforeRetry);
+    assert.equal(f.branchWrites.length, 1);
+  },
+);
+
+test('created post-tracking recovery preserves later ready content without replaying tracking writes', async () => {
+  const f = fixture();
+  f.controls.created = false;
+  f.controls.projectFailure = 'before';
+  const result = await startTrackedIssue(f.context, {
+    title: ready().title,
+    body: renderIssueBody(ready()),
+    issueType: 'Task',
+    points: 2,
+    requestId: 'edited-created-recovery',
+  });
+  if (result.status !== 'created-not-started') assert.fail('Expected known-created recovery');
+  f.controls.projectFailure = '';
+  await updateIssue(f.context, { issueNumber: 17, outcome: 'Deliver the revised current acceptance evidence.' });
+  const revised = f.live.body;
+  const writes = f.writes.length;
+  assert.ok(
+    'reused' in
+      (await startTrackedIssue(
+        f.context,
+        getAiDeliveryMcpTool('issue_start')!.inputSchema.parse(result.safeResume.arguments),
+      )),
+  );
+  assert.equal(f.live.body, revised);
+  assert.equal(f.writes.length, writes);
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(f.getStatus(), 'Active');
 });

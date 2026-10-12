@@ -340,8 +340,8 @@ test('failed remote branch start after parent linking preserves parseable CLI re
     assert.equal(result.failure.phase, 'branch-or-journal');
     assert.match(result.failure.message, /open GitHub issue/u);
     assert.equal(result.safeResume.arguments.issueNumber, 17);
-    assert.equal(result.safeResume.arguments.parentIssueNumber, 5);
-    assert.equal(result.safeResume.arguments.resumeCreated, true);
+    assert.equal('parentIssueNumber' in result.safeResume.arguments, false);
+    assert.equal('resumeCreated' in result.safeResume.arguments, false);
     assert.equal(output.exitCode, 1);
     assert.match(output.stderr, /Linked issue #17 as sub-issue of issue #5\./u);
   } finally {
