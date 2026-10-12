@@ -30,6 +30,7 @@ it('recovers an unknown issue-create outcome by its remote request marker withou
     headSha: 'a'.repeat(40),
     reused: true,
   });
+  vi.spyOn(issue, 'startIssueProject').mockResolvedValue({ itemId: 'ITEM17', status: 'In Progress' });
   vi.spyOn(issue, 'journalIssueStart').mockResolvedValue({} as Awaited<ReturnType<typeof issue.journalIssueStart>>);
   vi.spyOn(issue, 'readyCheck').mockResolvedValue({ ready: true, failures: [], warnings: [] });
   const request = {
