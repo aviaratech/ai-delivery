@@ -66,3 +66,26 @@ test('CLI preserves recoverable start JSON and exits nonzero after creation fail
   assert.ok(parsed !== null && typeof parsed === 'object' && 'status' in parsed);
   assert.equal(parsed.status, 'started');
 });
+
+test('CLI known-issue incomplete start preserves recovery JSON and exits nonzero', () => {
+  const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
+  const failure = {
+    status: 'start-incomplete',
+    issueNumber: 17,
+    repository: 'example/widget',
+    failure: { phase: 'project-status', message: 'Readback failed' },
+    safeResume: { tool: 'issue_start', arguments: { repo: 'example/widget', issueNumber: 17, branch: 'issue/17' } },
+  };
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { printCommandResult } from ${JSON.stringify(helper)}; printCommandResult('issue_start', ${JSON.stringify(failure)});`,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 1);
+  assert.deepEqual(JSON.parse(result.stdout), failure);
+  assert.equal(result.stderr, '');
+});

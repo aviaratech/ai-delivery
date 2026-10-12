@@ -1255,3 +1255,20 @@ export async function startIssueBranch(context: DeliveryContext, issueNumber: nu
     );
   return { issueNumber, issueUrl: issue.html_url, branch: name, headSha: base, reused: false };
 }
+
+/** Recheck native eligibility before an explicit start changes its selected Project. */
+export async function startIssueProject(context: DeliveryContext, issueNumber: number) {
+  const readiness = await readyCheck(context, issueNumber);
+  if (!readiness.ready) throw new IssueValidationError(readiness.failures);
+  const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
+  if (issue.number !== issueNumber || 'pull_request' in issue || issue.state !== 'open' || !issue.node_id)
+    throw new DeliveryError('Start requires the requested open GitHub issue before Project synchronization.');
+  return syncIssueProjectStatus({
+    graphql: context.clients.graphql,
+    issueNodeId: issue.node_id,
+    org: context.config.native.organization,
+    ...(context.projectConfiguration === undefined ? {} : { configuration: context.projectConfiguration }),
+    settings: projectSettingsFromDeliveryConfig(context.config),
+    status: 'In Progress',
+  });
+}

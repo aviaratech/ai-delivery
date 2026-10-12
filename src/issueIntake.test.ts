@@ -3,7 +3,9 @@ import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { test } from 'vitest';
+import { afterEach, test, vi } from 'vitest';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
@@ -13,6 +15,8 @@ import { digestValue } from './delivery/common.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import { IssueFields, ReadyIssue, renderIssueBody, parseIssueBody, ISSUE_BODY_MARKER } from './issueContract.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
+
+afterEach(() => vi.restoreAllMocks());
 
 const ready = () =>
   IssueFields.parse({
@@ -54,11 +58,21 @@ function fixture() {
     blockers: false,
     trackingParent: false,
     livePoints: 2,
+    projectMember: true,
+    projectArchived: false,
+    projectFailure: '' as '' | 'before' | 'after' | 'readback',
+    journalFailure: false,
+    branchFailure: false,
+    closeAfterBranch: false,
+    blockAfterBranch: false,
   };
   const branchWrites: Record<string, unknown>[] = [];
   const branches: { name: string; sha: string }[] = [];
   let points = 2;
   let status = 'Queued';
+  const statusWrites: Record<string, unknown>[] = [];
+  const membershipWrites: Record<string, unknown>[] = [];
+  const optionId = () => ({ Queued: 'TODO', Active: 'ACTIVE', Waiting: 'BLOCKED', Shipped: 'DONE' })[status];
   const values = () => [
     {
       issue_field_id: 101,
@@ -127,6 +141,7 @@ function fixture() {
               issue_url: 'https://api.github.com/repos/example/widget/issues/17',
             };
             comments.push(comment);
+            if (controls.journalFailure) throw new Error('Lost journal response');
             return { data: comment };
           },
           getComment: async (input: { comment_id: number }) => {
@@ -186,6 +201,9 @@ function fixture() {
           const fields = input.input as Record<string, unknown>;
           branchWrites.push(fields);
           branches.push({ name: String(fields.name), sha: String(fields.oid) });
+          if (controls.closeAfterBranch) live.state = 'closed';
+          if (controls.blockAfterBranch) controls.blockers = true;
+          if (controls.branchFailure) throw new Error('Lost branch response');
           return { createLinkedBranch: { linkedBranch: { ref: { name: fields.name, target: { oid: fields.oid } } } } };
         }
         if (query.includes('blockedBy(first:'))
@@ -217,19 +235,44 @@ function fixture() {
                 items: {
                   nodes: [
                     {
-                      id: 'ITEM17',
+                      id: 'OTHER',
                       isArchived: false,
-                      content: { id: 'ISSUE17' },
-                      fieldValueByName: { name: status, optionId: status === 'Queued' ? 'TODO' : 'ACTIVE' },
+                      content: { id: 'OTHER-ISSUE' },
+                      fieldValueByName: { name: 'Queued', optionId: 'TODO' },
                     },
+                    ...(controls.projectMember
+                      ? [
+                          {
+                            id: 'ITEM17',
+                            isArchived: controls.projectArchived,
+                            content: { id: 'ISSUE17' },
+                            fieldValueByName: { name: status, optionId: optionId() },
+                          },
+                        ]
+                      : []),
                   ],
                   pageInfo: { hasNextPage: false, endCursor: null },
                 },
               },
             },
           };
+        if (query.includes('AddProjectDeliveryItem')) {
+          membershipWrites.push(input);
+          assert.equal(input.projectId, 'PROJECT');
+          assert.equal(input.contentId, 'ISSUE17');
+          controls.projectMember = true;
+          return { addProjectV2ItemById: { item: { id: 'ITEM17' } } };
+        }
         if (query.includes('UpdateProjectDeliveryStatus')) {
+          statusWrites.push(input);
+          assert.equal(input.projectId, 'PROJECT');
+          assert.equal(input.itemId, 'ITEM17');
+          assert.equal(input.fieldId, 'STATUS');
+          if (input.optionId === 'ACTIVE' && controls.projectFailure === 'before')
+            throw new Error('Project write failed');
           status = input.optionId === 'TODO' ? 'Queued' : input.optionId === 'DONE' ? 'Shipped' : 'Active';
+          if (input.optionId === 'ACTIVE' && controls.projectFailure === 'after')
+            throw new Error('Lost Project response');
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
         }
         if (query.includes('ProjectDeliveryItemReadback'))
@@ -238,15 +281,31 @@ function fixture() {
               id: 'ITEM17',
               isArchived: false,
               project: { id: 'PROJECT', number: 1 },
-              content: { id: 'ISSUE17' },
-              fieldValueByName: { name: status, optionId: status === 'Queued' ? 'TODO' : 'ACTIVE' },
+              content: {
+                id: status === 'Active' && controls.projectFailure === 'readback' ? 'OTHER-ISSUE' : 'ISSUE17',
+              },
+              fieldValueByName: { name: status, optionId: optionId() },
             },
           };
         throw new Error('Unexpected native query ' + query);
       },
     },
   } as unknown as DeliveryContext;
-  return { context, live, writes, comments, controls, branchWrites, getStatus: () => status };
+  return {
+    context,
+    live,
+    writes,
+    comments,
+    controls,
+    branches,
+    branchWrites,
+    statusWrites,
+    membershipWrites,
+    getStatus: () => status,
+    setStatus: (value: string) => {
+      status = value;
+    },
+  };
 }
 
 test('native create validates first, writes canonical fields, reads back metadata and returns warnings', async () => {
@@ -511,7 +570,7 @@ test('created readiness refusal returns exact retry markers through safe resume 
     requestId: 'issue68-readiness-recovery',
   });
   const interrupted = await startTrackedIssue(f.context, request);
-  if (!('status' in interrupted)) assert.fail('Expected a known-created readiness refusal.');
+  if (interrupted.status !== 'created-not-started') assert.fail('Expected a known-created readiness refusal.');
   assert.equal(interrupted.status, 'created-not-started');
   const nativeBody = f.live.body;
   assert.match(nativeBody, /ai-delivery-start-intent: sha256:[a-f0-9]{64}/u);
@@ -697,4 +756,253 @@ test('intake skill example is Ready and every CLI line has actual required optio
   }
   assert.ok(skill.includes(ISSUE_BODY_MARKER));
   assert.ok(!skill.includes('ai-delivery develop'));
+});
+
+test('explicit start changes Todo to the configured In Progress option and preserves unrelated items', async () => {
+  const f = fixture();
+  const result = await startTrackedIssue(f.context, { issueNumber: 17 });
+  assert.ok('branch' in result);
+  assert.equal(f.getStatus(), 'Active');
+  assert.equal(f.statusWrites.length, 1);
+  assert.deepEqual(f.statusWrites[0], {
+    projectId: 'PROJECT',
+    itemId: 'ITEM17',
+    fieldId: 'STATUS',
+    optionId: 'ACTIVE',
+  });
+  assert.equal(f.comments.length, 1);
+  const retry = await startTrackedIssue(f.context, { issueNumber: 17 });
+  assert.ok('reused' in retry && retry.reused);
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(f.statusWrites.length, 1);
+  assert.equal(f.comments.length, 1);
+});
+
+test('explicit start adds missing membership only for its exact issue and accepts already active status', async () => {
+  for (const member of [true, false]) {
+    const f = fixture();
+    f.controls.projectMember = member;
+    if (member) f.setStatus('Active');
+    assert.ok('branch' in (await startTrackedIssue(f.context, { issueNumber: 17 })));
+    assert.equal(f.getStatus(), 'Active');
+    assert.equal(f.membershipWrites.length, member ? 0 : 1);
+    assert.equal(f.statusWrites.length, member ? 0 : 1);
+  }
+});
+
+test.each(['before', 'after', 'readback'] as const)(
+  'existing start returns known-issue recovery for Project %s failure',
+  async (failure) => {
+    const f = fixture();
+    f.controls.projectFailure = failure;
+    const result = await startTrackedIssue(f.context, { issueNumber: 17 });
+    if (!('status' in result)) assert.fail('Project failure must not report successful start');
+    assert.equal(result.status, 'start-incomplete');
+    assert.equal(result.failure.phase, 'project-status');
+    assert.equal(result.safeResume.arguments.issueNumber, 17);
+    assert.equal(result.safeResume.arguments.repo, 'example/widget');
+    assert.equal((result.safeResume.arguments as Record<string, unknown>).branch, 'issue/17');
+    assert.equal(f.comments.length, 0);
+    f.controls.projectFailure = '';
+    const resumed = await startTrackedIssue(
+      f.context,
+      getAiDeliveryMcpTool('issue_start')!.inputSchema.parse(result.safeResume.arguments),
+    );
+    assert.ok('reused' in resumed && resumed.reused);
+    assert.equal(f.getStatus(), 'Active');
+    assert.equal(f.branchWrites.length, 1);
+    assert.equal(f.comments.length, 1);
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.statusWrites.length, failure === 'before' ? 2 : 1);
+  },
+);
+
+test.each(['branch', 'journal'] as const)(
+  'existing start reconciles a lost %s response without duplicate mutations',
+  async (failure) => {
+    const f = fixture();
+    f.controls.branchFailure = failure === 'branch';
+    f.controls.journalFailure = failure === 'journal';
+    const result = await startTrackedIssue(f.context, { issueNumber: 17 });
+    if (!('status' in result)) assert.fail('An uncertain start must retain recovery');
+    assert.equal(result.status, 'start-incomplete');
+    f.controls.branchFailure = false;
+    f.controls.journalFailure = false;
+    assert.ok('reused' in (await startTrackedIssue(f.context, result.safeResume.arguments)));
+    assert.equal(f.branchWrites.length, 1);
+    assert.equal(f.comments.length, 1);
+    assert.equal(f.getStatus(), 'Active');
+  },
+);
+
+test('created start retains its exact issue recovery when Project synchronization fails', async () => {
+  const f = fixture();
+  f.controls.created = false;
+  f.controls.projectFailure = 'before';
+  const request = {
+    title: ready().title,
+    body: renderIssueBody(ready()),
+    issueType: 'Task',
+    points: 2,
+    requestId: 'project-recovery',
+  };
+  const result = await startTrackedIssue(f.context, request);
+  if (!('status' in result)) assert.fail('Expected created recovery');
+  assert.equal(result.status, 'created-not-started');
+  assert.equal(result.failure.phase, 'project-status');
+  f.controls.projectFailure = '';
+  assert.ok('reused' in (await startTrackedIssue(f.context, result.safeResume.arguments)));
+  assert.equal(f.branchWrites.length, 1);
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.writes.filter((write) => !('issue_number' in write)).length, 1);
+  assert.equal(f.getStatus(), 'Active');
+});
+
+test.each(['closed', 'blocked', 'parked', 'archived'] as const)(
+  'start recovery refuses current %s truth before Project or journal writes',
+  async (state) => {
+    const f = fixture();
+    f.controls.branchFailure = true;
+    const result = await startTrackedIssue(f.context, { issueNumber: 17 });
+    if (result.status !== 'start-incomplete') assert.fail('Expected recovery');
+    f.controls.branchFailure = false;
+    if (state === 'closed') f.live.state = 'closed';
+    if (state === 'blocked') f.controls.blockers = true;
+    if (state === 'parked') f.live.body = renderIssueBody({ ...ready(), draft: true });
+    if (state === 'archived') f.controls.projectArchived = true;
+    const retry = await startTrackedIssue(f.context, result.safeResume.arguments).catch((error: unknown) => {
+      assert.ok(error instanceof Error);
+      return undefined;
+    });
+    assert.ok(retry === undefined || 'status' in retry, 'Current refusal must not report success');
+    assert.equal(f.branchWrites.length, 1);
+    assert.equal(f.statusWrites.length, 0);
+    assert.equal(f.comments.length, 0);
+  },
+);
+
+test.each(['closeAfterBranch', 'blockAfterBranch'] as const)(
+  'start rechecks live eligibility after %s before changing the board',
+  async (control) => {
+    const f = fixture();
+    f.controls[control] = true;
+    const result = await startTrackedIssue(f.context, { issueNumber: 17 });
+    assert.ok('status' in result);
+    assert.equal(f.statusWrites.length, 0);
+    assert.equal(f.comments.length, 0);
+  },
+);
+
+async function bindStartFixture(f: ReturnType<typeof fixture>) {
+  const settings = await import('./config/deliveryConfig.js');
+  const issues = await import('./issue.js');
+  vi.spyOn(settings, 'loadDeliverySettings').mockResolvedValue({
+    roles: { author: { identity: 'author', authSource: 'personal' }, reviewer: { identity: 'reviewer' } },
+  } as unknown as Awaited<ReturnType<typeof settings.loadDeliverySettings>>);
+  vi.spyOn(issues, 'loadDeliveryContext').mockResolvedValue(f.context);
+}
+
+test('MCP explicit start returns Project recovery and reuses the exact branch on retry', async () => {
+  const f = fixture();
+  await bindStartFixture(f);
+  f.controls.projectFailure = 'after';
+  const server = createAiDeliveryMcpServer({ repoRoot: '/unrelated' });
+  const client = new Client({ name: 'fictional-start-project', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const call = async (arguments_: Record<string, unknown>) => {
+      const reply = await client.callTool({ name: 'issue_start', arguments: arguments_ });
+      assert.equal(reply.isError, undefined);
+      return JSON.parse(
+        z.object({ content: z.array(z.object({ type: z.literal('text'), text: z.string() })) }).parse(reply).content[0]!
+          .text,
+      ) as {
+        status?: string;
+        issueNumber: number;
+        branch?: string;
+        safeResume?: { arguments: Record<string, unknown> };
+      };
+    };
+    const interrupted = await call({ repo: 'example/widget', issueNumber: 17 });
+    assert.equal(interrupted.status, 'start-incomplete');
+    assert.ok(interrupted.safeResume);
+    assert.equal(f.comments.length, 0);
+    f.controls.projectFailure = '';
+    const result = await call(interrupted.safeResume.arguments);
+    assert.equal(result.branch, 'issue/17');
+    assert.equal(result.issueNumber, 17);
+    assert.equal(f.getStatus(), 'Active');
+    assert.equal(f.statusWrites.length, 1);
+    assert.equal(f.branchWrites.length, 1);
+    assert.equal(f.comments.length, 1);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test.each(['success', 'failure'] as const)(
+  'CLI explicit start shares Project transition and %s output',
+  async (mode) => {
+    vi.resetModules();
+    const f = fixture();
+    await bindStartFixture(f);
+    if (mode === 'failure') f.controls.projectFailure = 'before';
+    const argv = process.argv;
+    const exitCode = process.exitCode;
+    let stdout = '';
+    let completed: () => void = () => {};
+    const output = new Promise<void>((resolve) => {
+      completed = resolve;
+    });
+    vi.spyOn(process.stdout, 'write').mockImplementation((value) => {
+      stdout += String(value);
+      if (String(value).startsWith('{')) completed();
+      return true;
+    });
+    try {
+      process.exitCode = undefined;
+      process.argv = [process.execPath, 'ai-delivery', '--repo', 'example/widget', 'start', '--issue', '17'];
+      await import('./cli.js');
+      await output;
+      const result = JSON.parse(stdout) as {
+        status?: string;
+        branch?: string;
+        safeResume?: { arguments: { issueNumber: number } };
+      };
+      if (mode === 'failure') {
+        assert.equal(result.status, 'start-incomplete');
+        assert.equal(result.safeResume?.arguments.issueNumber, 17);
+        assert.equal(process.exitCode, 1);
+        assert.equal(f.getStatus(), 'Queued');
+        assert.equal(f.comments.length, 0);
+      } else {
+        assert.equal(result.branch, 'issue/17');
+        assert.equal(process.exitCode, undefined);
+        assert.equal(f.getStatus(), 'Active');
+        assert.equal(f.comments.length, 1);
+      }
+      assert.equal(f.branchWrites.length, 1);
+      assert.equal(f.statusWrites.length, 1);
+    } finally {
+      process.argv = argv;
+      process.exitCode = exitCode;
+    }
+  },
+);
+
+test('info and unrelated body edits never imply explicit activation', async () => {
+  const f = fixture();
+  const { issueInfo } = await import('./issue.js');
+  await issueInfo(f.context, 17);
+  await updateIssue(f.context, {
+    issueNumber: 17,
+    outcome: 'Reject invalid widgets while retaining deferred execution.',
+  });
+  assert.equal(f.getStatus(), 'Queued');
+  assert.equal(f.statusWrites.length, 0);
+  assert.equal(f.branchWrites.length, 0);
+  assert.equal(f.comments.length, 0);
 });

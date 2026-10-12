@@ -6,7 +6,7 @@ export function printCommandResult(command: string, value: unknown): void {
     typeof value === 'object' &&
     value !== null &&
     'status' in value &&
-    value.status === 'created-not-started'
+    (value.status === 'created-not-started' || value.status === 'start-incomplete')
   ) {
     process.exitCode = 1;
   }

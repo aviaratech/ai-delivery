@@ -16,6 +16,7 @@ import {
   readyCheck,
   resumeCreatedIssue,
   startIssueBranch,
+  startIssueProject,
   updateIssue,
   type CreateIssueInput,
   type ListIssuesInput,
@@ -102,8 +103,11 @@ export async function startTrackedIssue(
   let number = input.issueNumber === undefined ? undefined : requiredNumber(input, 'issueNumber');
   let created: { number: number; title: string; url: string } | undefined;
   let createdBody: string | undefined;
+  let branch: Awaited<ReturnType<typeof startIssueBranch>> | undefined;
+  let branchAttempted = false;
+  let phase = 'branch-or-journal';
   const registration = (phase: string, error: unknown) => ({
-    status: 'created-not-started',
+    status: 'created-not-started' as const,
     repository: context.config.repository,
     createdIssue: created,
     failure: { phase, message: error instanceof Error ? error.message : String(error) },
@@ -115,6 +119,7 @@ export async function startTrackedIssue(
         repo: context.config.repository,
         issueNumber: number,
         resumeCreated: true,
+        ...(branch === undefined ? {} : { branch: branch.branch }),
       },
     },
   });
@@ -198,7 +203,11 @@ export async function startTrackedIssue(
   try {
     const readiness = await readyCheck(context, number);
     if (!readiness.ready) throw new IssueValidationError(readiness.failures);
-    const branch = await startIssueBranch(context, number, optionalString(input, 'branch'));
+    branchAttempted = true;
+    branch = await startIssueBranch(context, number, optionalString(input, 'branch'));
+    phase = 'project-status';
+    await startIssueProject(context, number);
+    phase = 'journal';
     await journalIssueStart(context, number);
     return {
       issueNumber: number,
@@ -208,8 +217,24 @@ export async function startTrackedIssue(
       reused: branch.reused,
     };
   } catch (error) {
-    if (created) return registration('branch-or-journal', error);
-    throw error;
+    if (created) return registration(phase, error);
+    if (!branchAttempted) throw error;
+    return {
+      status: 'start-incomplete' as const,
+      issueNumber: number,
+      repository: context.config.repository,
+      failure: { phase, message: error instanceof Error ? error.message : String(error) },
+      safeResume: {
+        tool: 'issue_start',
+        arguments: {
+          repo: context.config.repository,
+          issueNumber: number,
+          ...((branch?.branch ?? optionalString(input, 'branch')) === undefined
+            ? {}
+            : { branch: branch?.branch ?? optionalString(input, 'branch') }),
+        },
+      },
+    };
   }
 }
 
