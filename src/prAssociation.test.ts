@@ -899,6 +899,41 @@ describe('directory-independent exact-PR contract', () => {
 describe('explicit native non-closing reference delivery', () => {
   const input = { issueNumber: 17, prNumber: 23, nonClosing: true };
 
+  it('submits confirmed-unprotected exact-head review while preserving distinct reviewer and stale-head guards', async () => {
+    const { context, reviewerContext, state, artifact } = fixture(true, true);
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    let protectionMessage = 'Branch not protected';
+    const request = async (route: string) => {
+      if (route.endsWith('/protection'))
+        throw { status: 404, response: { status: 404, data: { message: protectionMessage } } };
+      if (route.endsWith('/rules/branches/{branch}') || route.endsWith('/rulesets'))
+        return { status: 200, headers: {}, data: [] };
+      if (route.endsWith('/branches/{branch}'))
+        return { status: 200, data: { name: 'main', protected: false, protection: { enabled: false } } };
+      if (route === 'GET /repos/{owner}/{repo}')
+        return { status: 200, data: { full_name: repo, permissions: { push: true } } };
+      throw new Error(`Unexpected fictional route ${route}`);
+    };
+    context.clients.rest.request = request as typeof context.clients.rest.request;
+    await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
+    assert.equal(state.submissions, 0);
+    protectionMessage = 'Not Found';
+    await assert.rejects(
+      submitFormalReview(reviewerContext, { ...input, artifact }),
+      /complete native rule visibility/u,
+    );
+    protectionMessage = 'Branch not protected';
+    state.reviewerActor = 'author';
+    await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }), /differ|same GitHub actor/u);
+    state.reviewerActor = 'reviewer[bot]';
+    state.headSha = 'd'.repeat(40);
+    await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }), /head|artifact/u);
+    state.headSha = head;
+    await submitFormalReview(reviewerContext, { ...input, artifact });
+    assert.equal(state.submissions, 1);
+    assert.equal(state.reviews[0]?.commit_id, head);
+  });
+
   it('accepts the exact native historical reference with empty branch/closing connections', async () => {
     const { context, state } = fixture(true, true);
     assert.equal((await prInfo(context, input)).headSha, head);
