@@ -136,8 +136,8 @@ const GateClaimSchema = z.strictObject({
 type OutputGate = z.infer<typeof OutputGateSchema>;
 type GateClaim = z.infer<typeof GateClaimSchema>;
 
-function gateOwner(): z.infer<typeof GateOwnerSchema> {
-  const owner = processSnapshot().get(process.pid);
+function gateOwner(snapshot = processSnapshot()): z.infer<typeof GateOwnerSchema> {
+  const owner = snapshot.get(process.pid);
   if (!owner) throw new DeliveryError('Filesystem observation gate owner is unavailable.');
   return { pid: owner.pid, identity: owner.identity };
 }
@@ -166,7 +166,7 @@ function gateOwnerAlive(owner: z.infer<typeof GateOwnerSchema>, snapshot = proce
   return current?.identity === owner.identity && !current.status.startsWith('Z');
 }
 
-function assertOutputGate(gate: OutputGate, abandoned = false): void {
+function assertOutputGate(gate: OutputGate, abandoned = false): Map<number, ObservedProcess> {
   assertGateDirectory(gate.directory);
   const manifest = OutputGateSchema.parse(
     JSON.parse(assertPrivateFile(join(gate.directory, 'gate.json')).toString('utf8')) as unknown,
@@ -187,6 +187,7 @@ function assertOutputGate(gate: OutputGate, abandoned = false): void {
     throw new DeliveryError(
       'Filesystem observation gate ownership changed, was abandoned or is not an inherited ancestor.',
     );
+  return snapshot;
 }
 
 function readGateClaim(gate: OutputGate, path: string): GateClaim {
@@ -195,14 +196,14 @@ function readGateClaim(gate: OutputGate, path: string): GateClaim {
   return claim;
 }
 
-function gateScanRequests(gate: OutputGate): string[] {
+function gateScanRequests(gate: OutputGate, snapshot?: Map<number, ObservedProcess>): string[] {
   const directory = join(gate.directory, 'requests');
   assertGateDirectory(directory);
   const requests = readdirSync(directory);
   if (requests.length > 1024 || requests.some((name) => !/^[a-f0-9-]{36}\.json$/u.test(name)))
     throw new DeliveryError('Filesystem observation gate scan requests are invalid.');
   const live: string[] = [];
-  const snapshot = processSnapshot();
+  const currentSnapshot = snapshot ?? processSnapshot();
   for (const name of requests) {
     let claim: GateClaim;
     try {
@@ -211,7 +212,7 @@ function gateScanRequests(gate: OutputGate): string[] {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw error;
     }
-    if (claim.kind !== 'scan' || name !== claim.id + '.json' || !gateOwnerAlive(claim.owner, snapshot))
+    if (claim.kind !== 'scan' || name !== claim.id + '.json' || !gateOwnerAlive(claim.owner, currentSnapshot))
       throw new DeliveryError('Filesystem observation gate scan request was abandoned.');
     live.push(name);
   }
@@ -231,8 +232,9 @@ async function withOutputGateLock<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   if (!gate) return operation();
-  assertOutputGate(gate);
-  const claim: GateClaim = { gateId: gate.id, id: randomUUID(), kind, owner: gateOwner() };
+  // Self identity belongs to this same synchronous ownership check, before any claim publication.
+  const ownerSnapshot = assertOutputGate(gate);
+  const claim: GateClaim = { gateId: gate.id, id: randomUUID(), kind, owner: gateOwner(ownerSnapshot) };
   const request = kind === 'scan' ? join(gate.directory, 'requests', claim.id + '.json') : undefined;
   const lock = join(gate.directory, 'held');
   const holder = join(lock, 'owner.json');
@@ -258,8 +260,8 @@ async function withOutputGateLock<T>(
   try {
     for (;;) {
       if (signal?.aborted) throw new DeliveryError('Filesystem observation gate wait cancelled.');
-      assertOutputGate(gate);
-      const requests = gateScanRequests(gate);
+      const currentSnapshot = assertOutputGate(gate);
+      const requests = gateScanRequests(gate, currentSnapshot);
       if (kind === 'scan' || requests.length === 0) {
         let created = false;
         try {

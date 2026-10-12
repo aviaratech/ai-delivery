@@ -30,6 +30,62 @@ import * as atomicJson from './utils/atomicJson.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
+// These two unit scenarios isolate the synthetic controller RSS contract from host-wide PS latency.
+// Every integration scenario retains native observation; this is never fallback for a failed native call.
+const controllerObservation = vi.hoisted(() => ({
+  mode: 'native' as 'native' | 'healthy-controller' | 'unavailable-controller',
+}));
+vi.mock('node:child_process', async (original) => {
+  const actual = await original<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn: (...args: Parameters<typeof actual.spawn>) => {
+      if (controllerObservation.mode !== 'native')
+        throw new Error('Controller unit fixture must not launch an owned child.');
+      return actual.spawn(...args);
+    },
+    spawnSync: (...args: Parameters<typeof actual.spawnSync>) => {
+      if (controllerObservation.mode === 'native') return actual.spawnSync(...args);
+      // Native synchronous probes (including inert Git config) retain their actual result and failure.
+      const psCommand = args[0] === 'ps' || args[0].endsWith('/ps');
+      if (!psCommand) return actual.spawnSync(...args);
+      if (
+        (args[0] !== '/usr/bin/ps' && args[0] !== '/bin/ps') ||
+        !Array.isArray(args[1]) ||
+        args[1].join('|') !== '-A|-o|pid=,ppid=,pgid=,rss=,stat=,lstart=' ||
+        args[2]?.encoding !== 'utf8' ||
+        args[2]?.timeout !== 1_000 ||
+        args[2]?.maxBuffer !== 4 * 1024 ** 2
+      )
+        throw new Error('Controller unit fixture received an unsupported observation signature.');
+      if (controllerObservation.mode === 'unavailable-controller')
+        return {
+          status: null,
+          error: Object.assign(new Error('Synthetic controller observation unavailable'), { code: 'ETIMEDOUT' }),
+          signal: 'SIGTERM',
+          stdout: '',
+          stderr: '',
+        };
+      // This unit owns its own writer and gate; no real child is allowed in this one-controller universe.
+      return {
+        status: 0,
+        signal: null,
+        stdout: `${process.pid} 0 ${process.pid} 32 S controller unit birth\n`,
+        stderr: '',
+      };
+    },
+  };
+});
+function beginControllerObservation(mode: 'healthy-controller' | 'unavailable-controller'): void {
+  assert.equal(controllerObservation.mode, 'native', 'a controller unit observation scope leaked');
+  assert.equal(
+    process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE,
+    undefined,
+    'controller unit observation requires its own fixture gate',
+  );
+  controllerObservation.mode = mode;
+}
+
 const syncFailure = vi.hoisted(() => ({ directory: '' }));
 const sharedOutputRead = vi.hoisted(() => ({ path: '', unboundedReads: 0 }));
 vi.mock('node:fs', async (original) => {
@@ -371,6 +427,7 @@ test('runtime-stage controller growth during preflight fails before installing',
     rss: actors.authorCalls === 0 ? 64 * 1024 ** 2 : 1024 ** 3,
   }));
   try {
+    beginControllerObservation('healthy-controller');
     await assert.rejects(
       api.stageRuntime({
         ...f.input,
@@ -386,8 +443,47 @@ test('runtime-stage controller growth during preflight fails before installing',
     assert.equal(existsSync(f.counter), false, 'preflight failure must not release the npm command');
     assert.equal(existsSync(f.input.runtimeDirectory), false);
   } finally {
-    memory.mockRestore();
-    f.cleanup();
+    try {
+      memory.mockRestore();
+    } finally {
+      try {
+        f.cleanup();
+      } finally {
+        controllerObservation.mode = 'native';
+      }
+    }
+  }
+});
+
+test('runtime-stage unavailable initial controller observation refuses preflight and installer release', async () => {
+  const api = await producer();
+  const f = await fixture();
+  try {
+    beginControllerObservation('unavailable-controller');
+    await assert.rejects(
+      api.stageRuntime({
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+        },
+      }),
+      {
+        name: 'DeliveryError',
+        message:
+          'Owned process resource observation failed. {"status":null,"errorCode":"ETIMEDOUT","signal":"SIGTERM","stdoutPresent":true,"stdoutTerminated":false}',
+      },
+    );
+    assert.equal(actors.authorCalls, 0, 'unavailable observation must refuse before authenticated preflight');
+    assert.equal(existsSync(f.counter), false, 'unavailable observation must not release the npm command');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    try {
+      f.cleanup();
+    } finally {
+      controllerObservation.mode = 'native';
+    }
   }
 });
 

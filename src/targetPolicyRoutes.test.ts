@@ -191,8 +191,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
       followUps: [],
     },
   ]) {
-    test(`public MCP ${variant.kind} journal remains typed and reuses readback with ${kind} policy`, async () => {
-      const f = inertTarget();
+    test(`public MCP ${variant.kind} journal remains typed and reuses readback with ${kind} policy`, async ({
+      signal,
+    }) => {
+      const f = inertTarget(signal);
       let connection: Awaited<ReturnType<typeof f.connect>> | undefined;
       try {
         f.policy(kind);
@@ -211,8 +213,8 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }, 5_000);
   }
   for (const route of routes) {
-    test(`public MCP ${route.name} succeeds with ${kind} consumer policy (tracked HEAD/index)`, async () => {
-      const f = inertTarget();
+    test(`public MCP ${route.name} succeeds with ${kind} consumer policy (tracked HEAD/index)`, async ({ signal }) => {
+      const f = inertTarget(signal);
       let connection: Awaited<ReturnType<typeof f.connect>> | undefined;
       try {
         f.policy(kind);
@@ -234,8 +236,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }, 5_000);
   }
 
-  test(`public MCP retries reuse journal, branch and formal App review with ${kind} consumer policy`, async () => {
-    const f = inertTarget();
+  test(`public MCP retries reuse journal, branch and formal App review with ${kind} consumer policy`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let connection: Awaited<ReturnType<typeof f.connect>> | undefined;
     try {
       f.policy(kind);
@@ -266,8 +270,10 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 5_000);
 
-  test(`public MCP pagination and refused merge preserve policy and issue with ${kind} consumer policy`, async () => {
-    const f = inertTarget();
+  test(`public MCP pagination and refused merge preserve policy and issue with ${kind} consumer policy`, async ({
+    signal,
+  }) => {
+    const f = inertTarget(signal);
     let connection: Awaited<ReturnType<typeof f.connect>> | undefined;
     try {
       f.policy(kind);
@@ -309,8 +315,8 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
   }, 5_000);
 }
 
-test('one long-lived public MCP server keeps T then E consumer policy inert', async () => {
-  const f = inertTarget();
+test('one long-lived public MCP server keeps T then E consumer policy inert', async ({ signal }) => {
+  const f = inertTarget(signal);
   let connection: Awaited<ReturnType<typeof f.connect>> | undefined;
   try {
     f.policy('tracked');
