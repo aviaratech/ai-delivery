@@ -33,6 +33,51 @@ const userSettings = {
 };
 
 describe('directory-independent user configuration', () => {
+  it('publishes repository guidance during initialization before a tool is called outside Git', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'delivery-discovery-guidance-'));
+    const previous = process.env.AI_DELIVERY_CONFIG;
+    process.env.AI_DELIVERY_CONFIG = join(root, 'user.json');
+    writeFileSync(process.env.AI_DELIVERY_CONFIG, JSON.stringify(userSettings));
+    const server = createAiDeliveryMcpServer({ repoRoot: root });
+    const client = new Client({ name: 'discovery-guidance-fixture', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const instructions = client.getInstructions();
+      assert.equal(typeof instructions, 'string', 'initialize must provide guidance before deferred tool discovery');
+      assert.match(instructions ?? '', /\brepo\b/u);
+      assert.match(instructions ?? '', /\bissue_info\b/u);
+      // This observes real protocol metadata, not whether an agent follows it.
+      const listed = await client.listTools();
+      for (const name of ['issue_info', 'issue_ready_check']) {
+        const tool = listed.tools.find((candidate) => candidate.name === name);
+        assert.ok(tool);
+        const properties = tool.inputSchema.properties as Record<string, { description?: string }>;
+        assert.equal(typeof properties.repo?.description, 'string', `${name} must describe its repository input`);
+        assert.match(properties.repo?.description ?? '', /owner\/name/u);
+      }
+      for (const arguments_ of [
+        { issueNumber: 17, repo: 'example/widget', cached: true },
+        { issueNumber: 17, repository: 'example/widget' },
+        { issueNumber: 17, repo: 'invalid' },
+      ]) {
+        const rejected = await client.callTool({ name: 'issue_info', arguments: arguments_ });
+        assert.equal(rejected.isError, true);
+        assert.match(JSON.stringify(rejected), /Invalid arguments/u);
+        assert.doesNotMatch(JSON.stringify(rejected), /SYNTHETIC_TOKEN|Git remotes/u);
+      }
+      assert.equal(existsSync(join(root, '.git')), false);
+      assert.equal(existsSync(join(root, '.issue-cli')), false);
+    } finally {
+      await client.close();
+      await server.close();
+      if (previous === undefined) delete process.env.AI_DELIVERY_CONFIG;
+      else process.env.AI_DELIVERY_CONFIG = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('resolves an explicit repository in a non-Git directory without repository policy', async () => {
     const root = mkdtempSync(join(tmpdir(), 'delivery-directory-'));
     const previous = process.env.AI_DELIVERY_CONFIG;

@@ -352,7 +352,15 @@ test('a copied plugin root starts its exact MCP contract without a parent runtim
     await client.connect(transport, { timeout: 30000 });
     pid = transport.pid;
     assert.equal(client.getServerVersion()?.version, pkg.version);
+    const instructions = client.getInstructions();
+    assert.equal(typeof instructions, 'string', 'the copied native plugin must retain initialize guidance');
+    assert.match(instructions ?? '', /\brepo\b/u);
+    assert.match(instructions ?? '', /\bissue_info\b/u);
     const result = await client.listTools({}, { timeout: 30000 });
+    const issueInfo = result.tools.find((tool) => tool.name === 'issue_info');
+    assert.ok(issueInfo);
+    const properties = issueInfo.inputSchema.properties as Record<string, { description?: string }>;
+    assert.equal(typeof properties.repo?.description, 'string');
     assert.deepEqual(
       result.tools.map((tool) => tool.name).sort(),
       AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name).sort(),

@@ -6,10 +6,13 @@ import { IssueFields, IssueWriteFields, ISSUE_JSON_SCHEMAS, issueInputSchema } f
 
 const Positive = z.number().int().positive();
 const Labels = z.array(z.string().trim().min(1));
+const REPO_HELP =
+  'GitHub owner/name. Pass the repository named by the user. An explicit repo avoids launch-directory Git for ordinary remote issue/PR work; retained local modes keep their own checkout requirements.';
 const Repo = z
   .string()
   .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
-  .optional();
+  .optional()
+  .describe(REPO_HELP);
 export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@2' as const;
 const Tracking = {
   blockedBy: z.array(Positive).optional(),
@@ -25,7 +28,8 @@ const Tracking = {
   repo: z
     .string()
     .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
-    .optional(),
+    .optional()
+    .describe(REPO_HELP),
   title: z.string().trim().min(1).max(256),
 };
 const InvestigationStart = z.strictObject({
@@ -242,7 +246,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_info',
     commandName: 'info',
-    description: 'Read live issue metadata, relationships and Project status',
+    description:
+      'Read live GitHub issue metadata, relationships and Project status. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
     inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo }),
   },
   {

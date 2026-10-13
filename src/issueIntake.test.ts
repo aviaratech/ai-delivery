@@ -709,9 +709,27 @@ test('actual compiled stdio MCP returns every Ready diagnostic before credential
 
 test('intake skill example is Ready and every CLI line has actual required options and an explicit identity', () => {
   const skill = readFileSync(resolve('plugins/ai-delivery/skills/intake-create/SKILL.md'), 'utf8');
-  const json = /```json\n([\s\S]*?)\n```/u.exec(skill)?.[1];
-  assert.ok(json);
-  assert.ok(ReadyIssue.safeParse(JSON.parse(json) as unknown).success);
+  const examples = [...skill.matchAll(/```json\n([\s\S]*?)\n```/gu)].map((match) => {
+    const json = match[1] ?? '';
+    return { json, value: JSON.parse(json) as unknown };
+  });
+  const readTool = getAiDeliveryMcpTool('issue_info');
+  assert.ok(readTool?.name === 'issue_info');
+  const readSchema = readTool.inputSchema;
+  for (const example of examples) {
+    assert.ok(
+      ReadyIssue.safeParse(example.value).success || readSchema.safeParse(example.value).success,
+      'each documented JSON example must satisfy its supported contract',
+    );
+  }
+  const readExample = examples.find((example) => readSchema.safeParse(example.value).success);
+  assert.ok(readExample, 'the read-first example must use the actual MCP schema');
+  const readArguments = readSchema.parse(readExample.value);
+  assert.equal(readArguments.repo, 'example/widget');
+  assert.equal(readArguments.issueNumber, 17);
+  const createExample = examples.find((example) => ReadyIssue.safeParse(example.value).success);
+  assert.ok(createExample, 'the creation example must remain Ready');
+  const json = createExample.json;
   const root = mkdtempSync(join(tmpdir(), 'intake-cli-'));
   try {
     const fields = join(root, 'issue.json');
