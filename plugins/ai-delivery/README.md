@@ -6,6 +6,14 @@ The bundled skills cover issue intake, host-owned worktree development, and pull
 
 Configure operator-owned JSON at `~/.config/aviaratech-ai/ai-delivery.json` and provide its selected author/reviewer credential references outside source control. A personal author naming `GH_TOKEN` can use the machine's existing active `gh` session when that variable is absent. Every remote tool accepts an explicit `repo` and works without a checkout or repository policy files; one launched MCP server can switch repositories. The launcher needs no `AI_DELIVERY_IDENTITY`: command roles default from user settings. `issue_pr_create` with `dryRun: true` reports configured actors and rule visibility. Hosts own worktrees, contributor checks, commits and pushes. Explicit `runtime:stage` / `runtime:admit` remain separate controller operations; installing the plugin does not activate or alter a private runtime or adopt historical custody.
 
+## Ordinary issue reads and tool discovery
+
+Ask for the issue in ordinary language, for example “Use the ai-delivery MCP issue_info tool to read example/widget issue 17. Make no changes and don't use another GitHub tool.” The server supplies MCP initialization guidance before deferred tool discovery. The existing intake skill covers ordinary reading, listing and searching as well as authorized intake; no checkout or typed issue-creation fields are needed for a remote read with an explicit repository.
+
+Agents should carry the named repository into `repo`, discover the intended installed provider and inspect its schema. In Claude Code, if a bare ai-delivery tool and the installed plugin's tool coexist, the observed plugin-qualified read is `mcp__plugin_ai-delivery_ai-delivery__issue_info`, called with `{"repo":"example/widget","issueNumber":17}`. This is a host-specific discovery example, not a tool name to hardcode for every client. A competing `issueNumber`/`cached`-only tool without `repo` is a different contract; adding an unsupported field cannot select the repository.
+
+Honor explicit provider, read-only and MCP-only restrictions. If the requested compatible provider is unavailable, report that fact instead of changing directories, using another GitHub provider/CLI or repairing a registration. Successful explicit-repo reads demonstrate that read path; installed files or guidance alone do not prove which provider an agent selected, a running server's version or host isolation. Native validation should retain the actual selected tool, schema, arguments and result, with model/skill context when shown.
+
 ## Credentials and readiness
 
 User JSON names credential variables; it does not provide their values. For the
