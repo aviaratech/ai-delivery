@@ -9,6 +9,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import * as settings from './config/deliveryConfig.js';
 import * as github from './github/client.js';
 import { digestValue } from './delivery/common.js';
+import { DeliveryError, setMachineRequestDiagnostics } from './errors.js';
 import { executeTool } from './dispatch.js';
 import * as issues from './issue.js';
 import type { DeliveryContext } from './issue.js';
@@ -1087,6 +1088,30 @@ describe('explicit native non-closing reference delivery', () => {
     await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }), /head|artifact/u);
     assert.equal(state.submissions, 0);
     assert.equal(state.creations, 0);
+    assert.equal(state.updates, 0);
+  });
+
+  it('does not treat a sanitized machine-session 404 as proof of absent classic protection', async () => {
+    const { context, reviewerContext, state, artifact, evidence } = rulesetOnlyFixture();
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    const error = Object.assign(new DeliveryError('Machine GitHub session cannot access the selected operation.'), {
+      status: 404,
+    });
+    setMachineRequestDiagnostics(error, {
+      phase: 'rest.request',
+      endpoint: 'UNKNOWN',
+      status: 404,
+      code: undefined,
+      requestId: undefined,
+    });
+    evidence.protectionError = error;
+    await assert.rejects(publishPr(context, { ...input, draft: false }), /complete native rule visibility/u);
+    await assert.rejects(
+      submitFormalReview(reviewerContext, { ...input, artifact }),
+      /complete native rule visibility/u,
+    );
+    assert.equal(state.promotions, 0);
+    assert.equal(state.submissions, 0);
     assert.equal(state.updates, 0);
   });
 
