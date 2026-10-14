@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync,
+  constants,
+  fstatSync,
   closeSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -40,7 +43,7 @@ const Version = z
   .max(128)
   .regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u);
 const InputSchema = z.strictObject({
-  action: z.enum(['install', 'doctor', 'update', 'rollback', 'remove']),
+  action: z.enum(['install', 'doctor', 'preview', 'update', 'rollback', 'remove']),
   host: z.enum(['codex', 'claude-code']),
   scope: z.enum(['user', 'project', 'local']),
   version: Version.optional(),
@@ -120,6 +123,180 @@ export interface PluginResult {
   restartRequired?: boolean;
   recoveryRequired?: boolean;
   authProbe?: PluginAuthProbe;
+  diagnostics?: {
+    completeness: 'incomplete';
+    registrations: RegistrationObservation[];
+    nativeInventory: 'not_checked' | 'observed' | 'unavailable';
+    findings: string[];
+    plannedChanges: [];
+    migration: 'refused';
+  };
+  activation?: { installedVersion: string | null; startupVersion: string | null; loadedVersion: null };
+}
+
+interface RegistrationObservation {
+  kind: 'standalone' | 'plugin';
+  scope: 'user' | 'project' | 'local' | 'unknown';
+  ownership: 'managed' | 'external' | 'unknown';
+  source: 'managed_archive' | 'unknown';
+  version: string | null;
+  enabled: boolean | null;
+}
+
+function sourceDiagnostics(input: Input, target: Target): NonNullable<PluginResult['diagnostics']> {
+  const report: NonNullable<PluginResult['diagnostics']> = {
+    completeness: 'incomplete',
+    registrations: [],
+    nativeInventory: 'not_checked',
+    plannedChanges: [],
+    migration: 'refused',
+    findings: ['native_session_scope_unverified', 'settings_preservation_unproved', 'native_writer_exclusion_unproved'],
+  };
+  const text = (path: string): string | undefined => {
+    let descriptor: number | undefined;
+    try {
+      assertCanonical(path);
+      if (!existsSync(path)) return undefined;
+      const metadata = lstatSync(path);
+      if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 1024 * 1024)
+        throw new Error('Unsafe configuration');
+      // Nonblocking open also protects against replacement with a FIFO between
+      // lstat and open; descriptor validation remains authoritative.
+      descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const info = fstatSync(descriptor);
+      if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024) throw new Error('Unsafe configuration');
+      const bytes = Buffer.alloc(1024 * 1024 + 1);
+      let size = 0;
+      while (size < bytes.length) {
+        const count = readSync(descriptor, bytes, size, bytes.length - size, null);
+        if (count === 0) break;
+        size += count;
+      }
+      if (size > 1024 * 1024) throw new Error('Configuration exceeded read limit');
+      return bytes.subarray(0, size).toString('utf8');
+    } catch {
+      report.findings.push('configuration_unavailable');
+      return undefined;
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+  };
+  const json = (path: string): Record<string, unknown> | undefined => {
+    const value = text(path);
+    if (value === undefined) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return z.record(z.string(), z.unknown()).parse(parsed);
+    } catch {
+      report.findings.push('configuration_unavailable');
+      return undefined;
+    }
+  };
+  const observe = (scope: RegistrationObservation['scope'], servers: unknown) => {
+    if (typeof servers !== 'object' || servers === null || Array.isArray(servers)) {
+      if (servers !== undefined) report.findings.push('configuration_unavailable');
+      return;
+    }
+    // Names and launcher text identify candidates, never ownership. Nothing from
+    // command arguments, URLs, environments or permission values reaches output.
+    const candidate = Object.entries(servers).some(([name, value]) => {
+      if (name === 'ai-delivery') return true;
+      if (typeof value !== 'object' || value === null) return false;
+      const entry = value as Record<string, unknown>;
+      return (
+        entry.command === 'ai-delivery' ||
+        (Array.isArray(entry.args) &&
+          entry.args.some((arg: unknown) => typeof arg === 'string' && arg.includes('@aviaratech/ai-delivery')))
+      );
+    });
+    if (candidate)
+      report.registrations.push({
+        kind: 'standalone',
+        scope,
+        ownership: 'unknown',
+        source: 'unknown',
+        version: null,
+        enabled: null,
+      });
+  };
+  if (input.host === 'claude-code') {
+    if (process.env.CLAUDE_CONFIG_DIR) {
+      report.findings.push('custom_profile_configuration_unverified');
+    } else {
+      const user = json(join(realpathSync(homedir()), '.claude.json'));
+      const projects = user?.projects;
+      if (typeof projects === 'object' && projects !== null && !Array.isArray(projects)) {
+        const local = (projects as Record<string, unknown>)[target.projectRoot];
+        if (typeof local === 'object' && local !== null)
+          observe('local', (local as Record<string, unknown>).mcpServers);
+      }
+      observe('user', user?.mcpServers);
+    }
+    const project = json(join(target.projectRoot, '.mcp.json'))?.mcpServers;
+    const userIndex = report.registrations.findIndex((entry) => entry.scope === 'user');
+    observe('project', project);
+    if (userIndex !== -1 && report.registrations.at(-1)?.scope === 'project') {
+      const entry = report.registrations.pop()!;
+      report.registrations.splice(userIndex, 0, entry);
+    }
+  } else {
+    for (const [scope, path] of [
+      ['project', join(target.projectRoot, '.codex/config.toml')],
+      ['user', join(target.nativeHome, 'config.toml')],
+    ] as const) {
+      if (scope === 'project' && path === join(target.nativeHome, 'config.toml')) continue;
+      const value = text(path);
+      if (value === undefined) continue;
+      // This is a conservative header observation, not a TOML resolver. Quoted
+      // strings, profiles, managed and CLI overlays stay explicitly unverified.
+      report.findings.push('codex_configuration_not_fully_resolved');
+      if (/^\s*\[\s*mcp_servers\.(?:"ai-delivery"|'ai-delivery'|ai-delivery)\s*\]/mu.test(value))
+        observe(scope, { 'ai-delivery': {} });
+    }
+  }
+  report.findings = [...new Set(report.findings)];
+  return report;
+}
+
+function observeNativePlugins(
+  result: PluginResult,
+  input: Input,
+  target: Target,
+  entries: Record<string, unknown>[],
+  verifiedRegistration?: Record<string, unknown>,
+): void {
+  const report = result.diagnostics!;
+  report.nativeInventory = 'observed';
+  let count = 0;
+  for (const entry of entries) {
+    const id = entry.pluginId ?? entry.id;
+    if (!(entry.name === 'ai-delivery' || (typeof id === 'string' && id.startsWith('ai-delivery@')))) continue;
+    if (input.host === 'codex' && entry.installed !== true) continue;
+    if (input.host === 'claude-code' && (entry.scope === 'project' || entry.scope === 'local')) {
+      if (typeof entry.projectPath === 'string' && entry.projectPath !== target.projectRoot) continue;
+      if (typeof entry.projectPath !== 'string') report.findings.push('native_registration_project_unverified');
+    }
+    if (++count > 256) {
+      report.findings.push('native_inventory_truncated');
+      break;
+    }
+    const managed = result.sourceIntegrity === true && entry === verifiedRegistration;
+    const version = Version.safeParse(entry.version);
+    const scope =
+      input.host === 'codex'
+        ? 'user'
+        : entry.scope === 'user' || entry.scope === 'project' || entry.scope === 'local'
+          ? entry.scope
+          : 'unknown';
+    report.registrations.push({
+      kind: 'plugin',
+      scope,
+      ownership: managed ? 'managed' : 'external',
+      source: managed ? 'managed_archive' : 'unknown',
+      version: version.success ? version.data : null,
+      enabled: typeof entry.enabled === 'boolean' ? entry.enabled : null,
+    });
+  }
 }
 
 export interface PluginAuthProbe {
@@ -729,6 +906,7 @@ function catalog(target: Target, version: string): void {
   });
 }
 interface NativeEntry {
+  registration: Record<string, unknown>;
   version: string;
   installedPath?: string;
   enabled: boolean;
@@ -740,6 +918,7 @@ async function inventory(
   target: Target,
   signal: AbortSignal,
   publish?: (command: z.infer<typeof Pending>['command']) => void,
+  allPlugins = false,
 ): Promise<Record<string, unknown>[]> {
   const value: unknown = JSON.parse(
     await command(
@@ -747,7 +926,7 @@ async function inventory(
       [
         'plugin',
         'list',
-        ...(input.host === 'codex' ? ['--marketplace', target.marketplace, '--available'] : []),
+        ...(input.host === 'codex' && !allPlugins ? ['--marketplace', target.marketplace, '--available'] : []),
         '--json',
       ],
       target.projectRoot,
@@ -806,6 +985,7 @@ function nativeEntry(input: Input, target: Target, entries: Record<string, unkno
       ? z.object({ source: z.literal('local'), path: z.string() }).parse(entry.source).path
       : undefined;
   return {
+    registration: entry,
     version: Version.parse(entry.version),
     enabled: z.boolean().parse(entry.enabled),
     ...(typeof entry.installPath === 'string' ? { installedPath: entry.installPath } : {}),
@@ -939,10 +1119,26 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       reason: input.dryRun ? 'dry_run' : 'native_plugin_not_ready',
     };
   if (input.dryRun) return result;
+  result.diagnostics = sourceDiagnostics(input, target);
+  result.activation = { installedVersion: null, startupVersion: null, loadedVersion: null };
+  if (input.action === 'preview') return result;
   if (input.action === 'doctor') {
-    if (!state) return result;
-    result.recoveryRequired = state.pending !== undefined;
-    if (state.pending || !state.currentVersion) return result;
+    if (state) result.recoveryRequired = state.pending !== undefined;
+    if (state?.pending) return result;
+    if (!state?.currentVersion) {
+      try {
+        observeNativePlugins(
+          result,
+          input,
+          target,
+          await inventory(input, target, new AbortController().signal, undefined, true),
+        );
+      } catch {
+        result.diagnostics.nativeInventory = 'unavailable';
+        result.diagnostics.findings.push('native_inventory_unavailable');
+      }
+      return result;
+    }
     try {
       verifiedUnit(target, state.currentVersion);
     } catch {
@@ -959,8 +1155,20 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
     if (state.nativeVersion) result.nativeVersion = state.nativeVersion;
     if (!registered || !result.installed) {
       result.mcp = { configuration: 'missing', startup: 'not_checked' };
+      try {
+        observeNativePlugins(
+          result,
+          input,
+          target,
+          await inventory(input, target, new AbortController().signal, undefined, true),
+        );
+      } catch {
+        result.diagnostics.nativeInventory = 'unavailable';
+        result.diagnostics.findings.push('native_inventory_unavailable');
+      }
       return result;
     }
+    result.activation.installedVersion = state.currentVersion;
     try {
       result.nativePluginRoot = selectedRoot(input, target, entry!, state.installedPath);
       result.sourceIntegrity = true;
@@ -978,6 +1186,25 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
           : (error instanceof Error ? error.message : String(error)).slice(0, 2000),
       };
     }
+    observeNativePlugins(result, input, target, entries, entry!.registration);
+    if (input.host === 'codex') {
+      try {
+        const global = await inventory(input, target, new AbortController().signal, undefined, true);
+        const selectedIds = new Set(
+          entries.flatMap((entry) => (typeof entry.pluginId === 'string' ? [entry.pluginId] : [])),
+        );
+        observeNativePlugins(
+          result,
+          input,
+          target,
+          global.filter((entry) => typeof entry.pluginId !== 'string' || !selectedIds.has(entry.pluginId)),
+        );
+      } catch {
+        result.diagnostics.nativeInventory = 'unavailable';
+        result.diagnostics.findings.push('native_inventory_unavailable');
+      }
+    }
+    if (result.mcp?.startup === 'ready') result.activation.startupVersion = result.mcp.version ?? null;
     if (result.authProbe && result.sourceIntegrity && result.enabled && result.mcp?.startup === 'ready') {
       delete result.authProbe.reason;
       await checkAuthentication(input, result.nativePluginRoot!, result.authProbe);
@@ -1151,7 +1378,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         result.version = version;
         result.changed = prior !== version;
         result.installed = version !== null;
-        result.restartRequired = true;
+        result.activation = { installedVersion: version, startupVersion: null, loadedVersion: null };
         if (version)
           result.nativePluginRoot =
             input.host === 'codex' ? (state.installedPath ?? pluginRoot(target, version)) : pluginRoot(target, version);

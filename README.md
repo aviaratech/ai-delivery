@@ -127,13 +127,25 @@ An App approval does not prove that GitHub counted it. `pr:checks` exposes the l
 
 The removed `develop`, `verify`, `pr:checkout`, worktree creation/cleanup and local velocity record commands are no longer public CLI/MCP workflows. Preserve existing consumer checks, controller admissions and historical custody records. Their original schemas, digest identities, writer locks and operational closure rules remain separate. The legacy transition commands remain exposed, but this runtime cannot reproduce their historical repository-policy configuration binding: CLI/MCP inspection and apply refuse without executing policy or converting records. Complete those transitions with the original controller. Explicit runtime stage/admit remain supported.
 
-## Standalone plugin and explicit runtime setup
+## Plugin installation and explicit runtime setup
+
+The complete plugin is the canonical public installation for Codex and Claude
+Code. It ships the skills and one MCP runtime together. Standalone MCP server
+registration is a legacy setup; avoid adding a second registration alongside the
+plugin. The CLI, SDK exports and underlying MCP transport remain available.
+
+Legacy support will remain for **at least two subsequent stable releases and at
+least 90 days after a qualified migration path first ships**. That release/date
+anchor is currently unknown. Diagnostics and preview do not constitute qualified
+migration, start the clock, or withdraw legacy support. Live migration and native
+manifest qualification remain separate work under [#116](https://github.com/aviaratech/ai-delivery/issues/116).
 
 Manage the native plugin with an explicit package version:
 
 ```sh
 ai-delivery plugin install --host codex --scope user --version <published-version> --json
 ai-delivery plugin doctor --host codex --scope user --json
+ai-delivery plugin preview --host codex --scope user --json
 ai-delivery plugin update --host codex --scope user --version <published-version> --json
 ai-delivery plugin rollback --host codex --scope user --json
 ai-delivery plugin remove --host codex --scope user --json
@@ -149,7 +161,20 @@ the managed version units for recovery and uses Claude Code's `--keep-data`.
 
 Every command supports `--dry-run` and `--json`. Dry-run reports the target
 without fetching an archive, running a native command, or writing configuration.
-Doctor reports managed installation and source integrity, skills, and a direct
+`preview` makes bounded configuration observations without native commands,
+server startup, authentication, settings changes, backups, locks or checkpoints.
+It exposes no launcher arguments, URLs, environments or permission values.
+`plannedChanges` is empty and migration is refused. Unknown provenance and
+unavailable configuration remain explicit; Codex table-header observations do
+not resolve TOML, profiles or managed/CLI overrides. Claude custom-profile
+configuration is likewise unverified. Preview never adopts an external plugin
+or restores/removes a tool preference.
+
+Doctor can also observe native-marketplace plugins when managed state is absent.
+That observation does not establish ownership or permit startup of unknown
+bytes. It reports bounded registration candidates and incomplete scope evidence;
+the verified managed selection retains its separate integrity checks. Doctor
+reports managed installation and source integrity, skills, and a direct
 credential-free stdio startup check of the selected bundled MCP server. Startup
 means that the server initialized and listed its tools; it does not validate
 user settings, receive GitHub credentials, or authenticate either delivery role.
@@ -173,8 +198,22 @@ propagation or counted exact-head approval. `config:resolve` remains available
 for direct CLI readback; check an actual native tool call separately. The
 [credential and readiness guide](plugins/ai-delivery/README.md#credentials-and-readiness)
 explains the environment boundary and the evidence to retain without secrets.
-Restart the native host
-after changing a plugin so it reloads that selection. Installing a plugin does not admit a consumer controller. Ordinary remote GitHub delivery uses user configuration; explicit controller staging and admission remain separate operations.
+Installed-version observations, a separately launched startup check and the
+native conversation's loaded server version are distinct. The latter remains
+unverified unless observed in that host. Use the host's surface-specific
+activation guidance: [Claude Code plugin management](https://code.claude.com/docs/en/discover-plugins)
+and [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp).
+There is no blanket restart requirement or automatic activation. Installing a
+plugin does not admit a consumer controller. Ordinary remote GitHub delivery
+uses user configuration; explicit controller staging and admission remain
+separate operations.
+
+Migration apply, registration retirement and settings rollback are unavailable
+here. They require exact authorized ownership, lossless settings preservation
+and native writer exclusion/transactional guarantees. A matching name, missing
+preference, changed registration or incomplete inventory cannot satisfy those
+gates. No npm lifecycle cleanup or mandatory hook performs migration. Public npm
+publication or a local catalog does not establish public plugin-directory admission.
 
 First read `config:resolve` with the configured author, then stage a reviewed
 local archive using its independently accepted SHA-256 and package version:

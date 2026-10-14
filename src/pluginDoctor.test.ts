@@ -129,9 +129,11 @@ vi.mock('./verification.js', async (original) => ({
     fixture.commands.push({ args, environment: options.environment });
     assert.deepEqual(
       args,
-      fixture.host === 'codex'
+      fixture.host === 'codex' && args.includes('--marketplace')
         ? ['codex', 'plugin', 'list', '--marketplace', 'ai-delivery-user', '--available', '--json']
-        : ['claude', 'plugin', 'list', '--json'],
+        : fixture.host === 'codex'
+          ? ['codex', 'plugin', 'list', '--json']
+          : ['claude', 'plugin', 'list', '--json'],
     );
     const catalog = join(fixture.home, '.cache/ai-delivery/plugins', fixture.host, 'user/marketplace');
     const entry = { version: '0.3.24', enabled: fixture.enabled };
@@ -713,4 +715,21 @@ test('synthetic doctor reads never change managed state or settings', async () =
   const before = [readFileSync(state), readFileSync(fixture.config)];
   await doctor();
   assert.deepEqual([readFileSync(state), readFileSync(fixture.config)], before);
+});
+
+test.each([true, false])('doctor preserves a present or absent native tool preference (%s)', async (present) => {
+  const nativeConfig = join(fixture.home, '.codex', 'config.toml');
+  const bytes = present
+    ? '[plugins."ai-delivery".mcp_servers.ai-delivery.tools.issue_info]\napproval_mode="approve"\n'
+    : '# no explicit issue_info approval preference\n';
+  file(nativeConfig, bytes);
+  const result = await doctor('example/widget', false);
+  assert.equal(result.mcp?.startup, 'ready');
+  assert.equal(result.activation?.installedVersion, '0.3.24');
+  assert.equal(result.activation?.startupVersion, '0.3.24');
+  assert.equal(result.activation?.loadedVersion, null);
+  assert.equal(result.diagnostics?.migration, 'refused');
+  assert.equal(readFileSync(nativeConfig, 'utf8'), bytes);
+  assert.equal(fixture.authCalls, 0);
+  assert.equal(fixture.keyReads, 0);
 });
