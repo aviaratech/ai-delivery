@@ -694,16 +694,19 @@ function requiredApprovalCount(value: unknown): number | null {
   return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null;
 }
 
-/** Absence is proved only by an empty successful first page with no continuation evidence. */
-function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
+function completeRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
   return (
     response.status === 200 &&
     Array.isArray(response.data) &&
-    response.data.length === 0 &&
     response.headers !== undefined &&
     response.headers !== null &&
     (response.headers.link === undefined || response.headers.link === '')
   );
+}
+
+/** Absence is proved only by an empty successful first page with no continuation evidence. */
+function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
+  return completeRulePage(response) && Array.isArray(response.data) && response.data.length === 0;
 }
 
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
@@ -797,6 +800,7 @@ export async function preflightReviewRoute(
   ]);
   await check();
   let confirmedUnprotected = false;
+  let confirmedRulesetOnly = false;
   const protectionError =
     protectionResult.status === 'rejected'
       ? (protectionResult.reason as {
@@ -806,7 +810,7 @@ export async function preflightReviewRoute(
       : null;
   if (
     rulesetResult.status === 'fulfilled' &&
-    emptyRulePage(rulesetResult.value) &&
+    completeRulePage(rulesetResult.value) &&
     protectionError?.status === 404 &&
     protectionError.response?.status === 404 &&
     protectionError.response.data?.message === 'Branch not protected'
@@ -835,22 +839,59 @@ export async function preflightReviewRoute(
         protected?: boolean;
         protection?: { enabled?: boolean };
       } | null;
-      confirmedUnprotected =
+      const corroborated =
         repository.value.status === 200 &&
         branch.value.status === 200 &&
         typeof repoData?.full_name === 'string' &&
         repoData.full_name.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase() &&
         (repoData.permissions?.push === true || repoData.permissions?.admin === true) &&
-        branchData?.name === base &&
-        branchData.protected === false &&
+        branchData?.name === base;
+      confirmedUnprotected =
+        corroborated &&
+        emptyRulePage(rulesetResult.value) &&
+        branchData?.protected === false &&
         branchData.protection?.enabled === false &&
         emptyRulePage(rulesets.value);
+      // The applicable-rules endpoint includes all active repository/parent
+      // rules. A classic-protection 404 needs independent identity and active
+      // ruleset readbacks, not just an observed approval count.
+      confirmedRulesetOnly =
+        corroborated &&
+        branchData?.protected === true &&
+        branchData.protection?.enabled === true &&
+        completeRulePage(rulesets.value) &&
+        rulesetResult.value.data.length > 0 &&
+        rulesetResult.value.data.every((rule) => {
+          if (
+            typeof rule !== 'object' ||
+            rule === null ||
+            typeof rule.type !== 'string' ||
+            !rule.type ||
+            typeof rule.ruleset_id !== 'number' ||
+            !Number.isSafeInteger(rule.ruleset_id) ||
+            rule.ruleset_id <= 0 ||
+            typeof rule.ruleset_source !== 'string' ||
+            (rule.ruleset_source_type === 'Repository'
+              ? rule.ruleset_source.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
+              : rule.ruleset_source_type !== 'Organization' ||
+                rule.ruleset_source.toLowerCase() !== context.repo.owner.toLowerCase()) ||
+            (rule.type === 'pull_request' && requiredApprovalCount(rule.parameters) === null)
+          )
+            return false;
+          const matches = rulesets.value.data.filter((ruleset) => ruleset?.id === rule.ruleset_id);
+          return (
+            matches.length === 1 &&
+            matches[0]?.source_type === rule.ruleset_source_type &&
+            matches[0]?.source === rule.ruleset_source &&
+            matches[0]?.enforcement === 'active'
+          );
+        });
     }
   }
   const counts: number[] = [];
   if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
     for (const rule of rulesetResult.value.data) {
-      if (rule.type === 'pull_request') {
+      if (rule?.type === 'pull_request') {
         const count = requiredApprovalCount(rule.parameters);
         if (count !== null) counts.push(count);
       }
@@ -865,7 +906,9 @@ export async function preflightReviewRoute(
     rulesetResult.status === 'fulfilled' &&
     Array.isArray(rulesetResult.value.data) &&
     (rulesetResult.value.headers?.link === undefined || rulesetResult.value.headers.link === '');
-  const visible = Number(rulesVisible) + Number(protectionResult.status === 'fulfilled' || confirmedUnprotected);
+  const visible =
+    Number(rulesVisible) +
+    Number(protectionResult.status === 'fulfilled' || confirmedUnprotected || confirmedRulesetOnly);
   const visibility = visible === 2 ? 'complete' : visible === 1 ? 'partial' : 'unknown';
   const observedRequiredApprovals = counts.length > 0 ? Math.max(...counts) : confirmedUnprotected ? 0 : null;
   const insufficientPermission =

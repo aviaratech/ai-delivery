@@ -367,6 +367,71 @@ function fixture(published = true, nonClosing = false) {
 
 afterEach(() => vi.restoreAllMocks());
 
+function rulesetOnlyFixture(published = true) {
+  const current = fixture(published, true);
+  const evidence = {
+    deniedRoute: '',
+    protectionError: { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } } as unknown,
+    protection: undefined as unknown,
+    rules: {
+      status: 200,
+      headers: {},
+      data: [
+        {
+          type: 'required_status_checks',
+          ruleset_id: 41,
+          ruleset_source_type: 'Repository',
+          ruleset_source: repo,
+          parameters: {
+            strict_required_status_checks_policy: true,
+            required_status_checks: [{ context: 'local-verify' }],
+          },
+        },
+        {
+          type: 'pull_request',
+          ruleset_id: 42,
+          ruleset_source_type: 'Organization',
+          ruleset_source: 'example',
+          parameters: { required_approving_review_count: 1, dismiss_stale_reviews_on_push: true },
+        },
+      ],
+    } as unknown,
+    rulesets: {
+      status: 200,
+      headers: {},
+      data: [
+        { id: 41, source_type: 'Repository', source: repo, enforcement: 'active' },
+        { id: 42, source_type: 'Organization', source: 'example', enforcement: 'active' },
+      ],
+    } as unknown,
+    branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: true } } } as unknown,
+    repository: { status: 200, data: { full_name: repo, permissions: { push: true } } } as unknown,
+  };
+  current.context.clients.rest.request = (async (route: string, input: Record<string, unknown>) => {
+    assert.equal(input.owner, 'example');
+    assert.equal(input.repo, 'widget');
+    if (route === evidence.deniedRoute) throw { status: 403 };
+    if (route.endsWith('/protection')) {
+      if (evidence.protection !== undefined) return evidence.protection;
+      throw evidence.protectionError;
+    }
+    if (route.endsWith('/rules/branches/{branch}')) return evidence.rules;
+    if (route.endsWith('/rulesets')) {
+      assert.equal(input.includes_parents, true);
+      assert.equal(input.page, 1);
+      assert.equal(input.per_page, 100);
+      return evidence.rulesets;
+    }
+    if (route.endsWith('/branches/{branch}')) {
+      assert.equal(input.branch, 'main');
+      return evidence.branch;
+    }
+    if (route === 'GET /repos/{owner}/{repo}') return evidence.repository;
+    throw new Error(`Unexpected fictional route ${route}`);
+  }) as typeof current.context.clients.rest.request;
+  return { ...current, evidence };
+}
+
 describe('native exact PR association after publication', () => {
   it('replays native start, push, draft publication, empty branch links, author inspection and distinct App review', async () => {
     const { context, reviewerContext, state, artifact } = fixture(false);
@@ -898,6 +963,213 @@ describe('directory-independent exact-PR contract', () => {
 
 describe('explicit native non-closing reference delivery', () => {
   const input = { issueNumber: 17, prNumber: 23, nonClosing: true };
+
+  it('creates and independently reviews a non-closing PR with corroborated repository and parent ruleset protection', async () => {
+    const { context, reviewerContext, state, artifact } = rulesetOnlyFixture(false);
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    await startIssueBranch(context, 17);
+    state.remoteHead = head;
+    const preview = await publishPr(context, { issueNumber: 17, nonClosing: true, dryRun: true });
+    assert.equal(preview.nonClosing, true);
+    assert.equal(state.creations, 0);
+    await publishPr(context, { issueNumber: 17, nonClosing: true });
+    assert.equal(state.creations, 1);
+    assert.equal(state.issueState, 'open');
+    assert.equal(state.issueBody, 'Four retained criteria');
+    await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
+    assert.equal(state.submissions, 0);
+    await submitFormalReview(reviewerContext, { ...input, artifact });
+    assert.equal(state.submissions, 1);
+    assert.equal(state.reviews[0]?.commit_id, head);
+    assert.equal(state.reviews[0]?.user.login, 'reviewer[bot]');
+    assert.equal(state.updates, 0);
+  });
+
+  for (const [name, change] of [
+    ['generic 404', { protectionError: { status: 404, response: { status: 404, data: { message: 'Not Found' } } } }],
+    [
+      'permission 404',
+      { protectionError: { status: 404, response: { status: 403, data: { message: 'Branch not protected' } } } },
+    ],
+    ['denied protection', { deniedRoute: 'GET /repos/{owner}/{repo}/branches/{branch}/protection' }],
+    ['denied applicable rules', { deniedRoute: 'GET /repos/{owner}/{repo}/rules/branches/{branch}' }],
+    ['denied repository', { deniedRoute: 'GET /repos/{owner}/{repo}' }],
+    ['denied branch', { deniedRoute: 'GET /repos/{owner}/{repo}/branches/{branch}' }],
+    ['denied parent rulesets', { deniedRoute: 'GET /repos/{owner}/{repo}/rulesets' }],
+    [
+      'foreign repository',
+      { repository: { status: 200, data: { full_name: 'other/widget', permissions: { push: true } } } },
+    ],
+    ['unknown author write access', { repository: { status: 200, data: { full_name: repo, permissions: {} } } }],
+    [
+      'foreign branch',
+      { branch: { status: 200, data: { name: 'other', protected: true, protection: { enabled: true } } } },
+    ],
+    [
+      'conflicting branch protection',
+      { branch: { status: 200, data: { name: 'main', protected: false, protection: { enabled: true } } } },
+    ],
+    [
+      'conflicting protection summary',
+      { branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } } },
+    ],
+    ['missing protected branch summary', { branch: { status: 200, data: { name: 'main', protected: true } } }],
+    ['missing ruleset page headers', { rulesets: { status: 200, data: [] } }],
+    [
+      'incomplete parent ruleset page',
+      { rulesets: { status: 200, headers: { link: '<https://api.github.com/next>; rel="next"' }, data: [] } },
+    ],
+    ['malformed parent rulesets', { rulesets: { status: 200, headers: {}, data: null } }],
+    ['uncorroborated rulesets', { rulesets: { status: 200, headers: {}, data: [] } }],
+    [
+      'inactive applicable ruleset',
+      {
+        rulesets: {
+          status: 200,
+          headers: {},
+          data: [
+            { id: 41, source_type: 'Repository', source: repo, enforcement: 'evaluate' },
+            { id: 42, source_type: 'Organization', source: 'example', enforcement: 'active' },
+          ],
+        },
+      },
+    ],
+    [
+      'conflicting source identity',
+      {
+        rulesets: {
+          status: 200,
+          headers: {},
+          data: [
+            { id: 41, source_type: 'Repository', source: 'other/widget', enforcement: 'active' },
+            { id: 42, source_type: 'Organization', source: 'example', enforcement: 'active' },
+          ],
+        },
+      },
+    ],
+  ] as const) {
+    it(`refuses non-closing creation and review with ruleset-only ${name} without mutation`, async () => {
+      const { context, reviewerContext, state, artifact, evidence } = rulesetOnlyFixture(false);
+      vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+      Object.assign(evidence, change);
+      await startIssueBranch(context, 17);
+      state.remoteHead = head;
+      await assert.rejects(
+        publishPr(context, { issueNumber: 17, nonClosing: true }),
+        /complete native rule visibility/u,
+      );
+      assert.equal(state.creations, 0);
+      state.published = true;
+      await assert.rejects(
+        submitFormalReview(reviewerContext, { ...input, artifact }),
+        /complete native rule visibility/u,
+      );
+      assert.equal(state.submissions, 0);
+      assert.equal(state.promotions, 0);
+      assert.equal(state.updates, 0);
+      assert.equal(state.issueState, 'open');
+    });
+  }
+
+  it('keeps reviewer permission, distinct-actor and exact-head guards with complete ruleset-only protection', async () => {
+    const { context, reviewerContext, state, artifact } = rulesetOnlyFixture();
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    context.reviewerClients!.effectiveContentsPermission = 'read';
+    await assert.rejects(
+      submitFormalReview(reviewerContext, { ...input, artifact }),
+      /complete native rule visibility/u,
+    );
+    context.reviewerClients!.effectiveContentsPermission = 'write';
+    state.reviewerActor = 'author';
+    await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }), /differ|same GitHub actor/u);
+    state.reviewerActor = 'reviewer[bot]';
+    state.headSha = 'd'.repeat(40);
+    await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }), /head|artifact/u);
+    assert.equal(state.submissions, 0);
+    assert.equal(state.creations, 0);
+    assert.equal(state.updates, 0);
+  });
+
+  for (const name of [
+    'incomplete applicable page',
+    'incomplete parent page',
+    'missing applicable headers',
+    'non-success applicable response',
+    'malformed applicable rules',
+    'missing applicable ruleset identity',
+    'malformed approval count',
+    'duplicate corroborating ruleset',
+    'protected branch with empty rules',
+  ]) {
+    it(`refuses ${name} despite observed ruleset-only protection without mutation`, async () => {
+      const { context, reviewerContext, state, artifact, evidence } = rulesetOnlyFixture();
+      vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+      const rules = evidence.rules as { status: number; headers?: { link?: string }; data: unknown };
+      const rulesets = evidence.rulesets as { headers: { link?: string }; data: unknown[] };
+      switch (name) {
+        case 'incomplete applicable page':
+          rules.headers = { link: '<https://api.github.com/next>; rel="next"' };
+          break;
+        case 'incomplete parent page':
+          rulesets.headers = { link: '<https://api.github.com/next>; rel="next"' };
+          break;
+        case 'missing applicable headers':
+          delete rules.headers;
+          break;
+        case 'non-success applicable response':
+          rules.status = 206;
+          break;
+        case 'malformed applicable rules':
+          rules.data = [null];
+          break;
+        case 'missing applicable ruleset identity':
+          rules.data = [{ type: 'pull_request', parameters: { required_approving_review_count: 1 } }];
+          break;
+        case 'malformed approval count':
+          rules.data = [
+            {
+              type: 'pull_request',
+              ruleset_id: 42,
+              ruleset_source_type: 'Organization',
+              ruleset_source: 'example',
+              parameters: { required_approving_review_count: '1' },
+            },
+          ];
+          break;
+        case 'duplicate corroborating ruleset':
+          rulesets.data.push(rulesets.data[0]);
+          break;
+        case 'protected branch with empty rules':
+          rules.data = [];
+          rulesets.data = [];
+          break;
+      }
+      await assert.rejects(publishPr(context, { ...input, draft: false }), /complete native rule visibility/u);
+      await assert.rejects(
+        submitFormalReview(reviewerContext, { ...input, artifact }),
+        /complete native rule visibility/u,
+      );
+      assert.equal(state.creations, 0);
+      assert.equal(state.submissions, 0);
+      assert.equal(state.promotions, 0);
+      assert.equal(state.updates, 0);
+    });
+  }
+
+  it('preserves non-closing publication and exact-head review with readable classic protection', async () => {
+    const { context, reviewerContext, state, artifact, evidence } = rulesetOnlyFixture();
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    evidence.protection = {
+      status: 200,
+      data: { required_pull_request_reviews: { required_approving_review_count: 2 } },
+    };
+    await publishPr(context, { ...input, draft: false });
+    await submitFormalReview(reviewerContext, { ...input, artifact });
+    assert.equal(state.promotions, 1);
+    assert.equal(state.submissions, 1);
+    assert.equal(state.reviews[0]?.commit_id, head);
+    assert.equal(state.issueState, 'open');
+  });
 
   it('submits confirmed-unprotected exact-head review while preserving distinct reviewer and stale-head guards', async () => {
     const { context, reviewerContext, state, artifact } = fixture(true, true);
