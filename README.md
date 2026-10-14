@@ -252,6 +252,24 @@ Legacy transitions remain explicit preservation operations. Inspection returns e
 
 The remote contract is `ai-delivery.mcp@2`. CLI and MCP call the same owners. Issue listing/search preserve native filters, pagination, literal search boundaries and repository-qualified relationships. Issue updates preserve typed journals, history-before-rewrite and native reasoned closure. `issue_info.worktree` is null. Offline `migrate:legacy-issues --input-file` remains a read-only plan. Public exports expose remote delivery, metadata, digest utilities and explicit setup; removed executable policy/stage/evidence APIs are not exported.
 
+### Synthetic tracking replay and quick reference
+
+Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI, including outside Git. The following operations are shipped:
+
+| Operation | MCP tool | CLI command and key inputs |
+| --- | --- | --- |
+| List / search | `issue_list` / `issue_search` | `list` / `search --query <literal-text>`; native filters and pagination |
+| Read / check readiness | `issue_info` / `issue_ready_check` | `info --issue N` / `ready:check --issue N` |
+| Create a sized child | `issue_create` | `create --title <title> --fields-file <typed.json> --parent P --priority P2` |
+| Rewrite with prior history | `issue_update` | `update --issue N --fields-file <typed.json> --preserve-history` |
+| Reparent one issue | `issue_update` | `update --issue N --parent P`; repeat separately for each issue |
+| Record a typed journal | `issue_comment` | See the [typed journal contract](#typed-issue-journals); the MCP call returns the authored comment identity and readback |
+| Close with a reason | `issue_update` | `update --issue N --state closed --close-reason not_planned --superseded-by S` |
+
+Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
+
+`src/currentTrackingScenario.test.ts` composes these operations through one real SDK client/server session outside Git. Only external GitHub/auth ports are synthetic; settings, discovery, schemas, dispatch and owners run normally. Stored issue fields, parent membership, exact escaped history whitespace, comments, closure and configured Project Done are checked after writes. Invalid schemas and unsupported batch/defer requests must leave stored state and native write counts unchanged. Batch operations, trigger-based deferral and WIP enforcement remain unshipped; parking a draft is a separate operation. This synthetic replay does not complete the broader tracking parent or prove a live backlog replay.
+
 ## Blocker overrides and delivery health
 
 `create`, `start` and `update` accept `--blocks <issue-numbers>` to add the
