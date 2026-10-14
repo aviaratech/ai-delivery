@@ -157,7 +157,12 @@ function sourceDiagnostics(input: Input, target: Target): NonNullable<PluginResu
     try {
       assertCanonical(path);
       if (!existsSync(path)) return undefined;
-      descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const metadata = lstatSync(path);
+      if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 1024 * 1024)
+        throw new Error('Unsafe configuration');
+      // Nonblocking open also protects against replacement with a FIFO between
+      // lstat and open; descriptor validation remains authoritative.
+      descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const info = fstatSync(descriptor);
       if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024) throw new Error('Unsafe configuration');
       const bytes = Buffer.alloc(1024 * 1024 + 1);
@@ -258,6 +263,7 @@ function observeNativePlugins(
   input: Input,
   target: Target,
   entries: Record<string, unknown>[],
+  verifiedRegistration?: Record<string, unknown>,
 ): void {
   const report = result.diagnostics!;
   report.nativeInventory = 'observed';
@@ -266,11 +272,15 @@ function observeNativePlugins(
     const id = entry.pluginId ?? entry.id;
     if (!(entry.name === 'ai-delivery' || (typeof id === 'string' && id.startsWith('ai-delivery@')))) continue;
     if (input.host === 'codex' && entry.installed !== true) continue;
+    if (input.host === 'claude-code' && (entry.scope === 'project' || entry.scope === 'local')) {
+      if (typeof entry.projectPath === 'string' && entry.projectPath !== target.projectRoot) continue;
+      if (typeof entry.projectPath !== 'string') report.findings.push('native_registration_project_unverified');
+    }
     if (++count > 256) {
       report.findings.push('native_inventory_truncated');
       break;
     }
-    const managed = result.sourceIntegrity === true && id === `ai-delivery@${target.marketplace}`;
+    const managed = result.sourceIntegrity === true && entry === verifiedRegistration;
     const version = Version.safeParse(entry.version);
     const scope =
       input.host === 'codex'
@@ -896,6 +906,7 @@ function catalog(target: Target, version: string): void {
   });
 }
 interface NativeEntry {
+  registration: Record<string, unknown>;
   version: string;
   installedPath?: string;
   enabled: boolean;
@@ -974,6 +985,7 @@ function nativeEntry(input: Input, target: Target, entries: Record<string, unkno
       ? z.object({ source: z.literal('local'), path: z.string() }).parse(entry.source).path
       : undefined;
   return {
+    registration: entry,
     version: Version.parse(entry.version),
     enabled: z.boolean().parse(entry.enabled),
     ...(typeof entry.installPath === 'string' ? { installedPath: entry.installPath } : {}),
@@ -1111,7 +1123,9 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
   result.activation = { installedVersion: null, startupVersion: null, loadedVersion: null };
   if (input.action === 'preview') return result;
   if (input.action === 'doctor') {
-    if (!state) {
+    if (state) result.recoveryRequired = state.pending !== undefined;
+    if (state?.pending) return result;
+    if (!state?.currentVersion) {
       try {
         observeNativePlugins(
           result,
@@ -1125,8 +1139,6 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       }
       return result;
     }
-    result.recoveryRequired = state.pending !== undefined;
-    if (state.pending || !state.currentVersion) return result;
     try {
       verifiedUnit(target, state.currentVersion);
     } catch {
@@ -1174,7 +1186,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
           : (error instanceof Error ? error.message : String(error)).slice(0, 2000),
       };
     }
-    observeNativePlugins(result, input, target, entries);
+    observeNativePlugins(result, input, target, entries, entry!.registration);
     if (input.host === 'codex') {
       try {
         const global = await inventory(input, target, new AbortController().signal, undefined, true);

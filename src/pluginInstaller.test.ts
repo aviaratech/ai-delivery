@@ -195,6 +195,29 @@ test('doctor retains distinct external marketplace observations with identical r
   assert.equal(result.diagnostics.nativeInventory, 'observed');
 });
 
+test('doctor observes external installations after retained managed removal without adopting them', async () => {
+  mkdirSync(join(fixture.home, '.codex'));
+  const statePath = writeState({ ...pendingState('remove', null), pending: undefined });
+  const before = readFileSync(statePath);
+  fixture.responses.push(
+    JSON.stringify({
+      installed: [{ pluginId: 'ai-delivery@external-market', version: '0.3.24', enabled: true }],
+      available: [],
+    }),
+  );
+  const result = await managePlugin({ ...input(), action: 'doctor', version: undefined });
+  assert.ok(result.diagnostics);
+  assert.deepEqual(result.diagnostics.registrations, [
+    { kind: 'plugin', scope: 'user', ownership: 'external', source: 'unknown', version: '0.3.24', enabled: true },
+  ]);
+  assert.equal(result.installed, false);
+  assert.equal(result.sourceIntegrity, undefined);
+  assert.equal(result.mcp, undefined);
+  assert.deepEqual(result.activation, { installedVersion: null, startupVersion: null, loadedVersion: null });
+  assert.deepEqual(readFileSync(statePath), before);
+  assert.deepEqual(fixture.commandArguments, [['codex', 'plugin', 'list', '--json']]);
+});
+
 test('compiled preview never invokes native tools or creates installer state', () => {
   const profile = join(fixture.home, '.codex');
   const bin = join(fixture.home, 'bin');
@@ -230,6 +253,31 @@ test('preview refuses a symlinked configuration without following its target', a
   assert.deepEqual(result.diagnostics.registrations, []);
   assert.equal(JSON.stringify(result).includes('fictional-sensitive-content'), false);
   assert.deepEqual(fixture.commands, []);
+  assert.equal(existsSync(join(fixture.home, '.cache')), false);
+});
+
+test.each(['codex', 'claude-code'])('preview refuses a FIFO configuration without blocking in %s', (host) => {
+  const profile = join(fixture.home, '.codex');
+  mkdirSync(profile);
+  const config = host === 'codex' ? join(profile, 'config.toml') : join(fixture.home, '.mcp.json');
+  execFileSync('/usr/bin/mkfifo', [config]);
+  const metadata = lstatSync(config);
+  const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
+  // Bound only the known FIFO-open stall and reap this test-owned child.
+  const child = spawnSync(process.execPath, [cli, 'plugin', 'preview', '--host', host, '--json'], {
+    cwd: fixture.home,
+    env: { ...process.env, HOME: fixture.home, CODEX_HOME: profile },
+    encoding: 'utf8',
+    timeout: 3000,
+    killSignal: 'SIGKILL',
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0);
+  const result = JSON.parse(child.stdout) as Awaited<ReturnType<typeof managePlugin>>;
+  assert.ok(result.diagnostics);
+  assert.ok(result.diagnostics.findings.includes('configuration_unavailable'));
+  assert.deepEqual(result.diagnostics.registrations, []);
+  assert.equal(lstatSync(config).ino, metadata.ino);
   assert.equal(existsSync(join(fixture.home, '.cache')), false);
 });
 
@@ -642,6 +690,37 @@ test('Claude doctor retains its unfiltered native inventory and disabled selecti
   assert.deepEqual(fixture.commandArguments, [['claude', 'plugin', 'list', '--json']]);
 });
 
+test('Claude doctor binds managed provenance to the verified scope and source, excluding other projects', async () => {
+  doctorFixture(false, 'claude-code');
+  const entries = JSON.parse(fixture.responses[0] as string) as Record<string, unknown>[];
+  const selected = entries[0]!;
+  entries.push(
+    { ...selected, scope: 'project', projectPath: fixture.home, version: '0.3.24', installPath: '/unverified' },
+    { ...selected, scope: 'local', projectPath: fixture.home, installPath: '/unverified' },
+    { ...selected, scope: 'project', projectPath: join(fixture.home, 'other-project') },
+    { ...selected, scope: 'local' },
+  );
+  fixture.responses[0] = JSON.stringify(entries);
+  const result = await managePlugin({ ...input(), host: 'claude-code', action: 'doctor', version: undefined });
+  assert.equal(result.sourceIntegrity, true);
+  assert.ok(result.diagnostics);
+  assert.deepEqual(result.diagnostics.registrations, [
+    {
+      kind: 'plugin',
+      scope: 'user',
+      ownership: 'managed',
+      source: 'managed_archive',
+      version: '0.3.21',
+      enabled: false,
+    },
+    { kind: 'plugin', scope: 'project', ownership: 'external', source: 'unknown', version: '0.3.24', enabled: false },
+    { kind: 'plugin', scope: 'local', ownership: 'external', source: 'unknown', version: '0.3.21', enabled: false },
+    { kind: 'plugin', scope: 'local', ownership: 'external', source: 'unknown', version: '0.3.21', enabled: false },
+  ]);
+  assert.ok(result.diagnostics.findings.includes('native_registration_project_unverified'));
+  assert.deepEqual(fixture.commandArguments, [['claude', 'plugin', 'list', '--json']]);
+});
+
 test('doctor refuses a same-version native cache with changed skill bytes before starting MCP', async () => {
   const cache = doctorFixture(true);
   writeFileSync(join(cache, 'skills/intake/SKILL.md'), 'unexpected native bytes');
@@ -720,7 +799,8 @@ test('an absent native profile beneath a symlink keeps its identity after creati
   const result = await managePlugin({ ...input(), action: 'doctor', version: undefined });
   assert.equal(result.recoveryRequired, false);
   assert.deepEqual(readFileSync(statePath), before);
-  assert.deepEqual(fixture.commands, ['codex']);
+  assert.equal(result.diagnostics?.nativeInventory, 'unavailable');
+  assert.deepEqual(fixture.commands, ['codex', 'codex']);
 });
 
 test('a definitive version preparation failure preserves selection and permits a different valid request', async () => {
