@@ -3,11 +3,12 @@ import { graphql } from '@octokit/graphql';
 import type { graphql as GraphQLType } from '@octokit/graphql';
 import { Octokit } from '@octokit/rest';
 import { readFileSync } from 'node:fs';
+import { types } from 'node:util';
 
 import type { DeliveryConfig, DeliveryRole } from '../config/deliveryConfig.js';
 
 import { resolveDeliveryRoleCredentials } from '../config/deliveryConfig.js';
-import { DeliveryError } from '../errors.js';
+import { DeliveryError, setMachineRequestDiagnostics, type SafeMachineRequestDiagnostics } from '../errors.js';
 import {
   assertSupportedAuthorHost,
   machineAuthorEligible,
@@ -332,8 +333,8 @@ function buildClients(
     ...(signal === undefined ? {} : { request: { signal } }),
   });
   if (machineSession)
-    rest.hook.error('request', (error) => {
-      throw safeMachineRequestError(error);
+    rest.hook.error('request', (error, options) => {
+      throw safeMachineRequestError(error, 'rest.request', restMachineEndpoint(options));
     });
   const clients: GitHubClients = {
     authSource,
@@ -346,7 +347,7 @@ function buildClients(
       ? new Proxy(rawGraphql, {
           apply(target, receiver, args: unknown[]) {
             return (Reflect.apply(target, receiver, args) as Promise<unknown>).catch((error: unknown) => {
-              throw safeMachineRequestError(error);
+              throw safeMachineRequestError(error, 'graphql.request', 'graphql');
             });
           },
         })
@@ -357,8 +358,52 @@ function buildClients(
   return clients;
 }
 
-function safeMachineRequestError(error: unknown): DeliveryError {
-  const status = (error as { status?: unknown } | null)?.status;
+function ownData(value: unknown, name: string): unknown {
+  if (typeof value !== 'object' || value === null || types.isProxy(value) || Array.isArray(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+function restMachineEndpoint(options: unknown): SafeMachineRequestDiagnostics['endpoint'] {
+  const method = ownData(options, 'method'),
+    url = ownData(options, 'url');
+  if (typeof method !== 'string' || typeof url !== 'string' || url.length > 1024 || /[^\x21-\x7e]/u.test(url))
+    return 'UNKNOWN';
+  let path: string;
+  if (url.startsWith('/')) {
+    const base = ownData(options, 'baseUrl');
+    if (base !== 'https://api.github.com') return 'UNKNOWN';
+    path = url.split(/[?#]/u)[0]!;
+  } else {
+    try {
+      const parsed = new URL(url);
+      if (parsed.origin !== 'https://api.github.com' || parsed.username || parsed.password) return 'UNKNOWN';
+      path = parsed.pathname;
+    } catch {
+      return 'UNKNOWN';
+    }
+  }
+  const prefix = '/repos/[^/]{1,100}/[^/]{1,100}';
+  const number = '(?:[0-9]{1,20}|\\{pull_number\\})';
+  const routes: readonly [string, RegExp, SafeMachineRequestDiagnostics['endpoint']][] = [
+    ['PUT', new RegExp(`^${prefix}/pulls/${number}/merge$`, 'u'), 'pulls.merge'],
+    ['GET', new RegExp(`^${prefix}/pulls/${number}$`, 'u'), 'pulls.get'],
+    ['GET', new RegExp(`^${prefix}/pulls/${number}/reviews$`, 'u'), 'pulls.listReviews'],
+    ['GET', new RegExp(`^${prefix}/pulls/${number}/reviews/(?:[0-9]{1,20}|\\{review_id\\})$`, 'u'), 'pulls.getReview'],
+    ['GET', new RegExp(`^${prefix}/git/commits/[^/]{1,100}$`, 'u'), 'git.getCommit'],
+    ['GET', new RegExp(`^${prefix}/git/ref/.{1,300}$`, 'u'), 'git.getRef'],
+    ['GET', new RegExp(`^${prefix}/issues/(?:[0-9]{1,20}|\\{issue_number\\})$`, 'u'), 'issues.get'],
+    ['PATCH', new RegExp(`^${prefix}/issues/(?:[0-9]{1,20}|\\{issue_number\\})$`, 'u'), 'issues.update'],
+  ];
+  return routes.find(([verb, pattern]) => verb === method && pattern.test(path))?.[2] ?? 'UNKNOWN';
+}
+
+function safeMachineRequestError(
+  error: unknown,
+  phase: 'rest.request' | 'graphql.request',
+  endpoint: SafeMachineRequestDiagnostics['endpoint'],
+): DeliveryError {
+  const status = ownData(error, 'status');
   const safe = new DeliveryError(
     status === 401
       ? 'Machine GitHub session is invalid or expired; verify the selected github.com account.'
@@ -368,5 +413,13 @@ function safeMachineRequestError(error: unknown): DeliveryError {
   );
   if (typeof status === 'number' && Number.isSafeInteger(status) && status >= 400 && status <= 599)
     Object.assign(safe, { status });
+  const headers = ownData(error, 'headers') ?? ownData(ownData(error, 'response'), 'headers');
+  setMachineRequestDiagnostics(safe, {
+    phase,
+    endpoint,
+    status,
+    code: ownData(error, 'code'),
+    requestId: ownData(headers, 'x-github-request-id'),
+  });
   return safe;
 }

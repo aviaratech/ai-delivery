@@ -1,3 +1,5 @@
+import { getMachineRequestDiagnostics } from './errors.js';
+
 /** Keep a recoverable start failure machine-readable while signalling shell failure. */
 export function printCommandResult(command: string, value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -10,4 +12,14 @@ export function printCommandResult(command: string, value: unknown): void {
   ) {
     process.exitCode = 1;
   }
+}
+
+export function printCommandError(error: unknown): void {
+  const diagnostic = getMachineRequestDiagnostics(error);
+  if (diagnostic)
+    process.stderr.write(
+      `ai-delivery: request phase=${diagnostic.phase}; endpoint=${diagnostic.endpoint}; status=${diagnostic.status}; code=${diagnostic.code}; requestId=${diagnostic.requestId}\n`,
+    );
+  process.stderr.write(`ai-delivery: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
 }

@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
 
-import { printCommandResult } from './cliResult.js';
+import { printCommandError, printCommandResult } from './cliResult.js';
 import { contextFor, executeTool, type ExecutionContext } from './dispatch.js';
 import { listIssueSubissues } from './issue.js';
 import { listPrs, preflightReviewRoute, prChecks } from './pr.js';
@@ -609,7 +609,4 @@ program
   });
 program.command('mcp:serve').action(async () => serveAiDeliveryMcp(execution()));
 
-program.parseAsync(process.argv).catch((error) => {
-  process.stderr.write(`ai-delivery: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+program.parseAsync(process.argv).catch(printCommandError);
