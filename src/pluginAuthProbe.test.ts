@@ -77,3 +77,32 @@ test('successful authentication capture returns stdout only after owned cleanup'
   assert.deepEqual(result, { failed: false, stdout: 'fictional-readback', diagnostic: '', cleanupConfirmed: true });
   assert.deepEqual(readdirSync(root), []);
 });
+
+test('the production error renderer preserves the owned authentication probe final-line classification', async () => {
+  const cli = join(root, 'renderer.mjs');
+  writeFileSync(
+    cli,
+    `import { writeFileSync } from 'node:fs';
+import { DeliveryError,setMachineRequestDiagnostics } from ${JSON.stringify(new URL('./errors.js', import.meta.url).href)};
+import { printCommandError } from ${JSON.stringify(new URL('./cliResult.js', import.meta.url).href)};
+writeFileSync(${JSON.stringify(join(root, 'renderer-pid.json'))},JSON.stringify({pid:process.pid}));
+process.stdout.write('fictional_private_stdout');process.stderr.write('fictional_private_stderr\\n');
+const error=new DeliveryError('Machine GitHub session is invalid or expired; verify the selected github.com account.');
+setMachineRequestDiagnostics(error,{phase:'rest.request',endpoint:'issues.get',status:401,code:'UNKNOWN',requestId:'ABCD:1234:5678:9ABC:DEF0'});
+printCommandError(error);
+`,
+  );
+  const result = await captureAuthenticationProbe(root, [process.execPath, cli], environment());
+  assert.deepEqual(result, {
+    failed: true,
+    stdout: '',
+    diagnostic: 'ai-delivery: Machine GitHub session is invalid or expired; verify the selected github.com account.',
+    cleanupConfirmed: true,
+  });
+  assert.equal(JSON.stringify(result).includes('fictional_private'), false);
+  assert.equal(JSON.stringify(result).includes('ABCD:'), false);
+  const pid = (JSON.parse(readFileSync(join(root, 'renderer-pid.json'), 'utf8')) as { pid: number }).pid;
+  const observed = processSnapshot().get(pid);
+  assert.ok(observed === undefined || /^[ZX]/u.test(observed.status));
+  assert.deepEqual(readdirSync(root).sort(), ['renderer-pid.json', 'renderer.mjs']);
+});

@@ -9,6 +9,8 @@ import { resolveRepoFromRemote } from './repo.js';
 import { machineAuthorEligible, withMachineAuthorCredential } from './machineAuth.js';
 import { syntheticDiscoveryConfig, syntheticDiscoveryClients } from '../fixtures/discovery.js';
 import { contextFor } from '../dispatch.js';
+import { printCommandError } from '../cliResult.js';
+import { getMachineRequestDiagnostics } from '../errors.js';
 
 // This executable and all account/token/HTTP responses are fictional. No real
 // gh binary, home, configuration, keyring, GitHub session or network is used.
@@ -110,6 +112,29 @@ async function safeFailure(operation: Promise<unknown>, expected: RegExp) {
     assert.equal(error.cause, undefined);
     return true;
   });
+}
+function renderFailure(error: unknown): string {
+  const stderr: string[] = [];
+  const stdout: string[] = [];
+  const exitCode = process.exitCode;
+  const err = vi.spyOn(process.stderr, 'write').mockImplementation((value) => {
+    stderr.push(String(value));
+    return true;
+  });
+  const out = vi.spyOn(process.stdout, 'write').mockImplementation((value) => {
+    stdout.push(String(value));
+    return true;
+  });
+  try {
+    printCommandError(error);
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(stdout, []);
+    return stderr.join('');
+  } finally {
+    err.mockRestore();
+    out.mockRestore();
+    process.exitCode = exitCode;
+  }
 }
 beforeEach(() => {
   home = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-machine-session-')));
@@ -326,6 +351,182 @@ test('repository read and simulated write permission refusal preserve status and
   );
   await safeFailure(clients.graphql('query { repository(owner:"example",name:"widget") { id } }'), /cannot access/u);
   assert.equal(calls().length, 2);
+});
+
+test('machine REST request diagnostics reach the real CLI renderer without private response data', async () => {
+  identity();
+  const clients = await author();
+  vi.stubGlobal(
+    'fetch',
+    async () =>
+      new Response(JSON.stringify({ message: token, private: 'fictional_private_body' }), {
+        status: 500,
+        headers: {
+          'content-type': 'application/json',
+          'x-github-request-id': 'ABCD:1234:5678:9ABC:DEF0',
+          'x-private-header': token,
+        },
+      }),
+  );
+  await assert.rejects(
+    clients.rest.pulls.merge({ owner: 'example', repo: 'widget', pull_number: 17, sha: 'a'.repeat(40) }),
+    (error: unknown) => {
+      const output = renderFailure(error);
+      assert.equal(
+        output,
+        'ai-delivery: request phase=rest.request; endpoint=pulls.merge; status=500; code=UNKNOWN; requestId=ABCD:1234:5678:9ABC:DEF0\nai-delivery: Machine GitHub request failed; verify the selected account and repository access.\n',
+      );
+      assert.equal(output.includes(token), false);
+      assert.equal(output.includes('fictional_private'), false);
+      assert.equal(JSON.stringify(error).includes(token), false);
+      return true;
+    },
+  );
+  assert.equal(calls().length, 2);
+});
+
+test.each([500, 200])(
+  'machine GraphQL status %s diagnostics reach the real CLI renderer without query or data errors',
+  async (status) => {
+    identity();
+    const clients = await author();
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(
+          JSON.stringify({
+            errors: [{ message: token, extensions: { private: 'fictional_private_data' } }],
+            data: { private: token },
+          }),
+          {
+            status,
+            headers: {
+              'content-type': 'application/json',
+              'x-github-request-id': 'ABCD:1234:5678:9ABC:DEF0',
+              'x-private-header': token,
+            },
+          },
+        ),
+    );
+    await assert.rejects(
+      clients.graphql('query FictionalPrivate($value:String!){ repository(owner:$value,name:"widget"){id} }', {
+        value: 'fictional_private_variables',
+      }),
+      (error: unknown) => {
+        const output = renderFailure(error);
+        assert.equal(
+          output,
+          `ai-delivery: request phase=graphql.request; endpoint=graphql; status=${status === 500 ? '500' : 'UNKNOWN'}; code=UNKNOWN; requestId=ABCD:1234:5678:9ABC:DEF0\nai-delivery: Machine GitHub request failed; verify the selected account and repository access.\n`,
+        );
+        assert.equal(output.includes(token), false);
+        assert.equal(output.includes('fictional_private'), false);
+        assert.equal(output.includes('FictionalPrivate'), false);
+        assert.equal(JSON.stringify(error).includes(token), false);
+        return true;
+      },
+    );
+    assert.equal(calls().length, 2);
+  },
+);
+
+test('real machine REST failures classify only the finite guarded-delivery endpoints', async () => {
+  identity();
+  const clients = await author();
+  vi.stubGlobal(
+    'fetch',
+    async () =>
+      new Response(JSON.stringify({ message: token }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      }),
+  );
+  const operations: [string, () => Promise<unknown>][] = [
+    ['pulls.merge', () => clients.rest.pulls.merge({ owner: 'example', repo: 'widget', pull_number: 17 })],
+    ['pulls.get', () => clients.rest.pulls.get({ owner: 'example', repo: 'widget', pull_number: 17 })],
+    ['pulls.listReviews', () => clients.rest.pulls.listReviews({ owner: 'example', repo: 'widget', pull_number: 17 })],
+    [
+      'pulls.getReview',
+      () => clients.rest.pulls.getReview({ owner: 'example', repo: 'widget', pull_number: 17, review_id: 42 }),
+    ],
+    [
+      'git.getCommit',
+      () => clients.rest.git.getCommit({ owner: 'example', repo: 'widget', commit_sha: 'a'.repeat(40) }),
+    ],
+    ['git.getRef', () => clients.rest.git.getRef({ owner: 'example', repo: 'widget', ref: 'heads/issue/17' })],
+    ['issues.get', () => clients.rest.issues.get({ owner: 'example', repo: 'widget', issue_number: 17 })],
+    [
+      'issues.update',
+      () =>
+        clients.rest.issues.update({ owner: 'example', repo: 'widget', issue_number: 17, title: 'fictional title' }),
+    ],
+  ];
+  for (const [endpoint, operation] of operations)
+    await assert.rejects(operation(), (error: unknown) => {
+      assert.equal(getMachineRequestDiagnostics(error)?.endpoint, endpoint);
+      assert.equal(getMachineRequestDiagnostics(error)?.requestId, 'UNKNOWN');
+      assert.equal(renderFailure(error).includes(token), false);
+      return true;
+    });
+  assert.equal(calls().length, 2);
+});
+
+test.each([401, 403, 404])(
+  'machine status %s preserves exact refusal and legacy status through the real renderer',
+  async (status) => {
+    identity();
+    const clients = await author();
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(JSON.stringify({ message: token }), { status, headers: { 'content-type': 'application/json' } }),
+    );
+    await assert.rejects(
+      clients.rest.pulls.get({ owner: 'example', repo: 'widget', pull_number: 17 }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(Reflect.get(error, 'status'), status);
+        const message =
+          status === 401
+            ? 'Machine GitHub session is invalid or expired; verify the selected github.com account.'
+            : 'Machine GitHub session cannot access the selected repository or operation; verify its existing permissions.';
+        assert.equal(error.message, message);
+        assert.equal(renderFailure(error).trimEnd().split('\n').at(-1), `ai-delivery: ${message}`);
+        return true;
+      },
+    );
+    assert.equal(calls().length, 2);
+  },
+);
+
+test.each([
+  'GET https://private.invalid/fictional_private_path',
+  'DELETE /repos/example/widget/pulls/17/merge',
+  'GET /repos/example/widget/pulls/17/unknown',
+])('unknown request %s remains UNKNOWN and withholds arbitrary metadata', async (route) => {
+  identity();
+  const clients = await author();
+  vi.stubGlobal(
+    'fetch',
+    async () =>
+      new Response(JSON.stringify({ message: token, code: 'ENOTFOUND', cause: token }), {
+        status: 500,
+        headers: { 'content-type': 'application/json', 'x-github-request-id': token, 'x-private-header': token },
+      }),
+  );
+  await assert.rejects(clients.rest.request(route), (error: unknown) => {
+    assert.deepEqual(getMachineRequestDiagnostics(error), {
+      phase: 'rest.request',
+      endpoint: 'UNKNOWN',
+      status: 500,
+      code: 'UNKNOWN',
+      requestId: 'UNKNOWN',
+    });
+    const output = renderFailure(error);
+    assert.equal(output.includes(token), false);
+    assert.equal(output.includes('fictional_private_path'), false);
+    assert.equal(output.includes('ENOTFOUND'), false);
+    return true;
+  });
 });
 test('repository discovery and subsequent command construction retain one selected machine account', async () => {
   identity();
