@@ -1112,7 +1112,7 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
     body: issue.body ?? '',
     issueNumber,
     issueType: issue.type?.name ?? null,
-    labels: issue.labels.flatMap((label) =>
+    labels: (issue.labels ?? []).flatMap((label) =>
       typeof label === 'string' ? [label] : label.name === undefined ? [] : [label.name],
     ),
     milestone: issue.milestone?.number ?? null,

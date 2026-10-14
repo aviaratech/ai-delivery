@@ -154,6 +154,20 @@ for (const route of routes) {
     }
   });
 
+  test(`${route} info tolerates omitted native labels and milestone`, async () => {
+    const f = fixture();
+    Reflect.deleteProperty(f.native, 'labels');
+    Reflect.deleteProperty(f.native, 'milestone');
+    const api = await caller(route);
+    try {
+      const result = await api.call('issue_info', { issueNumber: 17 });
+      assert.deepEqual(result.labels, []);
+      assert.equal(result.milestone, null);
+    } finally {
+      await api.close();
+    }
+  });
+
   test(`${route} update readback preserves native set, omitted and cleared values`, async () => {
     const f = fixture();
     const api = await caller(route);
