@@ -79,7 +79,7 @@ function print(value: unknown): void {
 }
 
 const plugin = program.command('plugin').description('Manage the ai-delivery native plugin');
-for (const action of ['install', 'doctor', 'update', 'rollback', 'remove'] as const) {
+for (const action of ['install', 'doctor', 'preview', 'update', 'rollback', 'remove'] as const) {
   const command = plugin
     .command(action)
     .requiredOption('--host <host>', 'Native host: codex or claude-code')
@@ -119,6 +119,20 @@ for (const action of ['install', 'doctor', 'update', 'rollback', 'remove'] as co
       if (result.mcp)
         process.stdout.write(
           `Bundled MCP startup: ${result.mcp.startup}${result.mcp.error ? ` (${result.mcp.error})` : ''}\n`,
+        );
+      if (result.diagnostics) {
+        process.stdout.write(
+          `Registration observations: ${result.diagnostics.registrations.length}; completeness ${result.diagnostics.completeness}; migration ${result.diagnostics.migration}; planned changes ${result.diagnostics.plannedChanges.length}\n`,
+        );
+        for (const entry of result.diagnostics.registrations)
+          process.stdout.write(
+            `${entry.kind} ${entry.scope}: ownership ${entry.ownership}; source ${entry.source}; version ${entry.version ?? 'unknown'}\n`,
+          );
+        process.stdout.write(`Unverified conditions: ${result.diagnostics.findings.join(', ')}\n`);
+      }
+      if (result.activation)
+        process.stdout.write(
+          `Native session loaded version: unverified. Installed observation: ${result.activation.installedVersion ?? 'unknown'}; separate startup: ${result.activation.startupVersion ?? 'not checked'}. Use the host's surface-specific activation guidance.\n`,
         );
       if (result.recoveryRequired)
         process.stdout.write('Resume the interrupted original plugin command to recover this target.\n');
