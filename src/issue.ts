@@ -1073,6 +1073,8 @@ export interface IssueInfo {
   body: string;
   issueNumber: number;
   issueType: string | null;
+  labels: string[];
+  milestone: number | null;
   parentIssueNumber: number | null;
   points?: number;
   priority?: string;
@@ -1110,6 +1112,10 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
     body: issue.body ?? '',
     issueNumber,
     issueType: issue.type?.name ?? null,
+    labels: issue.labels.flatMap((label) =>
+      typeof label === 'string' ? [label] : label.name === undefined ? [] : [label.name],
+    ),
+    milestone: issue.milestone?.number ?? null,
     parentIssueNumber: relationships.parentNumber,
     ...(metadata.points === undefined ? {} : { points: metadata.points }),
     ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),
