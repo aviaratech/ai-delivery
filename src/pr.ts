@@ -1,5 +1,6 @@
 import { DeliveryError } from './errors.js';
-import { createDeliveryGitHubClients, hasBranchProtectionAbsence, type GitHubClients } from './github/client.js';
+import * as githubClients from './github/client.js';
+import type { GitHubClients } from './github/client.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
 import {
   commentIssue,
@@ -140,7 +141,7 @@ async function nonClosingRoute(context: DeliveryContext, base: string) {
       ? context
       : {
           ...context,
-          clients: await createDeliveryGitHubClients({
+          clients: await githubClients.createDeliveryGitHubClients({
             config: context.config,
             identity: context.config.roles.author.identity,
             role: 'author',
@@ -750,7 +751,7 @@ export async function preflightReviewRoute(
   const reviewer =
     selectedReviewer ??
     context.reviewerClients ??
-    (await createDeliveryGitHubClients({
+    (await githubClients.createDeliveryGitHubClients({
       config: context.config,
       identity: context.config.roles.reviewer.identity,
       role: 'reviewer',
@@ -805,7 +806,7 @@ export async function preflightReviewRoute(
     rulesetResult.status === 'fulfilled' &&
     completeRulePage(rulesetResult.value) &&
     protectionResult.status === 'rejected' &&
-    hasBranchProtectionAbsence(protectionResult.reason, context.clients, context.repo, base)
+    githubClients.hasBranchProtectionAbsence(protectionResult.reason, context.clients, context.repo, base)
   ) {
     // A generic/permission 404 is never absence. Corroborate the named branch,
     // selected author's write access, and all repository/parent rulesets.
@@ -1291,7 +1292,7 @@ export async function mergePr(
   if (pr.state !== 'open' || pr.draft) throw new DeliveryError('GitHub PR must be open and ready for merge.');
   const reviewer =
     context.reviewerClients ??
-    (await createDeliveryGitHubClients({
+    (await githubClients.createDeliveryGitHubClients({
       config: context.config,
       identity: context.config.roles.reviewer.identity,
       role: 'reviewer',
