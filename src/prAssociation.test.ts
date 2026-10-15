@@ -14,7 +14,7 @@ import { executeTool } from './dispatch.js';
 import * as issues from './issue.js';
 import type { DeliveryContext } from './issue.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
-import { prInfo, publishPr, startIssueBranch, submitFormalReview } from './pr.js';
+import { preflightReviewRoute, prInfo, publishPr, startIssueBranch, submitFormalReview } from './pr.js';
 
 const repo = 'example/widget';
 const head = 'a'.repeat(40);
@@ -1101,12 +1101,14 @@ describe('directory-independent exact-PR contract', () => {
 describe('explicit native non-closing reference delivery', () => {
   const input = { issueNumber: 17, prNumber: 23, nonClosing: true };
 
-  it.each(['ruleset-only', 'confirmed-unprotected'])(
+  it.each(['ruleset-only', 'ruleset-only with disabled protection summary', 'confirmed-unprotected'])(
     'creates and reviews %s protection through the real machine client and sanitizer',
     async (mode) => {
       const { context, reviewerContext, state, artifact, evidence, restore, token } =
         await machineRulesetOnlyFixture(false);
       try {
+        if (mode === 'ruleset-only with disabled protection summary')
+          evidence.branch = { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } };
         if (mode === 'confirmed-unprotected') {
           evidence.rules = { status: 200, headers: {}, data: [] };
           evidence.rulesets = { status: 200, headers: {}, data: [] };
@@ -1118,6 +1120,9 @@ describe('explicit native non-closing reference delivery', () => {
         assert.equal(state.creations, 0);
         const created = await publishPr(context, { issueNumber: 17, nonClosing: true });
         assert.equal(state.creations, 1);
+        const route = await preflightReviewRoute(context, 'main');
+        assert.equal(route.rules.visibility, 'complete');
+        assert.equal(route.rules.observedRequiredApprovals, mode === 'confirmed-unprotected' ? 0 : 1);
         const reviewPreview = await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
         assert.equal(state.submissions, 0);
         const reviewed = await submitFormalReview(reviewerContext, { ...input, artifact });
@@ -1155,6 +1160,7 @@ describe('explicit native non-closing reference delivery', () => {
       const { context, reviewerContext, state, artifact, evidence, restore, token } =
         await machineRulesetOnlyFixture(false);
       try {
+        evidence.branch = { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } };
         await startIssueBranch(context, 17);
         state.remoteHead = head;
         Object.assign(evidence, change);
@@ -1179,26 +1185,30 @@ describe('explicit native non-closing reference delivery', () => {
     });
   }
 
-  it('creates and independently reviews a non-closing PR with corroborated repository and parent ruleset protection', async () => {
-    const { context, reviewerContext, state, artifact } = rulesetOnlyFixture(false);
-    vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
-    await startIssueBranch(context, 17);
-    state.remoteHead = head;
-    const preview = await publishPr(context, { issueNumber: 17, nonClosing: true, dryRun: true });
-    assert.equal(preview.nonClosing, true);
-    assert.equal(state.creations, 0);
-    await publishPr(context, { issueNumber: 17, nonClosing: true });
-    assert.equal(state.creations, 1);
-    assert.equal(state.issueState, 'open');
-    assert.equal(state.issueBody, 'Four retained criteria');
-    await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
-    assert.equal(state.submissions, 0);
-    await submitFormalReview(reviewerContext, { ...input, artifact });
-    assert.equal(state.submissions, 1);
-    assert.equal(state.reviews[0]?.commit_id, head);
-    assert.equal(state.reviews[0]?.user.login, 'reviewer[bot]');
-    assert.equal(state.updates, 0);
-  });
+  it.each([true, false])(
+    'creates and independently reviews a non-closing PR with corroborated rulesets and protection summary %s',
+    async (enabled) => {
+      const { context, reviewerContext, state, artifact, evidence } = rulesetOnlyFixture(false);
+      evidence.branch = { status: 200, data: { name: 'main', protected: true, protection: { enabled } } };
+      vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+      await startIssueBranch(context, 17);
+      state.remoteHead = head;
+      const preview = await publishPr(context, { issueNumber: 17, nonClosing: true, dryRun: true });
+      assert.equal(preview.nonClosing, true);
+      assert.equal(state.creations, 0);
+      await publishPr(context, { issueNumber: 17, nonClosing: true });
+      assert.equal(state.creations, 1);
+      assert.equal(state.issueState, 'open');
+      assert.equal(state.issueBody, 'Four retained criteria');
+      await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
+      assert.equal(state.submissions, 0);
+      await submitFormalReview(reviewerContext, { ...input, artifact });
+      assert.equal(state.submissions, 1);
+      assert.equal(state.reviews[0]?.commit_id, head);
+      assert.equal(state.reviews[0]?.user.login, 'reviewer[bot]');
+      assert.equal(state.updates, 0);
+    },
+  );
 
   for (const [name, change] of [
     ['generic 404', { protectionError: { status: 404, response: { status: 404, data: { message: 'Not Found' } } } }],
@@ -1225,10 +1235,23 @@ describe('explicit native non-closing reference delivery', () => {
       { branch: { status: 200, data: { name: 'main', protected: false, protection: { enabled: true } } } },
     ],
     [
-      'conflicting protection summary',
-      { branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } } },
+      'unprotected branch with active rulesets',
+      { branch: { status: 200, data: { name: 'main', protected: false, protection: { enabled: false } } } },
     ],
     ['missing protected branch summary', { branch: { status: 200, data: { name: 'main', protected: true } } }],
+    ['missing enabled summary', { branch: { status: 200, data: { name: 'main', protected: true, protection: {} } } }],
+    [
+      'null enabled summary',
+      { branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: null } } } },
+    ],
+    [
+      'string enabled summary',
+      { branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: 'false' } } } },
+    ],
+    [
+      'numeric enabled summary',
+      { branch: { status: 200, data: { name: 'main', protected: true, protection: { enabled: 0 } } } },
+    ],
     ['missing ruleset page headers', { rulesets: { status: 200, data: [] } }],
     [
       'incomplete parent ruleset page',
