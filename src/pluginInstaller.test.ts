@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   existsSync,
+  chmodSync,
   cpSync,
   lstatSync,
   mkdirSync,
@@ -32,6 +33,7 @@ const fixture = vi.hoisted(() => ({
   commandArguments: [] as string[][],
   realCommands: false,
   responses: [] as (string | ((args: string[]) => string))[],
+  respond: undefined as ((args: string[]) => string | undefined) | undefined,
   packArchive: '',
 }));
 vi.mock('node:child_process', async (original) => {
@@ -50,7 +52,7 @@ vi.mock('node:child_process', async (original) => {
         stderr: new PassThrough(),
         kill: () => true,
       });
-      const queued = fixture.responses.shift();
+      const queued = fixture.responses.shift() ?? fixture.respond;
       let response = typeof queued === 'function' ? queued(commandArguments) : queued;
       if (binary === '/bin/sh' && args?.[3] === 'npm' && fixture.packArchive) {
         const destination = args[args.indexOf('--pack-destination') + 1]!;
@@ -298,6 +300,7 @@ beforeEach(() => {
   fixture.commandArguments = [];
   fixture.realCommands = false;
   fixture.responses = [];
+  fixture.respond = undefined;
   fixture.packArchive = '';
 });
 afterEach(() => {
@@ -381,6 +384,35 @@ function doctorFixture(enabled: boolean, host = 'codex') {
     },
     host,
   );
+  for (const [relative, content] of [
+    [
+      '.agents/plugins/marketplace.json',
+      {
+        name: 'ai-delivery-user',
+        interface: { displayName: 'ai-delivery' },
+        plugins: [
+          {
+            name: 'ai-delivery',
+            source: { source: 'local', path: `./versions/${version}/plugins/ai-delivery` },
+            policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+            category: 'Productivity',
+          },
+        ],
+      },
+    ],
+    [
+      '.claude-plugin/marketplace.json',
+      {
+        name: 'ai-delivery-user',
+        owner: { name: 'AviaraTech' },
+        plugins: [{ name: 'ai-delivery', source: `./versions/${version}/plugins/ai-delivery`, version }],
+      },
+    ],
+  ] as const) {
+    const path = join(catalog, relative);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, JSON.stringify(content), { mode: 0o600 });
+  }
   if (host === 'codex') {
     fixture.responses.push(
       JSON.stringify({
@@ -404,16 +436,6 @@ function doctorFixture(enabled: boolean, host = 'codex') {
       path,
       JSON.stringify({
         'ai-delivery-user': { source: { source: 'directory', path: catalog }, installLocation: catalog },
-      }),
-      { mode: 0o600 },
-    );
-    const published = join(catalog, '.claude-plugin/marketplace.json');
-    mkdirSync(dirname(published), { recursive: true, mode: 0o700 });
-    writeFileSync(
-      published,
-      JSON.stringify({
-        name: 'ai-delivery-user',
-        plugins: [{ name: 'ai-delivery', version, source: `./versions/${version}/plugins/ai-delivery` }],
       }),
       { mode: 0o600 },
     );
@@ -517,11 +539,11 @@ function installationFixture(
     marketplaceSource: { sourceType: 'local', source: catalog },
   };
   fixture.responses.push(
-    'codex-cli 0.153.0',
+    'codex-cli 0.162.1',
     oversizedCatalogue(previous),
     '',
     '0.3.22',
-    '{}',
+    ...(action === 'install' ? ['{}'] : []),
     (args) => {
       assert.deepEqual(args, ['codex', 'plugin', 'add', 'ai-delivery@ai-delivery-user', '--json']);
       mkdirSync(dirname(cache), { recursive: true, mode: 0o700 });
@@ -532,6 +554,403 @@ function installationFixture(
   );
   return { entry, cache, catalog, source };
 }
+
+function replacementFixture(preferences: unknown = { issue_info: { approval: 'fictional-explicit-allow' } }) {
+  const { entry, cache, catalog } = installationFixture('update');
+  fixture.responses = [];
+  const selector = 'ai-delivery@ai-delivery-user';
+  const policy: Record<string, unknown> = {
+    [selector]: { enabled: true, preferences },
+    'private-unrelated@other': { sentinel: 'fictional-private-value', enabled: false },
+  };
+  const before = structuredClone(policy);
+  const native = {
+    selected: [
+      {
+        ...entry,
+        version: '0.3.21',
+        source: { source: 'local', path: join(catalog, 'versions/0.3.21/plugins/ai-delivery') },
+      },
+    ],
+    version: 'codex-cli 0.162.1',
+    selectionCalls: 0,
+    loseAck: false,
+    failSelection: false,
+  };
+  fixture.respond = (args) => {
+    if (args[0] === 'npm') return '';
+    if (args[0] === process.execPath) return '0.3.22';
+    if (args[1] === '--version') return native.version;
+    if (args[2] === 'list') return JSON.stringify({ installed: native.selected, available: [] });
+    if (args[2] === 'marketplace') return '{}';
+    if (args[2] === 'remove') {
+      // Pinned Codex remove clears the complete qualified plugin table.
+      delete policy[selector];
+      native.selected = [];
+      return '{}';
+    }
+    if (args[2] === 'add') {
+      assert.deepEqual(args, ['codex', 'plugin', 'add', selector, '--json']);
+      native.selectionCalls++;
+      if (native.failSelection) return undefined;
+      // Pinned add retains existing fields but can evict older native caches.
+      policy[selector] = { ...(policy[selector] as object | undefined), enabled: true };
+      const offered = JSON.parse(readFileSync(join(catalog, '.agents/plugins/marketplace.json'), 'utf8')) as {
+        plugins: { source: { path: string } }[];
+      };
+      const offeredPath = offered.plugins[0]!.source.path;
+      const version = /^\.\/versions\/([^/]+)\/plugins\/ai-delivery$/u.exec(offeredPath)![1]!;
+      const selectedCache = join(dirname(cache), version);
+      mkdirSync(dirname(selectedCache), { recursive: true, mode: 0o700 });
+      cpSync(join(catalog, offeredPath), selectedCache, { recursive: true });
+      for (const old of readdirSync(dirname(cache)))
+        if (old !== version) rmSync(join(dirname(cache), old), { recursive: true });
+      native.selected = [{ ...entry, version, source: { source: 'local', path: join(catalog, offeredPath) } }];
+      return native.loseAck ? undefined : JSON.stringify({ installedPath: selectedCache });
+    }
+    return undefined;
+  };
+  return { catalog, policy, before, native };
+}
+
+test.each([
+  { issue_info: { approval: 'fictional-explicit-allow' }, unknown: { nested: ['retain', null] } },
+  { unknown: { nested: ['retain', null] } },
+  { issue_info: null, unknown: { nested: ['retain', null] } },
+])(
+  'managed replacement preserves fictional tool preferences %j without clearing the plugin entry',
+  async (preferences) => {
+    const { policy, before } = replacementFixture(preferences);
+    const result = await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+    assert.equal(result.version, '0.3.22');
+    assert.deepEqual(policy, before);
+    assert.equal(
+      fixture.commandArguments.some((args) => ['remove', 'uninstall'].includes(args[2] ?? '')),
+      false,
+    );
+  },
+);
+
+test('installing a different owned version cannot bypass the preserving replacement path', async () => {
+  const { policy, before } = replacementFixture();
+  await managePlugin({ ...input(), action: 'install', version: '0.3.22' });
+  assert.deepEqual(policy, before);
+  assert.equal(
+    fixture.commandArguments.some((args) => args[2] === 'remove'),
+    false,
+  );
+});
+
+test('an exact same-version owned selection is reused without invoking native add', async () => {
+  const { native } = replacementFixture();
+  const result = await managePlugin({ ...input(), action: 'update', version: '0.3.21' });
+  assert.equal(result.changed, false);
+  assert.equal(native.selectionCalls, 0);
+});
+
+test.each([
+  'disabled',
+  'missing selection',
+  'unregistered catalog',
+  'foreign source',
+  'changed cache',
+  'changed catalog',
+  'catalog symlink',
+  'read-only catalog',
+  'unqualified native',
+  'unqualified newer native',
+])('replacement refuses %s before preparing a new version', async (fault) => {
+  const { native, catalog, policy, before } = replacementFixture();
+  if (fault === 'disabled') native.selected[0]!.enabled = false;
+  if (fault === 'missing selection') native.selected = [];
+  if (fault === 'unregistered catalog')
+    native.selected[0]!.marketplaceSource.source = join(fixture.home, 'foreign-marketplace');
+  if (fault === 'foreign source') native.selected[0]!.source.path = join(fixture.home, 'unowned');
+  if (fault === 'changed cache')
+    writeFileSync(
+      join(fixture.home, '.codex/plugins/cache/ai-delivery-user/ai-delivery/0.3.21/skills/intake/SKILL.md'),
+      'changed',
+    );
+  if (fault === 'changed catalog') writeFileSync(join(catalog, '.agents/plugins/marketplace.json'), '{}');
+  const unrelatedCatalog = join(fixture.home, 'unrelated-catalog');
+  if (fault === 'catalog symlink') {
+    writeFileSync(unrelatedCatalog, 'unrelated catalog sentinel');
+    rmSync(join(catalog, '.agents/plugins/marketplace.json'));
+    symlinkSync(unrelatedCatalog, join(catalog, '.agents/plugins/marketplace.json'));
+  }
+  if (fault === 'read-only catalog') chmodSync(join(catalog, '.agents/plugins/marketplace.json'), 0o400);
+  if (fault === 'unqualified native') native.version = 'codex-cli 0.153.0';
+  if (fault === 'unqualified newer native') native.version = 'codex-cli 0.162.2';
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }));
+  assert.equal(native.selectionCalls, 0);
+  assert.equal(existsSync(join(catalog, 'versions/0.3.22')), false);
+  assert.deepEqual(policy, before);
+  if (fault === 'catalog symlink') assert.equal(readFileSync(unrelatedCatalog, 'utf8'), 'unrelated catalog sentinel');
+});
+
+test.each(['update', 'install', 'rollback'])(
+  'Claude owned %s refuses unqualified preservation before catalog or selection changes',
+  async (action) => {
+    doctorFixture(true, 'claude-code');
+    fixture.responses.unshift('2.1.296', '--keep-data');
+    const catalog = join(fixture.home, '.cache/ai-delivery/plugins/claude-code/user/marketplace');
+    if (action === 'rollback') {
+      const path = join(dirname(catalog), 'state.json');
+      const state = JSON.parse(readFileSync(path, 'utf8')) as { previousVersion: string | null };
+      state.previousVersion = '0.3.20';
+      writeState(state, 'claude-code');
+    }
+    const paths = ['.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json'].map((name) =>
+      join(catalog, name),
+    );
+    const before = paths.map((path) => readFileSync(path));
+    await assert.rejects(
+      managePlugin({ ...input(), host: 'claude-code', action, version: action === 'rollback' ? undefined : '0.3.22' }),
+      /preserv.*unqualified/iu,
+    );
+    assert.deepEqual(
+      paths.map((path) => readFileSync(path)),
+      before,
+    );
+    assert.equal(
+      fixture.commandArguments.some(
+        (args) => ['update', 'install', 'uninstall'].includes(args[2] ?? '') && !args.includes('--help'),
+      ),
+      false,
+    );
+  },
+);
+
+test('lost native acknowledgement remains a failure, then exact target postimage resumes without selecting twice', async () => {
+  const { native, policy, before, catalog } = replacementFixture();
+  native.loseAck = true;
+  await assert.rejects(
+    managePlugin({ ...input(), action: 'update', version: '0.3.22' }),
+    /Native fixture intentionally unavailable/u,
+  );
+  assert.deepEqual(policy, before);
+  const path = join(dirname(catalog), 'state.json');
+  const interrupted = JSON.parse(readFileSync(path, 'utf8')) as ReturnType<typeof pendingState>;
+  assert.equal(interrupted.currentVersion, '0.3.21');
+  assert.equal(interrupted.pending.targetVersion, '0.3.22');
+  interrupted.pending.owner = { pid: 2_000_000_000, birth: 'old owner' };
+  writeState(interrupted);
+  native.loseAck = false;
+  const result = await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  assert.equal(result.version, '0.3.22');
+  assert.equal(native.selectionCalls, 1);
+  assert.deepEqual(policy, before);
+  const finished = JSON.parse(readFileSync(path, 'utf8')) as {
+    currentVersion: string;
+    previousVersion: string;
+    pending?: unknown;
+  };
+  assert.equal(finished.currentVersion, '0.3.22');
+  assert.equal(finished.previousVersion, '0.3.21');
+  assert.equal(finished.pending, undefined);
+});
+
+test('a target catalog with prior native selection and an idle pending command refuses ambiguous replay', async () => {
+  const { native, catalog } = replacementFixture();
+  native.failSelection = true;
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }));
+  const path = join(dirname(catalog), 'state.json');
+  const interrupted = JSON.parse(readFileSync(path, 'utf8')) as ReturnType<typeof pendingState>;
+  interrupted.pending.owner = { pid: 2_000_000_000, birth: 'old owner' };
+  writeState(interrupted);
+  native.failSelection = false;
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }), /ambiguous/u);
+  assert.equal(native.selectionCalls, 1);
+  assert.equal(
+    (JSON.parse(readFileSync(path, 'utf8')) as { pending: { targetVersion: string } }).pending.targetVersion,
+    '0.3.22',
+  );
+});
+
+test('recovery rejects a corrupted completed unit before reusing the selected target', async () => {
+  const { native, catalog } = replacementFixture();
+  native.loseAck = true;
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }));
+  const statePath = join(dirname(catalog), 'state.json');
+  const pending = JSON.parse(readFileSync(statePath, 'utf8')) as ReturnType<typeof pendingState>;
+  pending.pending.owner = { pid: 2_000_000_000, birth: 'terminated selected owner' };
+  writeState(pending);
+  const archive = join(catalog, 'versions/0.3.22/archive.tgz');
+  writeFileSync(archive, 'corrupted completed archive');
+  native.loseAck = false;
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }));
+  assert.equal(native.selectionCalls, 1);
+  assert.equal(readFileSync(archive, 'utf8'), 'corrupted completed archive');
+  assert.ok((JSON.parse(readFileSync(statePath, 'utf8')) as { pending?: unknown }).pending);
+});
+
+test('qualified Codex rollback uses the retained immutable unit and preserves later unrelated edits', async () => {
+  const { native, catalog, policy, before } = replacementFixture();
+  await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  assert.equal(existsSync(join(fixture.home, '.codex/plugins/cache/ai-delivery-user/ai-delivery/0.3.21')), false);
+  assert.equal(existsSync(join(catalog, 'versions/0.3.21/version.json')), true);
+  policy.later = { sentinel: 'keep later edit' };
+  const rolled = await managePlugin({ ...input(), action: 'rollback', version: undefined });
+  assert.equal(rolled.version, '0.3.21');
+  assert.equal(native.selectionCalls, 2);
+  assert.deepEqual(policy, { ...before, later: { sentinel: 'keep later edit' } });
+});
+
+test('rollback of a removed managed selection refuses rather than reinstalling it', async () => {
+  const { catalog, native, policy } = replacementFixture();
+  const path = join(dirname(catalog), 'state.json');
+  const state = JSON.parse(readFileSync(path, 'utf8')) as {
+    currentVersion: string | null;
+    previousVersion: string | null;
+    installedPath: string | null;
+  };
+  state.currentVersion = null;
+  state.previousVersion = '0.3.21';
+  state.installedPath = null;
+  writeState(state);
+  native.selected = [];
+  delete policy['ai-delivery@ai-delivery-user'];
+  const before = structuredClone(policy);
+  await assert.rejects(
+    managePlugin({ ...input(), action: 'rollback', version: undefined }),
+    /current managed selection/u,
+  );
+  assert.deepEqual(fixture.commandArguments, []);
+  assert.deepEqual(policy, before);
+});
+
+test('rollback refuses a target superseded by the managed writer ahead of its lock', async () => {
+  const { catalog, native } = replacementFixture();
+  const path = join(dirname(catalog), 'state.json');
+  const initial = JSON.parse(readFileSync(path, 'utf8')) as { previousVersion: string | null };
+  initial.previousVersion = '0.3.20';
+  writeState(initial);
+  const respond = fixture.respond!;
+  let queuedRollback: Promise<unknown> | undefined;
+  fixture.respond = (args) => {
+    const output = respond(args);
+    if (args[2] === 'list' && native.selected[0]?.version === '0.3.22' && !queuedRollback)
+      queuedRollback = managePlugin({ ...input(), action: 'rollback', version: undefined }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    return output;
+  };
+  await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  assert.ok(queuedRollback);
+  const error = await queuedRollback;
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /rollback target changed before/u);
+  assert.equal(native.selectionCalls, 1);
+  assert.equal((JSON.parse(readFileSync(path, 'utf8')) as { currentVersion: string }).currentVersion, '0.3.22');
+});
+
+test('a partial catalog publication resumes with reused units and matches an uninterrupted update', async () => {
+  const first = replacementFixture();
+  await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  const statePath = join(dirname(first.catalog), 'state.json');
+  const uninterrupted: unknown = JSON.parse(readFileSync(statePath, 'utf8'));
+  const { catalog, native, policy, before } = replacementFixture();
+  const immutableArchive = join(catalog, 'versions/0.3.22/archive.tgz');
+  const archiveBefore = readFileSync(immutableArchive);
+  const actual = atomicJson.writePrivateJsonFileAtomically;
+  let interrupt = true;
+  vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+    if (interrupt && path === join(catalog, '.claude-plugin/marketplace.json')) {
+      interrupt = false;
+      throw new Error('Synthetic catalog publication interruption');
+    }
+    actual(path, value);
+  });
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }), /publication interruption/u);
+  assert.equal(native.selectionCalls, 0);
+  assert.equal(
+    (
+      JSON.parse(readFileSync(join(catalog, '.claude-plugin/marketplace.json'), 'utf8')) as {
+        plugins: { version: string }[];
+      }
+    ).plugins[0]!.version,
+    '0.3.21',
+  );
+  assert.match(readFileSync(join(catalog, '.agents/plugins/marketplace.json'), 'utf8'), /versions\/0\.3\.22/u);
+  const pending = JSON.parse(readFileSync(statePath, 'utf8')) as ReturnType<typeof pendingState>;
+  pending.pending.owner = { pid: 2_000_000_000, birth: 'terminated publication owner' };
+  writeState(pending);
+  fixture.commands = [];
+  await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')), uninterrupted);
+  assert.deepEqual(readFileSync(immutableArchive), archiveBefore);
+  assert.equal(fixture.commands.includes('npm'), false);
+  assert.equal(native.selectionCalls, 1);
+  assert.deepEqual(policy, before);
+});
+
+test('a failed managed-state commit retains selection and resumes without selecting again', async () => {
+  const { native, catalog, policy, before } = replacementFixture();
+  const actual = atomicJson.writePrivateJsonFileAtomically;
+  const fault = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+    const state = value as { currentVersion?: string; pending?: unknown };
+    if (path.endsWith('/state.json') && state.currentVersion === '0.3.22' && !state.pending)
+      throw new Error('Synthetic final state commit failure');
+    actual(path, value);
+  });
+  await assert.rejects(
+    managePlugin({ ...input(), action: 'update', version: '0.3.22' }),
+    /final state commit failure/u,
+  );
+  fault.mockRestore();
+  const path = join(dirname(catalog), 'state.json');
+  const pending = JSON.parse(readFileSync(path, 'utf8')) as ReturnType<typeof pendingState>;
+  pending.pending.owner = { pid: 2_000_000_000, birth: 'terminated commit owner' };
+  writeState(pending);
+  await managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  assert.equal(native.selectionCalls, 1);
+  assert.deepEqual(policy, before);
+  assert.equal((JSON.parse(readFileSync(path, 'utf8')) as { pending?: unknown }).pending, undefined);
+});
+
+test.each(['bytes', 'mode'])(
+  'managed state %s changed by another writer is not overwritten after native selection',
+  async (change) => {
+    const { catalog, native } = replacementFixture();
+    const respond = fixture.respond!;
+    const path = join(dirname(catalog), 'state.json');
+    let changed: Buffer | undefined;
+    fixture.respond = (args) => {
+      const output = respond(args);
+      if (args[2] === 'add') {
+        if (change === 'mode') chmodSync(path, 0o400);
+        else {
+          const state = JSON.parse(readFileSync(path, 'utf8')) as { previousVersion: string };
+          state.previousVersion = '0.3.19';
+          writeFileSync(path, JSON.stringify(state), { mode: 0o600 });
+        }
+        changed = readFileSync(path);
+      }
+      return output;
+    };
+    await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }), /Managed state changed/u);
+    assert.equal(native.selectionCalls, 1);
+    assert.ok(changed);
+    assert.deepEqual(readFileSync(path), changed);
+    if (change === 'mode') assert.equal(lstatSync(path).mode & 0o777, 0o400);
+  },
+);
+
+test('catalog custody changed during preparation refuses before selection without repairing it', async () => {
+  const { catalog, native, policy, before } = replacementFixture();
+  const respond = fixture.respond!;
+  const path = join(catalog, '.agents/plugins/marketplace.json');
+  fixture.respond = (args) => {
+    const output = respond(args);
+    if (args[0] === process.execPath) chmodSync(path, 0o644);
+    return output;
+  };
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }), /catalog.*changed/u);
+  assert.equal(native.selectionCalls, 0);
+  assert.equal(lstatSync(path).mode & 0o777, 0o644);
+  assert.deepEqual(policy, before);
+});
 
 for (const action of ['install', 'update'] as const)
   test(`${action} reads back its managed version without capturing an unrelated catalogue over 1 MiB`, async () => {
@@ -553,13 +972,17 @@ for (const action of ['install', 'update'] as const)
     assert.equal(state.currentVersion, '0.3.22');
     assert.equal(state.previousVersion, action === 'update' ? '0.3.21' : null);
     const mutation = fixture.commandArguments.find(
-      (args) => args[2] === (action === 'install' ? 'marketplace' : 'remove'),
+      (args) => args[2] === (action === 'install' ? 'marketplace' : 'add'),
     );
     assert.deepEqual(
       mutation,
       action === 'install'
         ? ['codex', 'plugin', 'marketplace', 'add', catalog, '--json']
-        : ['codex', 'plugin', 'remove', 'ai-delivery@ai-delivery-user', '--json'],
+        : ['codex', 'plugin', 'add', 'ai-delivery@ai-delivery-user', '--json'],
+    );
+    assert.equal(
+      fixture.commandArguments.some((args) => args[2] === 'remove'),
+      false,
     );
     fixture.responses.push(oversizedCatalogue([{ ...entry, enabled: false }]));
     const doctor = await managePlugin({ ...input(), action: 'doctor', version: undefined });
@@ -645,12 +1068,7 @@ test('interrupted filtered readback resumes the original install without fetchin
   state.pending.owner = { pid: 2_000_000_000, birth: 'terminated fixture owner' };
   writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 });
   const before = readFileSync(join(cache, 'skills/intake/SKILL.md'));
-  fixture.responses.push(
-    'codex-cli 0.153.0',
-    oversizedCatalogue([entry]),
-    JSON.stringify({ installedPath: cache }),
-    oversizedCatalogue([entry]),
-  );
+  fixture.responses.push('codex-cli 0.153.0', oversizedCatalogue([entry]), oversizedCatalogue([entry]));
   const result = await managePlugin({ ...input(), version: '0.3.22' });
   assert.equal(result.installed, true);
   assert.equal(result.version, '0.3.22');
@@ -805,11 +1223,11 @@ test('an absent native profile beneath a symlink keeps its identity after creati
 
 test('a definitive version preparation failure preserves selection and permits a different valid request', async () => {
   const cache = doctorFixture(true);
-  fixture.responses.unshift('codex-cli 0.153.0');
+  const response = fixture.responses[0]!;
+  fixture.responses.unshift('codex-cli 0.162.1');
   const catalog = join(fixture.home, '.cache/ai-delivery/plugins/codex/user/marketplace');
   const catalogPath = join(catalog, '.agents/plugins/marketplace.json');
   mkdirSync(dirname(catalogPath), { recursive: true, mode: 0o700 });
-  writeFileSync(catalogPath, 'unchanged selected catalog', { mode: 0o600 });
   const before = readFileSync(catalogPath);
   const data = join(fixture.home, 'native-data');
   writeFileSync(data, 'preserve native data');
@@ -829,27 +1247,30 @@ test('a definitive version preparation failure preserves selection and permits a
   assert.deepEqual(readFileSync(catalogPath), before);
   assert.equal(readFileSync(data, 'utf8'), 'preserve native data');
   assert.equal(readFileSync(join(cache, 'skills/intake/SKILL.md'), 'utf8'), 'owned skill bytes');
-  await assert.rejects(
-    managePlugin({ ...input(), action: 'update', version: '0.3.21' }),
-    /Native fixture intentionally unavailable/u,
-  );
-  assert.deepEqual(fixture.commands, ['codex', 'codex', 'npm', 'codex']);
+  fixture.responses.push('codex-cli 0.162.1', response, response);
+  const reused = await managePlugin({ ...input(), action: 'update', version: '0.3.21' });
+  assert.equal(reused.changed, false);
+  assert.equal(fixture.commands.filter((command) => command === 'npm').length, 1);
 });
 
 test('failure after catalog selection retains pending recovery before another version', async () => {
-  doctorFixture(true);
-  fixture.responses.unshift('codex-cli 0.153.0');
-  await assert.rejects(managePlugin({ ...input(), action: 'update' }), /Native fixture intentionally unavailable/u);
+  const { native } = replacementFixture();
+  native.failSelection = true;
+  await assert.rejects(
+    managePlugin({ ...input(), action: 'update', version: '0.3.22' }),
+    /Native fixture intentionally unavailable/u,
+  );
   const statePath = join(fixture.home, '.cache/ai-delivery/plugins/codex/user/state.json');
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
     pending?: { targetVersion: string };
   };
-  assert.equal(state.pending?.targetVersion, '0.3.21');
+  assert.equal(state.pending?.targetVersion, '0.3.22');
+  const before = [...fixture.commandArguments];
   await assert.rejects(
-    managePlugin({ ...input(), action: 'update', version: '0.3.22' }),
+    managePlugin({ ...input(), action: 'update', version: '0.3.23' }),
     /A live plugin installer still owns this target|Resume the interrupted original plugin command/u,
   );
-  assert.deepEqual(fixture.commands, ['codex', 'codex', 'codex']);
+  assert.deepEqual(fixture.commandArguments, before);
 });
 
 test('definitive preparation reports pending-state cleanup failure and preserves its recovery intent', async () => {
@@ -874,7 +1295,8 @@ test('definitive preparation reports pending-state cleanup failure and preserves
 
 test('an unsupported version archive leaves selection intact and permits a valid version request', async () => {
   const cache = doctorFixture(true);
-  fixture.responses.unshift('codex-cli 0.153.0');
+  const response = fixture.responses[0]!;
+  fixture.responses.unshift('codex-cli 0.162.1');
   const root = join(fixture.home, 'unsupported/package');
   const files = {
     'package.json': { name: '@aviaratech/ai-delivery', version: '0.3.22' },
@@ -937,11 +1359,10 @@ test('an unsupported version archive leaves selection intact and permits a valid
     false,
   );
   fixture.packArchive = '';
-  await assert.rejects(
-    managePlugin({ ...input(), action: 'update', version: '0.3.21' }),
-    /Native fixture intentionally unavailable/u,
-  );
-  assert.deepEqual(fixture.commands, ['codex', 'codex', 'npm', 'codex']);
+  fixture.responses.push('codex-cli 0.162.1', response, response);
+  const reused = await managePlugin({ ...input(), action: 'update', version: '0.3.21' });
+  assert.equal(reused.changed, false);
+  assert.equal(fixture.commands.filter((command) => command === 'npm').length, 1);
 });
 
 test('recovery removes only its recorded incomplete staging directory', async () => {
