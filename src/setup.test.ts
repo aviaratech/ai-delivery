@@ -1603,73 +1603,392 @@ for (const native of [false, true]) {
   });
 }
 
-test('CLI stage and admit execute the same public producer with explicit authority and prior absence', async () => {
-  const f = await fixture();
-  const argv = process.argv;
-  const exitCode = process.exitCode;
-  const stdout = vi.spyOn(process.stdout, 'write');
-  try {
-    const runCli = async (args: string[]): Promise<Record<string, unknown>> => {
-      const begin = stdout.mock.calls.length;
-      process.argv = [
-        process.execPath,
-        join(process.cwd(), 'dist/cli.js'),
-        '--repo-root',
-        f.root,
-        '--identity',
-        'host-author',
-        ...args,
-      ];
-      vi.resetModules();
-      await import('./cli.js');
-      for (let i = 0; i < 300; i++) {
-        const output = stdout.mock.calls
-          .slice(begin)
-          .map(([bytes]) => String(bytes))
-          .find((bytes) => bytes.startsWith('{'));
-        if (output) return JSON.parse(output) as Record<string, unknown>;
-        await new Promise((resolve) => setTimeout(resolve, 20));
+const stageAdmitCase = 'CLI stage and admit execute the same public producer with explicit authority and prior absence';
+type CliPhase = { phase: string; event: 'start' | 'end' | 'settled' | 'pending'; atMs: number };
+type CliScenario = 'normal' | 'budget' | 'unfinished' | 'installer-failure';
+
+// Re-enter this same case so cancellation can contain synchronous CLI work as well as promises.
+// The existing producer supervisor owns the native process; these callbacks only retain its observations.
+async function observeStageAdmitCase(scenario: CliScenario = 'normal') {
+  const { runStageCommand } = await import('./verification.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-cli-case-')));
+  const tracePath = join(root, 'phases.json');
+  const cancellation = new AbortController();
+  let idle = false;
+  let cleanupFailure: string | undefined;
+  let receiptFailure: string | undefined;
+  let lastPhase: CliPhase[] = [];
+  let deadline = performance.now() + 15_000;
+  const active = new Map<string, number>();
+  let seen = 0;
+  let cancelledPhase: string | undefined;
+  let failure: string | undefined;
+  let failedBytes: Buffer | undefined;
+  let owned: unknown;
+  const identities = new Map<string, { pid: number; identity: string; pgid: number }>();
+  let residualInstaller: { pid: number; counter: string } | undefined;
+  const save = (): void => {
+    try {
+      writeFileSync(join(root, 'ownership.json'), JSON.stringify({ idle, owned, cleanupFailure, receiptFailure }));
+    } catch (error) {
+      receiptFailure = error instanceof Error ? error.message : String(error);
+      cancellation.abort();
+    }
+  };
+  const watch = setInterval(() => {
+    try {
+      if (existsSync(tracePath)) {
+        assert.ok(lstatSync(tracePath).size <= 64 * 1024, 'CLI phase evidence exceeded its bound');
+        const phases = JSON.parse(readFileSync(tracePath, 'utf8')) as CliPhase[];
+        assert.ok(Array.isArray(phases) && phases.length <= 64, 'CLI phase count exceeded its bound');
+        lastPhase = phases;
+        for (const entry of phases.slice(seen)) {
+          if (entry.event === 'start')
+            active.set(
+              entry.phase,
+              performance.now() + (scenario === 'unfinished' && entry.phase === 'runtime:stage' ? 30_000 : 15_000),
+            );
+          else if (entry.event === 'end' || entry.event === 'settled') active.delete(entry.phase);
+        }
+        if (phases.length > seen) deadline = performance.now() + 15_000;
+        seen = phases.length;
       }
-      throw new Error('CLI completion output unavailable');
-    };
-    const common = [
-      '--source-commit',
-      f.input.expectedSourceCommit,
-      '--config-digest',
-      f.input.expectedConfigDigest,
-      '--runtime-directory',
-      f.input.runtimeDirectory,
-    ];
-    const staged = await runCli([
-      'runtime:stage',
-      '--authorize-stage',
-      '--archive',
-      f.input.archivePath,
-      '--archive-sha256',
-      f.input.expectedArchiveSha256,
-      '--package-version',
-      f.input.packageVersion,
-      ...common,
-    ]);
-    assert.equal(typeof staged.stageId, 'string');
-    const admitted = await runCli([
-      'runtime:admit',
-      '--authorize-admit',
-      '--stage-id',
-      String(staged.stageId),
-      '--expected-absent',
-      ...common,
-    ]);
-    assert.equal((admitted.admission as RuntimeAdmission).sourceCommit, f.input.expectedSourceCommit);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    assert.equal(process.exitCode, exitCode);
+      const overdue = [...active].find(([, limit]) => performance.now() >= limit);
+      if (overdue !== undefined || (active.size === 0 && performance.now() >= deadline)) {
+        cancelledPhase ??= overdue?.[0] ?? (seen === 0 ? 'bootstrap' : 'native-drain');
+        cancellation.abort();
+      }
+    } catch (error) {
+      // A concurrent bounded write can be partial; it cannot extend the observation deadline.
+      if (!(error instanceof SyntaxError)) {
+        receiptFailure = error instanceof Error ? error.message : String(error);
+        cancellation.abort();
+      } else if (performance.now() >= deadline) cancellation.abort();
+    }
+  }, 50);
+  try {
+    const output = await runStageCommand(
+      process.cwd(),
+      [
+        process.execPath,
+        join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+        'run',
+        'dist/setup.test.js',
+        '-t',
+        `^${stageAdmitCase}$`,
+      ],
+      cancellation.signal,
+      undefined,
+      { maxAggregateRssBytes: 3 * 1024 ** 3, minFreeDiskBytes: 100 * 1024 ** 3 },
+      undefined,
+      undefined,
+      {
+        starting: () => {
+          idle = false;
+          save();
+        },
+        observed: (state) => {
+          for (const member of state.tracked.values()) {
+            if (identities.size >= 512 && !identities.has(`${member.pid}:${member.identity}`)) {
+              receiptFailure ??= 'CLI ownership observation count exceeded its bound';
+              cancellation.abort();
+              break;
+            }
+            identities.set(`${member.pid}:${member.identity}`, {
+              pid: member.pid,
+              identity: member.identity,
+              pgid: member.pgid,
+            });
+          }
+          owned = {
+            rootPid: state.rootPid,
+            rootIdentity: state.rootIdentity,
+            sampled: state.sampled,
+            tracked: [...identities.values()],
+          };
+          save();
+        },
+        idle: () => {
+          idle = true;
+          save();
+        },
+        assertQuiescent: () => assert.ok(idle && cleanupFailure === undefined),
+      },
+      {
+        environment: {
+          ...process.env,
+          TMPDIR: root,
+          TMP: root,
+          TEMP: root,
+          AI_DELIVERY_STAGE_ADMIT_CHILD: tracePath,
+          AI_DELIVERY_STAGE_ADMIT_SCENARIO: scenario,
+        },
+        maxCapturedOutputBytes: 32 * 1024 ** 2,
+        includeControllerTree: true,
+        failedOutput: (bytes) => {
+          failedBytes = bytes;
+          return ` CLI case output ${digestBytes(bytes)} (${bytes.length} bytes).`;
+        },
+        onCleanupFailure: (reason) => {
+          cleanupFailure = reason;
+          save();
+        },
+      },
+    );
+    process.stdout.write(output);
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+    if (failedBytes !== undefined) process.stdout.write(failedBytes);
   } finally {
-    stdout.mockRestore();
-    process.argv = argv;
-    process.exitCode = exitCode;
-    f.cleanup();
+    clearInterval(watch);
+    if (existsSync(tracePath)) {
+      try {
+        lastPhase = JSON.parse(readFileSync(tracePath, 'utf8')) as CliPhase[];
+      } catch {
+        receiptFailure ??= 'Final CLI phase evidence unavailable';
+      }
+    }
+    if (idle && cleanupFailure === undefined) {
+      try {
+        for (const name of readdirSync(root).filter((name) => name.startsWith('ai-delivery-setup-'))) {
+          const base = join(root, name);
+          const marker = join(base, 'installer-running');
+          if (existsSync(marker)) {
+            assert.ok(lstatSync(marker).size <= 64 && lstatSync(join(base, 'installs')).size <= 64);
+            residualInstaller = {
+              pid: Number(readFileSync(marker, 'utf8')),
+              counter: readFileSync(join(base, 'installs'), 'utf8'),
+            };
+          }
+        }
+      } catch (error) {
+        receiptFailure ??= error instanceof Error ? error.message : String(error);
+      }
+    }
+    process.stdout.write(
+      'SETUP_CLI_PHASE_RECEIPT ' +
+        JSON.stringify({
+          scenario,
+          phases: lastPhase,
+          nativeIdle: idle,
+          cancelledPhase,
+          failure,
+          cleanupFailure,
+          receiptFailure,
+          owned,
+          root,
+          residualInstaller,
+        }) +
+        '\n',
+    );
   }
-}, 15_000);
+  if (!idle || cleanupFailure !== undefined || receiptFailure !== undefined)
+    throw new Error(`CLI case ownership unresolved; preserve ${root}`);
+  rmSync(root, { recursive: true, force: true });
+  assert.equal(existsSync(root), false, 'Owned CLI case root was not removed');
+  return {
+    phases: lastPhase,
+    nativeIdle: idle,
+    cancelledPhase,
+    failure,
+    rootRemoved: true,
+    residualInstaller,
+    identities: [...identities.values()],
+    installerFailureReported: failedBytes?.includes(Buffer.from('exit 7')) ?? false,
+  };
+}
+
+test(
+  stageAdmitCase,
+  async () => {
+    const tracePath = process.env.AI_DELIVERY_STAGE_ADMIT_CHILD;
+    if (tracePath === undefined) {
+      const result = await observeStageAdmitCase();
+      assert.equal(result.failure, undefined);
+      return;
+    }
+    const scenario = process.env.AI_DELIVERY_STAGE_ADMIT_SCENARIO as CliScenario;
+    const phases: CliPhase[] = [];
+    const phase = (name: string, event: CliPhase['event']): void => {
+      assert.ok(phases.length < 64, 'CLI phase count exceeded its bound');
+      phases.push({ phase: name, event, atMs: performance.now() });
+      writeFileSync(tracePath, JSON.stringify(phases));
+    };
+    phase('preparation', 'start');
+    if (scenario === 'budget') await new Promise((resolve) => setTimeout(resolve, 12_000));
+    const f = await fixture();
+    if (scenario === 'unfinished') writeFileSync(join(f.base, 'wait'), '');
+    if (scenario === 'installer-failure') writeFileSync(join(f.base, 'fail'), '');
+    phase('preparation', 'end');
+    const argv = process.argv;
+    const exitCode = process.exitCode;
+    const stdout = vi.spyOn(process.stdout, 'write');
+    const pending: Promise<unknown>[] = [];
+    try {
+      const runCli = async (args: string[]): Promise<Record<string, unknown>> => {
+        const begin = stdout.mock.calls.length;
+        let settled = false;
+        process.argv = [
+          process.execPath,
+          join(process.cwd(), 'dist/cli.js'),
+          '--repo-root',
+          f.root,
+          '--identity',
+          'host-author',
+          ...args,
+        ];
+        vi.resetModules();
+        const { Command } = await import('commander');
+        const descriptor = Object.getOwnPropertyDescriptor(Command.prototype, 'parseAsync');
+        assert.equal(typeof descriptor?.value, 'function', 'Commander parse operation is unavailable');
+        const parse = descriptor!.value as typeof Command.prototype.parseAsync;
+        let command: Promise<import('commander').Command> | undefined;
+        let observation: Promise<void> | undefined;
+        const observe = vi.spyOn(Command.prototype, 'parseAsync').mockImplementation(function (
+          this: import('commander').Command,
+          ...input
+        ) {
+          phase(args[0]!, 'start');
+          const operation = parse.apply(this, input);
+          command = operation;
+          observation = operation.then(
+            () => {
+              settled = true;
+              phase(args[0]!, 'settled');
+            },
+            () => {
+              settled = true;
+              phase(args[0]!, 'settled');
+            },
+          );
+          pending.push(operation, observation);
+          // Retain observer failures for the explicit join without an interim unhandled rejection.
+          void observation.catch(() => {});
+          return operation;
+        });
+        phase(`import:${args[0]!}`, 'start');
+        try {
+          await import('./cli.js');
+          phase(`import:${args[0]!}`, 'end');
+        } finally {
+          observe.mockRestore();
+        }
+        assert.ok(command, 'CLI import did not start its actual parse operation');
+        await command;
+        await observation;
+        for (let i = 0; i < 300; i++) {
+          const output = stdout.mock.calls
+            .slice(begin)
+            .map(([bytes]) => String(bytes))
+            .find((bytes) => bytes.startsWith('{'));
+          if (output) {
+            phase(`return:${args[0]!}`, settled ? 'end' : 'pending');
+            return JSON.parse(output) as Record<string, unknown>;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        phase(`return:${args[0]!}`, settled ? 'end' : 'pending');
+        throw new Error('CLI completion output unavailable');
+      };
+      const common = [
+        '--source-commit',
+        f.input.expectedSourceCommit,
+        '--config-digest',
+        f.input.expectedConfigDigest,
+        '--runtime-directory',
+        f.input.runtimeDirectory,
+      ];
+      const staged = await runCli([
+        'runtime:stage',
+        '--authorize-stage',
+        '--archive',
+        f.input.archivePath,
+        '--archive-sha256',
+        f.input.expectedArchiveSha256,
+        '--package-version',
+        f.input.packageVersion,
+        ...common,
+      ]);
+      assert.equal(typeof staged.stageId, 'string');
+      if (scenario === 'budget') actors.pauseAuthor = true;
+      const admitted = await runCli([
+        'runtime:admit',
+        '--authorize-admit',
+        '--stage-id',
+        String(staged.stageId),
+        '--expected-absent',
+        ...common,
+      ]);
+      phase('assertions', 'start');
+      assert.equal((admitted.admission as RuntimeAdmission).sourceCommit, f.input.expectedSourceCommit);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.equal(process.exitCode, exitCode);
+      phase('assertions', 'end');
+    } finally {
+      phase('drain', 'start');
+      await Promise.allSettled(pending);
+      phase('drain', 'end');
+      phase('cleanup', 'start');
+      stdout.mockRestore();
+      process.argv = argv;
+      process.exitCode = exitCode;
+      f.cleanup();
+      phase('cleanup', 'end');
+    }
+  },
+  // The parent supervises bootstrap, each overlapping phase, and native drain independently.
+  // Cancellation may terminate this isolated process; it never proves JavaScript settlement.
+  0,
+);
+
+test('CLI stage/admit preparation and commands retain separate finite budgets', async () => {
+  const result = await observeStageAdmitCase('budget');
+  assert.equal(result.failure, undefined, 'Bounded preparation consumed the command budget');
+  assert.ok(result.phases.at(-1)!.atMs - result.phases[0]!.atMs > 15_000);
+  for (const entry of result.phases.filter((entry) => entry.event === 'start')) {
+    const end = result.phases.find(
+      (candidate) => candidate.phase === entry.phase && ['end', 'settled'].includes(candidate.event),
+    );
+    assert.ok(
+      end !== undefined && end.atMs - entry.atMs < 15_000,
+      `${entry.phase} did not complete within its own bound`,
+    );
+  }
+});
+
+test('CLI stage/admit keeps an unfinished real installer owned until native quiescence', async () => {
+  const result = await observeStageAdmitCase('unfinished');
+  assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
+  assert.equal(result.residualInstaller?.counter, 'x', 'A real installer must execute exactly once');
+  assert.ok(
+    result.identities.some((member) => member.pid === result.residualInstaller?.pid),
+    'Installer birth identity was not observed by the native supervisor',
+  );
+  assert.equal(
+    result.phases.some((entry) => entry.event === 'pending'),
+    false,
+    'CLI caller relinquished an unfinished command',
+  );
+  assert.equal(result.cancelledPhase, 'runtime:stage');
+  assert.equal(
+    result.phases.some((entry) => entry.phase === 'cleanup'),
+    false,
+    'Child cleaned a fixture with active work',
+  );
+});
+
+test('CLI stage/admit joins a failed real installer before restoring its fixture', async () => {
+  const result = await observeStageAdmitCase('installer-failure');
+  assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
+  assert.equal(result.installerFailureReported, true, 'The real installer failure was not reported');
+  const settled = result.phases.findIndex((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled');
+  const cleanup = result.phases.findIndex((entry) => entry.phase === 'cleanup' && entry.event === 'start');
+  assert.ok(settled >= 0 && cleanup > settled, 'Failure cleanup preceded actual command settlement');
+  assert.equal(
+    result.phases.some((entry) => entry.phase === 'runtime:admit'),
+    false,
+  );
+});
 
 test(
   'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer',
