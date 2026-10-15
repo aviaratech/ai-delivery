@@ -847,11 +847,12 @@ export async function preflightReviewRoute(
         emptyRulePage(rulesets.value);
       // The applicable-rules endpoint includes all active repository/parent
       // rules. A classic-protection 404 needs independent identity and active
-      // ruleset readbacks, not just an observed approval count.
+      // ruleset readbacks, not just an observed approval count. The aggregate
+      // protected flag and nested enabled summary need not be equal.
       confirmedRulesetOnly =
         corroborated &&
         branchData?.protected === true &&
-        branchData.protection?.enabled === true &&
+        typeof branchData.protection?.enabled === 'boolean' &&
         completeRulePage(rulesets.value) &&
         rulesetResult.value.data.length > 0 &&
         rulesetResult.value.data.every((rule) => {
