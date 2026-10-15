@@ -848,6 +848,114 @@ async function prepareStage(scope: Scope) {
   return { f, c, runtime, staged };
 }
 
+// The edited-policy refusal has the same real staged prerequisites, then one
+// separately bounded tracked-to-edited transition (three Git calls, two controls).
+const editedAdmitSteps = [...stageSteps, ['edited policy', 5 * GIT_MS]] as const satisfies readonly SetupStep[];
+
+async function prepareEditedAdmit(scope: Scope) {
+  const prepared = await prepareStage(scope);
+  await setupStep(scope, 'edited policy', () => prepared.f.policy('edited'));
+  return prepared;
+}
+
+async function observeEditedAdmit({ f, c, runtime, staged }: Awaited<ReturnType<typeof prepareEditedAdmit>>) {
+  const admitted = await c.call('runtime_admit', {
+    ...runtime.common,
+    authority: 'runtime:admit',
+    stageId: staged.value!.stageId,
+    expectedPriorAdmissionSha256: null,
+  });
+  assert.equal(admitted.response.isError, true);
+  assert.match(admitted.text, /Delivery requires an exact clean worktree\./u);
+  assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+  assert.equal(existsSync(runtime.lifecycleSentinel), false);
+}
+
+for (const cancellation of ['operation deadline', 'forwarded cancellation'] as const)
+  test(
+    `edited runtime_admit preparation ${cancellation} retains its real stage handler through drain stall and late settlement`,
+    async ({ signal }) => {
+      const scope = runtimeScope(
+        editedAdmitSteps.map(([name, budget]) => [name, name === 'runtime_stage' ? 3_000 : budget] as const),
+      );
+      const hook = new AbortController();
+      scope.forward(signal);
+      scope.forward(hook.signal);
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const acquire = scope.acquire.bind(scope);
+      let handlerSettled = false;
+      scope.acquire = () => {
+        const f = acquire();
+        const get = f.rest.repos.get;
+        f.rest.repos.get = async (input) => {
+          entered();
+          await held;
+          handlerSettled = true;
+          return get(input);
+        };
+        return f;
+      };
+      try {
+        const preparing = prepareScope(scope, () => prepareEditedAdmit(scope)).then(
+          () => new Error('Controlled stage handler was not held'),
+          (error: unknown) => error,
+        );
+        await Promise.race([
+          reached,
+          preparing.then((result) => {
+            throw result;
+          }),
+        ]);
+        const f = scope.fixture!;
+        process.stderr.write('EDITED_REFUSAL_HELD ' + JSON.stringify({ cancellation, phases: scope.phases }) + '\n');
+        // This actual stage owns native supervision too: keep real timers while
+        // its held handler reaches the shortened fault-only operation deadline.
+        if (cancellation === 'forwarded cancellation')
+          hook.abort(new Error('Controlled edited-refusal setup cancellation'));
+        assert.match(String(await preparing), /drain-stall/u);
+        assert.equal(handlerSettled, false, 'Rejected transport cannot establish handler settlement');
+        assert.equal(scope.signal.aborted, true);
+        assert.equal(existsSync(f.base), true, 'Stalled handler must retain fixture and globals');
+        assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
+        assert.ok(
+          scope.phases.some(
+            (phase) =>
+              phase.name === 'setup:runtime_stage' &&
+              phase.outcome === (cancellation === 'operation deadline' ? 'deadline' : 'cancelled'),
+          ),
+        );
+        assert.ok(scope.phases.some((phase) => phase.name === 'drain' && phase.outcome === 'drain-stall'));
+        assert.equal(
+          scope.phases.some((phase) => phase.name === 'setup:edited policy'),
+          false,
+        );
+        release();
+        await scope.join();
+        assert.equal(handlerSettled, true);
+        assert.equal(scope.pending.size, 0);
+        assert.equal(existsSync(f.base), false);
+        process.stderr.write(
+          'EDITED_REFUSAL_OWNERSHIP ' +
+            JSON.stringify({ cancellation, phases: scope.phases, rootRemoved: true }) +
+            '\n',
+        );
+        const next = inertTarget(signal);
+        await next.dispose(undefined);
+      } finally {
+        release();
+        await scope.join();
+      }
+    },
+    editedAdmitSteps.reduce((sum, [, budget]) => sum + budget, 0) + 2 * DRAIN_MS,
+  );
+
 async function prepareTransition(scope: Scope) {
   const f = await setupStep(scope, 'fixture', () => scope.acquire());
   await setupStep(scope, 'worktree', () => f.worktree());
@@ -981,30 +1089,25 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
         await f.dispose(c);
       }
     }, 15_000);
-    test('public MCP runtime_admit refuses primary source edits and leaves edited policy inert', async ({ signal }) => {
-      const f = inertTarget(signal);
-      let c: Connection | undefined;
-      try {
-        const runtime = await runtimeFixture(f);
-        f.policy('tracked');
-        c = await f.connect();
-        const staged = await c.call('runtime_stage', runtime.stage);
-        assert.notEqual(staged.response.isError, true, staged.text);
-        f.policy('edited');
-        const admitted = await c.call('runtime_admit', {
-          ...runtime.common,
-          authority: 'runtime:admit',
-          stageId: staged.value!.stageId,
-          expectedPriorAdmissionSha256: null,
-        });
-        assert.equal(admitted.response.isError, true);
-        assert.match(admitted.text, /Delivery requires an exact clean worktree\./u);
-        assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-        assert.equal(existsSync(runtime.lifecycleSentinel), false);
-      } finally {
-        await f.dispose(c);
-      }
-    }, 15_000);
+    scopedRuntimeCase(
+      'public MCP runtime_admit refuses primary source edits and leaves edited policy inert',
+      editedAdmitSteps,
+      prepareEditedAdmit,
+      observeEditedAdmit,
+    );
+    scopedRuntimeCase(
+      'edited runtime_admit refusal keeps bounded preparation outside its asserted-work budget',
+      [['controlled before fixture', 10_000], ...editedAdmitSteps, ['controlled after staging', 10_000]],
+      async (scope) => {
+        const started = performance.now();
+        await setupStep(scope, 'controlled before fixture', () => new Promise((resolve) => setTimeout(resolve, 8_000)));
+        const prepared = await prepareEditedAdmit(scope);
+        await setupStep(scope, 'controlled after staging', () => new Promise((resolve) => setTimeout(resolve, 8_000)));
+        assert.ok(performance.now() - started > ASSERTED_MS, 'Preparation must exceed the original aggregate fuse');
+        return prepared;
+      },
+      observeEditedAdmit,
+    );
   }
 
   test(`public MCP investigation start ${kind === 'tracked' ? 'registers exact selected source' : 'refuses selected worktree edits'} with ${kind} policy`, async ({
