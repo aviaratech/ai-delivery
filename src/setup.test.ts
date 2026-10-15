@@ -1605,7 +1605,7 @@ for (const native of [false, true]) {
 
 const stageAdmitCase = 'CLI stage and admit execute the same public producer with explicit authority and prior absence';
 type CliPhase = { phase: string; event: 'start' | 'end' | 'settled' | 'pending'; atMs: number };
-type CliScenario = 'normal' | 'budget' | 'unfinished' | 'installer-failure';
+type CliScenario = 'normal' | 'budget' | 'unfinished' | 'installer-failure' | 'admission-stall';
 type CliTraceFault = 'missing' | 'oversized' | 'records' | 'write';
 type CliCaseFailure = Error & {
   root: string;
@@ -1927,6 +1927,7 @@ test(
     const exitCode = process.exitCode;
     const stdout = vi.spyOn(process.stdout, 'write');
     const pending: Promise<unknown>[] = [];
+    const restoreAuthorObservations: (() => void)[] = [];
     const restoreEnvs = vi.unstubAllEnvs.bind(vi);
     const environmentProbe =
       traceFault === 'write'
@@ -1949,6 +1950,39 @@ test(
           ...args,
         ];
         vi.resetModules();
+        if (args[0] === 'runtime:admit') {
+          const clientsModule = await import('./github/client.js');
+          const create = clientsModule.createDeliveryGitHubClients;
+          let authorChecks = 0;
+          const clients = vi
+            .spyOn(clientsModule, 'createDeliveryGitHubClients')
+            .mockImplementation(async (...input) => {
+              const client = await create(...input);
+              const authenticatedAuthor = client.authenticatedAuthor;
+              if (authenticatedAuthor !== undefined) {
+                client.authenticatedAuthor = async (...request) => {
+                  const name = `admit:author:${++authorChecks}${actors.pauseAuthor ? ':delayed' : ''}`;
+                  phase(name, 'start');
+                  try {
+                    assert.ok(
+                      scenario !== 'budget' || authorChecks === 1 || !actors.pauseAuthor,
+                      'Budget fixture repeated its deliberate HTTP delay at another required authority check',
+                    );
+                    const response = await authenticatedAuthor(...request);
+                    // This fictional HTTP port can withhold its response; the actual CLI parse remains pending.
+                    if (scenario === 'admission-stall') await new Promise<void>(() => {});
+                    return response;
+                  } finally {
+                    // The budget regression needs one four-second response, not one per required recheck.
+                    if (scenario === 'budget') actors.pauseAuthor = false;
+                    phase(name, 'end');
+                  }
+                };
+              }
+              return client;
+            });
+          restoreAuthorObservations.push(() => clients.mockRestore());
+        }
         const { Command } = await import('commander');
         const descriptor = Object.getOwnPropertyDescriptor(Command.prototype, 'parseAsync');
         assert.equal(typeof descriptor?.value, 'function', 'Commander parse operation is unavailable');
@@ -2029,6 +2063,7 @@ test(
       phase('assertions:stageId', 'start');
       assert.equal(typeof staged.stageId, 'string');
       phase('assertions:stageId', 'end');
+      const authorCallsBeforeAdmission = actors.authorCalls;
       if (scenario === 'budget') actors.pauseAuthor = true;
       const admitted = await runCli([
         'runtime:admit',
@@ -2039,6 +2074,11 @@ test(
         ...common,
       ]);
       phase('assertions', 'start');
+      assert.equal(
+        actors.authorCalls - authorCallsBeforeAdmission,
+        3,
+        'Admission must authenticate at its initial, locked and final controller checks',
+      );
       assert.equal((admitted.admission as RuntimeAdmission).sourceCommit, f.input.expectedSourceCommit);
       assert.equal(readFileSync(f.counter, 'utf8'), 'x');
       assert.equal(process.exitCode, exitCode);
@@ -2046,6 +2086,7 @@ test(
     } finally {
       phase('drain', 'start');
       await Promise.allSettled(pending);
+      for (const restore of restoreAuthorObservations) restore();
       environmentProbe?.mockRestore();
       phase('drain', 'end');
       phase('cleanup', 'start');
@@ -2064,7 +2105,16 @@ test(
 
 test('CLI stage/admit preparation and commands retain separate finite budgets', async () => {
   const result = await observeStageAdmitCase('budget');
-  assert.equal(result.failure, undefined, 'Bounded preparation consumed the command budget');
+  const authorChecks = result.phases.filter(
+    (entry) => entry.phase.startsWith('admit:author:') && entry.event === 'start',
+  );
+  assert.equal(authorChecks.length, 3, 'All three admission authority checks must execute');
+  assert.equal(
+    authorChecks.filter((entry) => entry.phase.endsWith(':delayed')).length,
+    1,
+    'The aggregate-budget regression must inject one delayed HTTP response, not repeat it for every authority check',
+  );
+  assert.equal(result.failure, undefined, 'A CLI operation failed; inspect the retained phase and ownership evidence');
   assert.ok(result.phases.at(-1)!.atMs - result.phases[0]!.atMs > 15_000);
   for (const entry of result.phases.filter((entry) => entry.event === 'start')) {
     const end = result.phases.find(
@@ -2108,6 +2158,24 @@ test('CLI stage/admit joins a failed real installer before restoring its fixture
   assert.equal(
     result.phases.some((entry) => entry.phase === 'runtime:admit'),
     false,
+  );
+});
+
+test('CLI stage/admit keeps a stalled admission response owned until native quiescence', async () => {
+  const result = await observeStageAdmitCase('admission-stall');
+  assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
+  assert.equal(result.cancelledPhase, 'runtime:admit');
+  assert.ok(result.phases.some((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled'));
+  assert.ok(result.phases.some((entry) => entry.phase === 'admit:author:1' && entry.event === 'start'));
+  assert.equal(
+    result.phases.some(
+      (entry) =>
+        entry.phase === 'cleanup' ||
+        entry.phase === 'return:runtime:admit' ||
+        (entry.phase === 'admit:author:1' && entry.event === 'end'),
+    ),
+    false,
+    'The stalled HTTP response must keep the original command pending until native cancellation',
   );
 });
 
