@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
@@ -96,6 +97,62 @@ if (child.error) throw child.error;
 process.exit(child.status ?? 1);`;
 }
 
+// Shared by both readiness producers and the controlled partial-write regression.
+const readinessPublisher = `async function publishReadiness(file, bytes, pause) {
+  const temporary = file + '.pending';
+  const fd = fs.openSync(temporary, 'wx', 0o600);
+  try {
+    if (pause) {
+      fs.writeSync(fd, bytes.slice(0, 1));
+      await pause();
+      fs.writeSync(fd, bytes.slice(1));
+    } else fs.writeFileSync(fd, bytes);
+  } finally { fs.closeSync(fd); }
+  fs.renameSync(temporary, file);
+}`;
+
+for (const name of ['capability', 'pids'])
+  test(`readiness record ${name} is unavailable during a controlled partial publication`, async ({ signal }) => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-readiness-')));
+    const file = join(output, name);
+    const child = spawn(
+      process.execPath,
+      [
+        '-e',
+        `
+      const fs = require('node:fs');
+      ${readinessPublisher}
+      publishReadiness(${JSON.stringify(file)}, '{"root":17,"descendant":23}', async () => {
+        const resumed = new Promise(resolve => process.once('message', resolve));
+        process.send('partial');
+        await resumed;
+      }).then(() => process.disconnect());
+    `,
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], timeout: 5_000 },
+    );
+    const closed = once(child, 'close');
+    try {
+      const [message] = (await once(child, 'message', {
+        signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+      })) as unknown[];
+      assert.equal(message, 'partial');
+      assert.equal(existsSync(file), false, 'Existence must mean a completely closed readiness record');
+    } finally {
+      if (child.connected) child.send('complete');
+      const [code] = (await closed) as unknown[];
+      try {
+        assert.equal(code, 0);
+        assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { root: 17, descendant: 23 });
+        // A fully published malformed record is an immediate failure, never retried.
+        writeFileSync(file, '{');
+        assert.throws(() => JSON.parse(readFileSync(file, 'utf8')), SyntaxError);
+      } finally {
+        rmSync(output, { recursive: true, force: true });
+      }
+    }
+  });
+
 function filesystemFixtureScript(
   output: string,
   mode: 'pass' | 'assertion' | 'abrupt' | 'block' | 'cancel',
@@ -117,10 +174,11 @@ function filesystemFixtureScript(
     finally { fs.renameSync(evidence, file); }
   };
   const gate = JSON.parse(process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE);
+  ${readinessPublisher}
   const trace = value => fs.appendFileSync(events, value + '\\n');
   await withVerificationFilesystemFixture(async () => {
     cp.execFileSync('mkfifo', ['-m', '600', fifo]);
-    fs.writeFileSync(path.join(output, 'capability'), JSON.stringify(gate));
+    await publishReadiness(path.join(output, 'capability'), JSON.stringify(gate));
     trace('created');
     try {
       if (${JSON.stringify(mode)} === 'abrupt') process.exit(9);
@@ -301,9 +359,10 @@ test.each(['verification', 'runtime'] as const)(
     const script = `
 (async () => {
   const fs = require('node:fs'), cp = require('node:child_process');
+  ${readinessPublisher}
   const child = cp.spawn(process.execPath, ['-e', ${JSON.stringify(filesystemFixtureScript(output, 'cancel'))}], { stdio: 'ignore' });
   child.unref();
-  fs.writeFileSync(${JSON.stringify(join(output, 'pids'))}, JSON.stringify({ root: process.pid, descendant: child.pid }));
+  await publishReadiness(${JSON.stringify(join(output, 'pids'))}, JSON.stringify({ root: process.pid, descendant: child.pid }));
   while (!fs.existsSync(${JSON.stringify(join(output, 'exit-parent'))})) await new Promise(resolve => setTimeout(resolve, 10));
   process.exit(0);
 })().catch(error => { console.error(error.message); process.exitCode = 1; });`;
@@ -311,6 +370,7 @@ test.each(['verification', 'runtime'] as const)(
     const controller = new AbortController();
     const progress = vi.spyOn(process.stderr, 'write');
     let running: Promise<unknown> | undefined;
+    let completed = false;
     try {
       const row = await hostFixtureCheckout({
         baseRef: 'main',
@@ -337,11 +397,19 @@ test.each(['verification', 'runtime'] as const)(
               runner.run([process.execPath, '-e', script], bounds, controller.signal),
             )
       ).catch((error: unknown) => error);
-      for (let attempt = 0; attempt < 300 && !existsSync(join(output, 'capability')); attempt++)
+      for (
+        let attempt = 0;
+        attempt < 300 && (!existsSync(join(output, 'capability')) || !existsSync(join(output, 'pids')));
+        attempt++
+      )
         await new Promise((resolve) => setTimeout(resolve, 20));
       assert.ok(existsSync(join(output, 'capability')));
+      assert.ok(existsSync(join(output, 'pids')));
       const cap = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
       const pids = JSON.parse(readFileSync(join(output, 'pids'), 'utf8')) as { root: number; descendant: number };
+      assert.equal(typeof cap.directory, 'string');
+      assert.ok(Number.isSafeInteger(pids.root) && pids.root > 0);
+      assert.ok(Number.isSafeInteger(pids.descendant) && pids.descendant > 0);
       const writerPath = join(root, '.git', 'ai-delivery', 'writers@1', digestValue(row.path).slice(7) + '.json');
       const descendantObserved = (): boolean => {
         const state = JSON.parse(readFileSync(writerPath, 'utf8')) as { command: { tracked?: { pid: number }[] } };
@@ -383,12 +451,17 @@ test.each(['verification', 'runtime'] as const)(
         progress.mock.calls.some(([line]) => String(line).includes('"state":"completed"')),
         false,
       );
+      completed = true;
     } finally {
       controller.abort();
       await running;
       progress.mockRestore();
-      rmSync(root, { recursive: true, force: true });
-      rmSync(output, { recursive: true, force: true });
+      // Preserve any future failed synthetic readiness bytes in the owned TMPDIR
+      // for the supervising run's recovery archive; never print capability bytes.
+      if (completed) {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(output, { recursive: true, force: true });
+      }
     }
   },
 );
