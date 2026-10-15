@@ -1061,8 +1061,10 @@ function selectedRoot(
   cachePath: string | null,
   sourceVersion = entry.version,
 ): string {
-  const unit = verifiedUnit(target, input.host === 'claude-code' ? sourceVersion : entry.version),
-    source = pluginRoot(target, input.host === 'claude-code' ? sourceVersion : entry.version);
+  const unitVersion = input.host === 'claude-code' ? sourceVersion : entry.version;
+  const unit = verifiedUnit(target, unitVersion),
+    source = pluginRoot(target, sourceVersion);
+  if (sourceVersion !== unitVersion) verifiedUnit(target, sourceVersion);
   if (input.host === 'claude-code' && claudeCatalogSelection(target).version !== sourceVersion)
     throw new Error('Claude catalog version differs from its native selection.');
   if (input.host === 'codex' && resolve(entry.sourceRoot!) !== source)
@@ -1406,18 +1408,6 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         }
         if (current && version && !current.enabled)
           throw new Error('Native plugin selection is disabled; preserving replacement cannot enable it.');
-        let observedRoot: string | undefined;
-        if (current)
-          observedRoot = selectedRoot(
-            input,
-            target,
-            current,
-            current.installedPath ??
-              (current.version === prior
-                ? state.installedPath
-                : join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', current.version)),
-            recoverySourceVersion,
-          );
         let catalogBefore: CatalogSnapshot | undefined;
         let reuseSelection = false;
         if (prior && version) {
@@ -1431,6 +1421,8 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
           const partialCatalog = resuming && targetMatches[0] && priorMatches[1];
           if (!priorCatalog && !targetCatalog && !partialCatalog)
             throw new Error('Managed catalog differs from the owned prior or target publication.');
+          // Codex list reports the installed cache version but the current catalog source.
+          recoverySourceVersion = targetMatches[0] ? version : prior;
           if (current.version === version) {
             if (!targetCatalog) throw new Error('Selected target has an incompatible managed catalog.');
             reuseSelection = true;
@@ -1443,6 +1435,18 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
             throw new Error('Selected target has an incompatible managed catalog.');
           reuseSelection = current.version === version;
         }
+        let observedRoot: string | undefined;
+        if (current)
+          observedRoot = selectedRoot(
+            input,
+            target,
+            current,
+            current.installedPath ??
+              (current.version === prior
+                ? state.installedPath
+                : join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', current.version)),
+            recoverySourceVersion,
+          );
         if (version) {
           await stageVersion(target, version, controller.signal, publish, (allocation) => {
             if (allocation) state!.pending!.staging = allocation;

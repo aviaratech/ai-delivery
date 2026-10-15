@@ -581,7 +581,25 @@ function replacementFixture(preferences: unknown = { issue_info: { approval: 'fi
     if (args[0] === 'npm') return '';
     if (args[0] === process.execPath) return '0.3.22';
     if (args[1] === '--version') return native.version;
-    if (args[2] === 'list') return JSON.stringify({ installed: native.selected, available: [] });
+    if (args[2] === 'list') {
+      let offeredPath: string;
+      try {
+        const offered = JSON.parse(readFileSync(join(catalog, '.agents/plugins/marketplace.json'), 'utf8')) as {
+          plugins: { source: { path: string } }[];
+        };
+        offeredPath = offered.plugins[0]!.source.path;
+      } catch {
+        return undefined;
+      }
+      // Pinned list takes installed version from cache and source from the current catalog.
+      return JSON.stringify({
+        installed: native.selected.map((plugin) => ({
+          ...plugin,
+          source: { source: 'local', path: join(catalog, offeredPath) },
+        })),
+        available: [],
+      });
+    }
     if (args[2] === 'marketplace') return '{}';
     if (args[2] === 'remove') {
       // Pinned Codex remove clears the complete qualified plugin table.
@@ -665,7 +683,16 @@ test.each([
   if (fault === 'missing selection') native.selected = [];
   if (fault === 'unregistered catalog')
     native.selected[0]!.marketplaceSource.source = join(fixture.home, 'foreign-marketplace');
-  if (fault === 'foreign source') native.selected[0]!.source.path = join(fixture.home, 'unowned');
+  if (fault === 'foreign source') {
+    const respond = fixture.respond!;
+    fixture.respond = (args) => {
+      const output = respond(args);
+      if (args[2] !== 'list' || !output) return output;
+      const listed = JSON.parse(output) as { installed: { source: { path: string } }[] };
+      listed.installed[0]!.source.path = join(fixture.home, 'unowned');
+      return JSON.stringify(listed);
+    };
+  }
   if (fault === 'changed cache')
     writeFileSync(
       join(fixture.home, '.codex/plugins/cache/ai-delivery-user/ai-delivery/0.3.21/skills/intake/SKILL.md'),
