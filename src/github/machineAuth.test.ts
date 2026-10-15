@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
-import { createDeliveryGitHubClients, retainMachineAuthorForConfiguration, withAuthorGitToken } from './client.js';
+import {
+  createDeliveryGitHubClients,
+  hasBranchProtectionAbsence,
+  retainMachineAuthorForConfiguration,
+  withAuthorGitToken,
+} from './client.js';
 import { resolveRepoFromRemote } from './repo.js';
 import { machineAuthorEligible, withMachineAuthorCredential } from './machineAuth.js';
 import { syntheticDiscoveryConfig, syntheticDiscoveryClients } from '../fixtures/discovery.js';
@@ -383,6 +388,174 @@ test('machine REST request diagnostics reach the real CLI renderer without priva
     },
   );
   assert.equal(calls().length, 2);
+});
+
+test('only the original real machine protection failure proves absence for its selected client and target', async () => {
+  identity();
+  const clients = await author();
+  const other = await author();
+  vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+    const response = new Response(JSON.stringify({ message: 'Branch not protected', private: token }), {
+      status: 404,
+      headers: { 'content-type': 'application/json', 'x-private-header': token },
+    });
+    Object.defineProperty(response, 'url', { value: input instanceof Request ? input.url : String(input) });
+    return response;
+  });
+  let absence: unknown;
+  await assert.rejects(
+    clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
+      owner: 'example',
+      repo: 'widget',
+      branch: 'release/next',
+    }),
+    (error: unknown) => {
+      absence = error;
+      assert.equal(
+        hasBranchProtectionAbsence(error, clients, { owner: 'example', repo: 'widget' }, 'release/next'),
+        true,
+      );
+      assert.equal(
+        hasBranchProtectionAbsence(error, other, { owner: 'example', repo: 'widget' }, 'release/next'),
+        false,
+      );
+      assert.equal(
+        hasBranchProtectionAbsence(error, clients, { owner: 'other', repo: 'widget' }, 'release/next'),
+        false,
+      );
+      assert.equal(
+        hasBranchProtectionAbsence(error, clients, { owner: 'example', repo: 'other' }, 'release/next'),
+        false,
+      );
+      assert.equal(hasBranchProtectionAbsence(error, clients, { owner: 'example', repo: 'widget' }, 'main'), false);
+      assert.equal(getMachineRequestDiagnostics(error)?.endpoint, 'UNKNOWN');
+      assert.equal(renderFailure(error).includes(token), false);
+      assert.equal(renderFailure(error).includes('Branch not protected'), false);
+      assert.equal(JSON.stringify(error).includes(token), false);
+      assert.equal(Object.hasOwn(error as object, 'response'), false);
+      assert.equal(Object.hasOwn(error as object, 'cause'), false);
+      return true;
+    },
+  );
+  const forged = {
+    ...(absence as object),
+    status: 404,
+    response: { status: 404, data: { message: 'Branch not protected' } },
+  };
+  assert.equal(
+    hasBranchProtectionAbsence(forged, clients, { owner: 'example', repo: 'widget' }, 'release/next'),
+    false,
+  );
+  assert.equal(
+    hasBranchProtectionAbsence(
+      new Proxy(absence as object, {}),
+      clients,
+      { owner: 'example', repo: 'widget' },
+      'release/next',
+    ),
+    false,
+  );
+});
+
+test('machine absence classification rejects hostile and foreign request metadata without invoking accessors', async () => {
+  identity();
+  const clients = await author();
+  const options = clients.rest.request.endpoint.merge('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
+    owner: 'example',
+    repo: 'widget',
+    branch: 'main',
+  });
+  const raw = {
+    status: 404,
+    response: {
+      status: 404,
+      url: 'https://api.github.com/repos/example/widget/branches/main/protection',
+      data: { message: 'Branch not protected', private: token },
+    },
+  };
+  let reads = 0;
+  const getter = (source: object, key: string) =>
+    Object.defineProperty({ ...source }, key, {
+      get() {
+        reads++;
+        throw new Error(token);
+      },
+    });
+  const cases: [unknown, unknown][] = [
+    [{ status: 404, response: { status: 404, data: { message: 'Not Found' } } }, options],
+    [{ ...raw, status: 403 }, options],
+    [{ ...raw, response: { ...raw.response, status: 403 } }, options],
+    [getter(raw, 'status'), options],
+    [getter(raw, 'response'), options],
+    [{ ...raw, response: getter(raw.response, 'status') }, options],
+    [{ ...raw, response: { ...raw.response, data: getter(raw.response.data, 'message') } }, options],
+    [new Proxy(raw, {}), options],
+    [{ ...raw, response: new Proxy(raw.response, {}) }, options],
+    [{ ...raw, response: getter(raw.response, 'url') }, options],
+    [
+      {
+        ...raw,
+        response: { ...raw.response, url: 'https://foreign.invalid/repos/example/widget/branches/main/protection' },
+      },
+      options,
+    ],
+    [
+      {
+        ...raw,
+        response: { ...raw.response, url: 'https://api.github.com/repos/other/widget/branches/main/protection' },
+      },
+      options,
+    ],
+    [
+      {
+        ...raw,
+        response: { ...raw.response, url: 'https://api.github.com/repos/example/widget/branches/other/protection' },
+      },
+      options,
+    ],
+    [raw, { ...options, method: 'POST' }],
+    [raw, { ...options, url: '/repos/example/widget/issues/17' }],
+    [raw, { ...options, baseUrl: 'https://foreign.invalid' }],
+    [raw, { ...options, url: 'https://foreign.invalid/repos/example/widget/branches/main/protection' }],
+    [raw, { ...options, url: 'https://private@api.github.com/repos/example/widget/branches/main/protection' }],
+    [raw, { ...options, url: '/repos/example/widget/branches/main/protection?private=value' }],
+    [raw, getter(options, 'url')],
+    [raw, getter(options, 'branch')],
+    [
+      raw,
+      {
+        ...options,
+        branch: {
+          toString() {
+            reads++;
+            return 'main';
+          },
+        },
+      },
+    ],
+  ];
+  for (const [error, metadata] of cases) {
+    const request = { ...options };
+    await assert.rejects(
+      clients.rest.hook(
+        'request',
+        async () => {
+          // Introduce hostile metadata at the external request failure boundary,
+          // after the SDK has prepared auth from the ordinary request options.
+          Object.defineProperties(request, Object.getOwnPropertyDescriptors(metadata));
+          throw error;
+        },
+        request as never,
+      ),
+      (safe: unknown) => {
+        assert.equal(hasBranchProtectionAbsence(safe, clients, { owner: 'example', repo: 'widget' }, 'main'), false);
+        assert.equal(renderFailure(safe).includes(token), false);
+        assert.equal(JSON.stringify(safe).includes(token), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(reads, 0);
 });
 
 test.each([500, 200])(

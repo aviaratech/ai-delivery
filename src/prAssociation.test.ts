@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, it, vi } from 'vitest';
@@ -431,6 +431,142 @@ function rulesetOnlyFixture(published = true) {
     throw new Error(`Unexpected fictional route ${route}`);
   }) as typeof current.context.clients.rest.request;
   return { ...current, evidence };
+}
+
+async function machineRulesetOnlyFixture(published = true) {
+  const current = rulesetOnlyFixture(published);
+  const { context, evidence } = current;
+  const rest = context.clients.rest;
+  const graphql = context.clients.graphql;
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-machine-protection-')));
+  const bin = join(home, 'bin');
+  mkdirSync(bin);
+  const token = 'fictional_machine_protection_token';
+  writeFileSync(
+    join(bin, 'gh'),
+    `#!${process.execPath}
+const args=process.argv.slice(2);
+if(JSON.stringify(args)===JSON.stringify(['auth','status','--hostname','github.com','--active','--json','hosts']))
+ process.stdout.write(JSON.stringify({hosts:{'github.com':[{host:'github.com',active:true,state:'success',login:'author'}]}}));
+else if(JSON.stringify(args)===JSON.stringify(['auth','token','--hostname','github.com','--user','author']))
+ process.stdout.write(${JSON.stringify(token)}+'\\n');
+else process.exit(91);
+`,
+    { mode: 0o755 },
+  );
+  const originalEnv = process.env;
+  const restore = () => {
+    process.env = originalEnv;
+    vi.unstubAllGlobals();
+    rmSync(home, { recursive: true });
+  };
+  process.env = { HOME: home, PATH: bin };
+  context.config.roles.author.credentialEnv = { token: 'GH_TOKEN' };
+  vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    assert.equal(url.origin, 'https://api.github.com');
+    const path = url.pathname;
+    const method = init?.method ?? 'GET';
+    const body = (typeof init?.body === 'string' ? JSON.parse(init.body) : {}) as {
+      query?: unknown;
+      draft?: unknown;
+      head?: unknown;
+      body?: unknown;
+    };
+    let result: { status?: number; headers?: Record<string, string | number | undefined>; data: unknown };
+    if (path === '/user') result = { data: { id: 42, login: 'author', type: 'User' } };
+    else if (path === '/graphql') {
+      assert.ok(typeof body.query === 'string');
+      result = { data: { data: await graphql(body.query) } };
+    } else {
+      const prefix = '/repos/example/widget';
+      assert.ok(path.startsWith(prefix));
+      const suffix = path.slice(prefix.length);
+      if (suffix === '') {
+        const native = await rest.repos.get({ owner: 'example', repo: 'widget' });
+        const visible = evidence.repository as { status: number; data: Record<string, unknown> };
+        result = { status: visible.status, data: { ...native.data, ...visible.data } };
+      } else if (suffix === '/branches/main/protection') {
+        if (evidence.protection !== undefined) result = evidence.protection as typeof result;
+        else {
+          const error = evidence.protectionError as { status: number; response: { data: object } };
+          result = {
+            status: error.status,
+            data: { ...error.response.data, private: token },
+            headers: { 'x-private': token },
+          };
+        }
+      } else if (suffix === '/rules/branches/main') result = evidence.rules as typeof result;
+      else if (suffix === '/branches/main') result = evidence.branch as typeof result;
+      else if (suffix === '/rulesets') {
+        assert.equal(url.searchParams.get('includes_parents'), 'true');
+        assert.equal(url.searchParams.get('per_page'), '100');
+        assert.equal(url.searchParams.get('page'), '1');
+        result = evidence.rulesets as typeof result;
+      } else if (suffix === '/issues/17')
+        result = await rest.issues.get({ owner: 'example', repo: 'widget', issue_number: 17 });
+      else if (suffix.startsWith('/git/ref/'))
+        result = await rest.git.getRef({
+          owner: 'example',
+          repo: 'widget',
+          ref: decodeURIComponent(suffix.slice('/git/ref/'.length)),
+        });
+      else if (suffix.startsWith('/git/commits/'))
+        result = await rest.git.getCommit({ owner: 'example', repo: 'widget', commit_sha: head });
+      else if (suffix.startsWith('/compare/'))
+        result = await rest.repos.compareCommitsWithBasehead({
+          owner: 'example',
+          repo: 'widget',
+          basehead: `${base}...${head}`,
+        });
+      else if (suffix === '/pulls' && method === 'POST') {
+        assert.ok(typeof body.draft === 'boolean' && typeof body.head === 'string' && typeof body.body === 'string');
+        result = await rest.pulls.create({
+          owner: 'example',
+          repo: 'widget',
+          title: 'Improve widget',
+          base: 'main',
+          draft: body.draft,
+          head: body.head,
+          body: body.body,
+        });
+      } else if (suffix === '/pulls') result = await rest.pulls.list({ owner: 'example', repo: 'widget' });
+      else if (suffix === '/pulls/23')
+        result = await rest.pulls.get({ owner: 'example', repo: 'widget', pull_number: 23 });
+      else if (suffix === '/pulls/23/files')
+        result = await rest.pulls.listFiles({ owner: 'example', repo: 'widget', pull_number: 23 });
+      else if (suffix === '/pulls/23/reviews')
+        result = await rest.pulls.listReviews({ owner: 'example', repo: 'widget', pull_number: 23 });
+      else throw new Error(`Unexpected fictional machine route ${method} ${suffix}`);
+      if (evidence.deniedRoute && suffix === evidence.deniedRoute) result = { status: 403, data: { message: token } };
+    }
+    const response = new Response(JSON.stringify(result.data), {
+      status: result.status ?? 200,
+      headers: {
+        'content-type': 'application/json',
+        ...Object.fromEntries(
+          Object.entries(result.headers ?? {}).filter(
+            (entry): entry is [string, string] => typeof entry[1] === 'string',
+          ),
+        ),
+      },
+    });
+    Object.defineProperty(response, 'url', { value: url.href });
+    return response;
+  });
+  try {
+    context.clients = await github.createDeliveryGitHubClients({
+      config: context.config,
+      role: 'author',
+      identity: 'author',
+      env: process.env,
+    });
+    github.retainMachineAuthorForConfiguration(context.config, context.clients);
+    return { ...current, restore, token };
+  } catch (error) {
+    restore();
+    throw error;
+  }
 }
 
 describe('native exact PR association after publication', () => {
@@ -964,6 +1100,84 @@ describe('directory-independent exact-PR contract', () => {
 
 describe('explicit native non-closing reference delivery', () => {
   const input = { issueNumber: 17, prNumber: 23, nonClosing: true };
+
+  it.each(['ruleset-only', 'confirmed-unprotected'])(
+    'creates and reviews %s protection through the real machine client and sanitizer',
+    async (mode) => {
+      const { context, reviewerContext, state, artifact, evidence, restore, token } =
+        await machineRulesetOnlyFixture(false);
+      try {
+        if (mode === 'confirmed-unprotected') {
+          evidence.rules = { status: 200, headers: {}, data: [] };
+          evidence.rulesets = { status: 200, headers: {}, data: [] };
+          evidence.branch = { status: 200, data: { name: 'main', protected: false, protection: { enabled: false } } };
+        }
+        await startIssueBranch(context, 17);
+        state.remoteHead = head;
+        const preview = await publishPr(context, { issueNumber: 17, nonClosing: true, dryRun: true });
+        assert.equal(state.creations, 0);
+        const created = await publishPr(context, { issueNumber: 17, nonClosing: true });
+        assert.equal(state.creations, 1);
+        const reviewPreview = await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
+        assert.equal(state.submissions, 0);
+        const reviewed = await submitFormalReview(reviewerContext, { ...input, artifact });
+        assert.equal(state.submissions, 1);
+        assert.equal(state.reviews[0]?.commit_id, head);
+        assert.equal(state.reviews[0]?.user.login, 'reviewer[bot]');
+        assert.equal(state.issueState, 'open');
+        assert.equal(state.issueBody, 'Four retained criteria');
+        assert.equal(state.updates, 0);
+        assert.equal(JSON.stringify([preview, created, reviewPreview, reviewed]).includes(token), false);
+      } finally {
+        restore();
+      }
+    },
+  );
+
+  for (const [name, change] of [
+    ['generic protection 404', { protectionError: { status: 404, response: { data: { message: 'Not Found' } } } }],
+    [
+      'denied protection',
+      { protectionError: { status: 403, response: { data: { message: 'Branch not protected' } } } },
+    ],
+    ['denied applicable rules', { deniedRoute: '/rules/branches/main' }],
+    [
+      'denied repository',
+      { deniedRoute: '', repository: { status: 403, data: { full_name: repo, permissions: { push: true } } } },
+    ],
+    ['denied parent rulesets', { deniedRoute: '/rulesets' }],
+    [
+      'incomplete rules',
+      { rules: { status: 200, headers: { link: '<https://api.github.com/next>; rel="next"' }, data: [] } },
+    ],
+  ] as const) {
+    it(`refuses ${name} through real machine sanitization before publication or review`, async () => {
+      const { context, reviewerContext, state, artifact, evidence, restore, token } =
+        await machineRulesetOnlyFixture(false);
+      try {
+        await startIssueBranch(context, 17);
+        state.remoteHead = head;
+        Object.assign(evidence, change);
+        for (const operation of [
+          () => publishPr(context, { issueNumber: 17, nonClosing: true }),
+          () => {
+            state.published = true;
+            return submitFormalReview(reviewerContext, { ...input, artifact });
+          },
+        ])
+          await assert.rejects(operation(), (error: unknown) => {
+            assert.ok(error instanceof DeliveryError);
+            assert.equal(JSON.stringify(error).includes(token), false);
+            return true;
+          });
+        assert.equal(state.creations, 0);
+        assert.equal(state.submissions, 0);
+        assert.equal(state.updates, 0);
+      } finally {
+        restore();
+      }
+    });
+  }
 
   it('creates and independently reviews a non-closing PR with corroborated repository and parent ruleset protection', async () => {
     const { context, reviewerContext, state, artifact } = rulesetOnlyFixture(false);

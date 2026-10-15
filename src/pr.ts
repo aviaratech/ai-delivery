@@ -1,5 +1,5 @@
 import { DeliveryError } from './errors.js';
-import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
+import { createDeliveryGitHubClients, hasBranchProtectionAbsence, type GitHubClients } from './github/client.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
 import {
   commentIssue,
@@ -801,19 +801,11 @@ export async function preflightReviewRoute(
   await check();
   let confirmedUnprotected = false;
   let confirmedRulesetOnly = false;
-  const protectionError =
-    protectionResult.status === 'rejected'
-      ? (protectionResult.reason as {
-          status?: unknown;
-          response?: { status?: unknown; data?: { message?: unknown } };
-        } | null)
-      : null;
   if (
     rulesetResult.status === 'fulfilled' &&
     completeRulePage(rulesetResult.value) &&
-    protectionError?.status === 404 &&
-    protectionError.response?.status === 404 &&
-    protectionError.response.data?.message === 'Branch not protected'
+    protectionResult.status === 'rejected' &&
+    hasBranchProtectionAbsence(protectionResult.reason, context.clients, context.repo, base)
   ) {
     // A generic/permission 404 is never absence. Corroborate the named branch,
     // selected author's write access, and all repository/parent rulesets.
