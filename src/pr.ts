@@ -1349,7 +1349,14 @@ export async function mergePr(
   });
   if (decision.submittedReviewAuthorCanPushToRepository !== true)
     throw new DeliveryError('Specific reviewer App approval is not verifiably qualifying for required review.');
-  if (decision.status !== 'satisfied')
+  // Unavailable or malformed decisions carry no qualifying review-access
+  // evidence. An observed null may accompany an independently confirmed zero.
+  const noReviewsRequired =
+    decision.status === 'unknown' &&
+    decision.reviewDecision === null &&
+    route.rules.visibility === 'complete' &&
+    route.rules.observedRequiredApprovals === 0;
+  if (decision.status !== 'satisfied' && !noReviewsRequired)
     throw new DeliveryError(`GitHub review eligibility is ${decision.status}: ${decision.nextAction}`);
   const blockers = await getNativeBlockerRelationships({
     graphql: context.clients.graphql,
@@ -1365,6 +1372,8 @@ export async function mergePr(
     refuseClosingDirective(squash!.commit_title);
     refuseClosingDirective(squash!.commit_message);
   }
+  if (noReviewsRequired && (pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha))
+    throw new DeliveryError('GitHub base changed; refresh the zero-review requirement observation before merge.');
   if (
     pr.head.sha !== reviewedHead ||
     pr.state !== 'open' ||

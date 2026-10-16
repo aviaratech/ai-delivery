@@ -3,6 +3,7 @@ import { describe, it } from 'vitest';
 import { publishPr, mergePr, finishIssue } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
+import { readRequiredReviewState } from './review.js';
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
@@ -17,7 +18,14 @@ function fixture(
     mergeAckLost?: boolean;
     reviewMoved?: boolean;
     headMoved?: boolean;
-    reviewDecision?: string;
+    reviewDecision?: unknown;
+    reviewPolicy?: 'legacy' | 'ruleset';
+    requiredApprovals?: unknown;
+    ruleVisibility?: 'partial' | 'unknown' | 'permission-404' | 'generic-404';
+    decisionUnavailable?: boolean;
+    decisionHeadMoved?: boolean;
+    baseChangedAfterDecision?: 'name' | 'sha';
+    reviewAccessActor?: string;
     unrelatedBranch?: boolean;
     failedClose?: boolean;
     deletedAfterMerge?: boolean;
@@ -36,6 +44,7 @@ function fixture(
   } = {},
 ) {
   let merged = false;
+  let decisionRead = false;
   let closes = 0;
   let publicationBody: string | undefined;
   let publicationTitle: string | undefined;
@@ -86,11 +95,75 @@ function fixture(
     mergeable: state === 'clean',
     mergeable_state: state,
     head: { sha: head, ref: 'issue/17', repo: { full_name: 'example/widget' } },
-    base: { sha: 'c'.repeat(40), ref: 'main', repo: { full_name: 'example/widget' } },
+    base: {
+      sha: decisionRead && option.baseChangedAfterDecision === 'sha' ? 'd'.repeat(40) : 'c'.repeat(40),
+      ref: decisionRead && option.baseChangedAfterDecision === 'name' ? 'other' : 'main',
+      repo: { full_name: 'example/widget' },
+    },
     user: { login: 'author' },
   });
   const rest = {
-    request: async () => ({ data: [] }),
+    request: async (route: string) => {
+      if (!option.reviewPolicy) return { data: [] };
+      const count = Object.hasOwn(option, 'requiredApprovals') ? option.requiredApprovals : 0;
+      if (option.ruleVisibility === 'unknown') throw { status: 403 };
+      if (route.endsWith('/rules/branches/{branch}')) {
+        if (option.ruleVisibility === 'partial') throw { status: 403 };
+        return {
+          status: 200,
+          headers: {},
+          data:
+            option.reviewPolicy === 'ruleset'
+              ? [
+                  {
+                    type: 'pull_request',
+                    ruleset_id: 41,
+                    ruleset_source_type: 'Repository',
+                    ruleset_source: 'example/widget',
+                    parameters: { required_approving_review_count: count },
+                  },
+                  {
+                    type: 'required_status_checks',
+                    ruleset_id: 41,
+                    ruleset_source_type: 'Repository',
+                    ruleset_source: 'example/widget',
+                    parameters: {
+                      required_status_checks: [{ context: 'local-verify' }, { context: 'money-path-review' }],
+                    },
+                  },
+                ]
+              : [],
+        };
+      }
+      if (route.endsWith('/protection')) {
+        if (option.ruleVisibility === 'permission-404' || option.ruleVisibility === 'generic-404')
+          throw {
+            status: 404,
+            response: {
+              status: option.ruleVisibility === 'permission-404' ? 403 : 404,
+              data: { message: option.ruleVisibility === 'generic-404' ? 'Not Found' : 'Branch not protected' },
+            },
+          };
+        if (option.reviewPolicy === 'ruleset')
+          throw { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } };
+        return {
+          status: 200,
+          headers: {},
+          data: { required_pull_request_reviews: { required_approving_review_count: count } },
+        };
+      }
+      if (route.endsWith('/rulesets'))
+        return {
+          status: 200,
+          headers: {},
+          data: [{ id: 41, source_type: 'Repository', source: 'example/widget', enforcement: 'active' }],
+        };
+      if (route.endsWith('/branches/{branch}'))
+        return { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } };
+      if (route === 'GET /repos/{owner}/{repo}')
+        return { status: 200, data: { full_name: 'example/widget', permissions: { push: true } } };
+      throw new Error(`Unexpected fictional rule route ${route}`);
+    },
     repos: { get: async () => ({ data: { node_id: 'REPO', default_branch: 'main', full_name: 'example/widget' } }) },
     git: {
       getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
@@ -99,7 +172,12 @@ function fixture(
           ref: `refs/${ref}`,
           object: {
             type: 'commit',
-            sha: ref === 'heads/main' ? (option.baseMoved ? 'e'.repeat(40) : 'c'.repeat(40)) : head,
+            sha:
+              ref === 'heads/main' || ref === 'heads/other'
+                ? option.baseMoved
+                  ? 'e'.repeat(40)
+                  : 'c'.repeat(40)
+                : head,
           },
         },
       }),
@@ -243,7 +321,7 @@ function fixture(
                 : [
                     {
                       fullDatabaseId: 99,
-                      author: { login: 'reviewer' },
+                      author: { login: option.reviewAccessActor ?? 'reviewer' },
                       authorCanPushToRepository: option.reviewCannotPush !== true,
                       commit: { oid: head },
                       state: 'APPROVED',
@@ -298,7 +376,16 @@ function fixture(
           issue: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, parent: null },
         },
       };
-    return { repository: { pullRequest: { headRefOid: head, reviewDecision: option.reviewDecision ?? 'APPROVED' } } };
+    if (option.decisionUnavailable) throw new Error('Fictional review decision unavailable');
+    decisionRead = true;
+    return {
+      repository: {
+        pullRequest: {
+          headRefOid: option.decisionHeadMoved ? 'd'.repeat(40) : head,
+          reviewDecision: Object.hasOwn(option, 'reviewDecision') ? option.reviewDecision : 'APPROVED',
+        },
+      },
+    };
   };
   const reviewer = { role: 'reviewer', authSource: 'app', appActorLogin: async () => 'reviewer[bot]', rest, graphql };
   const context = {
@@ -322,6 +409,84 @@ function fixture(
 }
 
 describe('remote GitHub lifecycle', () => {
+  for (const reviewPolicy of ['legacy', 'ruleset'] as const) {
+    it(`merges complete ${reviewPolicy} zero required reviews with observed null and a qualifying exact-head App approval`, async () => {
+      const { context, merges, closes } = fixture('clean', { reviewPolicy, reviewDecision: null });
+      const decision = await readRequiredReviewState(context, 23, head, { id: 99, login: 'reviewer[bot]' });
+      assert.equal(decision.reviewDecision, null);
+      assert.equal(decision.status, 'unknown');
+      assert.equal(decision.submittedReviewAuthorCanPushToRepository, true);
+      const preview = await mergePr(context, { issueNumber: 17, prNumber: 23, reviewedHeadSha: head, dryRun: true });
+      assert.equal(preview.headSha, head);
+      assert.equal(merges.length, 0);
+      assert.equal(closes(), 0);
+      await finishIssue(context, { issueNumber: 17, prNumber: 23, reviewedHeadSha: head });
+      assert.equal(merges.length, 1);
+      assert.equal(merges[0]?.sha, head);
+      assert.equal(closes(), 1);
+    });
+
+    for (const requiredApprovals of [undefined, null, -1, 1, '0', false, {}]) {
+      it(`refuses ${reviewPolicy} null decision with unconfirmed zero count ${String(requiredApprovals)}`, async () => {
+        const { context, merges, closes } = fixture('clean', { reviewPolicy, requiredApprovals, reviewDecision: null });
+        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+        assert.equal(merges.length, 0);
+        assert.equal(closes(), 0);
+      });
+    }
+    for (const ruleVisibility of ['partial', 'unknown', 'permission-404', 'generic-404'] as const) {
+      it(`refuses ${reviewPolicy} zero/null with ${ruleVisibility} visibility`, async () => {
+        const { context, merges, closes } = fixture('clean', { reviewPolicy, ruleVisibility, reviewDecision: null });
+        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+        assert.equal(merges.length, 0);
+        assert.equal(closes(), 0);
+      });
+    }
+    for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}]) {
+      it(`refuses ${reviewPolicy} zero reviews with missing or malformed decision ${String(reviewDecision)}`, async () => {
+        const { context, merges, closes } = fixture('clean', { reviewPolicy, reviewDecision });
+        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+        assert.equal(merges.length, 0);
+        assert.equal(closes(), 0);
+      });
+    }
+    for (const guard of [
+      { decisionUnavailable: true },
+      { decisionHeadMoved: true },
+      { baseMoved: true },
+      { baseChangedAfterDecision: 'name' },
+      { baseChangedAfterDecision: 'sha' },
+      { headMoved: true },
+      { reviewMoved: true },
+      { reviewCannotPush: true },
+      { reviewAccessUnknown: true },
+      { reviewAccessActor: 'foreign-reviewer' },
+      { reviewBinding: 'stale-head' },
+      { reviewBinding: 'wrong-tree' },
+      { reviewBinding: 'wrong-scope' },
+      { reviewBinding: 'invalid-digest' },
+      { reviewBinding: 'marker-only' },
+      { reviewBinding: 'wrong-issue' },
+      { reviewBinding: 'wrong-pr' },
+      { reviewBinding: 'wrong-role' },
+    ] as const) {
+      it(`preserves ${reviewPolicy} zero/null merge guard ${JSON.stringify(guard)}`, async () => {
+        const { context, merges, closes } = fixture('clean', { ...guard, reviewPolicy, reviewDecision: null });
+        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+        assert.equal(merges.length, 0);
+        assert.equal(closes(), 0);
+      });
+    }
+    for (const state of [null, 'unknown', 'blocked', 'unstable', 'behind', 'dirty']) {
+      it(`refuses ${reviewPolicy} zero/null with non-CLEAN native check and merge state ${String(state)}`, async () => {
+        const { context, merges, closes } = fixture(state, { reviewPolicy, reviewDecision: null });
+        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+        assert.equal(merges.length, 0);
+        assert.equal(closes(), 0);
+      });
+    }
+  }
+
   for (const reviewBinding of [
     'stale-head',
     'wrong-tree',
