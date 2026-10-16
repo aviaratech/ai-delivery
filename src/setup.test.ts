@@ -1490,6 +1490,51 @@ test('post-rename errors reconcile desired bytes and never overwrite third-party
   }
 });
 
+async function cancelNativeStageWhenReady(
+  running: Promise<Stage>,
+  input: SetupInput,
+  controller: AbortController,
+  onReady: () => void = () => {},
+) {
+  const settled = running.then(
+    () => ({ status: 'fulfilled' as const }),
+    (reason: unknown) => ({ status: 'rejected' as const, reason }),
+  );
+  let failed = false;
+  let failure: unknown;
+  let outcome: Awaited<typeof settled> | undefined;
+  try {
+    // The real operation retains its native request/resource/cancellation/drain guards.
+    // Readiness is an installer condition, not an assumed elapsed preparation duration.
+    while (!existsSync(join(input.runtimeDirectory, 'node_modules/.bin/ai-delivery'))) {
+      const outcome = await Promise.race([
+        settled,
+        new Promise<undefined>((resolve) => setTimeout(resolve, 20, undefined)),
+      ]);
+      if (outcome?.status === 'rejected') throw outcome.reason;
+      assert.notEqual(outcome?.status, 'fulfilled', 'Stage completed before the pending installer became ready');
+    }
+    assert.equal(
+      digestBytes(readFileSync(join(input.runtimeDirectory, 'reviewed-archive.tgz'))),
+      input.expectedArchiveSha256,
+    );
+    onReady();
+    controller.abort();
+    await assert.rejects(running, /cancelled/u);
+  } catch (error) {
+    failed = true;
+    failure = error;
+  } finally {
+    controller.abort();
+    outcome = await settled;
+  }
+  if (outcome?.status === 'rejected' && !/cancelled/u.test(String(outcome.reason)) && outcome.reason !== failure) {
+    if (failed) throw new AggregateError([failure, outcome.reason], 'Native fixture assertion and staging both failed');
+    throw outcome.reason;
+  }
+  if (failed) throw failure;
+}
+
 for (const native of [false, true]) {
   test(`${native ? 'native ' : ''}failure and cancellation remove only the owned incomplete stage and preserve unrelated output`, async () => {
     const api = await producer();
@@ -1505,15 +1550,18 @@ for (const native of [false, true]) {
       rmSync(join(f.base, 'fail'));
       writeFileSync(join(f.base, 'wait'), 'go');
       const running = api.stageRuntime({ ...f.input, signal: controller.signal });
-      void running.catch(() => undefined);
-      for (let i = 0; i < 100 && !existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery')); i++)
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(
-        digestBytes(readFileSync(join(f.input.runtimeDirectory, 'reviewed-archive.tgz'))),
-        f.input.expectedArchiveSha256,
-      );
-      controller.abort();
-      await assert.rejects(running, /cancelled/u);
+      if (native) await cancelNativeStageWhenReady(running, f.input, controller);
+      else {
+        void running.catch(() => undefined);
+        for (let i = 0; i < 100 && !existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery')); i++)
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(
+          digestBytes(readFileSync(join(f.input.runtimeDirectory, 'reviewed-archive.tgz'))),
+          f.input.expectedArchiveSha256,
+        );
+        controller.abort();
+        await assert.rejects(running, /cancelled/u);
+      }
       assert.equal(existsSync(f.input.runtimeDirectory), false);
       assert.equal(readFileSync(join(unrelated, 'keep'), 'utf8'), 'keep');
       assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
@@ -1528,6 +1576,106 @@ for (const native of [false, true]) {
     }
   });
 }
+
+test('native cancellation fixture waits for delayed installer readiness', async () => {
+  const api = await producer();
+  const f = await fixture(true);
+  const controller = new AbortController();
+  writeFileSync(join(f.base, 'wait'), 'go');
+  writeFileSync(join(f.base, 'unrelated'), 'keep');
+  actors.pauseAuthor = true;
+  const running = api.stageRuntime({ ...f.input, signal: controller.signal });
+  const settled = running.then(
+    () => 'fulfilled' as const,
+    () => 'rejected' as const,
+  );
+  try {
+    await cancelNativeStageWhenReady(running, f.input, controller);
+    assert.equal(actors.authorStarted, true);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+    assert.equal(readFileSync(join(f.base, 'unrelated'), 'utf8'), 'keep');
+    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+    assert.equal(
+      readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
+      'Synthetic copied native plugin.\n',
+    );
+  } finally {
+    controller.abort();
+    await settled;
+    actors.pauseAuthor = false;
+    f.cleanup();
+  }
+});
+
+test('native cancellation fixture preserves an early staging rejection', async () => {
+  const api = await producer();
+  const f = await fixture(true);
+  const controller = new AbortController();
+  const input = { ...f.input, authority: '', signal: controller.signal };
+  const running = api.stageRuntime(input);
+  const settled = running.then(
+    () => 'fulfilled' as const,
+    () => 'rejected' as const,
+  );
+  try {
+    await assert.rejects(
+      cancelNativeStageWhenReady(running, input, controller),
+      /Explicit runtime:stage authority is required/u,
+    );
+    assert.equal(existsSync(f.counter), false);
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    controller.abort();
+    await settled;
+    f.cleanup();
+  }
+});
+
+test('native cancellation fixture settles a real installer before assertion-failure cleanup', async () => {
+  const api = await producer();
+  const f = await fixture(true);
+  const controller = new AbortController();
+  writeFileSync(join(f.base, 'wait'), 'go');
+  writeFileSync(join(f.base, 'unrelated'), 'keep');
+  const running = api.stageRuntime({ ...f.input, signal: controller.signal });
+  let finished = false;
+  const settled = running.then(
+    () => {
+      finished = true;
+    },
+    () => {
+      finished = true;
+    },
+  );
+  const fault = new Error('Synthetic assertion failed with a pending native installer');
+  try {
+    // Establish readiness independently so this regression isolates teardown ordering.
+    while (!existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery'))) {
+      if (finished) await running;
+      assert.equal(finished, false, 'Stage settled before the pending installer became ready');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await assert.rejects(
+      cancelNativeStageWhenReady(running, f.input, controller, () => {
+        throw fault;
+      }),
+      (error) => error === fault,
+    );
+    assert.equal(finished, true, 'Fixture cleanup must wait for actual staging settlement');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    assert.equal(readFileSync(join(f.base, 'unrelated'), 'utf8'), 'keep');
+    assert.equal(
+      readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
+      'Synthetic copied native plugin.\n',
+    );
+  } finally {
+    controller.abort();
+    await settled;
+    f.cleanup();
+  }
+});
 
 test('admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes', async () => {
   const api = await producer();
