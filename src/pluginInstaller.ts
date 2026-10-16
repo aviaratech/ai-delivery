@@ -1061,20 +1061,21 @@ function selectedRoot(
   cachePath: string | null,
   sourceVersion = entry.version,
 ): string {
-  const unitVersion = input.host === 'claude-code' ? sourceVersion : entry.version;
-  const unit = verifiedUnit(target, unitVersion),
+  const unit = verifiedUnit(target, entry.version),
     source = pluginRoot(target, sourceVersion);
-  if (sourceVersion !== unitVersion) verifiedUnit(target, sourceVersion);
+  if (sourceVersion !== entry.version) verifiedUnit(target, sourceVersion);
   if (input.host === 'claude-code' && claudeCatalogSelection(target).version !== sourceVersion)
     throw new Error('Claude catalog version differs from its native selection.');
   if (input.host === 'codex' && resolve(entry.sourceRoot!) !== source)
     throw new Error('Native plugin source differs from the managed version.');
-  const root = input.host === 'codex' ? cachePath : source;
+  const root = cachePath;
   if (!root) throw new Error('Native cache path is missing.');
   if (
-    input.host === 'codex' &&
-    resolve(root) !== join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', entry.version)
+    input.host === 'claude-code' &&
+    (entry.installedPath === undefined || resolve(entry.installedPath) !== resolve(root))
   )
+    throw new Error('Native cache path differs from the managed native selection.');
+  if (resolve(root) !== join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', entry.version))
     throw new Error('Native cache path is outside the managed native selection.');
   assertCanonical(root);
   if (JSON.stringify(tree(root)) !== JSON.stringify(unit.files))
@@ -1376,18 +1377,33 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       const installArgs =
         input.host === 'codex'
           ? ['plugin', 'add', selector, '--json']
-          : ['plugin', 'install', selector, '--scope', input.scope];
+          : ['plugin', prior ? 'update' : 'install', selector, '--scope', input.scope];
       let selectionStarted = false;
       try {
         state.nativeVersion = (await native(['--version'])).trim();
         if (prior && version) {
-          if (input.host === 'claude-code')
-            throw new Error(
-              'Claude preserving replacement is unqualified; no catalog or native selection was changed.',
-            );
+          if (input.host === 'claude-code') {
+            // Qualified against this native binary in an isolated USER profile,
+            // including unknown settings, unrelated selections and a catalog path change.
+            const stable = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            if (
+              state.nativeVersion !== '2.1.296 (Claude Code)' ||
+              input.scope !== 'user' ||
+              !stable.test(prior) ||
+              !stable.test(version) ||
+              (version
+                .split('.')
+                .map(BigInt)
+                .map((part, index) => part - BigInt(prior.split('.')[index]!))
+                .find((part) => part !== 0n) ?? 0n) < 0n
+            )
+              throw new Error(
+                'Claude preserving replacement is unqualified; no catalog or native selection was changed.',
+              );
+          }
           // Only this pinned native source has a qualified preserving-add footprint.
           // This does not establish exclusion of concurrent, unrelated native writers.
-          if (state.nativeVersion !== 'codex-cli 0.162.1')
+          if (input.host === 'codex' && state.nativeVersion !== 'codex-cli 0.162.1')
             throw new Error('This native version has no qualified preserving replacement route.');
         }
         if (input.host === 'claude-code' && !(await native(['plugin', 'uninstall', '--help'])).includes('--keep-data'))
@@ -1421,8 +1437,8 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
           const partialCatalog = resuming && targetMatches[0] && priorMatches[1];
           if (!priorCatalog && !targetCatalog && !partialCatalog)
             throw new Error('Managed catalog differs from the owned prior or target publication.');
-          // Codex list reports the installed cache version but the current catalog source.
-          recoverySourceVersion = targetMatches[0] ? version : prior;
+          // The installed cache and the host-specific catalog source are separate observations.
+          recoverySourceVersion = targetMatches[input.host === 'codex' ? 0 : 1] ? version : prior;
           if (current.version === version) {
             if (!targetCatalog) throw new Error('Selected target has an incompatible managed catalog.');
             reuseSelection = true;
@@ -1497,9 +1513,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         result.changed = prior !== version;
         result.installed = version !== null;
         result.activation = { installedVersion: version, startupVersion: null, loadedVersion: null };
-        if (version)
-          result.nativePluginRoot =
-            input.host === 'codex' ? (state.installedPath ?? pluginRoot(target, version)) : pluginRoot(target, version);
+        if (version) result.nativePluginRoot = state.installedPath ?? pluginRoot(target, version);
         return result;
       } catch (error) {
         if (

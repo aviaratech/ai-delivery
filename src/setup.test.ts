@@ -1749,7 +1749,8 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
       ],
       cancellation.signal,
       undefined,
-      { maxAggregateRssBytes: 3 * 1024 ** 3, minFreeDiskBytes: 100 * 1024 ** 3 },
+      // This bounded synthetic case uses the fixture floor, not a local host's 100 GiB reserve.
+      { maxAggregateRssBytes: 3 * 1024 ** 3, minFreeDiskBytes: 256 * 1024 ** 2 },
       undefined,
       undefined,
       {

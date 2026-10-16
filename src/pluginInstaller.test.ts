@@ -716,10 +716,10 @@ test.each([
 });
 
 test.each(['update', 'install', 'rollback'])(
-  'Claude owned %s refuses unqualified preservation before catalog or selection changes',
+  'Claude owned %s refuses an unqualified native version before catalog or selection changes',
   async (action) => {
     doctorFixture(true, 'claude-code');
-    fixture.responses.unshift('2.1.296', '--keep-data');
+    fixture.responses.unshift('2.1.295 (Claude Code)', '--keep-data');
     const catalog = join(fixture.home, '.cache/ai-delivery/plugins/claude-code/user/marketplace');
     if (action === 'rollback') {
       const path = join(dirname(catalog), 'state.json');
@@ -747,6 +747,147 @@ test.each(['update', 'install', 'rollback'])(
     );
   },
 );
+
+function claudeReplacementFixture() {
+  doctorFixture(true, 'claude-code');
+  const initial = JSON.parse(fixture.responses.shift() as string) as Record<string, unknown>[];
+  nativeArchiveFixture();
+  const catalog = join(fixture.home, '.cache/ai-delivery/plugins/claude-code/user/marketplace');
+  const settings = join(fixture.home, '.claude/settings.json');
+  const preferences = {
+    enabledPlugins: { 'ai-delivery@ai-delivery-user': true, 'unrelated@fictional': false },
+    permissions: { allow: ['mcp__fictional__read'], deny: ['mcp__fictional__write'] },
+    unknown: { nested: ['retain', null, { explicit: false }] },
+  };
+  writeFileSync(settings, JSON.stringify(preferences), { mode: 0o600 });
+  const before = readFileSync(settings);
+  const native = { selected: initial, updates: 0, loseAck: false, failSelection: false };
+  fixture.respond = (args) => {
+    if (args[0] === 'npm') return '';
+    if (args[0] === process.execPath) return '0.3.22';
+    if (args[1] === '--version') return '2.1.296 (Claude Code)';
+    if (args[2] === 'uninstall' && args.includes('--help')) return '--keep-data';
+    if (args[2] === 'list') return JSON.stringify(native.selected);
+    if (args[2] === 'update') {
+      assert.deepEqual(args, ['claude', 'plugin', 'update', 'ai-delivery@ai-delivery-user', '--scope', 'user']);
+      native.updates++;
+      if (native.failSelection) return undefined;
+      const offered = JSON.parse(readFileSync(join(catalog, '.claude-plugin/marketplace.json'), 'utf8')) as {
+        plugins: { source: string; version: string }[];
+      };
+      const { source, version } = offered.plugins[0]!;
+      const cache = join(fixture.home, '.claude/plugins/cache/ai-delivery-user/ai-delivery', version);
+      mkdirSync(dirname(cache), { recursive: true, mode: 0o700 });
+      cpSync(join(catalog, source), cache, { recursive: true });
+      native.selected = [{ ...initial[0], version, installPath: cache }];
+      return native.loseAck ? undefined : '{}';
+    }
+    return undefined;
+  };
+  return { catalog, settings, before, native };
+}
+
+test.each(['update', 'install'])(
+  'Claude owned forward %s preserves preferences through native update',
+  async (action) => {
+    const { settings, before, native } = claudeReplacementFixture();
+    const result = await managePlugin({ ...input(), host: 'claude-code', action, version: '0.3.22' });
+    assert.equal(result.version, '0.3.22');
+    assert.equal(
+      result.nativePluginRoot,
+      join(fixture.home, '.claude/plugins/cache/ai-delivery-user/ai-delivery/0.3.22'),
+    );
+    assert.equal(native.updates, 1);
+    assert.deepEqual(readFileSync(settings), before);
+    assert.equal(
+      fixture.commandArguments.some(
+        (args) => ['install', 'uninstall'].includes(args[2] ?? '') && !args.includes('--help'),
+      ),
+      false,
+    );
+  },
+);
+
+test('Claude same-version replacement reuses its verified cache without a native update', async () => {
+  const { settings, before, native } = claudeReplacementFixture();
+  const result = await managePlugin({ ...input(), host: 'claude-code', action: 'update', version: '0.3.21' });
+  assert.equal(result.changed, false);
+  assert.equal(native.updates, 0);
+  assert.deepEqual(readFileSync(settings), before);
+});
+
+test.each(['0.3.20', '0.3.22-beta.1', '0.3.22+fixture'])(
+  'Claude refuses unqualified replacement target %s before publication',
+  async (version) => {
+    const { catalog, native, settings, before } = claudeReplacementFixture();
+    const paths = ['.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json'].map((name) =>
+      join(catalog, name),
+    );
+    const catalogs = paths.map((path) => readFileSync(path));
+    await assert.rejects(
+      managePlugin({ ...input(), host: 'claude-code', action: 'update', version }),
+      /preserv.*unqualified/iu,
+    );
+    assert.deepEqual(
+      paths.map((path) => readFileSync(path)),
+      catalogs,
+    );
+    assert.deepEqual(readFileSync(settings), before);
+    assert.equal(native.updates, 0);
+    assert.equal(existsSync(join(catalog, 'versions', version)), false);
+  },
+);
+
+test('Claude lost update acknowledgement resumes the exact target without selecting twice', async () => {
+  const { native, settings, before, catalog } = claudeReplacementFixture();
+  native.loseAck = true;
+  await assert.rejects(managePlugin({ ...input(), host: 'claude-code', action: 'update', version: '0.3.22' }));
+  const interrupted = JSON.parse(readFileSync(join(dirname(catalog), 'state.json'), 'utf8')) as ReturnType<
+    typeof pendingState
+  >;
+  interrupted.pending.owner = { pid: 2_000_000_000, birth: 'old owner' };
+  writeState(interrupted, 'claude-code');
+  native.loseAck = false;
+  await managePlugin({ ...input(), host: 'claude-code', action: 'update', version: '0.3.22' });
+  assert.equal(native.updates, 1);
+  assert.deepEqual(readFileSync(settings), before);
+});
+
+test('Claude prior selection with a published target catalog refuses an ambiguous retry', async () => {
+  const { native, settings, before, catalog } = claudeReplacementFixture();
+  native.failSelection = true;
+  await assert.rejects(managePlugin({ ...input(), host: 'claude-code', action: 'update', version: '0.3.22' }));
+  const interrupted = JSON.parse(readFileSync(join(dirname(catalog), 'state.json'), 'utf8')) as ReturnType<
+    typeof pendingState
+  >;
+  interrupted.pending.owner = { pid: 2_000_000_000, birth: 'old owner' };
+  writeState(interrupted, 'claude-code');
+  native.failSelection = false;
+  await assert.rejects(
+    managePlugin({ ...input(), host: 'claude-code', action: 'update', version: '0.3.22' }),
+    /ambiguous/iu,
+  );
+  assert.equal(native.updates, 1);
+  assert.deepEqual(readFileSync(settings), before);
+});
+
+test('Claude doctor rejects changed native cache bytes before starting MCP', async () => {
+  const cache = doctorFixture(true, 'claude-code');
+  writeFileSync(join(cache, 'skills/intake/SKILL.md'), 'foreign native cache bytes');
+  const result = await managePlugin({ ...input(), host: 'claude-code', action: 'doctor', version: undefined });
+  assert.equal(result.sourceIntegrity, false);
+  assert.equal(result.mcp?.startup, 'not_checked');
+});
+
+test('Claude doctor refuses a native cache path that differs from the owned selection', async () => {
+  doctorFixture(true, 'claude-code');
+  const entries = JSON.parse(fixture.responses[0] as string) as Record<string, unknown>[];
+  entries[0]!.installPath = join(fixture.home, 'foreign-native-cache');
+  fixture.responses[0] = JSON.stringify(entries);
+  const result = await managePlugin({ ...input(), host: 'claude-code', action: 'doctor', version: undefined });
+  assert.equal(result.sourceIntegrity, false);
+  assert.equal(result.mcp?.startup, 'not_checked');
+});
 
 test('lost native acknowledgement remains a failure, then exact target postimage resumes without selecting twice', async () => {
   const { native, policy, before, catalog } = replacementFixture();
