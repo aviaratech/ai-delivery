@@ -1045,12 +1045,14 @@ test('real npm keeps the reviewed tarball closure after hidden-lock invalidation
     const completeBytes = readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'));
     const metadataPaths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
     const metadataBytes = metadataPaths.map((path) => readFileSync(path));
-    const closure = () => {
-      const result = spawnSync(
+    const inspectClosure = () =>
+      spawnSync(
         process.execPath,
         [npmCli, 'ls', '--prefix', f.input.runtimeDirectory, '--omit=dev', '--all', '--json', '--logs-max', '0'],
         { cwd: f.root, encoding: 'utf8', maxBuffer: 1024 ** 2 },
       );
+    const closure = () => {
+      const result = inspectClosure();
       assert.equal(result.error, undefined);
       assert.equal(result.status, 0, result.stderr + result.stdout);
       const graph = JSON.parse(result.stdout) as {
@@ -1085,6 +1087,31 @@ test('real npm keeps the reviewed tarball closure after hidden-lock invalidation
       metadataPaths.map((path) => readFileSync(path)),
       metadataBytes,
     );
+    const admissionPath = join(f.root, '.git/ai-delivery/runtime-admission.json');
+    const admissionBytes = readFileSync(admissionPath);
+    for (const { field, edges, problem } of [
+      { field: 'optionalDependencies', edges: { '@aviaratech/ai-delivery': 'file:other.tgz' }, problem: /invalid:/u },
+      { field: 'peerDependencies', edges: { 'missing-runtime-stage-peer': '1.0.0' }, problem: /missing:/u },
+    ]) {
+      const changed = JSON.parse(metadataBytes[0]!.toString('utf8')) as Record<string, unknown>;
+      changed[field] = edges;
+      writeFileSync(metadataPaths[0]!, JSON.stringify(changed));
+      const damaged = readFileSync(metadataPaths[0]!);
+      const native = inspectClosure();
+      assert.equal(native.error, undefined);
+      assert.equal(native.status, 1, native.stderr + native.stdout);
+      const graph = JSON.parse(native.stdout) as { error?: { code: string }; problems?: string[] };
+      assert.equal(graph.error?.code, 'ELSPROBLEMS');
+      assert.ok(graph.problems?.some((entry) => problem.test(entry)));
+      await assert.rejects(api.stageRuntime(f.input), /dependency metadata/iu);
+      await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /dependency metadata/iu);
+      assert.deepEqual(readFileSync(metadataPaths[0]!), damaged);
+      assert.deepEqual(readFileSync(metadataPaths[1]!), metadataBytes[1]);
+      assert.deepEqual(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json')), completeBytes);
+      assert.deepEqual(readFileSync(admissionPath), admissionBytes);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      writeFileSync(metadataPaths[0]!, metadataBytes[0]!);
+    }
   } finally {
     f.cleanup();
     process.env.PATH = realPath;
@@ -1159,6 +1186,61 @@ test('completed stages refuse missing, corrupt or incompatible dependency metada
     f.cleanup();
   }
 });
+
+for (const metadata of ['package.json', 'package-lock.json']) {
+  test(`lost completion response refuses ${metadata} drift during final preflight without reinstalling`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    let operation: Promise<Stage> | undefined;
+    try {
+      const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
+      const target = join(f.input.runtimeDirectory, metadata);
+      let complete: Buffer | undefined;
+      let notifyWritten: (() => void) | undefined;
+      const written = new Promise<void>((resolve) => {
+        notifyWritten = resolve;
+      });
+      const actual = atomicJson.writePrivateJsonFileAtomically;
+      vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+        actual(path, value);
+        if (path === record && (value as { status?: string }).status === 'complete') {
+          complete = readFileSync(record);
+          actors.authorStarted = false;
+          actors.pauseAuthor = true;
+          notifyWritten!();
+          throw new Error('Synthetic completion response lost after durable write');
+        }
+      });
+      operation = api.stageRuntime(f.input);
+      const settled = operation.then(
+        (value) => ({ status: 'fulfilled' as const, value }),
+        (error: unknown) => ({ status: 'rejected' as const, error }),
+      );
+      const prematurelySettled = settled.then((result) => {
+        if (result.status === 'rejected') throw result.error;
+        throw new Error('Stage completed before the recovery fault was injected.');
+      });
+      await Promise.race([written, prematurelySettled]);
+      while (!actors.authorStarted)
+        await Promise.race([new Promise((resolve) => setTimeout(resolve, 10)), prematurelySettled]);
+      assert.ok(complete);
+      assert.equal((JSON.parse(complete.toString('utf8')) as { status: string }).status, 'complete');
+      if (metadata === 'package.json') rmSync(target);
+      else writeFileSync(target, '{');
+      const damaged = existsSync(target) ? readFileSync(target) : undefined;
+      await assert.rejects(operation, /dependency metadata/iu);
+      assert.deepEqual(readFileSync(record), complete);
+      assert.deepEqual(existsSync(target) ? readFileSync(target) : undefined, damaged);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+    } finally {
+      await operation?.catch(() => undefined);
+      actors.pauseAuthor = false;
+      vi.restoreAllMocks();
+      f.cleanup();
+    }
+  });
+}
 
 test('public producer stages exact bytes, explicitly admits and reuses completed work without installing again', async () => {
   const api = await producer();

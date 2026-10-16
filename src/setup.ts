@@ -241,7 +241,7 @@ function assertDependencyMetadata(intent: StageRecord['intent']): void {
     }
   };
   try {
-    const root = z.object({
+    const root = z.strictObject({
       dependencies: z.strictObject({ '@aviaratech/ai-delivery': z.literal('file:reviewed-archive.tgz') }),
     });
     root.parse(readMetadata('package.json'));
@@ -557,6 +557,7 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
             validateRuntimeAdmission(retained.admission!, final.configuration, retained.admission!.cliPath);
             durability(join(input.runtimeDirectory, 'runtime-stage.json'));
             syncDirectory(dirname(input.runtimeDirectory));
+            assertDependencyMetadata(intent);
             return stageResult(retained, final.reviewRoute, true);
           }
         }
