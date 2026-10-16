@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { types } from 'node:util';
 import {
   closeSync,
   existsSync,
@@ -355,13 +356,54 @@ function retireOutputGate(gate: OutputGate, abandoned = false): void {
   rmdirSync(gate.directory);
 }
 
-function retireOutputGateAfterOperation(gate: OutputGate, operationCompleted: boolean): void {
+function boundedOperationCause(operationFailure: unknown, prior: PropertyDescriptor | undefined): Error {
+  let detail = 'kind=UNKNOWN';
+  // Neither arbitrary thrown values nor their cause graphs are a diagnostic serialization contract.
+  if (!types.isProxy(operationFailure) && types.isNativeError(operationFailure)) {
+    detail = 'kind=Error';
+    const descriptor = Object.getOwnPropertyDescriptor(operationFailure, 'message');
+    const message: unknown = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    if (typeof message === 'string' && message.length <= 4096) {
+      detail += `; messageDigest=${digestBytes(Buffer.from(message))}`;
+      const exit = /^Selected policy stage command failed \(exit (\d{1,3})\)\. Command exit \1\./u.exec(message);
+      if (exit !== null && Number(exit[1]) <= 255) detail += `; exit=${Number(exit[1])}`;
+      if (message.startsWith('Owned process resource observation failed. ')) {
+        const code = /"errorCode":"(ETIMEDOUT|EACCES|EPERM|ENOENT|ENOBUFS|EAGAIN|ENOMEM|EIO|EINVAL|other)"/u.exec(
+          message,
+        );
+        detail += `; observation=${code?.[1] ?? 'UNKNOWN'}`;
+      }
+    }
+  }
+  return new Error(`Wrapped operation failed. ${detail}`, prior === undefined ? undefined : { cause: prior.value });
+}
+
+function retireOutputGateAfterOperation(
+  gate: OutputGate,
+  operationCompleted: boolean,
+  operationFailure?: unknown,
+): void {
   try {
     retireOutputGate(gate);
   } catch (error) {
     if (error instanceof ProcessSnapshotError)
       error.message += ` Output-gate retirement: wrappedOperation=${operationCompleted ? 'completed' : 'failed'}.`;
-    // Keep the original retirement error and its precedence over any operation error.
+    if (!operationCompleted && !types.isProxy(error) && types.isNativeError(error)) {
+      const prior = Object.getOwnPropertyDescriptor(error, 'cause');
+      // An inaccessible/non-writable existing cause must retain its original behavior and precedence.
+      if (
+        (prior === undefined && Object.isExtensible(error)) ||
+        (prior !== undefined && 'value' in prior && (prior.configurable || prior.writable))
+      ) {
+        Object.defineProperty(error, 'cause', {
+          configurable: prior?.configurable ?? true,
+          enumerable: prior?.enumerable ?? false,
+          writable: prior?.writable ?? true,
+          value: boundedOperationCause(operationFailure, prior),
+        });
+      }
+    }
+    // Keep the original retirement error, its existing cause lineage, and its primary precedence.
     throw error;
   }
 }
@@ -394,12 +436,16 @@ async function withOutputObservationGate<T>(
   const gate: OutputGate = { directory, id, owner: gateOwner() };
   writePrivateJsonFileAtomically(join(directory, 'gate.json'), gate);
   let operationCompleted = false;
+  let operationFailure: unknown;
   try {
     const value = await operation(gate);
     operationCompleted = true;
     return value;
+  } catch (error) {
+    operationFailure = error;
+    throw error;
   } finally {
-    retireOutputGateAfterOperation(gate, operationCompleted);
+    retireOutputGateAfterOperation(gate, operationCompleted, operationFailure);
   }
 }
 

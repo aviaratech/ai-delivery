@@ -18,8 +18,9 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, isAbsolute, sep } from 'node:path';
 import { afterEach, test, vi } from 'vitest';
+import { z } from 'zod';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import * as privateFiles from './delivery/common.js';
@@ -88,10 +89,26 @@ function beginControllerObservation(mode: 'healthy-controller' | 'unavailable-co
 
 const syncFailure = vi.hoisted(() => ({ directory: '' }));
 const sharedOutputRead = vi.hoisted(() => ({ path: '', unboundedReads: 0 }));
+const retirementFailure = vi.hoisted(() => ({ directory: '', error: undefined as Error | undefined, hits: 0 }));
 vi.mock('node:fs', async (original) => {
   const actual = await original<typeof import('node:fs')>();
   return {
     ...actual,
+    rmdirSync: (...args: Parameters<typeof actual.rmdirSync>) => {
+      const result = actual.rmdirSync(...args);
+      const path = String(args[0]);
+      if (
+        retirementFailure.error !== undefined &&
+        dirname(dirname(path)) === retirementFailure.directory &&
+        /^[a-f0-9]{64}[/\\][a-f0-9-]{36}$/u.test(path.slice(retirementFailure.directory.length + 1))
+      ) {
+        retirementFailure.hits++;
+        const error = retirementFailure.error;
+        retirementFailure.error = undefined;
+        throw error;
+      }
+      return result;
+    },
     readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
       if (sharedOutputRead.path && String(args[0]) === sharedOutputRead.path) {
         sharedOutputRead.unboundedReads++;
@@ -212,7 +229,7 @@ async function producer(): Promise<Producer> {
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
 }
-async function fixture(native = false) {
+async function fixture(native = false, parent = tmpdir()) {
   actors.author = 'host-user';
   actors.reviewer = 'reviewer[bot]';
   actors.access = true;
@@ -222,7 +239,7 @@ async function fixture(native = false) {
   actors.authorStarted = false;
   actors.authorAborted = false;
   actors.pauseAuthor = false;
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-setup-')));
+  const base = realpathSync(mkdtempSync(join(parent, 'ai-delivery-setup-')));
   const root = join(base, 'consumer');
   mkdirSync(root);
   git(root, 'init', '-q', '-b', 'main');
@@ -1677,6 +1694,183 @@ test('native cancellation fixture settles a real installer before assertion-fail
   }
 });
 
+async function assertRetirementErrorBoundaries(error: Error, repoRoot: string, forbidden: string[]): Promise<void> {
+  const { printCommandError } = await import('./cliResult.js');
+  const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  const exitCode = process.exitCode;
+  let cliOutput: string;
+  try {
+    printCommandError(error);
+    cliOutput = stderr.mock.calls.map(([chunk]) => String(chunk)).join('');
+    assert.equal(process.exitCode, 1);
+  } finally {
+    stderr.mockRestore();
+    process.exitCode = exitCode;
+  }
+  const dispatch = await import('./dispatch.js');
+  const invoke = vi.spyOn(dispatch, 'executeTool').mockRejectedValueOnce(error);
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const { createAiDeliveryMcpServer } = await import('./mcp/index.js');
+  const server = createAiDeliveryMcpServer({ repoRoot });
+  const client = new Client({ name: 'retirement-cause-privacy', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({
+      name: 'issue_info',
+      arguments: { repo: 'example/widget', issueNumber: 17 },
+    });
+    assert.equal(invoke.mock.calls.length, 1);
+    assert.equal(result.isError, true);
+    assert.deepEqual(result.content, [{ type: 'text', text: error.message }]);
+    const output = cliOutput + JSON.stringify(result);
+    assert.ok(output.length < 2048);
+    for (const value of forbidden) assert.equal(output.includes(value), false);
+  } finally {
+    await client.close();
+    await server.close();
+    invoke.mockRestore();
+  }
+}
+
+for (const fault of ['installer', 'accessors', 'cycle', 'proxy'] as const) {
+  test(`output retirement retains a bounded operation cause without exposing ${fault} failure data`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    const secret = 'fictional_operation_credential';
+    const priorSecret = 'fictional_existing_cause_credential';
+    const prior = new Error(priorSecret);
+    Object.defineProperty(prior, 'cause', { value: prior });
+    const primary = new Error('Synthetic retirement refusal', { cause: prior });
+    let reads = 0;
+    let operation: unknown = new Error(secret.repeat(2048));
+    if (fault === 'accessors') {
+      operation = Object.defineProperties(new Error(), {
+        message: {
+          get: () => {
+            reads++;
+            throw new Error(secret);
+          },
+        },
+        name: {
+          get: () => {
+            reads++;
+            throw new Error(secret);
+          },
+        },
+        stack: {
+          get: () => {
+            reads++;
+            throw new Error(secret);
+          },
+        },
+        cause: {
+          get: () => {
+            reads++;
+            throw new Error(secret);
+          },
+        },
+      });
+    } else if (fault === 'cycle') {
+      Object.defineProperty(operation, 'cause', { value: operation });
+      Object.freeze(operation);
+    } else if (fault === 'proxy') {
+      const trap = (): never => {
+        reads++;
+        throw new Error(secret);
+      };
+      operation = new Error(secret, {
+        // The spy checks the thrown root with instanceof; the diagnostic must never inspect its hostile cause.
+        cause: new Proxy({}, { get: trap, getPrototypeOf: trap, ownKeys: trap, getOwnPropertyDescriptor: trap }),
+      });
+    }
+    const write = atomicJson.writePrivateJsonFileAtomically;
+    const injected = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+      if (fault !== 'installer' && path === join(f.input.runtimeDirectory, 'runtime-stage.json')) throw operation;
+      write(path, value);
+    });
+    try {
+      if (fault === 'installer') writeFileSync(join(f.base, 'fail'), '');
+      retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
+      retirementFailure.error = primary;
+      retirementFailure.hits = 0;
+      let received: unknown;
+      try {
+        await api.stageRuntime(f.input);
+      } catch (error) {
+        received = error;
+      }
+      assert.equal(retirementFailure.hits, 1, 'the actual gate must retire before the injected refusal');
+      assert.equal(received, primary, 'retirement failure keeps its original instance and precedence');
+      assert.equal(primary.message, 'Synthetic retirement refusal');
+      const cause: unknown = Object.getOwnPropertyDescriptor(primary, 'cause')?.value;
+      assert.notEqual(cause, prior, 'the masked operation must have its own bounded diagnostic cause');
+      assert.ok(cause instanceof Error);
+      assert.match(cause.message, /^Wrapped operation failed/u);
+      if (fault === 'installer') assert.match(cause.message, /exit=7/u);
+      assert.ok(cause.message.length < 1024);
+      assert.equal(cause.message.includes(secret), false);
+      assert.equal(
+        Object.getOwnPropertyDescriptor(cause, 'cause')?.value,
+        prior,
+        'existing retirement cause is retained',
+      );
+      assert.equal(reads, 0, 'operation getters, proxy traps and cause graphs are never evaluated');
+      await assertRetirementErrorBoundaries(primary, f.root, [secret, priorSecret]);
+      assert.equal(reads, 0);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      if (fault === 'installer') assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      else assert.equal(existsSync(f.counter), false);
+    } finally {
+      retirementFailure.directory = '';
+      retirementFailure.error = undefined;
+      injected.mockRestore();
+      f.cleanup();
+    }
+  });
+}
+
+test('output retirement preserves an operation failure when native retirement succeeds', async () => {
+  const api = await producer();
+  const f = await fixture();
+  try {
+    writeFileSync(join(f.base, 'fail'), '');
+    await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    assert.equal(existsSync(f.input.runtimeDirectory), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('output retirement preserves its existing cause after a successful real stage', async () => {
+  const api = await producer();
+  const f = await fixture();
+  const prior = new Error('Existing retirement cause');
+  const primary = new Error('Synthetic retirement refusal', { cause: prior });
+  try {
+    retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
+    retirementFailure.error = primary;
+    retirementFailure.hits = 0;
+    await assert.rejects(api.stageRuntime(f.input), (error: unknown) => error === primary);
+    assert.equal(retirementFailure.hits, 1);
+    assert.equal(primary.cause, prior, 'successful operation does not add a failure cause');
+    assert.equal(
+      (JSON.parse(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'), 'utf8')) as { status: string })
+        .status,
+      'complete',
+    );
+    assert.equal((await api.stageRuntime(f.input)).reused, true);
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+  } finally {
+    retirementFailure.directory = '';
+    retirementFailure.error = undefined;
+    f.cleanup();
+  }
+});
+
 test('admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes', async () => {
   const api = await producer();
   const f = await fixture();
@@ -1762,6 +1956,10 @@ for (const denied of [
 }
 
 test('setup interruption child', { skip: !process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT }, async () => {
+  if (process.env.AI_DELIVERY_CLI_PREPARE) {
+    await prepareOwnedCliStage();
+    return;
+  }
   const api = await producer();
   const phase = process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE;
   if (phase) {
@@ -1980,8 +2178,206 @@ for (const native of [false, true]) {
 }
 
 const stageAdmitCase = 'CLI stage and admit execute the same public producer with explicit authority and prior absence';
+const preparedCliSchema = z.strictObject({
+  ownerRoot: z.string(),
+  base: z.string(),
+  stageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  configPath: z.string(),
+  npmBin: z.string(),
+  author: z.literal('host-user'),
+  reviewer: z.literal('reviewer[bot]'),
+  input: z.strictObject({
+    authority: z.literal('runtime:stage'),
+    identity: z.literal('host-author'),
+    repoRoot: z.string(),
+    archivePath: z.string(),
+    expectedArchiveSha256: z.string(),
+    packageVersion: z.literal('0.3.5'),
+    expectedSourceCommit: z.string(),
+    expectedConfigDigest: z.string(),
+    runtimeDirectory: z.string(),
+  }),
+  files: z.array(z.strictObject({ path: z.string(), digest: z.string() })).length(6),
+});
+type PreparedCli = z.infer<typeof preparedCliSchema>;
+
+function preparedCliClosure(input: SetupInput): void {
+  const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
+  assert.equal(
+    (JSON.parse(readFileSync(join(npmRoot, 'package.json'), 'utf8')) as { version: string }).version,
+    '11.19.0',
+  );
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(npmRoot, 'bin/npm-cli.js'),
+      'ls',
+      '--prefix',
+      input.runtimeDirectory,
+      '--omit=dev',
+      '--all',
+      '--json',
+      '--logs-max',
+      '0',
+    ],
+    {
+      cwd: input.repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 1024 ** 2,
+    },
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const graph = JSON.parse(result.stdout) as {
+    problems?: string[];
+    dependencies: Record<string, { version: string; resolved: string; invalid?: unknown; missing?: unknown }>;
+  };
+  assert.equal(graph.problems, undefined);
+  const dependency = graph.dependencies['@aviaratech/ai-delivery']!;
+  assert.equal(dependency.version, input.packageVersion);
+  assert.equal(dependency.resolved, `file:${join(input.runtimeDirectory, 'reviewed-archive.tgz')}`);
+  assert.equal(dependency.invalid, undefined);
+  assert.equal(dependency.missing, undefined);
+}
+
+function readPreparedCli(ownerRoot: string): PreparedCli {
+  assert.equal(realpathSync(ownerRoot), ownerRoot);
+  const prepared = preparedCliSchema.parse(
+    JSON.parse(
+      privateFiles.assertPrivateFile(join(ownerRoot, 'prepared.json'), { maxBytes: 16 * 1024 }).toString('utf8'),
+    ),
+  );
+  assert.equal(prepared.ownerRoot, ownerRoot);
+  const below = (path: string): void => {
+    const name = relative(ownerRoot, path);
+    assert.ok(name !== '' && name !== '..' && !name.startsWith('..' + sep) && !isAbsolute(name));
+    assert.equal(realpathSync(path), path);
+  };
+  for (const path of [
+    prepared.base,
+    prepared.configPath,
+    prepared.npmBin,
+    prepared.input.repoRoot,
+    prepared.input.archivePath,
+    prepared.input.runtimeDirectory,
+    ...prepared.files.map((f) => f.path),
+  ])
+    below(path);
+  assert.equal(dirname(prepared.base), ownerRoot);
+  assert.ok(prepared.base.split(sep).at(-1)!.startsWith('ai-delivery-setup-'));
+  assert.equal(prepared.input.repoRoot, join(prepared.base, 'consumer'));
+  assert.equal(prepared.input.runtimeDirectory, join(prepared.base, 'staged'));
+  assert.equal(prepared.input.archivePath, join(prepared.base, 'reviewed archive; inert.tgz'));
+  assert.equal(prepared.configPath, join(prepared.base, 'user.json'));
+  assert.equal(prepared.npmBin, join(prepared.base, 'prepared-npm'));
+  assert.equal(digestBytes(readFileSync(prepared.input.archivePath)), prepared.input.expectedArchiveSha256);
+  assert.equal(git(prepared.input.repoRoot, 'rev-parse', 'HEAD'), prepared.input.expectedSourceCommit);
+  assert.equal(git(prepared.input.repoRoot, 'status', '--porcelain'), '');
+  const recordPath = join(prepared.input.runtimeDirectory, 'runtime-stage.json');
+  const record = JSON.parse(privateFiles.assertPrivateFile(recordPath).toString('utf8')) as {
+    status: string;
+    stageId: string;
+    recordId: string;
+    intent: Record<string, unknown>;
+  };
+  const { recordId, ...content } = record;
+  assert.equal(digestValue(content), recordId);
+  assert.equal(record.status, 'complete');
+  assert.equal(record.stageId, prepared.stageId, 'Prepared CLI stage identity mismatch');
+  assert.equal(digestValue(record.intent), prepared.stageId);
+  for (const [field, value] of Object.entries({
+    repoRoot: prepared.input.repoRoot,
+    runtimeDirectory: prepared.input.runtimeDirectory,
+    sourceCommit: prepared.input.expectedSourceCommit,
+    configDigest: prepared.input.expectedConfigDigest,
+    archivePath: prepared.input.archivePath,
+    archiveSha256: prepared.input.expectedArchiveSha256,
+    packageVersion: prepared.input.packageVersion,
+  }))
+    assert.equal(record.intent[field], value);
+  assert.deepEqual(record.intent.resourceBounds, {
+    maxAggregateRssBytes: 1024 ** 3,
+    minFreeDiskBytes: 256 * 1024 ** 2,
+    maxNewOutputBytes: 512 * 1024 ** 2,
+    maxCapturedOutputBytes: 1024 ** 2,
+  });
+  const expectedPaths = [
+    recordPath,
+    join(prepared.input.runtimeDirectory, 'package.json'),
+    join(prepared.input.runtimeDirectory, 'package-lock.json'),
+    join(prepared.input.runtimeDirectory, 'reviewed-archive.tgz'),
+    join(prepared.input.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/dist/cli.js'),
+    prepared.configPath,
+  ];
+  assert.deepEqual(
+    prepared.files.map((f) => f.path),
+    expectedPaths,
+  );
+  for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
+  assert.equal(readFileSync(join(prepared.base, 'installs'), 'utf8'), 'x');
+  return prepared;
+}
+
+async function prepareOwnedCliStage(): Promise<void> {
+  const ownerRoot = process.env.AI_DELIVERY_CLI_PREPARE!;
+  const f = await fixture(false, ownerRoot);
+  const previousPath = process.env.PATH;
+  const scenario = process.env.AI_DELIVERY_STAGE_ADMIT_SCENARIO;
+  try {
+    writeFileSync(join(f.base, 'unrelated-preparation'), 'unrelated');
+    const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
+    assert.equal(
+      (JSON.parse(readFileSync(join(npmRoot, 'package.json'), 'utf8')) as { version: string }).version,
+      '11.19.0',
+    );
+    const npmBin = join(f.base, 'prepared-npm');
+    mkdirSync(npmBin);
+    writeFileSync(
+      join(npmBin, 'npm'),
+      `#!${process.execPath}\nconst fs=require('node:fs'),assert=require('node:assert/strict');if(process.argv[2]==='install'){assert.ok(process.argv.includes('--ignore-scripts'));fs.appendFileSync(${JSON.stringify(f.counter)},'x');fs.writeFileSync(${JSON.stringify(f.marker)},String(process.pid));}${scenario === 'preparation-failure' ? "process.argv[2]='synthetic-unknown-command';" : ''}${scenario === 'preparation-cancel' ? 'setInterval(()=>{},1000);' : ''}require(${JSON.stringify(join(npmRoot, 'bin/npm-cli.js'))});\n`,
+    );
+    chmodSync(join(npmBin, 'npm'), 0o755);
+    process.env.PATH = `${npmBin}:${previousPath ?? ''}`;
+    const stage = await (await producer()).stageRuntime(f.input);
+    preparedCliClosure(f.input);
+    assert.equal(stage.reused, false);
+    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+    const files = [
+      join(f.input.runtimeDirectory, 'runtime-stage.json'),
+      join(f.input.runtimeDirectory, 'package.json'),
+      join(f.input.runtimeDirectory, 'package-lock.json'),
+      join(f.input.runtimeDirectory, 'reviewed-archive.tgz'),
+      stage.admission.cliPath,
+      join(f.base, 'user.json'),
+    ].map((path) => ({ path, digest: digestBytes(readFileSync(path)) }));
+    atomicJson.writePrivateJsonFileAtomically(join(ownerRoot, 'prepared.json'), {
+      ownerRoot,
+      base: f.base,
+      stageId: stage.stageId,
+      configPath: join(f.base, 'user.json'),
+      npmBin,
+      author: actors.author,
+      reviewer: actors.reviewer,
+      input: f.input,
+      files,
+    });
+    readPreparedCli(ownerRoot);
+  } finally {
+    // The outer supervisor owns fixture disposal, including a killed preparation process.
+    process.env.PATH = previousPath;
+  }
+}
+
 type CliPhase = { phase: string; event: 'start' | 'end' | 'settled' | 'pending'; atMs: number };
-type CliScenario = 'normal' | 'budget' | 'unfinished' | 'installer-failure' | 'admission-stall';
+type CliScenario =
+  | 'normal'
+  | 'budget'
+  | 'unfinished'
+  | 'installer-failure'
+  | 'admission-stall'
+  | 'handoff-mismatch'
+  | 'preparation-failure'
+  | 'preparation-cancel';
 type CliTraceFault = 'missing' | 'oversized' | 'records' | 'write';
 type CliCaseFailure = Error & {
   root: string;
@@ -2005,7 +2401,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
   let cleanupFailure: string | undefined;
   let receiptFailure: string | undefined;
   let lastPhase: CliPhase[] = [];
-  let deadline = performance.now() + 15_000;
+  let deadline = 0;
   const active = new Map<string, number>();
   let seen = 0;
   let cancelledPhase: string | undefined;
@@ -2017,6 +2413,17 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
   let cleanupState: import('./verification.js').OwnedProcessState | undefined;
   let traceFaultInjected = false;
   let unreadableSince: number | undefined;
+  let prepared: PreparedCli | undefined;
+  let preparationStartedAt: number | undefined;
+  let preparationElapsedMs: number | undefined;
+  let preparationCompleted = false;
+  const needsPreparation = [
+    'budget',
+    'admission-stall',
+    'handoff-mismatch',
+    'preparation-failure',
+    'preparation-cancel',
+  ].includes(scenario);
   const readPhases = (): CliPhase[] => {
     const value: unknown = JSON.parse(
       privateFiles.assertPrivateFile(tracePath, { maxBytes: 64 * 1024 }).toString('utf8'),
@@ -2062,7 +2469,8 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
       cancellation.abort();
     }
   };
-  const watch = setInterval(() => {
+  let watch: ReturnType<typeof setInterval> | undefined;
+  const watchPhases = (): void => {
     try {
       if (existsSync(tracePath)) {
         const phases = readPhases();
@@ -2111,8 +2519,10 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
       cancelledPhase ??= overdue?.[0] ?? (seen === 0 ? 'bootstrap' : 'native-drain');
       cancellation.abort();
     }
-  }, 50);
-  try {
+  };
+  const executeChild = async (preparing: boolean): Promise<void> => {
+    idle = false;
+    failedBytes = undefined;
     const output = await runStageCommand(
       process.cwd(),
       [
@@ -2121,7 +2531,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
         'run',
         'dist/setup.test.js',
         '-t',
-        `^${stageAdmitCase}$`,
+        preparing ? '^setup interruption child$' : `^${stageAdmitCase}$`,
       ],
       cancellation.signal,
       undefined,
@@ -2171,6 +2581,9 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
           AI_DELIVERY_STAGE_ADMIT_CHILD: tracePath,
           AI_DELIVERY_STAGE_ADMIT_SCENARIO: scenario,
           AI_DELIVERY_STAGE_ADMIT_TRACE_FAULT: traceFault ?? '',
+          AI_DELIVERY_CLI_PREPARE: preparing ? root : '',
+          ...(preparing ? { AI_DELIVERY_SETUP_INTERRUPT_INPUT: 'owned-cli-preparation' } : {}),
+          AI_DELIVERY_CLI_PREPARED_ROOT: !preparing && prepared !== undefined ? root : '',
         },
         maxCapturedOutputBytes: 32 * 1024 ** 2,
         includeControllerTree: true,
@@ -2188,15 +2601,48 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     );
     if (output.includes(Buffer.from('SETUP_CLI_TRACE_FAILURE'))) receiptFailure ??= 'Child CLI phase write failed';
     process.stdout.write(output);
+  };
+  try {
+    if (needsPreparation) {
+      preparationStartedAt = performance.now();
+      const cancelPreparation =
+        scenario === 'preparation-cancel'
+          ? setInterval(() => {
+              const base = readdirSync(root).find((name) => name.startsWith('ai-delivery-setup-'));
+              if (base !== undefined && existsSync(join(root, base, 'installer-running'))) cancellation.abort();
+            }, 50)
+          : undefined;
+      try {
+        await executeChild(true);
+        assert.ok(idle && cleanupFailure === undefined, 'preparation must settle with native quiescence');
+        prepared = readPreparedCli(root);
+        preparedCliClosure(prepared.input);
+        preparationCompleted = true;
+        if (scenario === 'handoff-mismatch')
+          atomicJson.writePrivateJsonFileAtomically(join(root, 'prepared.json'), {
+            ...prepared,
+            stageId: 'sha256:' + '0'.repeat(64),
+          });
+      } finally {
+        if (cancelPreparation !== undefined) clearInterval(cancelPreparation);
+        preparationElapsedMs = performance.now() - preparationStartedAt;
+      }
+    }
+    deadline = performance.now() + 15_000;
+    watch = setInterval(watchPhases, 50);
+    await executeChild(false);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     if (failedBytes !== undefined) process.stdout.write(failedBytes);
   } finally {
-    clearInterval(watch);
-    try {
-      lastPhase = readPhases();
-    } catch (error) {
-      receiptFailure ??= error instanceof Error ? error.message : String(error);
+    if (watch !== undefined) clearInterval(watch);
+    if (needsPreparation && !preparationCompleted) receiptFailure ??= 'CLI preparation failed before completed handoff';
+    else {
+      try {
+        lastPhase = readPhases();
+      } catch (error) {
+        receiptFailure ??= error instanceof Error ? error.message : String(error);
+      }
     }
     if (idle && cleanupFailure === undefined) {
       try {
@@ -2230,6 +2676,8 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
           owned,
           root,
           residualInstaller,
+          preparationElapsedMs,
+          preparationCompleted,
         }) +
         '\n',
     );
@@ -2245,6 +2693,14 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
       traceFaultInjected,
       restoredGlobalsWithPending: failedBytes?.includes(Buffer.from('SETUP_CLI_ENV_RESTORED_WITH_PENDING')) ?? false,
     });
+  if (prepared !== undefined) {
+    // Parent retains original validated bindings even when the child receives the mismatch fault.
+    for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
+    assert.equal(readFileSync(join(prepared.base, 'installs'), 'utf8'), 'x');
+    preparedCliClosure(prepared.input);
+    if (scenario !== 'budget' || failure !== undefined)
+      assert.equal(existsSync(join(prepared.input.repoRoot, '.git/ai-delivery/runtime-admission.json')), false);
+  }
   rmSync(root, { recursive: true, force: true });
   assert.equal(existsSync(root), false, 'Owned CLI case root was not removed');
   return {
@@ -2256,6 +2712,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     residualInstaller,
     identities: [...identities.values()],
     installerFailureReported: failedBytes?.includes(Buffer.from('exit 7')) ?? false,
+    handoffMismatchReported: failedBytes?.includes(Buffer.from('Prepared CLI stage identity mismatch')) ?? false,
   };
 }
 
@@ -2296,7 +2753,26 @@ test(
     };
     phase('preparation', 'start');
     if (scenario === 'budget') await new Promise((resolve) => setTimeout(resolve, 12_000));
-    const f = await fixture();
+    const preparedRoot = process.env.AI_DELIVERY_CLI_PREPARED_ROOT;
+    const prepared = preparedRoot ? readPreparedCli(preparedRoot) : undefined;
+    const ownedFixture = prepared === undefined ? await fixture() : undefined;
+    const f = ownedFixture ?? {
+      base: prepared!.base,
+      root: prepared!.input.repoRoot,
+      input: prepared!.input,
+      counter: join(prepared!.base, 'installs'),
+      marker: join(prepared!.base, 'installer-running'),
+    };
+    const previousPath = process.env.PATH;
+    if (prepared !== undefined) {
+      vi.stubEnv('AI_DELIVERY_CONFIG', prepared.configPath);
+      process.env.PATH = `${prepared.npmBin}:${previousPath ?? ''}`;
+      assert.equal((await loadDeliveryConfig(f.root)).configDigest, f.input.expectedConfigDigest);
+      assert.equal(actors.author, prepared.author);
+      assert.equal(actors.reviewer, prepared.reviewer);
+      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+      preparedCliClosure(f.input);
+    }
     if (scenario === 'unfinished') writeFileSync(join(f.base, 'wait'), '');
     if (scenario === 'installer-failure') writeFileSync(join(f.base, 'fail'), '');
     phase('preparation', 'end');
@@ -2439,6 +2915,12 @@ test(
       ]);
       phase('assertions:stageId', 'start');
       assert.equal(typeof staged.stageId, 'string');
+      if (prepared !== undefined) {
+        assert.equal(staged.reused, true, 'the actual CLI must reuse the completed prepared stage');
+        assert.equal(staged.stageId, prepared.stageId);
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+        for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
+      }
       phase('assertions:stageId', 'end');
       const authorCallsBeforeAdmission = actors.authorCalls;
       if (scenario === 'budget') actors.pauseAuthor = true;
@@ -2470,7 +2952,8 @@ test(
       stdout.mockRestore();
       process.argv = argv;
       process.exitCode = exitCode;
-      f.cleanup();
+      if (ownedFixture !== undefined) ownedFixture.cleanup();
+      else process.env.PATH = previousPath;
       phase('cleanup', 'end');
     }
     if (traceFailure !== undefined) throw traceFailure;
@@ -2503,6 +2986,68 @@ test('CLI stage/admit preparation and commands retain separate finite budgets', 
     );
   }
 });
+
+test('CLI prepared handoff rejects a mismatched stage identity without reinstall or admission', async () => {
+  const result = await observeStageAdmitCase('handoff-mismatch');
+  assert.equal(result.handoffMismatchReported, true, 'the actual child must refuse its mismatched prepared stage');
+  assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
+  assert.equal(
+    result.phases.some((entry) => entry.phase === 'runtime:admit'),
+    false,
+  );
+});
+
+for (const fault of ['failure', 'cancel'] as const) {
+  test(`CLI preparation ${fault} retains owned evidence through native drain`, async () => {
+    const previousPath = process.env.PATH;
+    let received: unknown;
+    try {
+      await observeStageAdmitCase(`preparation-${fault}`);
+    } catch (error) {
+      received = error;
+    }
+    assert.ok(received instanceof Error, 'failed preparation must retain its owned root for recovery');
+    const error = received as CliCaseFailure;
+    assert.equal(error.nativeIdle, true);
+    assert.ok(error.cleanupState !== undefined);
+    assert.equal(error.restoredGlobalsWithPending, false);
+    assert.equal(realpathSync(error.root), error.root);
+    assert.equal(dirname(error.root), realpathSync(tmpdir()));
+    assert.match(error.root, /ai-delivery-cli-case-/u);
+    const ownership = JSON.parse(
+      privateFiles.assertPrivateFile(join(error.root, 'ownership.json')).toString('utf8'),
+    ) as {
+      idle: boolean;
+      owned: { rootPid: number; rootIdentity: string };
+    };
+    assert.equal(ownership.idle, true);
+    assert.equal(ownership.owned.rootPid, error.cleanupState.rootPid);
+    assert.equal(ownership.owned.rootIdentity, error.cleanupState.rootIdentity);
+    const { confirmOwnedCleanup } = await import('./verification.js');
+    await confirmOwnedCleanup(error.cleanupState);
+    try {
+      const bases = readdirSync(error.root).filter((name) => name.startsWith('ai-delivery-setup-'));
+      assert.equal(bases.length, 1);
+      const base = join(error.root, bases[0]!);
+      assert.equal(readFileSync(join(base, 'unrelated-preparation'), 'utf8'), 'unrelated');
+      assert.equal(readFileSync(join(base, 'installs'), 'utf8'), 'x');
+      assert.equal(existsSync(join(base, 'consumer/.git/ai-delivery/runtime-admission.json')), false);
+      if (fault === 'cancel') {
+        assert.equal(error.residualInstaller?.counter, 'x');
+        assert.ok(error.cleanupState.tracked.has(error.residualInstaller!.pid));
+      }
+      assert.equal(process.env.PATH, previousPath);
+    } finally {
+      rmSync(error.root, { recursive: true, force: true });
+    }
+    assert.equal(existsSync(error.root), false);
+    process.stdout.write(
+      'SETUP_CLI_PREPARATION_RECOVERY ' +
+        JSON.stringify({ fault, root: error.root, quiescenceRechecked: true, removed: true }) +
+        '\n',
+    );
+  });
+}
 
 test('CLI stage/admit keeps an unfinished real installer owned until native quiescence', async () => {
   const result = await observeStageAdmitCase('unfinished');
