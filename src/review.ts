@@ -121,6 +121,19 @@ export async function readRequiredReviewState(
   if (pr.headRefOid !== expectedHead) {
     throw new DeliveryError('GitHub review decision does not match the exact PR head.');
   }
+  if (
+    pr.reviewDecision !== null &&
+    pr.reviewDecision !== 'APPROVED' &&
+    pr.reviewDecision !== 'REVIEW_REQUIRED' &&
+    pr.reviewDecision !== 'CHANGES_REQUESTED'
+  ) {
+    return {
+      reviewDecision: null,
+      submittedReviewAuthorCanPushToRepository: null,
+      status: 'unknown',
+      nextAction: 'Inspect the PR review requirement in GitHub before merge; review decision readback is malformed.',
+    };
+  }
   let submittedReviewAuthorCanPushToRepository: boolean | null = null;
   if (submittedReview) {
     try {

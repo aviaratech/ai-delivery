@@ -28,6 +28,11 @@ export interface GitHubClients {
 }
 
 const authorGitTokens = new WeakMap<GitHubClients, string>();
+const machineClients = new WeakSet<GitHubClients>();
+const machineProtectionAbsence = new WeakMap<
+  DeliveryError,
+  { clients: GitHubClients; owner: string; repo: string; branch: string }
+>();
 interface MachineSelection {
   env: NodeJS.ProcessEnv;
   signal: AbortSignal | undefined;
@@ -334,7 +339,19 @@ function buildClients(
   });
   if (machineSession)
     rest.hook.error('request', (error, options) => {
-      throw safeMachineRequestError(error, 'rest.request', restMachineEndpoint(options));
+      const safe = safeMachineRequestError(error, 'rest.request', restMachineEndpoint(options));
+      const target = branchProtectionTarget(options);
+      const responseTarget = branchProtectionTarget({ method: 'GET', url: ownData(ownData(error, 'response'), 'url') });
+      if (
+        target &&
+        responseTarget &&
+        target.owner.toLowerCase() === responseTarget.owner.toLowerCase() &&
+        target.repo.toLowerCase() === responseTarget.repo.toLowerCase() &&
+        target.branch === responseTarget.branch &&
+        exactBranchProtectionAbsence(error)
+      )
+        machineProtectionAbsence.set(safe, { clients, ...target });
+      throw safe;
     });
   const clients: GitHubClients = {
     authSource,
@@ -354,6 +371,7 @@ function buildClients(
       : rawGraphql,
     rest,
   };
+  if (machineSession) machineClients.add(clients);
   if (role === 'author') authorGitTokens.set(clients, token);
   return clients;
 }
@@ -362,6 +380,85 @@ function ownData(value: unknown, name: string): unknown {
   if (typeof value !== 'object' || value === null || types.isProxy(value) || Array.isArray(value)) return undefined;
   const descriptor = Object.getOwnPropertyDescriptor(value, name);
   return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+function exactBranchProtectionAbsence(error: unknown): boolean {
+  const response = ownData(error, 'response');
+  return (
+    ownData(error, 'status') === 404 &&
+    ownData(response, 'status') === 404 &&
+    ownData(ownData(response, 'data'), 'message') === 'Branch not protected'
+  );
+}
+
+function branchProtectionTarget(options: unknown): { owner: string; repo: string; branch: string } | undefined {
+  const url = ownData(options, 'url');
+  if (ownData(options, 'method') !== 'GET' || typeof url !== 'string' || url.length > 1024 || /[^\x21-\x7e]/u.test(url))
+    return undefined;
+  let path: string;
+  if (url.startsWith('/')) {
+    if (ownData(options, 'baseUrl') !== 'https://api.github.com' || /[?#]/u.test(url)) return undefined;
+    path = url;
+  } else {
+    try {
+      const parsed = new URL(url);
+      if (
+        parsed.origin !== 'https://api.github.com' ||
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash
+      )
+        return undefined;
+      path = parsed.pathname;
+    } catch {
+      return undefined;
+    }
+  }
+  let owner: unknown, repo: unknown, branch: unknown;
+  if (path === '/repos/{owner}/{repo}/branches/{branch}/protection') {
+    owner = ownData(options, 'owner');
+    repo = ownData(options, 'repo');
+    branch = ownData(options, 'branch');
+  } else {
+    const match = /^\/repos\/([^/]+)\/([^/]+)\/branches\/(.+)\/protection$/u.exec(path);
+    if (!match) return undefined;
+    try {
+      [owner, repo, branch] = match.slice(1).map((part) => decodeURIComponent(part));
+    } catch {
+      return undefined;
+    }
+  }
+  if (
+    typeof owner !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,100}$/u.test(owner) ||
+    typeof repo !== 'string' ||
+    !/^[A-Za-z0-9_.-]{1,100}$/u.test(repo) ||
+    typeof branch !== 'string' ||
+    !branch.length ||
+    branch.length > 1024 ||
+    /[^\x21-\x7e]/u.test(branch)
+  )
+    return undefined;
+  return { owner, repo, branch };
+}
+
+/** Internal read-only predicate: machine absence never comes from copied error fields. */
+export function hasBranchProtectionAbsence(
+  error: unknown,
+  clients: GitHubClients,
+  repository: { owner: string; repo: string },
+  branch: string,
+): boolean {
+  if (!machineClients.has(clients)) return exactBranchProtectionAbsence(error);
+  if (typeof error !== 'object' || error === null || types.isProxy(error)) return false;
+  const target = machineProtectionAbsence.get(error as DeliveryError);
+  return (
+    target?.clients === clients &&
+    target.owner.toLowerCase() === repository.owner.toLowerCase() &&
+    target.repo.toLowerCase() === repository.repo.toLowerCase() &&
+    target.branch === branch
+  );
 }
 
 function restMachineEndpoint(options: unknown): SafeMachineRequestDiagnostics['endpoint'] {

@@ -1,5 +1,6 @@
 import { DeliveryError } from './errors.js';
-import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
+import * as githubClients from './github/client.js';
+import type { GitHubClients } from './github/client.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
 import {
   commentIssue,
@@ -140,7 +141,7 @@ async function nonClosingRoute(context: DeliveryContext, base: string) {
       ? context
       : {
           ...context,
-          clients: await createDeliveryGitHubClients({
+          clients: await githubClients.createDeliveryGitHubClients({
             config: context.config,
             identity: context.config.roles.author.identity,
             role: 'author',
@@ -694,16 +695,19 @@ function requiredApprovalCount(value: unknown): number | null {
   return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null;
 }
 
-/** Absence is proved only by an empty successful first page with no continuation evidence. */
-function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
+function completeRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
   return (
     response.status === 200 &&
     Array.isArray(response.data) &&
-    response.data.length === 0 &&
     response.headers !== undefined &&
     response.headers !== null &&
     (response.headers.link === undefined || response.headers.link === '')
   );
+}
+
+/** Absence is proved only by an empty successful first page with no continuation evidence. */
+function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
+  return completeRulePage(response) && Array.isArray(response.data) && response.data.length === 0;
 }
 
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
@@ -747,7 +751,7 @@ export async function preflightReviewRoute(
   const reviewer =
     selectedReviewer ??
     context.reviewerClients ??
-    (await createDeliveryGitHubClients({
+    (await githubClients.createDeliveryGitHubClients({
       config: context.config,
       identity: context.config.roles.reviewer.identity,
       role: 'reviewer',
@@ -797,19 +801,12 @@ export async function preflightReviewRoute(
   ]);
   await check();
   let confirmedUnprotected = false;
-  const protectionError =
-    protectionResult.status === 'rejected'
-      ? (protectionResult.reason as {
-          status?: unknown;
-          response?: { status?: unknown; data?: { message?: unknown } };
-        } | null)
-      : null;
+  let confirmedRulesetOnly = false;
   if (
     rulesetResult.status === 'fulfilled' &&
-    emptyRulePage(rulesetResult.value) &&
-    protectionError?.status === 404 &&
-    protectionError.response?.status === 404 &&
-    protectionError.response.data?.message === 'Branch not protected'
+    completeRulePage(rulesetResult.value) &&
+    protectionResult.status === 'rejected' &&
+    githubClients.hasBranchProtectionAbsence(protectionResult.reason, context.clients, context.repo, base)
   ) {
     // A generic/permission 404 is never absence. Corroborate the named branch,
     // selected author's write access, and all repository/parent rulesets.
@@ -835,39 +832,93 @@ export async function preflightReviewRoute(
         protected?: boolean;
         protection?: { enabled?: boolean };
       } | null;
-      confirmedUnprotected =
+      const corroborated =
         repository.value.status === 200 &&
         branch.value.status === 200 &&
         typeof repoData?.full_name === 'string' &&
         repoData.full_name.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase() &&
         (repoData.permissions?.push === true || repoData.permissions?.admin === true) &&
-        branchData?.name === base &&
-        branchData.protected === false &&
+        branchData?.name === base;
+      confirmedUnprotected =
+        corroborated &&
+        emptyRulePage(rulesetResult.value) &&
+        branchData?.protected === false &&
         branchData.protection?.enabled === false &&
         emptyRulePage(rulesets.value);
+      // The applicable-rules endpoint includes all active repository/parent
+      // rules. A classic-protection 404 needs independent identity and active
+      // ruleset readbacks, not just an observed approval count. The aggregate
+      // protected flag and nested enabled summary need not be equal.
+      confirmedRulesetOnly =
+        corroborated &&
+        branchData?.protected === true &&
+        typeof branchData.protection?.enabled === 'boolean' &&
+        completeRulePage(rulesets.value) &&
+        rulesetResult.value.data.length > 0 &&
+        rulesetResult.value.data.every((rule) => {
+          if (
+            typeof rule !== 'object' ||
+            rule === null ||
+            typeof rule.type !== 'string' ||
+            !rule.type ||
+            typeof rule.ruleset_id !== 'number' ||
+            !Number.isSafeInteger(rule.ruleset_id) ||
+            rule.ruleset_id <= 0 ||
+            typeof rule.ruleset_source !== 'string' ||
+            (rule.ruleset_source_type === 'Repository'
+              ? rule.ruleset_source.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
+              : rule.ruleset_source_type !== 'Organization' ||
+                rule.ruleset_source.toLowerCase() !== context.repo.owner.toLowerCase()) ||
+            (rule.type === 'pull_request' && requiredApprovalCount(rule.parameters) === null)
+          )
+            return false;
+          const matches = rulesets.value.data.filter((ruleset) => ruleset?.id === rule.ruleset_id);
+          return (
+            matches.length === 1 &&
+            matches[0]?.source_type === rule.ruleset_source_type &&
+            matches[0]?.source === rule.ruleset_source &&
+            matches[0]?.enforcement === 'active'
+          );
+        });
     }
   }
   const counts: number[] = [];
+  let countsKnown = rulesetResult.status === 'fulfilled' && completeRulePage(rulesetResult.value);
   if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
     for (const rule of rulesetResult.value.data) {
-      if (rule.type === 'pull_request') {
+      if (typeof rule !== 'object' || rule === null || typeof rule.type !== 'string' || !rule.type) countsKnown = false;
+      if (rule?.type === 'pull_request') {
         const count = requiredApprovalCount(rule.parameters);
-        if (count !== null) counts.push(count);
+        if (count === null) countsKnown = false;
+        else counts.push(count);
       }
     }
   }
   if (protectionResult.status === 'fulfilled') {
     const protection = protectionResult.value.data as { required_pull_request_reviews?: unknown };
-    const count = requiredApprovalCount(protection.required_pull_request_reviews);
+    const count =
+      typeof protection === 'object' && protection !== null && !Array.isArray(protection)
+        ? requiredApprovalCount(protection.required_pull_request_reviews)
+        : null;
+    if (protectionResult.value.status !== 200 || count === null) countsKnown = false;
     if (count !== null) counts.push(count);
-  }
+  } else if (!confirmedUnprotected && !confirmedRulesetOnly) countsKnown = false;
   const rulesVisible =
     rulesetResult.status === 'fulfilled' &&
     Array.isArray(rulesetResult.value.data) &&
     (rulesetResult.value.headers?.link === undefined || rulesetResult.value.headers.link === '');
-  const visible = Number(rulesVisible) + Number(protectionResult.status === 'fulfilled' || confirmedUnprotected);
+  const visible =
+    Number(rulesVisible) +
+    Number(protectionResult.status === 'fulfilled' || confirmedUnprotected || confirmedRulesetOnly);
   const visibility = visible === 2 ? 'complete' : visible === 1 ? 'partial' : 'unknown';
-  const observedRequiredApprovals = counts.length > 0 ? Math.max(...counts) : confirmedUnprotected ? 0 : null;
+  // A positive observation is a conservative lower bound for permission checks.
+  // Zero requires complete, valid requirement evidence from every source.
+  const observedRequiredApprovals =
+    counts.length > 0 && (countsKnown || counts.some((count) => count > 0))
+      ? Math.max(...counts)
+      : countsKnown && confirmedUnprotected
+        ? 0
+        : null;
   const insufficientPermission =
     observedRequiredApprovals !== null &&
     observedRequiredApprovals > 0 &&
@@ -1256,7 +1307,7 @@ export async function mergePr(
   if (pr.state !== 'open' || pr.draft) throw new DeliveryError('GitHub PR must be open and ready for merge.');
   const reviewer =
     context.reviewerClients ??
-    (await createDeliveryGitHubClients({
+    (await githubClients.createDeliveryGitHubClients({
       config: context.config,
       identity: context.config.roles.reviewer.identity,
       role: 'reviewer',
@@ -1312,7 +1363,14 @@ export async function mergePr(
   });
   if (decision.submittedReviewAuthorCanPushToRepository !== true)
     throw new DeliveryError('Specific reviewer App approval is not verifiably qualifying for required review.');
-  if (decision.status !== 'satisfied')
+  // Unavailable or malformed decisions carry no qualifying review-access
+  // evidence. An observed null may accompany an independently confirmed zero.
+  const noReviewsRequired =
+    decision.status === 'unknown' &&
+    decision.reviewDecision === null &&
+    route.rules.visibility === 'complete' &&
+    route.rules.observedRequiredApprovals === 0;
+  if (decision.status !== 'satisfied' && !noReviewsRequired)
     throw new DeliveryError(`GitHub review eligibility is ${decision.status}: ${decision.nextAction}`);
   const blockers = await getNativeBlockerRelationships({
     graphql: context.clients.graphql,
@@ -1328,6 +1386,8 @@ export async function mergePr(
     refuseClosingDirective(squash!.commit_title);
     refuseClosingDirective(squash!.commit_message);
   }
+  if (noReviewsRequired && (pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha))
+    throw new DeliveryError('GitHub base changed; refresh the zero-review requirement observation before merge.');
   if (
     pr.head.sha !== reviewedHead ||
     pr.state !== 'open' ||

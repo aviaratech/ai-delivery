@@ -197,6 +197,45 @@ test('reviewer App rejects self review and a foreign marker actor', async () => 
   }
 });
 
+for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}]) {
+  test(`missing or malformed review decision ${JSON.stringify(reviewDecision)} cannot carry qualifying review evidence`, async () => {
+    let accessReads = 0;
+    const context = {
+      repo: { owner: 'example', repo: 'repo' },
+      clients: {
+        graphql: async (query: string) => {
+          if (query.includes('DeliveryReviewAccess')) {
+            accessReads++;
+            return {
+              repository: {
+                pullRequest: {
+                  reviews: {
+                    nodes: [
+                      {
+                        fullDatabaseId: 41,
+                        author: { login: 'reviewer' },
+                        commit: { oid: head.sha },
+                        state: 'APPROVED',
+                        authorCanPushToRepository: true,
+                      },
+                    ],
+                  },
+                },
+              },
+            };
+          }
+          return { repository: { pullRequest: { headRefOid: head.sha, reviewDecision } } };
+        },
+      },
+    } as unknown as DeliveryContext;
+    const result = await readRequiredReviewState(context, 19, head.sha, { id: 41, login: 'reviewer[bot]' });
+    assert.equal(result.reviewDecision, null);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.submittedReviewAuthorCanPushToRepository, null);
+    assert.equal(accessReads, 0);
+  });
+}
+
 test('live GitHub review decision distinguishes a submitted review from a satisfied requirement', async () => {
   const state = fixture();
   try {

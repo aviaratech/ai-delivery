@@ -884,26 +884,69 @@ async function stageVersion(
   }
   if (failed) throw failure;
 }
-function catalog(target: Target, version: string): void {
-  verifiedUnit(target, version);
+function catalogDocuments(target: Target, version: string): { path: string; value: unknown }[] {
   const source = `./versions/${version}/plugins/ai-delivery`;
-  writePrivateJsonFileAtomically(join(target.catalog, '.agents/plugins/marketplace.json'), {
-    name: target.marketplace,
-    interface: { displayName: 'ai-delivery' },
-    plugins: [
-      {
-        name: 'ai-delivery',
-        source: { source: 'local', path: source },
-        policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
-        category: 'Productivity',
+  return [
+    {
+      path: join(target.catalog, '.agents/plugins/marketplace.json'),
+      value: {
+        name: target.marketplace,
+        interface: { displayName: 'ai-delivery' },
+        plugins: [
+          {
+            name: 'ai-delivery',
+            source: { source: 'local', path: source },
+            policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+            category: 'Productivity',
+          },
+        ],
       },
-    ],
+    },
+    {
+      path: join(target.catalog, '.claude-plugin/marketplace.json'),
+      value: {
+        name: target.marketplace,
+        owner: { name: 'AviaraTech' },
+        plugins: [{ name: 'ai-delivery', source, version }],
+      },
+    },
+  ];
+}
+type CatalogSnapshot = { path: string; bytes: Buffer; device: number; inode: number }[];
+function readCatalog(target: Target, version: string): CatalogSnapshot {
+  return catalogDocuments(target, version).map(({ path }) => {
+    assertCanonical(path);
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600 || metadata.size > 1024 ** 2)
+      throw new Error('Managed catalog is unsafe.');
+    return { path, bytes: readFileSync(path), device: metadata.dev, inode: metadata.ino };
   });
-  writePrivateJsonFileAtomically(join(target.catalog, '.claude-plugin/marketplace.json'), {
-    name: target.marketplace,
-    owner: { name: 'AviaraTech' },
-    plugins: [{ name: 'ai-delivery', source, version }],
-  });
+}
+function catalogMatches(snapshot: CatalogSnapshot, target: Target, version: string): boolean[] {
+  return catalogDocuments(target, version).map(
+    ({ value }, index) => JSON.stringify(JSON.parse(snapshot[index]!.bytes.toString())) === JSON.stringify(value),
+  );
+}
+function assertCatalogUnchanged(entry: CatalogSnapshot[number]): void {
+  assertCanonical(entry.path);
+  const current = lstatSync(entry.path);
+  if (
+    !current.isFile() ||
+    current.nlink !== 1 ||
+    (current.mode & 0o777) !== 0o600 ||
+    current.size !== entry.bytes.length ||
+    current.dev !== entry.device ||
+    current.ino !== entry.inode ||
+    !readFileSync(entry.path).equals(entry.bytes)
+  )
+    throw new Error('Managed catalog changed during this operation.');
+}
+function catalog(target: Target, version: string, expected?: CatalogSnapshot): void {
+  verifiedUnit(target, version);
+  for (const [index, document] of catalogDocuments(target, version).entries()) {
+    if (expected) assertCatalogUnchanged(expected[index]!);
+    writePrivateJsonFileAtomically(document.path, document.value);
+  }
 }
 interface NativeEntry {
   registration: Record<string, unknown>;
@@ -1018,18 +1061,21 @@ function selectedRoot(
   cachePath: string | null,
   sourceVersion = entry.version,
 ): string {
-  const unit = verifiedUnit(target, input.host === 'claude-code' ? sourceVersion : entry.version),
-    source = pluginRoot(target, input.host === 'claude-code' ? sourceVersion : entry.version);
+  const unit = verifiedUnit(target, entry.version),
+    source = pluginRoot(target, sourceVersion);
+  if (sourceVersion !== entry.version) verifiedUnit(target, sourceVersion);
   if (input.host === 'claude-code' && claudeCatalogSelection(target).version !== sourceVersion)
     throw new Error('Claude catalog version differs from its native selection.');
   if (input.host === 'codex' && resolve(entry.sourceRoot!) !== source)
     throw new Error('Native plugin source differs from the managed version.');
-  const root = input.host === 'codex' ? cachePath : source;
+  const root = cachePath;
   if (!root) throw new Error('Native cache path is missing.');
   if (
-    input.host === 'codex' &&
-    resolve(root) !== join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', entry.version)
+    input.host === 'claude-code' &&
+    (entry.installedPath === undefined || resolve(entry.installedPath) !== resolve(root))
   )
+    throw new Error('Native cache path differs from the managed native selection.');
+  if (resolve(root) !== join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', entry.version))
     throw new Error('Native cache path is outside the managed native selection.');
   assertCanonical(root);
   if (JSON.stringify(tree(root)) !== JSON.stringify(unit.files))
@@ -1223,6 +1269,37 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
     },
     operation: async () => {
       state = readState(input, target);
+      if (input.action === 'rollback') {
+        if (!state?.currentVersion)
+          throw new Error(
+            'Preserving rollback requires a current managed selection; it cannot reinstall a removed plugin.',
+          );
+        if (state.previousVersion !== result.version)
+          throw new Error('Managed rollback target changed before acquiring its ownership lock.');
+      }
+      let expectedState = existsSync(target.statePath)
+        ? { bytes: readFileSync(target.statePath), metadata: lstatSync(target.statePath) }
+        : undefined;
+      // Guard the cooperative owned record; this is not a native-settings CAS.
+      const persist = () => {
+        assertCanonical(target.statePath);
+        if (expectedState) {
+          readState(input, target);
+          const current = lstatSync(target.statePath);
+          if (
+            current.dev !== expectedState.metadata.dev ||
+            current.ino !== expectedState.metadata.ino ||
+            (current.mode & 0o777) !== 0o600 ||
+            current.mode !== expectedState.metadata.mode ||
+            !readFileSync(target.statePath).equals(expectedState.bytes)
+          )
+            throw new Error('Managed state changed during this operation.');
+        } else if (existsSync(target.statePath)) {
+          throw new Error('Managed state appeared during this operation.');
+        }
+        writePrivateJsonFileAtomically(target.statePath, state);
+        expectedState = { bytes: readFileSync(target.statePath), metadata: lstatSync(target.statePath) };
+      };
       const resuming = state?.pending !== undefined;
       if (state?.pending) {
         await recover(state.pending);
@@ -1256,10 +1333,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         if (state.pending.action !== input.action || state.pending.targetVersion !== result.version)
           throw new Error('Resume the interrupted original plugin command before selecting a different operation.');
       }
-      if (
-        (input.action === 'update' || input.action === 'rollback') &&
-        (!state || (input.action === 'update' && !state.currentVersion))
-      )
+      if (input.action === 'update' && !state?.currentVersion)
         throw new Error('Install a managed plugin before updating or rolling it back.');
       const version = input.action === 'remove' ? null : result.version;
       if (version === null && input.action !== 'remove')
@@ -1285,14 +1359,14 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         producerDigest: retainedWorktreeTransitionProducerDigest(dirname(fileURLToPath(import.meta.url))),
         command: { phase: 'idle' },
       };
-      writePrivateJsonFileAtomically(target.statePath, state);
+      persist();
       const controller = new AbortController();
       const cancel = () => controller.abort();
       process.once('SIGINT', cancel);
       process.once('SIGTERM', cancel);
       const publish = (command: z.infer<typeof Pending>['command']) => {
         state!.pending!.command = command;
-        writePrivateJsonFileAtomically(target.statePath, state);
+        persist();
       };
       const native = (args: string[]) => command(target.tool, args, target.projectRoot, controller.signal, publish);
       const selector = `ai-delivery@${target.marketplace}`;
@@ -1303,10 +1377,35 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       const installArgs =
         input.host === 'codex'
           ? ['plugin', 'add', selector, '--json']
-          : ['plugin', 'install', selector, '--scope', input.scope];
+          : ['plugin', prior ? 'update' : 'install', selector, '--scope', input.scope];
       let selectionStarted = false;
       try {
         state.nativeVersion = (await native(['--version'])).trim();
+        if (prior && version) {
+          if (input.host === 'claude-code') {
+            // Qualified against this native binary in an isolated USER profile,
+            // including unknown settings, unrelated selections and a catalog path change.
+            const stable = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+            if (
+              state.nativeVersion !== '2.1.296 (Claude Code)' ||
+              input.scope !== 'user' ||
+              !stable.test(prior) ||
+              !stable.test(version) ||
+              (version
+                .split('.')
+                .map(BigInt)
+                .map((part, index) => part - BigInt(prior.split('.')[index]!))
+                .find((part) => part !== 0n) ?? 0n) < 0n
+            )
+              throw new Error(
+                'Claude preserving replacement is unqualified; no catalog or native selection was changed.',
+              );
+          }
+          // Only this pinned native source has a qualified preserving-add footprint.
+          // This does not establish exclusion of concurrent, unrelated native writers.
+          if (input.host === 'codex' && state.nativeVersion !== 'codex-cli 0.162.1')
+            throw new Error('This native version has no qualified preserving replacement route.');
+        }
         if (input.host === 'claude-code' && !(await native(['plugin', 'uninstall', '--help'])).includes('--keep-data'))
           throw new Error('This Claude Code version cannot preserve plugin data; upgrade the native tool first.');
         process.stderr.write(
@@ -1323,25 +1422,58 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
           if (recoverySourceVersion !== prior && recoverySourceVersion !== version)
             throw new Error('Interrupted native selection has an incompatible catalog version.');
         }
+        if (current && version && !current.enabled)
+          throw new Error('Native plugin selection is disabled; preserving replacement cannot enable it.');
+        let catalogBefore: CatalogSnapshot | undefined;
+        let reuseSelection = false;
+        if (prior && version) {
+          if (!registered || !current || (current.version !== prior && !(resuming && current.version === version)))
+            throw new Error('Managed native selection changed; replacement ownership is unresolved.');
+          catalogBefore = readCatalog(target, prior);
+          const priorMatches = catalogMatches(catalogBefore, target, prior);
+          const targetMatches = catalogMatches(catalogBefore, target, version);
+          const priorCatalog = priorMatches.every(Boolean),
+            targetCatalog = targetMatches.every(Boolean);
+          const partialCatalog = resuming && targetMatches[0] && priorMatches[1];
+          if (!priorCatalog && !targetCatalog && !partialCatalog)
+            throw new Error('Managed catalog differs from the owned prior or target publication.');
+          // The installed cache and the host-specific catalog source are separate observations.
+          recoverySourceVersion = targetMatches[input.host === 'codex' ? 0 : 1] ? version : prior;
+          if (current.version === version) {
+            if (!targetCatalog) throw new Error('Selected target has an incompatible managed catalog.');
+            reuseSelection = true;
+          } else if (targetCatalog) {
+            throw new Error('Interrupted replacement is ambiguous; native selection will not be repeated.');
+          }
+        } else if (version && current && resuming) {
+          catalogBefore = readCatalog(target, version);
+          if (!catalogMatches(catalogBefore, target, version).every(Boolean))
+            throw new Error('Selected target has an incompatible managed catalog.');
+          reuseSelection = current.version === version;
+        }
+        let observedRoot: string | undefined;
         if (current)
-          selectedRoot(
+          observedRoot = selectedRoot(
             input,
             target,
             current,
-            current.version === prior
-              ? state.installedPath
-              : join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', current.version),
+            current.installedPath ??
+              (current.version === prior
+                ? state.installedPath
+                : join(target.nativeHome, 'plugins/cache', target.marketplace, 'ai-delivery', current.version)),
             recoverySourceVersion,
           );
         if (version) {
           await stageVersion(target, version, controller.signal, publish, (allocation) => {
             if (allocation) state!.pending!.staging = allocation;
             else delete state!.pending!.staging;
-            writePrivateJsonFileAtomically(target.statePath, state);
+            persist();
           });
-          selectionStarted = true;
-          catalog(target, version);
-          if (!registered)
+          if (!reuseSelection) {
+            selectionStarted = true;
+            catalog(target, version, catalogBefore);
+          }
+          if (!registered && !reuseSelection)
             await native([
               'plugin',
               'marketplace',
@@ -1350,12 +1482,14 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
               ...(input.host === 'codex' ? ['--json'] : ['--scope', input.scope]),
             ]);
         }
-        if (current && (current.version !== version || input.action === 'remove')) {
+        if (current && input.action === 'remove') {
           selectionStarted = true;
           await native(removeArgs);
         }
-        let installedPath = state.installedPath;
-        if (version) {
+        let installedPath = reuseSelection
+          ? (current?.installedPath ?? observedRoot ?? state.installedPath)
+          : state.installedPath;
+        if (version && !reuseSelection) {
           const installed = await native(installArgs);
           if (input.host === 'codex')
             installedPath = z.object({ installedPath: z.string() }).parse(JSON.parse(installed)).installedPath;
@@ -1374,14 +1508,12 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         if (prior !== version) state.previousVersion = prior;
         state.installedPath = version ? (readback?.installedPath ?? installedPath) : null;
         delete state.pending;
-        writePrivateJsonFileAtomically(target.statePath, state);
+        persist();
         result.version = version;
         result.changed = prior !== version;
         result.installed = version !== null;
         result.activation = { installedVersion: version, startupVersion: null, loadedVersion: null };
-        if (version)
-          result.nativePluginRoot =
-            input.host === 'codex' ? (state.installedPath ?? pluginRoot(target, version)) : pluginRoot(target, version);
+        if (version) result.nativePluginRoot = state.installedPath ?? pluginRoot(target, version);
         return result;
       } catch (error) {
         if (
@@ -1393,7 +1525,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         ) {
           delete state.pending;
           try {
-            writePrivateJsonFileAtomically(target.statePath, state);
+            persist();
           } catch (recoveryError) {
             throw new AggregateError(
               [error, recoveryError],
@@ -1401,14 +1533,8 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
             );
           }
         }
-        // Preserve recovery after selection and restore the prior catalog when possible.
-        if (selectionStarted && prior) {
-          try {
-            catalog(target, prior);
-          } catch {
-            /* Keep the original failure and pending intent. */
-          }
-        }
+        // A failed acknowledgement may follow a successful selection. Retain the
+        // catalog and pending intent for exact postimage reconciliation, not rollback.
         throw error;
       } finally {
         process.removeListener('SIGINT', cancel);
