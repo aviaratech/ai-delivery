@@ -883,19 +883,26 @@ export async function preflightReviewRoute(
     }
   }
   const counts: number[] = [];
+  let countsKnown = rulesetResult.status === 'fulfilled' && completeRulePage(rulesetResult.value);
   if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
     for (const rule of rulesetResult.value.data) {
+      if (typeof rule !== 'object' || rule === null || typeof rule.type !== 'string' || !rule.type) countsKnown = false;
       if (rule?.type === 'pull_request') {
         const count = requiredApprovalCount(rule.parameters);
-        if (count !== null) counts.push(count);
+        if (count === null) countsKnown = false;
+        else counts.push(count);
       }
     }
   }
   if (protectionResult.status === 'fulfilled') {
     const protection = protectionResult.value.data as { required_pull_request_reviews?: unknown };
-    const count = requiredApprovalCount(protection.required_pull_request_reviews);
+    const count =
+      typeof protection === 'object' && protection !== null && !Array.isArray(protection)
+        ? requiredApprovalCount(protection.required_pull_request_reviews)
+        : null;
+    if (protectionResult.value.status !== 200 || count === null) countsKnown = false;
     if (count !== null) counts.push(count);
-  }
+  } else if (!confirmedUnprotected && !confirmedRulesetOnly) countsKnown = false;
   const rulesVisible =
     rulesetResult.status === 'fulfilled' &&
     Array.isArray(rulesetResult.value.data) &&
@@ -904,7 +911,14 @@ export async function preflightReviewRoute(
     Number(rulesVisible) +
     Number(protectionResult.status === 'fulfilled' || confirmedUnprotected || confirmedRulesetOnly);
   const visibility = visible === 2 ? 'complete' : visible === 1 ? 'partial' : 'unknown';
-  const observedRequiredApprovals = counts.length > 0 ? Math.max(...counts) : confirmedUnprotected ? 0 : null;
+  // A positive observation is a conservative lower bound for permission checks.
+  // Zero requires complete, valid requirement evidence from every source.
+  const observedRequiredApprovals =
+    counts.length > 0 && (countsKnown || counts.some((count) => count > 0))
+      ? Math.max(...counts)
+      : countsKnown && confirmedUnprotected
+        ? 0
+        : null;
   const insufficientPermission =
     observedRequiredApprovals !== null &&
     observedRequiredApprovals > 0 &&

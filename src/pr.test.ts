@@ -21,6 +21,9 @@ function fixture(
     reviewDecision?: unknown;
     reviewPolicy?: 'legacy' | 'ruleset';
     requiredApprovals?: unknown;
+    classicApprovals?: unknown;
+    classicStatus?: number;
+    rulePage?: 'missing-headers' | 'non-200' | 'continuation';
     ruleVisibility?: 'partial' | 'unknown' | 'permission-404' | 'generic-404';
     decisionUnavailable?: boolean;
     decisionHeadMoved?: boolean;
@@ -110,8 +113,13 @@ function fixture(
       if (route.endsWith('/rules/branches/{branch}')) {
         if (option.ruleVisibility === 'partial') throw { status: 403 };
         return {
-          status: 200,
-          headers: {},
+          status: option.rulePage === 'non-200' ? 500 : 200,
+          ...(option.rulePage === 'missing-headers'
+            ? {}
+            : {
+                headers:
+                  option.rulePage === 'continuation' ? { link: '<https://api.github.com/next>; rel="next"' } : {},
+              }),
           data:
             option.reviewPolicy === 'ruleset'
               ? [
@@ -144,12 +152,18 @@ function fixture(
               data: { message: option.ruleVisibility === 'generic-404' ? 'Not Found' : 'Branch not protected' },
             },
           };
-        if (option.reviewPolicy === 'ruleset')
+        if (option.reviewPolicy === 'ruleset' && !Object.hasOwn(option, 'classicApprovals'))
           throw { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } };
         return {
-          status: 200,
+          status: option.classicStatus ?? 200,
           headers: {},
-          data: { required_pull_request_reviews: { required_approving_review_count: count } },
+          data: {
+            required_pull_request_reviews: {
+              required_approving_review_count: Object.hasOwn(option, 'classicApprovals')
+                ? option.classicApprovals
+                : count,
+            },
+          },
         };
       }
       if (route.endsWith('/rulesets'))
@@ -409,6 +423,56 @@ function fixture(
 }
 
 describe('remote GitHub lifecycle', () => {
+  for (const unknownCount of [undefined, null, '1']) {
+    for (const source of ['classic', 'ruleset'] as const) {
+      it(`refuses mixed zero/null with unknown ${source} count ${String(unknownCount)}`, async () => {
+        const { context, merges, closes } = fixture('clean', {
+          reviewPolicy: 'ruleset',
+          reviewDecision: null,
+          requiredApprovals: source === 'ruleset' ? unknownCount : 0,
+          classicApprovals: source === 'classic' ? unknownCount : 0,
+        });
+        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+        assert.equal(merges.length, 0);
+        assert.equal(closes(), 0);
+      });
+    }
+  }
+  for (const rulePage of ['missing-headers', 'non-200', 'continuation'] as const) {
+    it(`refuses mixed zero/null with incomplete applicable rule page ${rulePage}`, async () => {
+      const { context, merges, closes } = fixture('clean', {
+        reviewPolicy: 'ruleset',
+        reviewDecision: null,
+        classicApprovals: 0,
+        rulePage,
+      });
+      await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+      assert.equal(merges.length, 0);
+      assert.equal(closes(), 0);
+    });
+  }
+  it('refuses mixed zero/null with a fulfilled non-successful classic response', async () => {
+    const { context, merges, closes } = fixture('clean', {
+      reviewPolicy: 'ruleset',
+      reviewDecision: null,
+      classicApprovals: 0,
+      classicStatus: 500,
+    });
+    await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
+    assert.equal(merges.length, 0);
+    assert.equal(closes(), 0);
+  });
+  it('merges mixed zero/null only when both complete policy sources explicitly require zero', async () => {
+    const { context, merges, closes } = fixture('clean', {
+      reviewPolicy: 'ruleset',
+      reviewDecision: null,
+      classicApprovals: 0,
+    });
+    await finishIssue(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges.length, 1);
+    assert.equal(merges[0]?.sha, head);
+    assert.equal(closes(), 1);
+  });
   for (const reviewPolicy of ['legacy', 'ruleset'] as const) {
     it(`merges complete ${reviewPolicy} zero required reviews with observed null and a qualifying exact-head App approval`, async () => {
       const { context, merges, closes } = fixture('clean', { reviewPolicy, reviewDecision: null });
