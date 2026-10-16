@@ -298,7 +298,7 @@ function native(host = 'codex') {
   const source = join(unit, 'plugins/ai-delivery');
   const nativeHome = join(fixture.home, host === 'codex' ? '.codex' : '.claude');
   const cache = join(nativeHome, 'plugins/cache/ai-delivery-user/ai-delivery/0.3.24');
-  fixture.root = host === 'codex' ? cache : source;
+  fixture.root = cache;
   const files = {
     'runtime/dist/cli.js': 'fictional selected CLI; execution simulated',
     'dist/mcp-launcher.js': 'fictional launcher',
