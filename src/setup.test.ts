@@ -299,7 +299,7 @@ async function fixture(native = false) {
   // Synthetic installer boundary: the real owned command copies fixture bytes; no process manager is mocked.
   writeFileSync(
     join(bin, 'npm'),
-    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-settings'))},JSON.stringify({args,cwd:process.cwd(),TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP}));\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nconst logs=${JSON.stringify(join(base, 'log-bytes'))};\nif(fs.existsSync(logs))process.stdout.write(Buffer.alloc(Number(fs.readFileSync(logs,'utf8')),65),()=>{if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);});\nelse if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nconst memory=${JSON.stringify(join(base, 'memory-bytes'))};\nif(fs.existsSync(memory)){globalThis.fixtureAllocation=Buffer.alloc(Number(fs.readFileSync(memory,'utf8')),1);setInterval(()=>{},1000);}\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{},1000);\n`,
+    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-settings'))},JSON.stringify({args,cwd:process.cwd(),TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP}));\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nconst dependency={'@aviaratech/ai-delivery':'file:reviewed-archive.tgz'};fs.writeFileSync(path.join(prefix,'package.json'),JSON.stringify({dependencies:dependency}));\nif(!args.includes('--package-lock=false')){const targetPackage=JSON.parse(fs.readFileSync(path.join(target,'package.json'),'utf8')),integrity='sha512-'+require('node:crypto').createHash('sha512').update(fs.readFileSync(archive)).digest('base64');fs.writeFileSync(path.join(prefix,'package-lock.json'),JSON.stringify({lockfileVersion:3,packages:{'':{dependencies:dependency},'node_modules/@aviaratech/ai-delivery':{version:targetPackage.version,resolved:'file:reviewed-archive.tgz',integrity}}}));}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nconst logs=${JSON.stringify(join(base, 'log-bytes'))};\nif(fs.existsSync(logs))process.stdout.write(Buffer.alloc(Number(fs.readFileSync(logs,'utf8')),65),()=>{if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);});\nelse if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nconst memory=${JSON.stringify(join(base, 'memory-bytes'))};\nif(fs.existsSync(memory)){globalThis.fixtureAllocation=Buffer.alloc(Number(fs.readFileSync(memory,'utf8')),1);setInterval(()=>{},1000);}\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{},1000);\n`,
   );
   chmodSync(join(bin, 'npm'), 0o755);
   const previousPath = process.env.PATH;
@@ -1013,6 +1013,152 @@ for (const mode of ['success', 'failure', 'cancel'] as const) {
     }
   });
 }
+
+test('real npm keeps the reviewed tarball closure after hidden-lock invalidation and completed reuse', async () => {
+  const api = await producer();
+  const realPath = process.env.PATH;
+  const f = await fixture();
+  try {
+    const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
+    const npmCli = join(npmRoot, 'bin/npm-cli.js');
+    assert.equal(
+      (JSON.parse(readFileSync(join(npmRoot, 'package.json'), 'utf8')) as { version: string }).version,
+      '11.19.0',
+    );
+    const bin = join(f.base, 'real-npm-bin');
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, 'npm'),
+      `#!${process.execPath}\nconst fs=require('node:fs');if(process.argv[2]==='install')fs.appendFileSync(${JSON.stringify(f.counter)},'x');require(${JSON.stringify(npmCli)});\n`,
+    );
+    chmodSync(join(bin, 'npm'), 0o755);
+    process.env.PATH = `${bin}:${realPath ?? ''}`;
+    const manifestPath = join(f.base, 'archive/package/package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    manifest.scripts = { preinstall: 'node -e "process.exit(91)"', install: 'node -e "process.exit(92)"' };
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    execFileSync('tar', ['-czf', f.input.archivePath, '-C', join(f.base, 'archive'), 'package']);
+    f.input.expectedArchiveSha256 = digestBytes(readFileSync(f.input.archivePath));
+    const installed = join(f.input.runtimeDirectory, 'node_modules');
+    const hidden = join(installed, '.package-lock.json');
+    const stage = await api.stageRuntime(f.input);
+    const completeBytes = readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'));
+    const metadataPaths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
+    const metadataBytes = metadataPaths.map((path) => readFileSync(path));
+    const closure = () => {
+      const result = spawnSync(
+        process.execPath,
+        [npmCli, 'ls', '--prefix', f.input.runtimeDirectory, '--omit=dev', '--all', '--json', '--logs-max', '0'],
+        { cwd: f.root, encoding: 'utf8', maxBuffer: 1024 ** 2 },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr + result.stdout);
+      const graph = JSON.parse(result.stdout) as {
+        problems?: string[];
+        dependencies: Record<string, { version: string; resolved?: string; invalid?: boolean; missing?: boolean }>;
+      };
+      assert.equal(graph.problems, undefined);
+      const target = graph.dependencies['@aviaratech/ai-delivery']!;
+      assert.equal(target.version, '0.3.5');
+      assert.equal(target.invalid, undefined);
+      assert.equal(target.missing, undefined);
+      assert.equal(target.resolved, `file:${join(f.input.runtimeDirectory, 'reviewed-archive.tgz')}`);
+    };
+    closure();
+    const lockTime = lstatSync(hidden).mtime;
+    utimesSync(installed, new Date(lockTime.getTime() + 2000), new Date(lockTime.getTime() + 2000));
+    assert.ok(lstatSync(installed).mtimeMs > lstatSync(hidden).mtimeMs);
+    closure();
+    assert.deepEqual(await api.stageRuntime(f.input), { ...stage, reused: true });
+    assert.deepEqual(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json')), completeBytes);
+    assert.deepEqual(
+      metadataPaths.map((path) => readFileSync(path)),
+      metadataBytes,
+    );
+    rmSync(hidden);
+    closure();
+    assert.deepEqual(await api.stageRuntime(f.input), { ...stage, reused: true });
+    await api.admitRuntime(admitInput(f.input, stage.stageId));
+    assert.equal(readFileSync(f.counter, 'utf8'), 'x', 'completed reuse must never reinstall');
+    assert.deepEqual(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json')), completeBytes);
+    assert.deepEqual(
+      metadataPaths.map((path) => readFileSync(path)),
+      metadataBytes,
+    );
+  } finally {
+    f.cleanup();
+    process.env.PATH = realPath;
+  }
+});
+
+test('completed stages refuse missing, corrupt or incompatible dependency metadata without reinstalling or rewriting', async () => {
+  const api = await producer();
+  const f = await fixture();
+  try {
+    const staged = await api.stageRuntime(f.input);
+    const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
+    const complete = readFileSync(record);
+    const paths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
+    const retained = paths.map((path) => (existsSync(path) ? readFileSync(path) : undefined));
+    for (const [index, path] of paths.entries()) {
+      for (const fault of [
+        'missing',
+        'corrupt',
+        'incompatible',
+        'symlink',
+        'hardlink',
+        'fifo',
+        ...(index === 1 ? ['version', 'resolved', 'integrity'] : []),
+      ]) {
+        const sentinel = join(f.base, `unrelated-metadata-${index}-${fault}`);
+        if (fault === 'missing') rmSync(path, { force: true });
+        else if (fault === 'symlink' || fault === 'hardlink') {
+          writeFileSync(sentinel, retained[index]!);
+          rmSync(path);
+          if (fault === 'symlink') symlinkSync(sentinel, path);
+          else linkSync(sentinel, path);
+        } else if (fault === 'fifo') {
+          rmSync(path);
+          execFileSync('mkfifo', [path]);
+        } else if (['version', 'resolved', 'integrity'].includes(fault)) {
+          const lock = JSON.parse(retained[index]!.toString('utf8')) as {
+            packages: Record<string, Record<string, unknown>>;
+          };
+          lock.packages['node_modules/@aviaratech/ai-delivery']![fault] = 'incompatible';
+          writeFileSync(path, JSON.stringify(lock));
+        } else
+          writeFileSync(
+            path,
+            fault === 'corrupt'
+              ? '{'
+              : JSON.stringify(
+                  index === 0
+                    ? { dependencies: { '@aviaratech/ai-delivery': 'file:other.tgz' } }
+                    : { lockfileVersion: 99, packages: {} },
+                ),
+          );
+        const damaged = fault !== 'fifo' && existsSync(path) ? readFileSync(path) : undefined;
+        await assert.rejects(
+          api.stageRuntime(f.input),
+          fault === 'symlink' ? /symbolic link/iu : fault === 'fifo' ? /unsupported file/iu : /dependency metadata/iu,
+        );
+        await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /dependency metadata/iu);
+        assert.deepEqual(readFileSync(record), complete);
+        if (fault === 'fifo') assert.equal(lstatSync(path).isFIFO(), true);
+        else assert.deepEqual(existsSync(path) ? readFileSync(path) : undefined, damaged);
+        if (fault === 'symlink' || fault === 'hardlink') {
+          assert.deepEqual(readFileSync(sentinel), retained[index]);
+          assert.equal(lstatSync(path).isSymbolicLink(), fault === 'symlink');
+        }
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x', 'metadata refusal must not reinstall');
+        rmSync(path, { force: true });
+        if (retained[index] !== undefined) writeFileSync(path, retained[index]!);
+      }
+    }
+  } finally {
+    f.cleanup();
+  }
+});
 
 test('public producer stages exact bytes, explicitly admits and reuses completed work without installing again', async () => {
   const api = await producer();
