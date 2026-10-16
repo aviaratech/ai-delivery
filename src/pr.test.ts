@@ -491,7 +491,7 @@ describe('remote GitHub lifecycle', () => {
     });
 
     for (const requiredApprovals of [undefined, null, -1, 1, '0', false, {}]) {
-      it(`refuses ${reviewPolicy} null decision with unconfirmed zero count ${String(requiredApprovals)}`, async () => {
+      it(`refuses ${reviewPolicy} null decision with unconfirmed zero count ${JSON.stringify(requiredApprovals)}`, async () => {
         const { context, merges, closes } = fixture('clean', { reviewPolicy, requiredApprovals, reviewDecision: null });
         await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
         assert.equal(merges.length, 0);
@@ -507,7 +507,7 @@ describe('remote GitHub lifecycle', () => {
       });
     }
     for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}]) {
-      it(`refuses ${reviewPolicy} zero reviews with missing or malformed decision ${String(reviewDecision)}`, async () => {
+      it(`refuses ${reviewPolicy} zero reviews with missing or malformed decision ${JSON.stringify(reviewDecision)}`, async () => {
         const { context, merges, closes } = fixture('clean', { reviewPolicy, reviewDecision });
         await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
         assert.equal(merges.length, 0);

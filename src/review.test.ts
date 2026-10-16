@@ -198,7 +198,7 @@ test('reviewer App rejects self review and a foreign marker actor', async () => 
 });
 
 for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}]) {
-  test(`missing or malformed review decision ${String(reviewDecision)} cannot carry qualifying review evidence`, async () => {
+  test(`missing or malformed review decision ${JSON.stringify(reviewDecision)} cannot carry qualifying review evidence`, async () => {
     let accessReads = 0;
     const context = {
       repo: { owner: 'example', repo: 'repo' },
