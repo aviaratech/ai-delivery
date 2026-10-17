@@ -316,6 +316,7 @@ Status values are single lines rendered as literal text. Status-only patches
 preserve every byte outside Status, including canonical data and start markers;
 no-op patches keep the timestamp. Display blockers create no dependency edges:
 use native `blockedBy` for those, and do not combine it with `status.blockers`.
+Convert handwritten legacy bodies explicitly before applying a status-only patch.
 The nonblocking body-length warning counts readable text, excludes embedded
 issue-data, and triggers strictly above 4,000 characters.
 

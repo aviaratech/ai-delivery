@@ -138,6 +138,67 @@ test('normal-start recovery preserves legacy rendering across repeated exact ret
   assert.equal(f.comments.length, 1);
 });
 
+test.each([{ points: 4 }, { issueType: 'Feature' }])(
+  'normal-start retry refuses changed contract metadata %j before native writes',
+  async (patch) => {
+    const f = fixture();
+    f.controls.created = false;
+    f.context.config = { ...f.context.config, native: { ...f.context.config.native, issueTypes: ['Task', 'Feature'] } };
+    const request = getAiDeliveryMcpTool('issue_start')!.inputSchema.parse({
+      title: ready().title,
+      body: renderIssueBody(ready()),
+      issueType: 'Task',
+      points: 2,
+      requestId: 'contract-metadata-retry',
+    });
+    await startTrackedIssue(f.context, request);
+    await updateIssue(f.context, { issueNumber: 17, ...patch });
+    const before = f.live.body;
+    const writes = f.writes.length;
+    const comments = f.comments.length;
+    await assert.rejects(startTrackedIssue(f.context, request), /conflicts/u);
+    assert.equal(f.live.body, before);
+    assert.equal(f.writes.length, writes);
+    assert.equal(f.comments.length, comments);
+  },
+);
+
+test('default legacy omission refuses drift between preparation and the history snapshot', async () => {
+  const f = fixture();
+  f.live.body = renderIssueBody({ ...ready(), legacyBody: 'Original unpreserved legacy bytes.\n' });
+  f.controls.driftBeforeUpdate = true;
+  await assert.rejects(updateIssue(f.context, { issueNumber: 17 }), /content changed/u);
+  assert.equal(f.live.body, 'Concurrent operator edit');
+  assert.equal(f.comments.length, 0);
+  assert.equal(f.writes.length, 0);
+});
+
+test('status-only updates preserve embedded metadata and old formatting despite different native metadata', async () => {
+  const f = fixture();
+  const data = {
+    ...ready(),
+    acceptanceCriteria: [{ behavior: 'Reject malformed input:\n- Empty input', verifiedBy: 'Regression test.' }],
+  };
+  f.live.body =
+    renderIssueBody(data).replace('  - Empty input\n\n  Verified', '- Empty input\n  Verified') +
+    '\n\n<!-- ai-delivery-start-intent: sha256:' +
+    'a'.repeat(64) +
+    ' -->\n<!-- ai-delivery-start: sha256:' +
+    'b'.repeat(64) +
+    ' -->';
+  f.controls.livePoints = 4;
+  f.live.type.name = 'Feature';
+  const before = f.live.body;
+  const patch = { issueNumber: 17, status: { nextMilestone: 'Await review' } };
+  const result = await updateIssue(f.context, patch);
+  const outside = (body: string) => body.replace(/(## Status\n\n)[\s\S]*?(\n\n## Problem)/u, '$1$2');
+  assert.equal(outside(result.body), outside(before));
+  assert.equal(f.controls.livePoints, 4);
+  assert.equal(f.live.type.name, 'Feature');
+  assert.equal(f.writes.length, 1);
+  assert.deepEqual(Object.keys(f.writes[0]!).sort(), ['body', 'issue_number', 'owner', 'repo']);
+});
+
 test('status patches reject secrets, multiline and unknown fields without native writes', async () => {
   for (const status of [
     { nextMilestone: 'password=' + 'X'.repeat(16) },

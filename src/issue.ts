@@ -266,7 +266,10 @@ function prepareIssueWrite(
   if (input.blockedBy !== undefined && patch && 'blockers' in patch)
     throw new DeliveryError('Choose native blockedBy or display-only status.blockers in one update, not both.');
   const statusOnly =
-    patch !== undefined && Object.keys(input).every((key) => ['repo', 'issueNumber', 'status'].includes(key));
+    patch !== undefined &&
+    Object.entries(input).every(
+      ([key, value]) => value === undefined || ['repo', 'issueNumber', 'status'].includes(key),
+    );
   const title = input.title ?? current?.title ?? '';
   const source = input.body ?? current?.body;
   const prior = current?.body ?? source;
@@ -279,8 +282,10 @@ function prepareIssueWrite(
           ...(current.issueType === null ? {} : { issueType: current.issueType }),
         });
   const currentLegacy = currentParsed?.legacy === true;
-  const points = input.points ?? current?.points;
-  const issueType = input.issueType ?? current?.issueType ?? undefined;
+  if (statusOnly && currentLegacy)
+    throw new DeliveryError('Convert the legacy contract explicitly before a status-only update.');
+  const points = statusOnly ? currentParsed?.issue.points : (input.points ?? current?.points);
+  const issueType = statusOnly ? currentParsed?.issue.issueType : (input.issueType ?? current?.issueType ?? undefined);
   const metadata = {
     title: input.body === undefined && current ? current.title : title,
     ...(points === undefined ? {} : { points }),
@@ -362,6 +367,7 @@ function prepareIssueWrite(
   return {
     issue,
     body,
+    statusOnly,
     preserveHistory:
       input.preserveHistory ??
       ((currentLegacy ||
@@ -907,12 +913,16 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
   const prepared = prepareIssueWrite(input, currentContent);
   input = {
     ...input,
-    title: prepared.issue.title,
     body: prepared.body,
-    ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
-    ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
+    ...(prepared.statusOnly
+      ? {}
+      : {
+          title: prepared.issue.title,
+          ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
+          ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
+          ...(prepared.issue.draft ? { park: true as const } : {}),
+        }),
     preserveHistory: prepared.preserveHistory,
-    ...(prepared.issue.draft ? { park: true } : {}),
   };
   const acceptedLabels = input.labels === undefined ? undefined : await labels(context, input.labels);
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
@@ -1001,7 +1011,7 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
     if (current.number !== input.issueNumber || 'pull_request' in current)
       throw new DeliveryError('History target is not the requested issue.');
     const prior = { title: current.title, body: current.body ?? '' };
-    if (input.status !== undefined && (prior.title !== currentContent.title || prior.body !== currentContent.body))
+    if (prior.title !== currentContent.title || prior.body !== currentContent.body)
       throw new DeliveryError('Issue content changed after preparation; retry against the current title and body.');
     if (
       (input.title !== undefined && input.title !== prior.title) ||

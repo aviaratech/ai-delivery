@@ -177,7 +177,7 @@ export async function startTrackedIssue(
     if (
       prior &&
       (prior.title !== title ||
-        canonicalIssueBody({ ...tracking, body: prior.body ?? '' }) !== tracking.body ||
+        canonicalIssueBody({ title: prior.title, body: prior.body ?? '' }) !== tracking.body ||
         prior.state !== 'open')
     )
       throw new DeliveryError('Prior issue-start request conflicts with the requested intent or state.');
