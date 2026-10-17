@@ -4,7 +4,7 @@ import * as issue from './issue.js';
 import * as configuration from './config/deliveryConfig.js';
 import { executeTool } from './dispatch.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
-import { getRateLimitDiagnostics } from './errors.js';
+import { DeliveryError, getRateLimitDiagnostics } from './errors.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
@@ -365,30 +365,40 @@ async function runBatch(input: issue.BatchUpdateIssueInput) {
   ) as Promise<Awaited<ReturnType<typeof issue.batchUpdateIssues>>>;
 }
 
-test('the first canonical-body retry preserves its generated timestamp and adds no history', async () => {
-  const f = batchFixture();
-  const body = renderIssueBody(
-    IssueFields.parse({ title: 'Synthetic item 1', draft: true, problem: 'Changed contract' }),
-    {
-      state: 'Draft',
-      lastUpdated: '2026-01-01T00:00:00.000Z',
-      nextMilestone: 'Not started',
-      blockers: 'None',
-      latestJournal: 'None yet',
-    },
-  );
-  const input = { items: [{ issueNumber: 1, body, preserveHistory: true }] };
-  const first = await runBatch(input);
-  assert.equal(first.results[0]!.status, 'applied', JSON.stringify(first));
-  const writtenBody = f.rows.get(1)!.body;
-  const writes = [...f.writes];
-  const comments = [...f.comments];
-  const retry = await runBatch(input);
-  assert.equal(retry.results[0]!.status, 'unchanged', JSON.stringify(retry));
-  assert.equal(f.rows.get(1)!.body, writtenBody);
-  assert.deepEqual(f.writes, writes);
-  assert.deepEqual(f.comments, comments);
-});
+test.each([{}, { status: { nextMilestone: 'Run checks' } }, { blockedBy: [2] }])(
+  'canonical-body retries with overrides %j preserve generated timestamps and history',
+  async (overrides) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-17T00:00:00.000Z'));
+    const f = batchFixture();
+    const body = renderIssueBody(
+      IssueFields.parse({ title: 'Synthetic item 1', draft: true, problem: 'Changed contract' }),
+      {
+        state: 'Draft',
+        lastUpdated: '2026-01-01T00:00:00.000Z',
+        nextMilestone: 'Not started',
+        blockers: 'None',
+        latestJournal: 'None yet',
+      },
+    );
+    f.statuses.set(1, 'Queued');
+    const input = { items: [{ issueNumber: 1, body, preserveHistory: true, ...overrides }] };
+    const first = await runBatch(input);
+    assert.equal(first.results[0]!.status, 'applied', JSON.stringify(first));
+    const writtenBody = f.rows.get(1)!.body;
+    const writes = [...f.writes];
+    const comments = [...f.comments];
+    clock.mockReturnValue(Date.parse('2026-10-17T00:01:00.000Z'));
+    const retry = await runBatch(input);
+    assert.equal(retry.results[0]!.status, 'unchanged', JSON.stringify(retry));
+    assert.equal(f.rows.get(1)!.body, writtenBody);
+    assert.deepEqual(f.writes, writes);
+    assert.deepEqual(f.comments, comments);
+    clock.mockReturnValue(Date.parse('2026-10-17T00:02:00.000Z'));
+    assert.equal((await runBatch(input)).results[0]!.status, 'unchanged');
+    assert.deepEqual(f.writes, writes);
+    assert.deepEqual(f.comments, comments);
+  },
+);
 
 test.each([
   ['foreign/repository', 'FOREIGN5'],
@@ -422,6 +432,52 @@ test('correctable local batch refusals retain distinct bounded reasons', async (
   assert.match(result.results[1]!.reason!, /labels.*selected repository/u);
   assert.match(result.results[2]!.reason!, /overrideReason/u);
   assert.equal(JSON.stringify(result).includes('unknown-label-private-content'), false);
+  assert.deepEqual(f.writes, []);
+});
+
+test('a conflicting closure reason explains the required explicit reopen without more writes', async () => {
+  const f = batchFixture();
+  assert.equal(
+    (await runBatch({ items: [{ issueNumber: 1, state: 'closed', closeReason: 'not_planned' }] })).results[0]!.status,
+    'applied',
+  );
+  const writes = [...f.writes];
+  const comments = [...f.comments];
+  const result = await runBatch({ items: [{ issueNumber: 1, state: 'closed', closeReason: 'completed' }] });
+  assert.equal(result.results[0]!.status, 'failed');
+  assert.match(result.results[0]!.reason!, /different closure evidence; reopen it explicitly/u);
+  assert.deepEqual(f.writes, writes);
+  assert.deepEqual(f.comments, comments);
+});
+
+test('unknown remote errors, message getters and proxies retain the generic safe batch failure', async () => {
+  const f = batchFixture();
+  let inspected = 0;
+  const getter = Object.defineProperty(new DeliveryError(''), 'message', {
+    get() {
+      inspected++;
+      throw new Error('PRIVATE_GETTER_CONTENT');
+    },
+  });
+  const proxy = new Proxy(new DeliveryError('PRIVATE_PROXY_CONTENT'), {
+    get() {
+      inspected++;
+      throw new Error('PRIVATE_PROXY_CONTENT');
+    },
+    getPrototypeOf() {
+      inspected++;
+      throw new Error('PRIVATE_PROXY_CONTENT');
+    },
+  });
+  const get = vi.spyOn(f.context.clients.rest.issues, 'get');
+  for (const error of [new DeliveryError('PRIVATE_REMOTE_CONTENT'), getter, proxy]) {
+    get.mockRejectedValue(error);
+    const result = await runBatch({ items: [{ issueNumber: 1, title: 'Requested update' }] });
+    assert.equal(result.results[0]!.status, 'failed');
+    assert.match(result.results[0]!.reason!, /preparation failed/u);
+    assert.equal(JSON.stringify(result).includes('PRIVATE_'), false);
+  }
+  assert.equal(inspected, 0);
   assert.deepEqual(f.writes, []);
 });
 

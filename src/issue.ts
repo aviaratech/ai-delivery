@@ -371,12 +371,7 @@ function prepareIssueWrite(
   const unchangedContract =
     currentParsed !== undefined && JSON.stringify(issue) === JSON.stringify(currentParsed.issue);
   const legacyFormatting = unchangedContract && parsed.legacyFormatting === true;
-  let base = parsed.status ?? currentParsed?.status;
-  if (unchangedContract && parsed.status && currentParsed?.status) {
-    const { lastUpdated: _requestedTimestamp, ...requestedDisplay } = parsed.status;
-    const { lastUpdated: _liveTimestamp, ...liveDisplay } = currentParsed.status;
-    if (JSON.stringify(requestedDisplay) === JSON.stringify(liveDisplay)) base = currentParsed.status;
-  }
+  const base = parsed.status ?? currentParsed?.status;
   const proposed: IssueStatusData = {
     state: issue.draft ? 'Draft' : 'Ready',
     lastUpdated: base?.lastUpdated ?? new Date(Date.now()).toISOString(),
@@ -389,6 +384,11 @@ function prepareIssueWrite(
           blockers: input.blockedBy.length ? input.blockedBy.map((number) => '#' + String(number)).join(', ') : 'None',
         }),
   };
+  const unchangedDisplay =
+    currentParsed?.status !== undefined &&
+    (['state', 'nextMilestone', 'blockers', 'latestJournal'] as const).every(
+      (key) => proposed[key] === currentParsed.status![key],
+    );
   const displayChanged = JSON.stringify(proposed) !== JSON.stringify(base);
   const status = forIntent
     ? undefined
@@ -400,14 +400,16 @@ function prepareIssueWrite(
           blockers: input.blockedBy?.length ? input.blockedBy.map((number) => '#' + String(number)).join(', ') : 'None',
           latestJournal: 'None yet',
         }
-      : !unchangedContract ||
-          (patch !== undefined && displayChanged) ||
-          (input.blockedBy !== undefined && displayChanged)
-        ? {
-            ...proposed,
-            lastUpdated: new Date(Date.now()).toISOString(),
-          }
-        : base;
+      : unchangedContract && unchangedDisplay
+        ? currentParsed?.status
+        : !unchangedContract ||
+            (patch !== undefined && displayChanged) ||
+            (input.blockedBy !== undefined && displayChanged)
+          ? {
+              ...proposed,
+              lastUpdated: new Date(Date.now()).toISOString(),
+            }
+          : base;
   const body =
     renderIssueBody(issue, status, forIntent ? false : legacyFormatting) +
     (source === undefined || parsed.legacy ? '' : issueStartFooter(source));
@@ -1531,9 +1533,50 @@ function localBatchFailureReason(error: unknown): string | undefined {
   if (typeof message !== 'string') return undefined;
   if (
     [
+      'Choose a valid defer condition or explicit undefer, never both.',
+      'Use defer or undefer to change deferral state.',
+      'Choose native blockedBy or display-only status.blockers in one update, not both.',
+      'Convert the legacy contract explicitly before a status-only update.',
+      'Issue labels must be non-empty and unique.',
+      'Repository label listing exceeds the bounded readback window.',
       'Unsupported configured Issue Type.',
       'Unsupported configured Points value.',
       'Unsupported configured Priority value.',
+      'Closure details require state closed and a supported close reason.',
+      'A superseding issue must be a different positive issue number.',
+      'Superseding issue readback is not the requested repository issue.',
+      'Issue is already closed with different closure evidence; reopen it explicitly first.',
+      'Native closure readback disagrees with the requested reason or superseding issue.',
+      'Native closure readback returned a foreign issue identity.',
+      'Native closure readback has contradictory state evidence.',
+      'History target is not the requested issue.',
+      'Issue content changed after preparation; retry against the current title and body.',
+      'Complete issue history exceeds the supported comment body limit; issue was not rewritten.',
+      'Issue update readback disagrees with the requested content or state.',
+      'Issue comments require the authenticated author role.',
+      'Issue comment author identity is missing.',
+      'Issue comment target is not the requested issue.',
+      'Issue comment history exceeds the bounded readback window.',
+      'Issue comment has duplicate authored retry matches.',
+      'Issue comment conflicts with its authored operation marker.',
+      'Issue comment readback disagrees with the authored issue comment.',
+      'Authenticated update journal author is missing.',
+      'Update journal author identity is missing.',
+      'Update journal readback exceeds the bounded history window.',
+      'An issue cannot be its own parent or blocker.',
+      'Native blockers must be unique.',
+      'Native Points and Priority catalogs must select distinct issue fields.',
+      'Dependency endpoint must be a positive issue number.',
+      'Dependency endpoint is not the requested repository issue.',
+      'Dependency writes require configured author authority.',
+      'Dependency author identity is unavailable.',
+      'An issue cannot block itself.',
+      'Dependency removal episode is ambiguous.',
+      'Complete dependency history is required for an active blocker override.',
+      'Override comment author, body or issue readback disagrees; native dependency was not added.',
+      'Override comment search is incomplete or has duplicate authoritative markers.',
+      'Override comment evidence is malformed.',
+      'Existing override comment conflicts with the requested reason or endpoint evidence.',
       'Native batch relationship belongs to a different repository.',
       'Native batch relationship node identity disagrees with its repository issue.',
       'Native parent changed during batch readback; reconcile the current state.',
@@ -1546,6 +1589,12 @@ function localBatchFailureReason(error: unknown): string | undefined {
     return 'One or more requested labels do not exist in the selected repository.';
   if (/^Adding a blocker to active issue #\d+ requires overrideReason\.$/u.test(message))
     return 'Adding a blocker to an active issue requires overrideReason.';
+  if (/^Project status for dependent #\d+ is unresolved; dependency additions were refused\.$/u.test(message))
+    return 'Project status for a dependent is unresolved; dependency additions were refused.';
+  if (message.startsWith('Complete dependency history is required for an active blocker override: '))
+    return 'Complete dependency history is required for an active blocker override.';
+  if (/^Issue #\d+ content or metadata may have changed, but dependency tracking did not complete: /u.test(message))
+    return 'Issue content or metadata may have changed, but dependency tracking did not complete. Inspect native state and resume this existing issue.';
   return undefined;
 }
 
