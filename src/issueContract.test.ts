@@ -38,6 +38,42 @@ export const validIssue = () =>
     },
   });
 
+test('readable body length excludes embedded issue data and warns strictly above 4000', () => {
+  for (const [length, warning] of [
+    [3500, false],
+    [4000, false],
+    [4001, true],
+    [4500, true],
+  ] as const) {
+    const issue = validIssue();
+    issue.problem = '';
+    const prefix = () => renderIssueBody(issue).split('<!-- ai-delivery:issue-data@1 ')[0]!;
+    issue.problem = '<'.repeat(length - prefix().length);
+    assert.equal(prefix().length, length);
+    assert.equal(
+      issueWarnings(issue).some((item) => item.code === 'body.length'),
+      warning,
+      String(length),
+    );
+  }
+});
+
+test('multiline criteria keep nested bullets and verification attached to their own checkbox', () => {
+  const issue = validIssue();
+  issue.acceptanceCriteria = [
+    {
+      behavior: 'Reject malformed input:\n- Empty input\n  - Whitespace only\n- Invalid shape',
+      verifiedBy: 'Regression cases:\n- Empty and malformed',
+    },
+    { behavior: 'A valid input is stored once.', verifiedBy: 'One observed write.' },
+  ];
+  const actual = renderIssueBody(issue).split('## Acceptance criteria\n\n')[1]!.split('\n\n## Out of scope')[0];
+  assert.equal(
+    actual,
+    '- [ ] Reject malformed input:\n  - Empty input\n    - Whitespace only\n  - Invalid shape\n\n  Verified by: Regression cases:\n  - Empty and malformed\n- [ ] A valid input is stored once.\n  Verified by: One observed write.',
+  );
+});
+
 test('MCP create/update fields derive from the canonical schema and patch omissions retain no defaults', () => {
   const create = AI_DELIVERY_MCP_TOOLS.find((t) => t.name === 'issue_create')!;
   const update = AI_DELIVERY_MCP_TOOLS.find((t) => t.name === 'issue_update')!;
@@ -340,7 +376,7 @@ const warningCases: [string, (issue: ReturnType<typeof validIssue>) => void, str
   [
     'long body',
     (i) => {
-      i.context.evidence.push('A'.repeat(3100));
+      i.context.evidence.push('A'.repeat(4500));
     },
     'body.length',
   ],

@@ -89,22 +89,22 @@ export const JournalInputSchema = z
 
 export function renderJournal(raw: JournalInput, marker?: string): string {
   const input = JournalVariants.parse(raw);
+  const field = (label: string, value: string): string =>
+    `**${label}:**${/\n|^(?:[-*+]\s|\d+[.)]\s)/u.test(value) ? '\n' : ' '}${value}`;
+  const list = (values: string[]): string => values.map((value) => '- ' + value.replace(/\n/gu, '\n  ')).join('\n');
   const sections = [`**Kind:** ${input.kind}. **Status:** ${input.status}`];
   switch (input.kind) {
     case 'start':
-      sections.push(`**Outcome:** ${input.outcome}`);
+      sections.push(field('Outcome', input.outcome));
       break;
     case 'progress':
-      sections.push(
-        `**Done since last:**\n${input.done.map((item) => `- ${item}`).join('\n')}`,
-        `**Decision needed:** ${input.decisionNeeded}`,
-      );
+      sections.push(`**Done since last:**\n${list(input.done)}`, field('Decision needed', input.decisionNeeded));
       break;
     case 'decision':
-      sections.push(`**Decision:** ${input.decision}`, `**Rationale:** ${input.rationale}`);
+      sections.push(field('Decision', input.decision), field('Rationale', input.rationale));
       break;
     case 'blocker':
-      sections.push(`**Blocker:** ${input.blocker}`, `**Resolution needed:** ${input.resolution}`);
+      sections.push(field('Blocker', input.blocker), field('Resolution needed', input.resolution));
       break;
     case 'closeout':
       sections.push(

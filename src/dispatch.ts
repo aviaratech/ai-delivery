@@ -174,15 +174,23 @@ export async function startTrackedIssue(
       );
     if (matches.length > 1) throw new DeliveryError('Conflicting issues claim the same start request.');
     const prior = matches[0];
-    if (prior && (prior.title !== title || prior.body !== tracking.body || prior.state !== 'open'))
+    if (
+      prior &&
+      (prior.title !== title ||
+        canonicalIssueBody({ title: prior.title, body: prior.body ?? '' }) !== tracking.body ||
+        prior.state !== 'open')
+    )
       throw new DeliveryError('Prior issue-start request conflicts with the requested intent or state.');
     try {
       if (prior) {
+        createdBody = prior.body ?? '';
         created = { number: prior.number, title: prior.title, url: prior.html_url };
         number = prior.number;
         await resumeCreatedIssue(context, { ...tracking, issueNumber: number });
       } else {
-        created = (await createIssue(context, tracking)).created;
+        const result = await createIssue(context, tracking);
+        created = result.created;
+        createdBody = result.body;
         number = created.number;
       }
     } catch (error) {

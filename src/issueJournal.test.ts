@@ -18,6 +18,25 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+test('decision journal list fields start below their label and preserve nested structure', () => {
+  const result = renderJournal({
+    issueNumber: 17,
+    kind: 'decision',
+    summary: 'A decision was made.',
+    status: 'Ready',
+    decision: '- First\n  - Nested\n- Second',
+    rationale: 'The existing owner is sufficient.',
+    nextStep: 'Run checks',
+    nextDate: null,
+    keyNumbers: [],
+    evidence: [],
+  });
+  assert.equal(
+    result,
+    'A decision was made.\n\n**Kind:** decision. **Status:** Ready\n\n**Decision:**\n- First\n  - Nested\n- Second\n\n**Rationale:** The existing owner is sufficient.\n\n**Key numbers:** None reported.\n\n**Next:** Run checks (date not scheduled).\n\n**Evidence:** None yet.',
+  );
+});
+
 test('journal tool validates all five typed templates before dispatch', () => {
   const tool = getAiDeliveryMcpTool('issue_comment');
   assert.ok(tool, 'issue_comment must be exposed');

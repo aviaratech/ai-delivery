@@ -38,6 +38,9 @@ import { JournalInputSchema, renderJournal, type JournalInput } from './issueJou
 import {
   IssueFields,
   IssueWriteFields,
+  CreateIssueStatus,
+  IssueStatusPatch,
+  requireIssueStatus,
   parseIssueBody,
   requireIssue,
   renderIssueBody,
@@ -48,6 +51,7 @@ import {
   IssueValidationError,
   type IssueFieldsInput,
   type IssueDiagnostic,
+  type IssueStatusData,
 } from './issueContract.js';
 
 export interface IssueCommentReadback {
@@ -226,6 +230,7 @@ async function labels(context: DeliveryContext, input: readonly string[] | undef
 }
 
 export interface CreateIssueInput extends Partial<IssueFieldsInput> {
+  status?: { nextMilestone?: string };
   blockedBy?: number[];
   /** Add this issue as a blocker of these dependents without replacing their other blockers. */
   blocks?: number[];
@@ -240,7 +245,31 @@ export interface CreateIssueInput extends Partial<IssueFieldsInput> {
   title: string;
 }
 
-function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; park?: true }, current?: IssueInfo) {
+function prepareIssueWrite(
+  input: Partial<IssueFieldsInput> & {
+    body?: string;
+    park?: true;
+    status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
+    blockedBy?: number[];
+    preserveHistory?: boolean;
+  },
+  current?: IssueInfo,
+  forIntent = false,
+) {
+  const patch =
+    input.status === undefined
+      ? undefined
+      : requireIssueStatus(
+          IssueStatusPatch,
+          current === undefined ? requireIssueStatus(CreateIssueStatus, input.status) : input.status,
+        );
+  if (input.blockedBy !== undefined && patch && 'blockers' in patch)
+    throw new DeliveryError('Choose native blockedBy or display-only status.blockers in one update, not both.');
+  const statusOnly =
+    patch !== undefined &&
+    Object.entries(input).every(
+      ([key, value]) => value === undefined || ['repo', 'issueNumber', 'status'].includes(key),
+    );
   const title = input.title ?? current?.title ?? '';
   const source = input.body ?? current?.body;
   const prior = current?.body ?? source;
@@ -253,14 +282,16 @@ function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; p
           ...(current.issueType === null ? {} : { issueType: current.issueType }),
         });
   const currentLegacy = currentParsed?.legacy === true;
-  const points = input.points ?? current?.points;
-  const issueType = input.issueType ?? current?.issueType ?? undefined;
+  if (statusOnly && currentLegacy)
+    throw new DeliveryError('Convert the legacy contract explicitly before a status-only update.');
+  const points = statusOnly ? currentParsed?.issue.points : (input.points ?? current?.points);
+  const issueType = statusOnly ? currentParsed?.issue.issueType : (input.issueType ?? current?.issueType ?? undefined);
   const metadata = {
     title: input.body === undefined && current ? current.title : title,
     ...(points === undefined ? {} : { points }),
     ...(issueType === undefined ? {} : { issueType }),
   };
-  const parsed =
+  const parsed: ReturnType<typeof parseIssueBody> =
     source === undefined ? { issue: IssueFields.parse({ title }), legacy: false } : parseIssueBody(source, metadata);
   let legacyBody = currentParsed?.issue.legacyBody ?? parsed.issue.legacyBody;
   if (
@@ -269,6 +300,11 @@ function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; p
     !legacyBody.includes(parsed.issue.legacyBody)
   )
     legacyBody += '\n\n' + parsed.issue.legacyBody;
+  const incomingLegacy =
+    current !== undefined &&
+    parsed.issue.legacyBody !== undefined &&
+    parsed.issue.legacyBody !== currentParsed?.issue.legacyBody &&
+    parsed.issue.legacyBody !== current.body;
   const fields = Object.fromEntries(
     Object.keys(IssueWriteFields).flatMap((key) => {
       const value = input[key as keyof IssueFieldsInput];
@@ -281,21 +317,74 @@ function prepareIssueWrite(input: Partial<IssueFieldsInput> & { body?: string; p
     ...fields,
     title,
     ...(legacyBody === undefined ? {} : { legacyBody }),
+    ...(input.retainLegacyBody !== undefined
+      ? { retainLegacyBody: input.retainLegacyBody }
+      : incomingLegacy
+        ? { retainLegacyBody: true }
+        : current !== undefined && legacyBody !== undefined && input.preserveHistory !== false && !statusOnly
+          ? { retainLegacyBody: false }
+          : {}),
     ...(input.park ? { draft: true } : {}),
   });
-  const body = renderIssueBody(issue) + (source === undefined || parsed.legacy ? '' : issueStartFooter(source));
+  const unchangedContract =
+    currentParsed !== undefined && JSON.stringify(issue) === JSON.stringify(currentParsed.issue);
+  const legacyFormatting = unchangedContract && parsed.legacyFormatting === true;
+  const base = parsed.status ?? currentParsed?.status;
+  const proposed: IssueStatusData = {
+    state: issue.draft ? 'Draft' : 'Ready',
+    lastUpdated: base?.lastUpdated ?? new Date(Date.now()).toISOString(),
+    nextMilestone: patch?.nextMilestone ?? base?.nextMilestone ?? 'Not started',
+    blockers: patch?.blockers ?? base?.blockers ?? 'None',
+    latestJournal: patch?.latestJournal ?? base?.latestJournal ?? 'None yet',
+    ...(input.blockedBy === undefined
+      ? {}
+      : {
+          blockers: input.blockedBy.length ? input.blockedBy.map((number) => '#' + String(number)).join(', ') : 'None',
+        }),
+  };
+  const displayChanged = JSON.stringify(proposed) !== JSON.stringify(base);
+  const status = forIntent
+    ? undefined
+    : current === undefined
+      ? {
+          ...proposed,
+          state: issue.draft ? ('Draft' as const) : ('Ready' as const),
+          lastUpdated: new Date(Date.now()).toISOString(),
+          blockers: input.blockedBy?.length ? input.blockedBy.map((number) => '#' + String(number)).join(', ') : 'None',
+          latestJournal: 'None yet',
+        }
+      : !unchangedContract ||
+          (patch !== undefined && displayChanged) ||
+          (input.blockedBy !== undefined && displayChanged)
+        ? {
+            ...proposed,
+            lastUpdated: new Date(Date.now()).toISOString(),
+          }
+        : base;
+  const body =
+    renderIssueBody(issue, status, forIntent ? false : legacyFormatting) +
+    (source === undefined || parsed.legacy ? '' : issueStartFooter(source));
   return {
     issue,
     body,
-    warnings: issueWarnings(issue),
+    statusOnly,
+    preserveHistory:
+      input.preserveHistory ??
+      ((currentLegacy ||
+        parsed.legacy ||
+        (legacyBody !== undefined &&
+          issue.retainLegacyBody === false &&
+          currentParsed?.issue.retainLegacyBody !== false)) &&
+        !statusOnly),
+    warnings: issueWarnings(issue, status, legacyFormatting),
     ...((currentLegacy || parsed.legacy) && prior !== undefined
       ? { conversion: { priorBody: prior, canonicalBody: body, diff: issueBodyDiff(prior, body) } }
       : {}),
   };
 }
-/** The normal start route computes its retry intent from the same accepted canonical write. */
+/** Display timestamps are excluded from the contract-bound normal-start retry intent. */
 export function canonicalIssueBody(input: CreateIssueInput): string {
-  return prepareIssueWrite(input).body;
+  return prepareIssueWrite(input, undefined, true).body;
 }
 
 export class CreatedTrackingIssueError extends DeliveryError {
@@ -779,6 +868,7 @@ export async function readIssueClosure(context: DeliveryContext, issueNumber: nu
 }
 
 export interface UpdateIssueInput extends Partial<IssueFieldsInput> {
+  status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
   blockedBy?: number[];
   /** Add this issue as a blocker of these dependents without replacing their other blockers. */
   blocks?: number[];
@@ -823,12 +913,16 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
   const prepared = prepareIssueWrite(input, currentContent);
   input = {
     ...input,
-    title: prepared.issue.title,
     body: prepared.body,
-    ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
-    ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
-    ...(prepared.conversion === undefined ? {} : { preserveHistory: true }),
-    ...(prepared.issue.draft ? { park: true } : {}),
+    ...(prepared.statusOnly
+      ? {}
+      : {
+          title: prepared.issue.title,
+          ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
+          ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
+          ...(prepared.issue.draft ? { park: true as const } : {}),
+        }),
+    preserveHistory: prepared.preserveHistory,
   };
   const acceptedLabels = input.labels === undefined ? undefined : await labels(context, input.labels);
   if (input.issueType !== undefined && !config.native.issueTypes.includes(input.issueType)) {
@@ -910,12 +1004,15 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
     }
   }
   let historyComment: IssueCommentReadback | undefined;
-  let priorContent: { title: string; body: string } | undefined;
+  let priorContent: { title: string; body: string } | undefined =
+    input.status === undefined ? undefined : { title: currentContent.title, body: currentContent.body };
   if (input.preserveHistory === true && (input.title !== undefined || input.body !== undefined)) {
     const current = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
     if (current.number !== input.issueNumber || 'pull_request' in current)
       throw new DeliveryError('History target is not the requested issue.');
     const prior = { title: current.title, body: current.body ?? '' };
+    if (prior.title !== currentContent.title || prior.body !== currentContent.body)
+      throw new DeliveryError('Issue content changed after preparation; retry against the current title and body.');
     if (
       (input.title !== undefined && input.title !== prior.title) ||
       (input.body !== undefined && input.body !== prior.body)
@@ -945,9 +1042,7 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
       current.title !== priorContent.title ||
       (current.body ?? '') !== priorContent.body
     )
-      throw new DeliveryError(
-        'Issue content changed after history readback; retry against the current title and body.',
-      );
+      throw new DeliveryError('Issue content changed after preparation; retry against the current title and body.');
   }
   await clients.rest.issues.update({
     issue_number: input.issueNumber,
@@ -1064,7 +1159,8 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
 
 /** Complete the native tracking and Project state of an issue created before an interrupted response. */
 export async function resumeCreatedIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<IssueInfo> {
-  return updateIssue(context, input);
+  // Tracking recovery must not trigger an unrelated first render omission and change the retry intent.
+  return updateIssue(context, { ...input, preserveHistory: input.preserveHistory ?? false });
 }
 
 export interface IssueInfo {
