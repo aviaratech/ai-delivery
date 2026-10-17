@@ -3,6 +3,91 @@ import { test } from 'vitest';
 import { updateIssue, createIssue, CreatedTrackingIssueError } from './issue.js';
 import { issue63Fixture as guardFixture } from './fixtures/issue63.js';
 
+test('forward creation reads a known Blocked item when its list status projection is empty', async () => {
+  const f = guardFixture();
+  f.controls.missingProjectStatus = 20;
+  const result = await createIssue(f.context, { ...f.ready, blockedBy: [18] });
+  assert.equal(result.created.number, 20);
+  assert.equal(result.created.url, 'https://github.com/example/widget/issues/20');
+  assert.deepEqual([...f.edges.get(20)!], [18]);
+  assert.equal(f.statuses.get(20), 'Waiting');
+  assert.ok(f.writes.indexOf('status') < f.writes.indexOf('add'));
+  assert.deepEqual(
+    f.graphqlCalls.filter((call) => call.query.includes('addBlockedBy')).map((call) => call.variables),
+    [{ blocking: 'ISSUE18', issue: 'ISSUE20' }],
+  );
+  const reads = f.graphqlCalls.filter((call) => call.query.includes('ProjectDeliveryItemReadback'));
+  assert.ok(reads.length >= 2, 'Status synchronization and dependency guard must read the exact item.');
+  assert.ok(reads.every((call) => call.variables.itemId === 'ITEM20' && call.variables.statusField === 'Flow'));
+  assert.equal(f.comments.length, 0);
+});
+
+test('a forward dependency failure preserves the created issue and update repairs its Blocked item', async () => {
+  const f = guardFixture();
+  f.controls.missingProjectStatus = 20;
+  f.controls.failAdd = true;
+  await assert.rejects(createIssue(f.context, { ...f.ready, blockedBy: [18] }), (error) => {
+    assert.ok(error instanceof CreatedTrackingIssueError);
+    assert.deepEqual(error.created, {
+      number: 20,
+      title: f.ready.title,
+      url: 'https://github.com/example/widget/issues/20',
+    });
+    assert.match(error.message, /Native add failed/u);
+    assert.match(error.message, /Resume this known issue/u);
+    return true;
+  });
+  assert.equal(f.statuses.get(20), 'Waiting');
+  assert.deepEqual([...f.edges.get(20)!], []);
+  f.controls.failAdd = false;
+  const repaired = await updateIssue(f.context, { issueNumber: 20, blockedBy: [18] });
+  assert.equal(repaired.issueNumber, 20);
+  assert.equal(repaired.projectStatus, 'Blocked');
+  assert.deepEqual(repaired.blockedBy, [18]);
+  await updateIssue(f.context, { issueNumber: 20, blockedBy: [18] });
+  assert.equal(f.writes.filter((write) => write === 'create').length, 1);
+  assert.equal(f.writes.filter((write) => write === 'add').length, 1);
+  assert.deepEqual([...f.edges.get(20)!], [18]);
+});
+
+test('an exact active item still requires an override when the list projection is empty', async () => {
+  const f = guardFixture();
+  f.controls.missingProjectStatus = 17;
+  await assert.rejects(updateIssue(f.context, { issueNumber: 17, blockedBy: [18] }), /overrideReason/u);
+  assert.deepEqual(f.writes, []);
+  await updateIssue(f.context, {
+    issueNumber: 17,
+    blockedBy: [18],
+    overrideReason: 'Wait for the newly identified prerequisite.',
+  });
+  assert.deepEqual([...f.edges.get(17)!], [18]);
+  assert.equal(f.comments.length, 1);
+});
+
+test('missing or contradictory exact item evidence refuses a dependency without writes', async () => {
+  for (const readback of [
+    { fieldValueByName: null },
+    { isArchived: true },
+    { id: 'ITEM18' },
+    { project: { id: 'OTHER', number: 1 } },
+    { project: { id: 'PROJECT', number: 2 } },
+    { content: { id: 'ISSUE18' } },
+    { fieldValueByName: { name: 'Waiting', optionId: 'ACTIVE' } },
+  ]) {
+    const f = guardFixture();
+    f.statuses.set(17, 'Waiting');
+    f.controls.missingProjectStatus = 17;
+    f.controls.projectItemReadback = readback;
+    await assert.rejects(updateIssue(f.context, { issueNumber: 17, blockedBy: [18] }), /Project/u);
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual([...f.edges.get(17)!], []);
+  }
+  const absent = guardFixture();
+  absent.controls.missingProjectIssue = 17;
+  await assert.rejects(updateIssue(absent.context, { issueNumber: 17, blockedBy: [18] }), /unresolved/u);
+  assert.deepEqual(absent.writes, []);
+});
+
 test('new blocker on active work refuses before every affected write without an override reason', async () => {
   const f = guardFixture();
   await assert.rejects(updateIssue(f.context, { issueNumber: 17, blockedBy: [18] }), /overrideReason/u);

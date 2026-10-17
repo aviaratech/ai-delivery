@@ -108,8 +108,19 @@ export async function getIssueProjectStatus(
   const configuration =
     input.configuration ??
     (await getProjectDeliveryConfiguration({ ...input, settings: requireProjectSettings(input.settings) }));
-  const item = await findIssueProjectItem({ ...input, configuration });
+  let item = await findIssueProjectItem({ ...input, configuration });
   if (item === null || item.archived) return null;
+  // The list projection may omit a status already verified by a direct item read.
+  // Resolve that exact item without inferring a status or accepting a missing item.
+  if (item.status === null && item.statusOptionId === null) {
+    item = await readProjectItem({
+      configuration,
+      graphql: input.graphql,
+      issueNodeId: input.issueNodeId,
+      itemId: item.id,
+    });
+  }
+  if (item.archived) return null;
   if (item.status === null && item.statusOptionId === null) return null;
   const status = requireItemStatus(item, configuration);
   return { itemId: item.id, status };
@@ -657,6 +668,23 @@ async function readBackProjectItem(input: {
   itemId: string;
   status: ProjectDeliveryStatus;
 }): Promise<ProjectDeliveryStatusReadback> {
+  const item = await readProjectItem(input);
+  if (
+    item.archived ||
+    item.status !== input.status ||
+    item.statusOptionId !== input.configuration.statusOptionIds[input.status]
+  ) {
+    throw new DeliveryError(`Project Status readback did not report ${input.status} for the exact issue item.`);
+  }
+  return { itemId: input.itemId, status: input.status };
+}
+
+async function readProjectItem(input: {
+  configuration: ProjectDeliveryConfiguration;
+  graphql: typeof GraphQLType;
+  issueNodeId: string;
+  itemId: string;
+}): Promise<ProjectDeliveryItem> {
   const response: unknown = await input.graphql(
     `
       query ProjectDeliveryItemReadback($itemId: ID!, $statusField: String!) {
@@ -679,21 +707,18 @@ async function readBackProjectItem(input: {
   const node = requireRecord(record.node, 'GitHub omitted Project item readback.');
   const project = requireRecord(node.project, 'GitHub omitted Project identity readback.');
   const content = requireRecord(node.content, 'GitHub omitted Project item content readback.');
-  const fieldValue = requireRecord(node.fieldValueByName, 'GitHub omitted Project Status readback.');
-  const observedName = requireString(fieldValue.name, 'GitHub omitted Project Status name readback.');
-  const observedOptionId = requireString(fieldValue.optionId, 'GitHub omitted Project Status option readback.');
   if (
     node.id !== input.itemId ||
-    node.isArchived === true ||
+    typeof node.isArchived !== 'boolean' ||
     project.id !== input.configuration.projectId ||
     project.number !== input.configuration.projectNumber ||
-    content.id !== input.issueNodeId ||
-    observedName !== input.configuration.settings.statuses[input.status] ||
-    observedOptionId !== input.configuration.statusOptionIds[input.status]
+    content.id !== input.issueNodeId
   ) {
-    throw new DeliveryError(`Project Status readback did not report ${input.status} for the exact issue item.`);
+    throw new DeliveryError('Project Status readback did not report the exact issue item.');
   }
-  return { itemId: input.itemId, status: input.status };
+  const item = parseProjectItem(node, input.configuration);
+  if (item === null) throw new DeliveryError('GitHub omitted Project item content readback.');
+  return item;
 }
 
 function readOptions(raw: unknown, fieldName: string): { id: string; name: string }[] {
