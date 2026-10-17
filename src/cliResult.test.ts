@@ -274,3 +274,83 @@ test('the real CLI renderer bounds diagnostics and leaves the unchanged refusal 
   assert.ok(Buffer.byteLength(result.stderr.split('\n')[0]! + '\n') <= 512);
   assert.equal(result.stderr.trimEnd().split('\n').at(-1), 'ai-delivery: safe refusal');
 });
+
+test('CLI batch partial failure prints every result before returning nonzero', () => {
+  const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
+  const partial = {
+    results: [
+      { issueNumber: 1, status: 'applied' },
+      { issueNumber: 2, status: 'failed', reason: 'Native readback unavailable' },
+    ],
+    summary: { failed: 1 },
+  };
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { printCommandResult } from ${JSON.stringify(helper)};printCommandResult('issue_batch_update',${JSON.stringify(partial)});`,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 1);
+  assert.deepEqual(JSON.parse(result.stdout), partial);
+  assert.equal(result.stderr, '');
+  const success = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { printCommandResult } from ${JSON.stringify(helper)};printCommandResult('issue_batch_update',{summary:{failed:0}});`,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(success.status, 0);
+});
+
+test('actual CLI batch input validates before configuration or native access', () => {
+  const root = mkdtempSync(join(tmpdir(), 'batch-cli-refusal-'));
+  try {
+    const file = join(root, 'items.json');
+    writeFileSync(file, '[]');
+    const result = spawnSync(
+      process.execPath,
+      [
+        join(process.cwd(), 'dist', 'cli.js'),
+        '--repo',
+        'example/widget',
+        'batch:update',
+        '--items-file',
+        file,
+        '--dry-run',
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { PATH: process.env.PATH, AI_DELIVERY_CONFIG: join(root, 'absent-settings.json') },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.doesNotMatch(result.stderr, /absent-settings|credential|token/iu);
+    const diagnostic = JSON.parse(result.stderr.replace(/^ai-delivery: /u, '').trim()) as {
+      failures: { field: string; code: string }[];
+    };
+    assert.equal(diagnostic.failures[0]!.field, 'items');
+    assert.equal(diagnostic.failures[0]!.code, 'field.type');
+    writeFileSync(file, JSON.stringify([{ issueNumber: 1, PRIVATE_PROPERTY: 'PRIVATE_VALUE' }]));
+    const privateInput = spawnSync(
+      process.execPath,
+      [join(process.cwd(), 'dist', 'cli.js'), '--repo', 'example/widget', 'batch:update', '--items-file', file],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { PATH: process.env.PATH, AI_DELIVERY_CONFIG: join(root, 'absent-settings.json') },
+      },
+    );
+    assert.equal(privateInput.status, 1);
+    assert.doesNotMatch(privateInput.stderr, /PRIVATE_PROPERTY|PRIVATE_VALUE|absent-settings/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

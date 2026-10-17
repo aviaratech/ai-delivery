@@ -396,6 +396,18 @@ program
   );
 
 program
+  .command('batch:update')
+  .description('Plan or apply 1–50 current-repository issue updates with ordered readback')
+  .requiredOption('--items-file <path>', 'UTF-8 JSON array of complete issue_update inputs')
+  .option('--dry-run', 'Return plans and readback without any native writes')
+  .action(async (o: { itemsFile: string; dryRun?: boolean }) =>
+    run('issue_batch_update', {
+      items: JSON.parse(readFileSync(o.itemsFile, 'utf8')) as unknown,
+      dryRun: o.dryRun === true,
+    }),
+  );
+
+program
   .command('health')
   .requiredOption('--from <utc>', 'Inclusive UTC ISO timestamp')
   .requiredOption('--to <utc>', 'Exclusive UTC ISO timestamp')

@@ -390,6 +390,36 @@ test('machine REST request diagnostics reach the real CLI renderer without priva
   assert.equal(calls().length, 2);
 });
 
+test.each(['rest', 'graphql', 'graphql200'] as const)(
+  'numeric %s rate limits remain observable after a caller wraps the failure',
+  async (kind) => {
+    identity();
+    const clients = await author();
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(JSON.stringify({ message: token, errors: [{ message: token }] }), {
+          status: kind === 'graphql200' ? 200 : 429,
+          headers: {
+            'content-type': 'application/json',
+            'retry-after': '30',
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': '1900000000',
+            'x-private-header': token,
+          },
+        }),
+    );
+    await assert.rejects(
+      kind === 'rest'
+        ? clients.rest.issues.get({ owner: 'example', repo: 'widget', issue_number: 17 })
+        : clients.graphql('query { viewer { login } }'),
+    );
+    const retained = (clients as unknown as { rateLimitObservation?: () => unknown }).rateLimitObservation?.();
+    assert.deepEqual(retained, { retryAfterSeconds: 30, resetAtSeconds: 1900000000, remaining: 0 });
+    assert.doesNotMatch(JSON.stringify(retained), /fictional_|private|header/u);
+  },
+);
+
 test('only the original real machine protection failure proves absence for its selected client and target', async () => {
   identity();
   const clients = await author();

@@ -22,6 +22,44 @@ const Repo = z
   .optional()
   .describe(REPO_HELP);
 export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@2' as const;
+const IssueUpdateInput = issueInputSchema(
+  z
+    .strictObject({
+      ...IssueWriteFields,
+      status: IssueStatusPatch.optional(),
+      repo: Repo,
+      blockedBy: z.array(Positive).optional(),
+      blocks: z.array(Positive).optional(),
+      overrideReason: OverrideReason.optional(),
+      body: z.string().optional(),
+      issueNumber: Positive,
+      issueType: IssueWriteFields.issueType,
+      labels: Labels.optional(),
+      milestone: Positive.nullable().optional(),
+      parentIssueNumber: Positive.nullable().optional(),
+      park: z.literal(true).optional(),
+      ...IssueDeferralPatch,
+      points: IssueWriteFields.points,
+      priority: z.string().min(1).optional(),
+      state: z.enum(['open', 'closed']).optional(),
+      preserveHistory: z.boolean().optional(),
+      closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
+      supersededBy: Positive.optional(),
+      title: IssueWriteFields.title,
+    })
+    .superRefine((input, ctx) => {
+      if (input.defer !== undefined && input.undefer !== undefined)
+        ctx.addIssue({ code: 'custom', message: 'Choose defer or undefer, never both.', path: ['defer'] });
+      if ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
+        ctx.addIssue({
+          code: 'custom',
+          path: ['state'],
+          message: 'Closure details require state closed',
+          params: { issueCode: 'closure.state' },
+        });
+    }),
+);
+
 const Tracking = {
   blockedBy: z.array(Positive).optional(),
   blocks: z.array(Positive).optional(),
@@ -225,42 +263,14 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_update',
     commandName: 'update',
     description: 'Update native issue fields and exact relationship sets with readback',
+    inputSchema: IssueUpdateInput,
+  },
+  {
+    name: 'issue_batch_update',
+    commandName: 'batch:update',
+    description: 'Plan or apply 1–50 issue updates in one repository, with ordered partial results and readback',
     inputSchema: issueInputSchema(
-      z
-        .strictObject({
-          ...IssueWriteFields,
-          status: IssueStatusPatch.optional(),
-          repo: Repo,
-          blockedBy: z.array(Positive).optional(),
-          blocks: z.array(Positive).optional(),
-          overrideReason: OverrideReason.optional(),
-          body: z.string().optional(),
-          issueNumber: Positive,
-          issueType: IssueWriteFields.issueType,
-          labels: Labels.optional(),
-          milestone: Positive.nullable().optional(),
-          parentIssueNumber: Positive.nullable().optional(),
-          park: z.literal(true).optional(),
-          ...IssueDeferralPatch,
-          points: IssueWriteFields.points,
-          priority: z.string().min(1).optional(),
-          state: z.enum(['open', 'closed']).optional(),
-          preserveHistory: z.boolean().optional(),
-          closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
-          supersededBy: Positive.optional(),
-          title: IssueWriteFields.title,
-        })
-        .superRefine((input, ctx) => {
-          if (input.defer !== undefined && input.undefer !== undefined)
-            ctx.addIssue({ code: 'custom', message: 'Choose defer or undefer, never both.', path: ['defer'] });
-          if ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
-            ctx.addIssue({
-              code: 'custom',
-              path: ['state'],
-              message: 'Closure details require state closed',
-              params: { issueCode: 'closure.state' },
-            });
-        }),
+      z.strictObject({ repo: Repo, items: z.array(IssueUpdateInput).min(1).max(50), dryRun: z.boolean().optional() }),
     ),
   },
   {

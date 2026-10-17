@@ -8,7 +8,12 @@ import type {
 } from './config/deliveryConfig.js';
 import { loadDeliveryConfig, WipLimits, type WipLane } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/legacy.js';
-import { DeliveryError } from './errors.js';
+import {
+  DeliveryError,
+  getRateLimitDiagnostics,
+  getMachineRequestDiagnostics,
+  type RateLimitDiagnostics,
+} from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
 import {
   NATIVE_ISSUE_API_VERSION,
@@ -138,23 +143,35 @@ async function writeAuthenticatedIssueComment(
       existing ??
       (await context.clients.rest.issues.createComment({ ...context.repo, issue_number: input.issueNumber, body }))
         .data;
-    const readback = (await context.clients.rest.issues.getComment({ ...context.repo, comment_id: created.id })).data;
-    const expectedIssuePath = `/repos/${context.repo.owner}/${context.repo.repo}/issues/${String(input.issueNumber)}`;
-    if (
-      !Number.isSafeInteger(readback.id) ||
-      readback.id <= 0 ||
-      readback.id !== created.id ||
-      readback.html_url !== created.html_url ||
-      readback.body !== (existing?.body ?? body) ||
-      (lifecycleKey === undefined && readback.body !== body) ||
-      readback.user?.login.toLowerCase() !== actor.toLowerCase() ||
-      new URL(readback.issue_url).pathname.toLowerCase() !== expectedIssuePath.toLowerCase() ||
-      !readback.html_url.startsWith('https://')
-    )
+    if (lifecycleKey === undefined && (existing?.body ?? body) !== body)
       throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
-    return { commentId: readback.id, url: readback.html_url, body: readback.body!, reused: existing !== undefined };
+    const readback = await readAuthoredIssueComment(context, input.issueNumber, created, existing?.body ?? body, actor);
+    return { ...readback, reused: existing !== undefined };
   };
   return operation();
+}
+
+async function readAuthoredIssueComment(
+  context: DeliveryContext,
+  issueNumber: number,
+  created: { id: number; html_url: string },
+  body: string,
+  actor: string,
+): Promise<Omit<IssueCommentReadback, 'reused'>> {
+  const readback = (await context.clients.rest.issues.getComment({ ...context.repo, comment_id: created.id })).data;
+  const expectedIssuePath = `/repos/${context.repo.owner}/${context.repo.repo}/issues/${String(issueNumber)}`;
+  if (
+    !Number.isSafeInteger(readback.id) ||
+    readback.id <= 0 ||
+    readback.id !== created.id ||
+    readback.html_url !== created.html_url ||
+    readback.body !== body ||
+    readback.user?.login.toLowerCase() !== actor.toLowerCase() ||
+    new URL(readback.issue_url).pathname.toLowerCase() !== expectedIssuePath.toLowerCase() ||
+    !readback.html_url.startsWith('https://')
+  )
+    throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
+  return { commentId: readback.id, url: readback.html_url, body: readback.body! };
 }
 
 export async function journalIssueStart(context: DeliveryContext, issueNumber: number): Promise<IssueCommentReadback> {
@@ -1005,7 +1022,19 @@ export interface UpdateIssueResult extends IssueInfo {
   closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
 }
 
-export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
+function updateProjectStatus(info: IssueInfo, input: UpdateIssueInput) {
+  return info.state === 'closed' || info.projectStatus === 'Done'
+    ? 'Done'
+    : info.blockedBy.length > 0
+      ? 'Blocked'
+      : input.park === true || input.blockedBy !== undefined || info.projectStatus === null
+        ? 'Todo'
+        : info.projectStatus === 'In Progress' || (info.projectStatus === 'Blocked' && input.state === undefined)
+          ? info.projectStatus
+          : 'Todo';
+}
+
+async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueInput) {
   requireDeferralPatch({
     ...(input.defer === undefined ? {} : { defer: input.defer }),
     ...(input.undefer === undefined ? {} : { undefer: input.undefer }),
@@ -1117,7 +1146,7 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
       }
     }
   }
-  let historyComment: IssueCommentReadback | undefined;
+  let historyBody: string | undefined;
   let priorContent: { title: string; body: string } | undefined =
     input.status === undefined ? undefined : { title: currentContent.title, body: currentContent.body };
   if (input.preserveHistory === true && (input.title !== undefined || input.body !== undefined)) {
@@ -1139,14 +1168,57 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
           'Complete issue history exceeds the supported comment body limit; issue was not rewritten.',
         );
       priorContent = prior;
-      historyComment = await commentIssue(context, { issueNumber: input.issueNumber, body });
+      historyBody = body;
     }
   }
+  const closureBody =
+    closeReason === undefined
+      ? undefined
+      : `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`;
+  return {
+    input,
+    prepared,
+    acceptedLabels,
+    beforeAdd,
+    closeReason,
+    supersedingIssueId,
+    assertClosure,
+    currentContent,
+    priorContent,
+    historyBody,
+    closureBody,
+  };
+}
+
+type PreparedIssueUpdate = Awaited<ReturnType<typeof prepareIssueUpdate>>;
+
+export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
+  return applyIssueUpdate(context, await prepareIssueUpdate(context, input));
+}
+
+async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpdate): Promise<UpdateIssueResult> {
+  const { clients, config, repo } = context;
+  const {
+    input,
+    prepared,
+    acceptedLabels,
+    beforeAdd,
+    closeReason,
+    supersedingIssueId,
+    assertClosure,
+    priorContent,
+    historyBody,
+    closureBody,
+  } = plan;
+  const historyComment =
+    historyBody === undefined
+      ? undefined
+      : await commentIssue(context, { issueNumber: input.issueNumber, body: historyBody });
   let closureComment: IssueCommentReadback | undefined;
-  if (closeReason !== undefined)
+  if (closureBody !== undefined)
     closureComment = await commentIssue(context, {
       issueNumber: input.issueNumber,
-      body: `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`,
+      body: closureBody,
     });
   if (priorContent !== undefined) {
     const current = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
@@ -1232,16 +1304,7 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
     );
   }
   const info = await issueInfo(context, input.issueNumber);
-  const status =
-    info.state === 'closed' || info.projectStatus === 'Done'
-      ? 'Done'
-      : info.blockedBy.length > 0
-        ? 'Blocked'
-        : input.park === true || input.blockedBy !== undefined || info.projectStatus === null
-          ? 'Todo'
-          : info.projectStatus === 'In Progress' || (info.projectStatus === 'Blocked' && input.state === undefined)
-            ? info.projectStatus
-            : 'Todo';
+  const status = updateProjectStatus(info, input);
   const issue = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
   await syncIssueProjectStatus({
     graphql: clients.graphql,
@@ -1268,6 +1331,280 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
     ...(closure === undefined || closureComment === undefined
       ? {}
       : { closure: { ...closure, supersededBy: input.supersededBy ?? null, comment: closureComment } }),
+  };
+}
+
+export interface BatchUpdateIssueInput {
+  items: (UpdateIssueInput & { repo?: string })[];
+  dryRun?: boolean;
+}
+interface UpdateProjection {
+  readback: IssueInfo;
+  values: Record<string, unknown>;
+}
+interface BatchUpdateItemResult {
+  issueNumber: number;
+  status: 'planned' | 'applied' | 'unchanged' | 'failed';
+  changes?: Record<string, unknown>;
+  readback: IssueInfo | null;
+  relatedReadback?: Record<string, unknown>;
+  reason?: string;
+  readbackError?: string;
+  diagnostics?: ReturnType<typeof getMachineRequestDiagnostics>;
+}
+
+/** Read-only inspection of the same authenticated closure journal used by updateIssue. */
+async function hasUpdateComment(context: DeliveryContext, issueNumber: number, body: string): Promise<boolean> {
+  if (!context.clients.authenticatedAuthor) throw new DeliveryError('Authenticated update journal author is missing.');
+  const actor = (await context.clients.authenticatedAuthor()).actorLogin;
+  if (!actor) throw new DeliveryError('Update journal author identity is missing.');
+  const matches: { id: number; html_url: string }[] = [];
+  let complete = false;
+  for (let page = 1; page <= 20; page++) {
+    const comments = (
+      await context.clients.rest.issues.listComments({
+        ...context.repo,
+        issue_number: issueNumber,
+        per_page: 100,
+        page,
+      })
+    ).data;
+    matches.push(
+      ...comments.filter(
+        (comment) => comment.user?.login?.toLowerCase() === actor.toLowerCase() && comment.body === body,
+      ),
+    );
+    if (comments.length < 100) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete) throw new DeliveryError('Update journal readback exceeds the bounded history window.');
+  if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
+  if (!matches[0]) return false;
+  await readAuthoredIssueComment(context, issueNumber, matches[0], body, actor);
+  return true;
+}
+
+async function updateProjection(context: DeliveryContext, plan: PreparedIssueUpdate): Promise<UpdateProjection> {
+  const { input } = plan;
+  const readback = await issueInfo(context, input.issueNumber);
+  const values: Record<string, unknown> = { ...readback };
+  if (input.blockedBy !== undefined) {
+    values.blockedBy = (
+      await getNativeBlockerRelationships({
+        graphql: context.clients.graphql,
+        repo: context.repo,
+        issueNumber: input.issueNumber,
+      })
+    ).blockers
+      .map((value) => value.number)
+      .sort((a, b) => a - b);
+  }
+  if (input.parentIssueNumber !== undefined && input.parentIssueNumber !== null) {
+    const metadata = await getConfiguredNativeIssueMetadata({
+      issueNumber: input.parentIssueNumber,
+      ...context.repo,
+      rest: context.clients.rest,
+      settings: nativeIssueSettingsFromDeliveryConfig(context.config),
+    });
+    values.parentPoints = { issueNumber: input.parentIssueNumber, points: metadata.points ?? null };
+  }
+  if (input.blocks !== undefined) {
+    values.blocks = await Promise.all(
+      [...new Set(input.blocks)].map(async (dependent) => ({
+        issueNumber: dependent,
+        linked: (
+          await getNativeBlockerRelationships({
+            graphql: context.clients.graphql,
+            repo: context.repo,
+            issueNumber: dependent,
+          })
+        ).blockers.some((value) => value.number === input.issueNumber),
+      })),
+    );
+  }
+  if (plan.closeReason !== undefined) {
+    const closure = await readIssueClosure(context, input.issueNumber);
+    values.closeReason = closure.closeReason;
+    if (plan.closeReason === 'duplicate' && input.supersededBy !== undefined)
+      values.supersededBy = closure.duplicateOf?.number ?? null;
+    values.closureComment = await hasUpdateComment(context, input.issueNumber, plan.closureBody!);
+  }
+  return { readback, values };
+}
+
+async function desiredUpdateValues(
+  context: DeliveryContext,
+  plan: PreparedIssueUpdate,
+): Promise<Record<string, unknown>> {
+  const { input } = plan;
+  const values: Record<string, unknown> = {};
+  for (const key of [
+    'title',
+    'body',
+    'issueType',
+    'points',
+    'priority',
+    'milestone',
+    'state',
+    'parentIssueNumber',
+  ] as const) {
+    if (input[key] !== undefined) values[key] = input[key];
+  }
+  if (plan.acceptedLabels !== undefined) values.labels = [...plan.acceptedLabels].sort();
+  let openBlockers = plan.currentContent.blockedBy;
+  if (input.blockedBy !== undefined) {
+    values.blockedBy = [...new Set(input.blockedBy)].sort((a, b) => a - b);
+    const targets = await Promise.all(
+      input.blockedBy.map(
+        async (number) => (await context.clients.rest.issues.get({ ...context.repo, issue_number: number })).data,
+      ),
+    );
+    openBlockers = targets.filter((target) => target.state === 'open').map((target) => target.number);
+  }
+  values.projectStatus = updateProjectStatus(
+    {
+      ...plan.currentContent,
+      state: input.state ?? plan.currentContent.state,
+      blockedBy: openBlockers,
+    },
+    input,
+  );
+  if (input.parentIssueNumber !== undefined && input.parentIssueNumber !== null)
+    values.parentPoints = { issueNumber: input.parentIssueNumber, points: null };
+  if (input.blocks !== undefined)
+    values.blocks = [...new Set(input.blocks)].map((issueNumber) => ({ issueNumber, linked: true }));
+  if (plan.closeReason !== undefined) {
+    values.closeReason = plan.closeReason;
+    if (plan.closeReason === 'duplicate' && input.supersededBy !== undefined) values.supersededBy = input.supersededBy;
+    values.closureComment = true;
+  }
+  return values;
+}
+
+function pendingUpdateValues(
+  desired: Record<string, unknown>,
+  actual: Record<string, unknown>,
+): Record<string, unknown> {
+  const labels = (value: unknown): unknown =>
+    Array.isArray(value) && value.every((label: unknown): label is string => typeof label === 'string')
+      ? value.map((label) => label.toLowerCase()).sort()
+      : value;
+  return Object.fromEntries(
+    Object.entries(desired).filter(
+      ([key, value]) =>
+        JSON.stringify(key === 'labels' ? labels(value) : value) !==
+        JSON.stringify(key === 'labels' ? labels(actual[key]) : actual[key]),
+    ),
+  );
+}
+
+/** One serial operation; each application uses the existing single-update mutation owner. */
+export async function batchUpdateIssues(context: DeliveryContext, input: BatchUpdateIssueInput, signal?: AbortSignal) {
+  if (context.clients.role !== 'author') throw new DeliveryError('Batch updates require the configured author role.');
+  if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 50)
+    throw new DeliveryError('Provide 1–50 batch items.');
+  const repository = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+  if (input.items.some((item) => item.repo !== undefined && item.repo.toLowerCase() !== repository))
+    throw new DeliveryError('Every batch item must use the selected repository.');
+  const results: BatchUpdateItemResult[] = [];
+  const rateLimits: RateLimitDiagnostics[] = [];
+  const priorRateObservation = context.clients.rateLimitObservation?.();
+  let limited = false;
+  for (const { repo: _repo, ...item } of input.items) {
+    if (limited || signal?.aborted) {
+      results.push({
+        issueNumber: item.issueNumber,
+        status: 'failed',
+        reason: limited ? 'Not attempted: GitHub rate limit exhausted.' : 'Not attempted: operation cancelled.',
+        readback: null,
+        readbackError: 'No new readback requested after rate-limit exhaustion or cancellation.',
+      });
+      continue;
+    }
+    let phase = 'preparation';
+    try {
+      const plan = await prepareIssueUpdate(context, item);
+      const desired = await desiredUpdateValues(context, plan);
+      const before = await updateProjection(context, plan);
+      if (JSON.stringify(before.readback) !== JSON.stringify(plan.currentContent))
+        throw new DeliveryError('Native issue changed during batch preparation; reconcile the current state.');
+      if (context.clients.rateLimitObservation?.() !== priorRateObservation)
+        throw new DeliveryError('A native request exhausted its rate limit during batch preparation.');
+      const changes = pendingUpdateValues(desired, before.values);
+      if (Object.keys(changes).length === 0 || input.dryRun === true) {
+        results.push({
+          issueNumber: item.issueNumber,
+          status: Object.keys(changes).length === 0 ? 'unchanged' : 'planned',
+          changes,
+          readback: before.readback,
+          relatedReadback: before.values,
+        });
+        continue;
+      }
+      phase = 'application';
+      await applyIssueUpdate(context, {
+        ...plan,
+        priorContent: { title: before.readback.title, body: before.readback.body },
+      });
+      phase = 'readback';
+      const after = await updateProjection(context, plan);
+      if (Object.keys(pendingUpdateValues(desired, after.values)).length)
+        throw new DeliveryError('Native batch readback disagrees with the requested outcomes.');
+      results.push({
+        issueNumber: item.issueNumber,
+        status: 'applied',
+        changes,
+        readback: after.readback,
+        relatedReadback: after.values,
+      });
+    } catch (error) {
+      const observed = context.clients.rateLimitObservation?.();
+      const limit = getRateLimitDiagnostics(error) ?? (observed !== priorRateObservation ? observed : undefined);
+      if (limit !== undefined) {
+        limited = true;
+        rateLimits.push(limit);
+      }
+      const diagnostics = getMachineRequestDiagnostics(error);
+      const failed: BatchUpdateItemResult = {
+        issueNumber: item.issueNumber,
+        status: 'failed',
+        readback: null,
+        reason:
+          limit !== undefined
+            ? 'GitHub rate limit exhausted; reconcile native state before retrying.'
+            : `Issue update ${phase} failed; inspect native readback before retrying.`,
+        ...(diagnostics === undefined ? {} : { diagnostics }),
+      };
+      if (!limited && !signal?.aborted) {
+        try {
+          failed.readback = await issueInfo(context, item.issueNumber);
+        } catch (readbackError) {
+          const latest = context.clients.rateLimitObservation?.();
+          const readbackLimit =
+            getRateLimitDiagnostics(readbackError) ?? (latest !== priorRateObservation ? latest : undefined);
+          if (readbackLimit !== undefined) {
+            limited = true;
+            rateLimits.push(readbackLimit);
+          }
+          failed.readbackError = 'Native issue readback unavailable; reconcile this existing issue before retrying.';
+        }
+      } else failed.readbackError = 'Readback deferred after rate-limit exhaustion or cancellation.';
+      results.push(failed);
+    }
+  }
+  return {
+    dryRun: input.dryRun === true,
+    results,
+    summary: {
+      total: results.length,
+      applied: results.filter((item) => item.status === 'applied').length,
+      planned: results.filter((item) => item.status === 'planned').length,
+      unchanged: results.filter((item) => item.status === 'unchanged').length,
+      failed: results.filter((item) => item.status === 'failed').length,
+      rateLimits,
+    },
   };
 }
 

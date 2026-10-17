@@ -65,6 +65,26 @@ Save this UTF-8 typed field object as `/owned/issue.json` in your task-owned dir
 }
 ```
 
+## Batch tracking updates
+
+For an authorized list of 1–50 current-repository updates, use
+`issue_batch_update({repo, items, dryRun})`, or the CLI
+`batch:update --items-file <UTF-8-JSON-array> [--dry-run]`. Each item supports the
+complete `issue_update` contract, including close, defer/undefer, parent,
+blockers, status, typed contract and history/render-retention fields. A per-item
+repository must match the selected repository. Existing author and native guards
+still apply; this tool adds no authority or live fixture permission.
+
+Use dry run for read-only intent: it performs no writes, including journals,
+history, metadata, Project or related-issue changes. Inspect each ordered plan
+and current readback. Execution returns applied/unchanged/failed results for all
+items and a summary; CLI retains complete JSON and exits nonzero for any failure.
+Partial writes remain failed with observed state or an explicit unavailable
+readback. Reconcile that existing state before retrying; a rerun skips satisfied
+outcomes and reuses authored comments. Rate exhaustion stops remaining writes,
+reports every remaining item and exposes only numeric rate-limit observations.
+No cross-repository transaction, rollback or automatic mutation replay is implied.
+
 ## CLI fallback
 
 Use the installed CLI when MCP is unavailable only if the user's requested tool/provider restrictions permit that fallback. An MCP-only request, “no other GitHub tool,” or unavailable/incompatible requested-provider stop above does not authorize CLI substitution. Substitute your configured author identity, intended repository, owned JSON path and actual issue number. Explicit CLI values override the corresponding field-file values; omitted flags preserve them. `--fields-file` accepts the same typed field patch used by MCP. These commands perform real native operations only under your already authorized lifecycle:
