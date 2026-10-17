@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { test, vi } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createAiDeliveryMcpServer } from './mcp/index.js';
+import { inertTarget } from './fixtures/inertTarget.js';
 
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import * as issue from './issue.js';
@@ -329,4 +333,126 @@ test('journal evidence rejects local hosts and IP literals while accepting publi
     assert.equal(tool.inputSchema.safeParse({ ...input, evidence: [`https://${host}/evidence`] }).success, false, host);
   for (const host of ['github.com', '10.docs.example.com'])
     assert.equal(tool.inputSchema.safeParse({ ...input, evidence: [`https://${host}/evidence`] }).success, true, host);
+});
+
+test('registered journal tool returns actionable decision refusals before native writes', async ({ signal }) => {
+  const f = inertTarget(signal);
+  const server = createAiDeliveryMcpServer({ repoRoot: f.root, signal });
+  const client = new Client({ name: 'journal-contract-fixture', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const common = {
+    repo: 'example/widget',
+    issueNumber: 17,
+    summary: 'Parser validation is ready.',
+    status: 'In progress',
+    nextStep: 'Review the parser',
+    nextDate: null,
+    keyNumbers: [],
+    evidence: ['https://github.com/example/widget/pull/23'],
+  };
+  const decision = {
+    ...common,
+    kind: 'decision',
+    decision: 'Use the existing parser',
+    rationale: 'Preserves compatibility',
+  };
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    // A successful call first proves the synthetic external ports and real dispatch are wired correctly.
+    const valid = await client.callTool({ name: 'issue_comment', arguments: decision });
+    assert.notEqual(valid.isError, true, JSON.stringify(valid));
+    assert.equal(f.comments.length, 1);
+    const before = f.calls.length;
+    const { rationale: _rationale, ...missingRationale } = decision;
+    const refused = await client.callTool({ name: 'issue_comment', arguments: missingRationale });
+    assert.equal(refused.isError, true);
+    assert.equal(f.comments.length, 1, 'the invalid call makes zero additional native writes');
+    assert.equal(f.calls.length, before, 'refusal precedes external authentication and reads');
+    const text = JSON.stringify(refused);
+    assert.doesNotMatch(text, /-32602|Input validation error/u, 'a normal contract refusal must reach the handler');
+    assert.match(text, /rationale/u);
+    assert.match(text, /[Pp]rovide/u, 'the refusal explains the correction');
+    const listed = (await client.listTools()).tools.find((tool) => tool.name === 'issue_comment');
+    assert.ok(listed);
+    assert.match(listed.description ?? '', /decision: non-empty decision and rationale/u);
+    const properties = listed.inputSchema.properties as Record<string, { description?: string }>;
+    for (const field of ['decision', 'rationale'])
+      assert.match(properties[field]?.description ?? '', /Required non-empty text when kind is decision/u);
+    assert.match(properties.kind?.description ?? '', /progress: done, decisionNeeded and non-empty evidence/u);
+    assert.equal(listed.inputSchema.additionalProperties, false);
+
+    const { decision: _decision, ...missingDecision } = decision;
+    for (const invalid of [
+      missingDecision,
+      { ...missingRationale, decision: 'PRIVATE_INPUT_SENTINEL' },
+      { ...decision, rationale: '' },
+      { ...decision, rationale: 17 },
+      { ...decision, kind: 'PRIVATE_INPUT_SENTINEL' },
+      { ...decision, unknown: 'PRIVATE_INPUT_SENTINEL' },
+      { ...decision, outcome: 'PRIVATE_INPUT_SENTINEL' },
+      { ...common, kind: 'start' },
+      { ...common, kind: 'progress', done: ['Validated'], decisionNeeded: 'None', evidence: [] },
+      { ...common, kind: 'blocker', blocker: 'Review pending' },
+      { ...common, kind: 'closeout', acceptance: [], followUps: [] },
+    ]) {
+      const invalidResult = await client.callTool({ name: 'issue_comment', arguments: invalid });
+      assert.equal(invalidResult.isError, true);
+      assert.doesNotMatch(JSON.stringify(invalidResult), /PRIVATE_INPUT_SENTINEL/u);
+      assert.equal(f.comments.length, 1, 'invalid journals never create a native comment');
+      assert.equal(f.calls.length, before, 'invalid journals stop before external ports');
+    }
+
+    const renderedDecision = f.comments[0]!.body;
+    assert.match(
+      renderedDecision,
+      /^Parser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
+    );
+    assert.match(renderedDecision, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
+    const retry = await client.callTool({ name: 'issue_comment', arguments: decision });
+    assert.notEqual(retry.isError, true);
+    const retried = JSON.parse((retry.content as { text: string }[])[0]!.text) as {
+      body: string;
+      reused: boolean;
+      commentId: number;
+      url: string;
+    };
+    assert.equal(retried.reused, true);
+    assert.equal(retried.body, renderedDecision);
+    assert.equal(retried.commentId, 101);
+    assert.equal(retried.url, 'https://github.com/example/widget/issues/17#issuecomment-101');
+    assert.equal(f.comments.length, 1);
+    for (const [variant, section] of [
+      [{ ...common, kind: 'start', outcome: 'Deliver validation' }, '**Outcome:** Deliver validation'],
+      [
+        { ...common, kind: 'progress', done: ['Validated'], decisionNeeded: 'None' },
+        '**Done since last:**\n- Validated',
+      ],
+      [
+        { ...common, kind: 'blocker', blocker: 'Review pending', resolution: 'Independent acceptance' },
+        '**Resolution needed:** Independent acceptance',
+      ],
+      [
+        {
+          ...common,
+          kind: 'closeout',
+          acceptance: [{ criterion: 'Validation works', evidence: common.evidence[0] }],
+          followUps: [],
+        },
+        '**Follow-ups:** None.',
+      ],
+    ] as const) {
+      const accepted = await client.callTool({ name: 'issue_comment', arguments: variant });
+      assert.notEqual(accepted.isError, true, JSON.stringify(accepted));
+      const value = JSON.parse((accepted.content as { text: string }[])[0]!.text) as { body: string; reused: boolean };
+      assert.equal(value.reused, false);
+      assert.ok(value.body.includes(section));
+      assert.equal(value.body, f.comments.at(-1)!.body, 'response retains authoritative native readback');
+    }
+    assert.equal(f.comments.length, 5, 'all five valid journal kinds remain usable');
+  } finally {
+    await client.close();
+    await server.close();
+    await f.dispose(undefined);
+  }
 });

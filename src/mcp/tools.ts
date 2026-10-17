@@ -117,7 +117,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_comment',
     commandName: 'comment',
-    description: 'Post a typed issue journal with authoritative comment readback',
+    description:
+      'Post a typed issue journal with authoritative comment readback. Provide the fields required by kind: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: non-empty decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps. Omit fields belonging to other kinds.',
     inputSchema: z
       .strictObject({ ...JournalInputSchema.shape, repo: Repo })
       .superRefine(({ repo: _repo, ...journal }, ctx) => {
