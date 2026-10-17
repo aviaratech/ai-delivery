@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { z } from 'zod';
 
 import type {
@@ -370,7 +371,12 @@ function prepareIssueWrite(
   const unchangedContract =
     currentParsed !== undefined && JSON.stringify(issue) === JSON.stringify(currentParsed.issue);
   const legacyFormatting = unchangedContract && parsed.legacyFormatting === true;
-  const base = parsed.status ?? currentParsed?.status;
+  let base = parsed.status ?? currentParsed?.status;
+  if (unchangedContract && parsed.status && currentParsed?.status) {
+    const { lastUpdated: _requestedTimestamp, ...requestedDisplay } = parsed.status;
+    const { lastUpdated: _liveTimestamp, ...liveDisplay } = currentParsed.status;
+    if (JSON.stringify(requestedDisplay) === JSON.stringify(liveDisplay)) base = currentParsed.status;
+  }
   const proposed: IssueStatusData = {
     state: issue.draft ? 'Draft' : 'Ready',
     lastUpdated: base?.lastUpdated ?? new Date(Date.now()).toISOString(),
@@ -1390,16 +1396,37 @@ async function updateProjection(context: DeliveryContext, plan: PreparedIssueUpd
   const { input } = plan;
   const readback = await issueInfo(context, input.issueNumber);
   const values: Record<string, unknown> = { ...readback };
-  if (input.blockedBy !== undefined) {
-    values.blockedBy = (
-      await getNativeBlockerRelationships({
-        graphql: context.clients.graphql,
-        repo: context.repo,
-        issueNumber: input.issueNumber,
-      })
-    ).blockers
-      .map((value) => value.number)
-      .sort((a, b) => a - b);
+  const relationships = async (issueNumber: number) => {
+    const native = await getNativeBlockerRelationships({
+      graphql: context.clients.graphql,
+      repo: context.repo,
+      issueNumber,
+      requireRepositoryIdentity: true,
+    });
+    const repository = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+    const edges = [
+      ...native.blockers,
+      ...(native.parentNumber === null
+        ? []
+        : [{ number: native.parentNumber, id: native.parentId, repository: native.parentRepository }]),
+    ];
+    if (edges.some((edge) => edge.repository?.toLowerCase() !== repository))
+      throw new DeliveryError('Native batch relationship belongs to a different repository.');
+    const targets = await resolveNativeRelationshipTargets({
+      blockers: edges.map((edge) => edge.number),
+      repo: context.repo,
+      rest: context.clients.rest,
+    });
+    if (edges.some((edge) => edge.id !== targets.blockerNodeIds.get(edge.number)))
+      throw new DeliveryError('Native batch relationship node identity disagrees with its repository issue.');
+    return native;
+  };
+  if (input.blockedBy !== undefined || input.parentIssueNumber !== undefined) {
+    const native = await relationships(input.issueNumber);
+    if (native.parentNumber !== readback.parentIssueNumber)
+      throw new DeliveryError('Native parent changed during batch readback; reconcile the current state.');
+    if (input.blockedBy !== undefined)
+      values.blockedBy = native.blockers.map((value) => value.number).sort((a, b) => a - b);
   }
   if (input.parentIssueNumber !== undefined && input.parentIssueNumber !== null) {
     const metadata = await getConfiguredNativeIssueMetadata({
@@ -1414,13 +1441,7 @@ async function updateProjection(context: DeliveryContext, plan: PreparedIssueUpd
     values.blocks = await Promise.all(
       [...new Set(input.blocks)].map(async (dependent) => ({
         issueNumber: dependent,
-        linked: (
-          await getNativeBlockerRelationships({
-            graphql: context.clients.graphql,
-            repo: context.repo,
-            issueNumber: dependent,
-          })
-        ).blockers.some((value) => value.number === input.issueNumber),
+        linked: (await relationships(dependent)).blockers.some((value) => value.number === input.issueNumber),
       })),
     );
   }
@@ -1500,6 +1521,34 @@ function pendingUpdateValues(
   );
 }
 
+function localBatchFailureReason(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || types.isProxy(error)) return undefined;
+  const prototype: unknown = Object.getPrototypeOf(error);
+  if (prototype === IssueValidationError.prototype) return 'Requested issue fields do not satisfy the issue contract.';
+  if (prototype !== DeliveryError.prototype) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(error, 'message');
+  const message: unknown = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  if (typeof message !== 'string') return undefined;
+  if (
+    [
+      'Unsupported configured Issue Type.',
+      'Unsupported configured Points value.',
+      'Unsupported configured Priority value.',
+      'Native batch relationship belongs to a different repository.',
+      'Native batch relationship node identity disagrees with its repository issue.',
+      'Native parent changed during batch readback; reconcile the current state.',
+      'Native issue changed during batch preparation; reconcile the current state.',
+      'Native batch readback disagrees with the requested outcomes.',
+    ].includes(message)
+  )
+    return message;
+  if (message.startsWith('Unknown repository label(s): '))
+    return 'One or more requested labels do not exist in the selected repository.';
+  if (/^Adding a blocker to active issue #\d+ requires overrideReason\.$/u.test(message))
+    return 'Adding a blocker to an active issue requires overrideReason.';
+  return undefined;
+}
+
 /** One serial operation; each application uses the existing single-update mutation owner. */
 export async function batchUpdateIssues(context: DeliveryContext, input: BatchUpdateIssueInput, signal?: AbortSignal) {
   if (context.clients.role !== 'author') throw new DeliveryError('Batch updates require the configured author role.');
@@ -1574,7 +1623,8 @@ export async function batchUpdateIssues(context: DeliveryContext, input: BatchUp
         reason:
           limit !== undefined
             ? 'GitHub rate limit exhausted; reconcile native state before retrying.'
-            : `Issue update ${phase} failed; inspect native readback before retrying.`,
+            : (localBatchFailureReason(error) ??
+              `Issue update ${phase} failed; inspect native readback before retrying.`),
         ...(diagnostics === undefined ? {} : { diagnostics }),
       };
       if (!limited && !signal?.aborted) {

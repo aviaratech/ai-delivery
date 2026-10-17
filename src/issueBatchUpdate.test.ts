@@ -33,7 +33,15 @@ function batchFixture() {
     }),
   );
   const writes: string[] = [];
-  const controls = { failAfterWrite: 0, failReadback: 0, driftOnRead: 0, rateLimited: 0, ignoreLabels: false };
+  const controls = {
+    failAfterWrite: 0,
+    failReadback: 0,
+    driftOnRead: 0,
+    rateLimited: 0,
+    ignoreLabels: false,
+    parentRepository: 'example/widget',
+    parentNodeId: '',
+  };
   const reads = new Map<number, number>();
   const metadata = new Map<number, Record<string, string>>();
   const parents = new Map<number, number>();
@@ -217,9 +225,9 @@ function batchFixture() {
               issue: {
                 parent: parents.has(number)
                   ? {
-                      id: `ISSUE${parents.get(number)}`,
+                      id: controls.parentNodeId || `ISSUE${parents.get(number)}`,
                       number: parents.get(number),
-                      repository: { nameWithOwner: 'example/widget' },
+                      repository: { nameWithOwner: controls.parentRepository },
                     }
                   : null,
                 blockedBy: {
@@ -356,6 +364,66 @@ async function runBatch(input: issue.BatchUpdateIssueInput) {
     { repoRoot: '/synthetic', identity: 'host-author' },
   ) as Promise<Awaited<ReturnType<typeof issue.batchUpdateIssues>>>;
 }
+
+test('the first canonical-body retry preserves its generated timestamp and adds no history', async () => {
+  const f = batchFixture();
+  const body = renderIssueBody(
+    IssueFields.parse({ title: 'Synthetic item 1', draft: true, problem: 'Changed contract' }),
+    {
+      state: 'Draft',
+      lastUpdated: '2026-01-01T00:00:00.000Z',
+      nextMilestone: 'Not started',
+      blockers: 'None',
+      latestJournal: 'None yet',
+    },
+  );
+  const input = { items: [{ issueNumber: 1, body, preserveHistory: true }] };
+  const first = await runBatch(input);
+  assert.equal(first.results[0]!.status, 'applied', JSON.stringify(first));
+  const writtenBody = f.rows.get(1)!.body;
+  const writes = [...f.writes];
+  const comments = [...f.comments];
+  const retry = await runBatch(input);
+  assert.equal(retry.results[0]!.status, 'unchanged', JSON.stringify(retry));
+  assert.equal(f.rows.get(1)!.body, writtenBody);
+  assert.deepEqual(f.writes, writes);
+  assert.deepEqual(f.comments, comments);
+});
+
+test.each([
+  ['foreign/repository', 'FOREIGN5'],
+  ['example/widget', 'DIFFERENT5'],
+])('same-number parent in %s with node %s cannot satisfy a batch retry', async (repository, nodeId) => {
+  const f = batchFixture();
+  const input = { items: [{ issueNumber: 1, parentIssueNumber: 5 }] };
+  assert.equal((await runBatch(input)).results[0]!.status, 'applied');
+  const writes = [...f.writes];
+  f.controls.parentRepository = repository;
+  f.controls.parentNodeId = nodeId;
+  const result = await runBatch(input);
+  assert.equal(result.results[0]!.status, 'failed', JSON.stringify(result));
+  assert.deepEqual(f.writes, writes);
+});
+
+test('correctable local batch refusals retain distinct bounded reasons', async () => {
+  const f = batchFixture();
+  const result = await runBatch({
+    items: [
+      { issueNumber: 1, priority: 'Unsupported' },
+      { issueNumber: 2, labels: ['unknown-label-private-content'] },
+      { issueNumber: 3, blocks: [4] },
+    ],
+  });
+  assert.deepEqual(
+    result.results.map((item) => item.status),
+    ['failed', 'failed', 'failed'],
+  );
+  assert.match(result.results[0]!.reason!, /configured Priority/u);
+  assert.match(result.results[1]!.reason!, /labels.*selected repository/u);
+  assert.match(result.results[2]!.reason!, /overrideReason/u);
+  assert.equal(JSON.stringify(result).includes('unknown-label-private-content'), false);
+  assert.deepEqual(f.writes, []);
+});
 
 test('mixed failures retain later results and a rerun reports unchanged native outcomes', async () => {
   const f = batchFixture();
