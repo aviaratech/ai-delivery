@@ -28,11 +28,30 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
   for (const tool of tools) {
     server.registerTool(
       tool.name,
-      { description: tool.description, inputSchema: tool.inputSchema },
+      {
+        description: tool.description,
+        // The SDK must leave journal kind refinements to the handler so missing
+        // conditional fields receive a safe, actionable contract refusal. Unknown
+        // property names stay private through a schema-local error message.
+        inputSchema:
+          tool.name === 'issue_comment'
+            ? z.strictObject(tool.inputSchema.shape, {
+                error: 'Invalid journal object. Provide only the advertised fields.',
+              })
+            : tool.inputSchema,
+      },
       async (args, extra) => {
         const parsed = tool.inputSchema.safeParse(args);
         if (!parsed.success) {
-          return { content: [{ type: 'text' as const, text: `Invalid arguments for ${tool.name}.` }], isError: true };
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Invalid arguments for ${tool.name}.${tool.name === 'issue_comment' ? ` ${tool.description}` : ''}`,
+              },
+            ],
+            isError: true,
+          };
         }
         try {
           const signal = context.signal === undefined ? extra.signal : AbortSignal.any([context.signal, extra.signal]);

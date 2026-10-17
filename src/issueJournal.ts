@@ -57,16 +57,25 @@ export type JournalInput = z.infer<typeof JournalVariants>;
 export const JournalInputSchema = z
   .strictObject({
     ...Common,
-    kind: z.enum(['start', 'progress', 'decision', 'blocker', 'closeout']),
+    kind: z
+      .enum(['start', 'progress', 'decision', 'blocker', 'closeout'])
+      .describe(
+        'Select a journal kind and provide its required fields: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps.',
+      ),
     outcome: Text.optional(),
     done: z.array(Text).min(1).optional(),
     decisionNeeded: Text.optional(),
-    decision: Text.optional(),
-    rationale: Text.optional(),
+    decision: Text.optional().describe('Required non-empty text when kind is decision; omit for every other kind.'),
+    rationale: Text.optional().describe('Required non-empty text when kind is decision; omit for every other kind.'),
     blocker: Text.optional(),
     resolution: Text.optional(),
     acceptance: z
-      .array(z.strictObject({ criterion: Text, evidence: Evidence }))
+      .array(
+        z.strictObject(
+          { criterion: Text, evidence: Evidence },
+          { error: 'Invalid acceptance entry. Provide only criterion and evidence.' },
+        ),
+      )
       .min(1)
       .optional(),
     followUps: z.array(Text).optional(),
