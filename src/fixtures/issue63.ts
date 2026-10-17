@@ -39,12 +39,15 @@ export function issue63Fixture() {
     [19, 'Queued'],
   ]);
   const writes: string[] = [];
+  const graphqlCalls: { query: string; variables: Record<string, unknown> }[] = [];
   const comments: { id: number; body: string; html_url: string; issue_url: string; user: { login: string } }[] = [];
   const history: Record<string, unknown>[] = [];
   const histories = new Map<number, Record<string, unknown>[]>();
   const controls = {
     timelineIncomplete: false,
     missingProjectIssue: undefined as number | undefined,
+    missingProjectStatus: undefined as number | undefined,
+    projectItemReadback: undefined as Record<string, unknown> | undefined,
     commentRace: undefined as (() => void) | undefined,
     actor: 'operator',
     corruptComment: false,
@@ -163,6 +166,7 @@ export function issue63Fixture() {
         },
       },
       graphql: async (query: string, v: Record<string, unknown>) => {
+        graphqlCalls.push({ query, variables: structuredClone(v) });
         if (query.includes('NativeIssueHistory'))
           return {
             repository: {
@@ -212,15 +216,18 @@ export function issue63Fixture() {
                       id: `ITEM${r.number}`,
                       isArchived: false,
                       content: { id: r.node_id },
-                      fieldValueByName: {
-                        name: statuses.get(r.number),
-                        optionId:
-                          statuses.get(r.number) === 'Active'
-                            ? 'ACTIVE'
-                            : statuses.get(r.number) === 'Waiting'
-                              ? 'BLOCKED'
-                              : 'TODO',
-                      },
+                      fieldValueByName:
+                        controls.missingProjectStatus === r.number
+                          ? null
+                          : {
+                              name: statuses.get(r.number),
+                              optionId:
+                                statuses.get(r.number) === 'Active'
+                                  ? 'ACTIVE'
+                                  : statuses.get(r.number) === 'Waiting'
+                                    ? 'BLOCKED'
+                                    : 'TODO',
+                            },
                     })),
                   pageInfo: { hasNextPage: false, endCursor: null },
                 },
@@ -245,6 +252,7 @@ export function issue63Fixture() {
                 name: statuses.get(n),
                 optionId: statuses.get(n) === 'Active' ? 'ACTIVE' : statuses.get(n) === 'Waiting' ? 'BLOCKED' : 'TODO',
               },
+              ...controls.projectItemReadback,
             },
           };
         }
@@ -267,5 +275,5 @@ export function issue63Fixture() {
       },
     },
   } as unknown as DeliveryContext;
-  return { context, ready, rows, edges, statuses, writes, comments, history, histories, controls };
+  return { context, ready, rows, edges, statuses, writes, graphqlCalls, comments, history, histories, controls };
 }
