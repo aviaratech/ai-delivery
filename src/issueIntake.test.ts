@@ -857,6 +857,146 @@ test('WIP capacity override refuses a mismatched native comment author and recon
   }
 });
 
+test.each(['edited', 'exact-and-edited'] as const)(
+  'WIP override retry refuses %s authored evidence with the same operation marker',
+  async (mode) => {
+    const f = fixture();
+    f.controls.capacityMode = true;
+    f.live.labels = ['critical'];
+    f.context.config = {
+      ...f.context.config,
+      wipLimits: [{ repository: 'example/widget', name: 'Critical work', match: { label: 'critical' }, limit: 0 }],
+    };
+    f.controls.journalFailure = true;
+    const input = { issueNumber: 17, overrideReason: 'Explicit synthetic capacity authorization.' };
+    assert.equal(Reflect.get(await startTrackedIssue(f.context, input), 'status'), 'start-incomplete');
+    assert.equal(f.comments.length, 1);
+    const original = f.comments[0]!;
+    const edited = original.body.replace('WIP capacity override.', 'Edited capacity override.');
+    if (mode === 'edited') original.body = edited;
+    else
+      f.comments.push({
+        ...original,
+        id: 92,
+        html_url: 'https://github.com/example/widget/issues/17#issuecomment-92',
+        body: edited,
+      });
+    const before = structuredClone(f.comments);
+    f.controls.journalFailure = false;
+    const result = await startTrackedIssue(f.context, input);
+    assert.equal(Reflect.get(result, 'status'), 'start-incomplete');
+    assert.match(Reflect.get(result, 'failure')!.message, /conflict|duplicate|override/iu);
+    assert.deepEqual(f.comments, before);
+    assert.equal(f.branchWrites.length, 1);
+    assert.equal(f.statusWrites.length, 0);
+    assert.equal(f.getStatus(), 'Queued');
+  },
+);
+
+test.each(
+  (['text', 'number', 'date', 'single_select', 'multi_select'] as const).flatMap((type) =>
+    [17, 18].map((number) => ({ type, number })),
+  ),
+)('WIP refuses omitted $type payload on issue $number even with an override reason', async ({ type, number }) => {
+  const f = fixture();
+  f.controls.capacityMode = true;
+  f.capacity.push({ number: 18, label: 'other', value: 'High', status: 'Active' });
+  const value = type === 'number' ? 1 : type === 'date' ? '2026-10-17' : 'High';
+  f.context.config = {
+    ...f.context.config,
+    wipLimits: [{ repository: 'example/widget', name: 'Urgent work', match: { field: 'Urgency', value }, limit: 1 }],
+  };
+  let capacityReadStarted = false;
+  const list = f.context.clients.rest.issues.listForRepo;
+  f.context.clients.rest.issues.listForRepo = (async (input) => {
+    capacityReadStarted = true;
+    return list(input);
+  }) as typeof list;
+  const request = f.context.clients.rest.request;
+  f.context.clients.rest.request = (async (route, input) => {
+    const response = await request(route, input);
+    if (!capacityReadStarted || typeof route !== 'string' || !route.startsWith('GET ')) return response;
+    const rows = z.array(z.record(z.string(), z.unknown())).parse(response.data);
+    const catalog = route === 'GET /orgs/{org}/issue-fields';
+    return {
+      ...response,
+      data: rows.map((row) => {
+        if ((catalog ? row.id : row.issue_field_id) !== 102) return row;
+        if (catalog) return { ...row, data_type: type };
+        return {
+          issue_field_id: 102,
+          issue_field_name: 'Urgency',
+          data_type: type,
+          ...(input?.issue_number === number
+            ? {}
+            : type === 'single_select'
+              ? { single_select_option: { name: value } }
+              : type === 'multi_select'
+                ? { multi_select_options: [{ name: value }] }
+                : { value }),
+        };
+      }),
+    };
+  }) as typeof request;
+  await assert.rejects(
+    startTrackedIssue(f.context, { issueNumber: 17, overrideReason: 'Capacity cannot override missing evidence.' }),
+    /capacity|payload|field/iu,
+  );
+  assert.equal(f.branchWrites.length, 0);
+  assert.equal(f.statusWrites.length, 0);
+  assert.equal(f.membershipWrites.length, 0);
+  assert.equal(f.comments.length, 0);
+});
+
+test.each(['absent', 'null', 'empty-multi'] as const)(
+  'WIP accepts complete native %s peer values as nonmatching',
+  async (mode) => {
+    const f = fixture();
+    f.controls.capacityMode = true;
+    f.capacity.push({ number: 18, label: 'other', value: 'High', status: 'Active' });
+    const multi = mode === 'empty-multi';
+    f.context.config = {
+      ...f.context.config,
+      wipLimits: [
+        {
+          repository: 'example/widget',
+          name: 'Urgent work',
+          match: { field: multi ? 'Tags' : 'Urgency', value: multi ? '0' : 'High' },
+          limit: 1,
+        },
+      ],
+    };
+    const request = f.context.clients.rest.request;
+    f.context.clients.rest.request = (async (route, input) => {
+      const response = await request(route, input);
+      if (typeof route !== 'string' || !route.endsWith('/issue-field-values') || input?.issue_number !== 18)
+        return response;
+      const rows = z.array(z.record(z.string(), z.unknown())).parse(response.data);
+      return {
+        ...response,
+        data: rows.flatMap((row) =>
+          row.issue_field_id !== (multi ? 103 : 102)
+            ? [row]
+            : mode === 'absent'
+              ? []
+              : [
+                  {
+                    issue_field_id: row.issue_field_id,
+                    issue_field_name: row.issue_field_name,
+                    data_type: row.data_type,
+                    ...(multi ? { multi_select_options: [] } : { value: null }),
+                  },
+                ],
+        ),
+      };
+    }) as typeof request;
+    await startTrackedIssue(f.context, { issueNumber: 17 });
+    assert.equal(f.getStatus(), 'Active');
+    assert.equal(f.branchWrites.length, 1);
+    assert.equal(f.comments.length, 1);
+  },
+);
+
 test('WIP missing target and unknown native field evidence refuse rather than counting zero', async () => {
   for (const failure of ['target', 'field'] as const) {
     const f = fixture();

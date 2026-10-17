@@ -76,6 +76,15 @@ export async function commentIssue(
   input: IssueCommentInput,
   lifecycleKey?: string,
 ): Promise<IssueCommentReadback> {
+  return writeAuthenticatedIssueComment(context, input, lifecycleKey);
+}
+
+async function writeAuthenticatedIssueComment(
+  context: DeliveryContext,
+  input: IssueCommentInput,
+  lifecycleKey?: string,
+  rawMarker?: string,
+): Promise<IssueCommentReadback> {
   const accepted =
     'body' in input ? RawIssueCommentSchema.parse(input) : (JournalInputSchema.parse(input) as JournalInput);
   const rawBody = 'body' in accepted ? accepted.body : undefined;
@@ -84,7 +93,7 @@ export async function commentIssue(
   const marker =
     rawBody === undefined
       ? `<!-- ai-delivery:journal@1:${digestValue({ issueNumber: accepted.issueNumber, key: lifecycleKey ?? accepted })} -->`
-      : undefined;
+      : rawMarker;
   const body = rawBody ?? renderJournal(accepted as JournalInput, marker);
   if (body.length > ISSUE_COMMENT_BODY_LIMIT || !body.trim())
     throw new DeliveryError(
@@ -111,8 +120,11 @@ export async function commentIssue(
       matches.push(
         ...batch.filter(
           (comment) =>
-            (marker === undefined ? comment.body === body : comment.body?.endsWith(marker)) &&
-            comment.user?.login.toLowerCase() === actor.toLowerCase(),
+            (marker === undefined
+              ? comment.body === body
+              : rawMarker === undefined
+                ? comment.body?.endsWith(marker)
+                : comment.body?.includes(marker)) && comment.user?.login.toLowerCase() === actor.toLowerCase(),
         ),
       );
       if (batch.length < 100) break;
@@ -120,6 +132,8 @@ export async function commentIssue(
     }
     if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
     const existing = matches[0];
+    if (rawMarker !== undefined && existing && existing.body !== body)
+      throw new DeliveryError('Issue comment conflicts with its authored operation marker.');
     const created =
       existing ??
       (await context.clients.rest.issues.createComment({ ...context.repo, issue_number: input.issueNumber, body }))
@@ -828,6 +842,15 @@ export async function listIssues(
       )
         throw new DeliveryError('Native issue field readback conflicts with its catalog.');
       observed.add(field.issue_field_id);
+      if (
+        options.capacityRead &&
+        (field.data_type === 'single_select'
+          ? field.single_select_option === undefined && field.value !== null
+          : field.data_type === 'multi_select'
+            ? field.multi_select_options === undefined && field.value !== null
+            : field.value === undefined)
+      )
+        throw new DeliveryError('WIP capacity native field value payload is missing.');
       if (
         ((field.data_type === 'single_select' && !field.single_select_option) ||
           (field.data_type === 'multi_select' && field.multi_select_options === undefined)) &&
@@ -1580,10 +1603,11 @@ export async function assertIssueStartCapacity(
     if (!author.actorLogin || !author.credentialIdentity)
       throw new DeliveryError('WIP capacity author identity is incomplete.');
     const record = { ...evidence, author: author.actorLogin, reason };
-    const body = `WIP capacity override.\n\n\`\`\`json\n${JSON.stringify(record, null, 2)}\n\`\`\`\n\n<!-- ai-delivery:wip-override@1:${digestValue(record)} -->`;
+    const marker = `<!-- ai-delivery:wip-override@1:${digestValue(record)} -->`;
+    const body = `WIP capacity override.\n\n\`\`\`json\n${JSON.stringify(record, null, 2)}\n\`\`\`\n\n${marker}`;
     const publicRecord = validateIssue({ title: 'WIP capacity override', legacyBody: body, draft: true }, false);
     if (publicRecord.failures.length) throw new IssueValidationError(publicRecord.failures);
-    await commentIssue(context, { issueNumber, body });
+    await writeAuthenticatedIssueComment(context, { issueNumber, body }, undefined, marker);
     const finalAuthor = await context.clients.authenticatedAuthor();
     if (finalAuthor.actorLogin !== author.actorLogin || finalAuthor.credentialIdentity !== author.credentialIdentity)
       throw new DeliveryError('WIP capacity override author changed during comment verification.');
