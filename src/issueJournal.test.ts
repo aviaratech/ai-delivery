@@ -390,6 +390,13 @@ test('registered journal tool returns actionable decision refusals before native
       { ...decision, rationale: 17 },
       { ...decision, kind: 'PRIVATE_INPUT_SENTINEL' },
       { ...decision, unknown: 'PRIVATE_INPUT_SENTINEL' },
+      { ...decision, PRIVATE_INPUT_SENTINEL: 'private value' },
+      {
+        ...common,
+        kind: 'closeout',
+        acceptance: [{ criterion: 'Validated', evidence: common.evidence[0], PRIVATE_INPUT_SENTINEL: 'private value' }],
+        followUps: [],
+      },
       { ...decision, outcome: 'PRIVATE_INPUT_SENTINEL' },
       { ...common, kind: 'start' },
       { ...common, kind: 'progress', done: ['Validated'], decisionNeeded: 'None', evidence: [] },

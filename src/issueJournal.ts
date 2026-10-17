@@ -70,7 +70,12 @@ export const JournalInputSchema = z
     blocker: Text.optional(),
     resolution: Text.optional(),
     acceptance: z
-      .array(z.strictObject({ criterion: Text, evidence: Evidence }))
+      .array(
+        z.strictObject(
+          { criterion: Text, evidence: Evidence },
+          { error: 'Invalid acceptance entry. Provide only criterion and evidence.' },
+        ),
+      )
       .min(1)
       .optional(),
     followUps: z.array(Text).optional(),

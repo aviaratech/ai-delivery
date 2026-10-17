@@ -31,8 +31,14 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
       {
         description: tool.description,
         // The SDK must leave journal kind refinements to the handler so missing
-        // conditional fields receive a safe, actionable contract refusal.
-        inputSchema: tool.name === 'issue_comment' ? z.strictObject(tool.inputSchema.shape) : tool.inputSchema,
+        // conditional fields receive a safe, actionable contract refusal. Unknown
+        // property names stay private through a schema-local error message.
+        inputSchema:
+          tool.name === 'issue_comment'
+            ? z.strictObject(tool.inputSchema.shape, {
+                error: 'Invalid journal object. Provide only the advertised fields.',
+              })
+            : tool.inputSchema,
       },
       async (args, extra) => {
         const parsed = tool.inputSchema.safeParse(args);
