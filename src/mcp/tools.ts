@@ -9,6 +9,7 @@ import {
   issueInputSchema,
   CreateIssueStatus,
   IssueStatusPatch,
+  IssueDeferralPatch,
 } from '../issueContract.js';
 
 const Positive = z.number().int().positive();
@@ -240,6 +241,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
           milestone: Positive.nullable().optional(),
           parentIssueNumber: Positive.nullable().optional(),
           park: z.literal(true).optional(),
+          ...IssueDeferralPatch,
           points: IssueWriteFields.points,
           priority: z.string().min(1).optional(),
           state: z.enum(['open', 'closed']).optional(),
@@ -249,6 +251,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
           title: IssueWriteFields.title,
         })
         .superRefine((input, ctx) => {
+          if (input.defer !== undefined && input.undefer !== undefined)
+            ctx.addIssue({ code: 'custom', message: 'Choose defer or undefer, never both.', path: ['defer'] });
           if ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
             ctx.addIssue({
               code: 'custom',

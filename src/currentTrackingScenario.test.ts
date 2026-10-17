@@ -499,7 +499,11 @@ test('composes shipped tracking through one non-Git MCP session with persisted r
     assert.equal(storedJournal.user.login, 'operator');
     assert.match(journal.body, /Tracking replay is verified/u);
     await refuse('issue_defer', { issueNumber: 17, trigger: 'After review' });
-    await refuse('issue_update', { issueNumber: 17, defer: { trigger: 'After review' } });
+    const deferred = await call<IssueInfo>('issue_update', { issueNumber: 17, defer: { trigger: 'After review' } });
+    assert.deepEqual(deferred.deferred, { trigger: 'After review' });
+    assert.deepEqual((await call<IssueInfo>('issue_info', { issueNumber: 17 })).deferred, { trigger: 'After review' });
+    const undeferred = await call<IssueInfo>('issue_update', { issueNumber: 17, undefer: true });
+    assert.equal(undeferred.deferred, null);
     const closed = await call<
       IssueInfo & {
         closure: {

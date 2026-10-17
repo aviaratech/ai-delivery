@@ -1,7 +1,7 @@
 import { syntheticDiscoveryClients, syntheticOverrides } from '../fixtures/discovery.js';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +28,7 @@ import { resolveDeliveryRepo } from '../github/repo.js';
 import {
   readDeliveryOverrides,
   loadDeliveryConfig,
+  loadDeliverySettings,
   parseDeliveryConfig,
   resolveDeliveryRoleCredentials,
 } from './deliveryConfig.js';
@@ -143,6 +144,43 @@ function userConfig(path: string, config: ReturnType<typeof parseDeliveryConfig>
   );
   vi.stubEnv('AI_DELIVERY_CONFIG', path);
 }
+
+it('loads optional repository-scoped WIP limits without treating them as routing overrides', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'delivery-wip-config-'));
+  try {
+    const path = join(root, 'settings.json');
+    const configured = parseDeliveryConfig(syntheticConfig({ owner: 'example', repo: 'widget', projectNumber: 1 }));
+    userConfig(path, configured);
+    const base = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    assert.equal(Reflect.get(await loadDeliverySettings(), 'wipLimits'), undefined);
+    const lanes = [
+      { repository: 'example/widget', name: 'Urgent', match: { label: 'Needs Review' }, limit: 2 },
+      { repository: 'example/other', name: 'Urgent', match: { field: 'Priority', value: ' High ' }, limit: 0 },
+    ];
+    writeFileSync(path, JSON.stringify({ ...base, wipLimits: lanes }));
+    const settings = await loadDeliverySettings();
+    assert.deepEqual(Reflect.get(settings, 'wipLimits'), lanes);
+    assert.equal(Reflect.has(settings.overrides, 'wipLimits'), false);
+    const loaded = await loadDeliveryConfig(root, {
+      repository: 'example/widget',
+      clients: syntheticDiscoveryClients(configured),
+    });
+    assert.deepEqual(loaded.config.wipLimits, lanes);
+    for (const bad of [
+      [{ ...lanes[0], limit: -1 }],
+      [{ ...lanes[0], limit: 1.5 }],
+      [{ ...lanes[0], match: { label: 'urgent', field: 'Priority', value: 'High' } }],
+      [{ ...lanes[0], match: { field: 'Priority' } }],
+      [lanes[0], { ...lanes[0], repository: 'EXAMPLE/WIDGET' }],
+      [{ ...lanes[0], repository: 'not-a-repository' }],
+    ]) {
+      writeFileSync(path, JSON.stringify({ ...base, wipLimits: bad }));
+      await assert.rejects(loadDeliverySettings(), /wipLimits/u);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe('portable delivery configuration', () => {
   it('selects a configured personal author token without ambient fallback and keeps the reviewer App role', async () => {

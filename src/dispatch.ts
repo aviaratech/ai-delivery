@@ -17,6 +17,7 @@ import {
   resumeCreatedIssue,
   startIssueBranch,
   startIssueProject,
+  assertIssueStartCapacity,
   updateIssue,
   type CreateIssueInput,
   type ListIssuesInput,
@@ -120,6 +121,7 @@ export async function startTrackedIssue(
           : {}),
         repo: context.config.repository,
         issueNumber: number,
+        ...(input.overrideReason === undefined ? {} : { overrideReason: input.overrideReason }),
         ...((branch?.branch ?? optionalString(input, 'branch')) === undefined
           ? {}
           : { branch: branch?.branch ?? optionalString(input, 'branch') }),
@@ -214,10 +216,11 @@ export async function startTrackedIssue(
   try {
     const readiness = await readyCheck(context, number);
     if (!readiness.ready) throw new IssueValidationError(readiness.failures);
+    await assertIssueStartCapacity(context, number, optionalString(input, 'overrideReason'));
     branchAttempted = true;
     branch = await startIssueBranch(context, number, optionalString(input, 'branch'));
     phase = 'project-status';
-    await startIssueProject(context, number);
+    await startIssueProject(context, number, optionalString(input, 'overrideReason'));
     phase = 'journal';
     await journalIssueStart(context, number);
     return {
@@ -240,6 +243,7 @@ export async function startTrackedIssue(
         arguments: {
           repo: context.config.repository,
           issueNumber: number,
+          ...(input.overrideReason === undefined ? {} : { overrideReason: input.overrideReason }),
           ...((branch?.branch ?? optionalString(input, 'branch')) === undefined
             ? {}
             : { branch: branch?.branch ?? optionalString(input, 'branch') }),
