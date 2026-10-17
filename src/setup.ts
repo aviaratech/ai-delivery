@@ -1,14 +1,18 @@
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
+  readSync,
   rmSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { z } from 'zod';
 
@@ -209,6 +213,59 @@ function assertArchiveSnapshot(intent: StageRecord['intent']): string {
     throw new DeliveryError('Runtime stage archive snapshot bytes changed.');
   return path;
 }
+/** npm's hidden lock is only a cache. Completion requires the durable root file edge. */
+function assertDependencyMetadata(intent: StageRecord['intent']): void {
+  const readMetadata = (name: string): unknown => {
+    const path = canonicalPath(join(intent.runtimeDirectory, name));
+    const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = fstatSync(descriptor);
+      if (!before.isFile() || before.nlink !== 1 || before.size > 8 * 1024 ** 2)
+        throw new Error('Invalid dependency metadata file.');
+      const bytes = Buffer.alloc(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+        if (!count) throw new Error('Dependency metadata was truncated.');
+        offset += count;
+      }
+      fsyncSync(descriptor);
+      const after = fstatSync(descriptor);
+      const named = lstatSync(path);
+      for (const key of ['dev', 'ino', 'size', 'mode', 'nlink', 'uid', 'mtimeMs', 'ctimeMs'] as const)
+        if (before[key] !== after[key] || before[key] !== named[key])
+          throw new Error('Dependency metadata identity changed.');
+      return JSON.parse(bytes.toString('utf8')) as unknown;
+    } finally {
+      closeSync(descriptor);
+    }
+  };
+  try {
+    const root = z.strictObject({
+      dependencies: z.strictObject({ '@aviaratech/ai-delivery': z.literal('file:reviewed-archive.tgz') }),
+    });
+    root.parse(readMetadata('package.json'));
+    const lock = z
+      .object({
+        lockfileVersion: z.literal(3),
+        packages: z.record(z.string(), z.unknown()),
+      })
+      .parse(readMetadata('package-lock.json'));
+    root.parse(lock.packages['']);
+    const integrity = `sha512-${createHash('sha512')
+      .update(assertPrivateFile(assertArchiveSnapshot(intent)))
+      .digest('base64')}`;
+    z.object({
+      version: z.literal(intent.packageVersion),
+      resolved: z.literal('file:reviewed-archive.tgz'),
+      integrity: z.literal(integrity),
+    }).parse(lock.packages['node_modules/@aviaratech/ai-delivery']);
+    syncDirectory(intent.runtimeDirectory);
+  } catch {
+    throw new DeliveryError('Runtime stage dependency metadata is missing, incompatible or corrupt.');
+  }
+}
+
 async function controller(
   input: SetupControllerInput,
   command: 'runtime:stage' | 'runtime:admit',
@@ -276,6 +333,7 @@ function readStage(directory: string): StageRecord {
   if (record.status === 'complete') {
     assertArchiveSnapshot(record.intent);
     assertNativePlugin(record.intent);
+    assertDependencyMetadata(record.intent);
   }
   return record;
 }
@@ -385,6 +443,7 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
           durability(join(input.runtimeDirectory, 'runtime-stage.json'));
           syncDirectory(dirname(input.runtimeDirectory));
           await runner.checkResources();
+          assertDependencyMetadata(intent);
           return stageResult(prior, reread.reviewRoute, true);
         }
         runner.assertQuiescent();
@@ -432,7 +491,7 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
             '--ignore-scripts',
             '--no-audit',
             '--no-fund',
-            '--package-lock=false',
+            '--package-lock=true',
             '--cache',
             cache,
             '--logs-dir',
@@ -460,6 +519,7 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
         assertArchive(input.archivePath, input.expectedArchiveSha256);
         assertArchiveSnapshot(intent);
         assertNativePlugin(intent);
+        assertDependencyMetadata(intent);
         const admission = buildRuntimeAdmission({
           ...runtimePaths(input.runtimeDirectory, input.nativePluginRoot),
           packageVersion: input.packageVersion,
@@ -497,6 +557,7 @@ export async function stageRuntime(input: StageRuntimeInput): Promise<RuntimeSta
             validateRuntimeAdmission(retained.admission!, final.configuration, retained.admission!.cliPath);
             durability(join(input.runtimeDirectory, 'runtime-stage.json'));
             syncDirectory(dirname(input.runtimeDirectory));
+            assertDependencyMetadata(intent);
             return stageResult(retained, final.reviewRoute, true);
           }
         }
@@ -545,6 +606,7 @@ export async function admitRuntime(
       assertStageController(record, current, input);
       assertArchive(record.intent.archivePath, record.intent.archiveSha256);
       assertArchiveSnapshot(record.intent);
+      assertDependencyMetadata(record.intent);
       validateRuntimeAdmission(record.admission, current.configuration, record.admission.cliPath);
       const desired = Buffer.from(`${JSON.stringify(record.admission, null, 2)}\n`);
       canonicalPath(path);
@@ -552,6 +614,7 @@ export async function admitRuntime(
       const reconcile = (): { admission: RuntimeAdmission; reused: boolean } => {
         canonicalPath(path);
         assertArchiveSnapshot(record.intent);
+        assertDependencyMetadata(record.intent);
         validateRuntimeAdmission(record.admission!, current.configuration, record.admission!.cliPath);
         if (!existsSync(path) || !assertPrivateFile(path).equals(desired))
           throw new DeliveryError('Runtime admission third-party replacement conflict; current bytes preserved.');
@@ -572,6 +635,7 @@ export async function admitRuntime(
       assertStageController(record, final, input);
       assertArchive(record.intent.archivePath, record.intent.archiveSha256);
       assertArchiveSnapshot(record.intent);
+      assertDependencyMetadata(record.intent);
       validateRuntimeAdmission(record.admission, final.configuration, record.admission.cliPath);
       canonicalPath(path);
       const priorNow = existsSync(path) ? assertPrivateFile(path) : undefined;
