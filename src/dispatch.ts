@@ -19,6 +19,8 @@ import {
   startIssueProject,
   assertIssueStartCapacity,
   updateIssue,
+  batchUpdateIssues,
+  type BatchUpdateIssueInput,
   type CreateIssueInput,
   type ListIssuesInput,
   type UpdateIssueInput,
@@ -320,6 +322,8 @@ export async function executeTool(
           expectedHeadSha: requireString(input, 'expectedHeadSha'),
         });
       return startTrackedIssue(context, input);
+    case 'issue_batch_update':
+      return batchUpdateIssues(context, input as unknown as BatchUpdateIssueInput, selectedExecution.signal);
     case 'issue_update':
       return updateIssue(context, input as unknown as UpdateIssueInput);
     case 'issue_list':

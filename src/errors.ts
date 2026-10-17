@@ -38,6 +38,60 @@ export interface SafeMachineRequestDiagnostics {
   readonly status: number | 'UNKNOWN';
   readonly code: (typeof codes)[number] | 'UNKNOWN';
   readonly requestId: string;
+  readonly rateLimit?: RateLimitDiagnostics;
+}
+export interface RateLimitDiagnostics {
+  readonly retryAfterSeconds?: number;
+  readonly resetAtSeconds?: number;
+  readonly remaining?: number;
+}
+
+function ownData(value: unknown, key: string): unknown {
+  if (typeof value !== 'object' || value === null || types.isProxy(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+function numericHeader(value: unknown): number | undefined {
+  if (typeof value === 'string' && /^(?:0|[1-9][0-9]{0,15})$/u.test(value)) value = Number(value);
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function rateLimit(
+  status: unknown,
+  retryAfter: unknown,
+  resetAt: unknown,
+  remainingValue: unknown,
+  graphqlFailure = false,
+): RateLimitDiagnostics | undefined {
+  const retryAfterSeconds = numericHeader(retryAfter);
+  const resetAtSeconds = numericHeader(resetAt);
+  const remaining = numericHeader(remainingValue);
+  if (
+    status !== 429 &&
+    !(status === 403 && (retryAfterSeconds !== undefined || remaining === 0)) &&
+    !(graphqlFailure && remaining === 0)
+  )
+    return undefined;
+  return Object.freeze({
+    ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+    ...(resetAtSeconds === undefined ? {} : { resetAtSeconds }),
+    ...(remaining === undefined ? {} : { remaining }),
+  });
+}
+
+/** Preserve only positive rate-limit identification and numeric timing, never remote error content. */
+export function getRateLimitDiagnostics(error: unknown, graphqlFailure = false): RateLimitDiagnostics | undefined {
+  const retained = getMachineRequestDiagnostics(error)?.rateLimit;
+  if (retained !== undefined) return retained;
+  const headers = ownData(error, 'headers') ?? ownData(ownData(error, 'response'), 'headers');
+  return rateLimit(
+    ownData(error, 'status'),
+    ownData(headers, 'retry-after'),
+    ownData(headers, 'x-ratelimit-reset'),
+    ownData(headers, 'x-ratelimit-remaining'),
+    graphqlFailure,
+  );
 }
 const diagnostics = new WeakMap<DeliveryError, Readonly<SafeMachineRequestDiagnostics>>();
 
@@ -49,6 +103,9 @@ export function setMachineRequestDiagnostics(
     status: unknown;
     code: unknown;
     requestId: unknown;
+    retryAfter?: unknown;
+    resetAt?: unknown;
+    remaining?: unknown;
   },
 ): void {
   if (!(error instanceof DeliveryError) || diagnostics.has(error)) return;
@@ -61,6 +118,13 @@ export function setMachineRequestDiagnostics(
     typeof value === 'string' && allowed.includes(value as T) ? (value as T) : 'UNKNOWN';
   const status = data('status'),
     requestId = data('requestId');
+  const observedRateLimit = rateLimit(
+    status,
+    data('retryAfter'),
+    data('resetAt'),
+    data('remaining'),
+    data('phase') === 'graphql.request',
+  );
   diagnostics.set(
     error,
     Object.freeze({
@@ -77,6 +141,7 @@ export function setMachineRequestDiagnostics(
         /^[A-Fa-f0-9]{4}(?::[A-Fa-f0-9]{4,32}){3,5}$/u.test(requestId)
           ? requestId
           : 'UNKNOWN',
+      ...(observedRateLimit === undefined ? {} : { rateLimit: observedRateLimit }),
     }),
   );
 }

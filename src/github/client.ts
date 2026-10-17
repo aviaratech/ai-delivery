@@ -8,7 +8,13 @@ import { types } from 'node:util';
 import type { DeliveryConfig, DeliveryRole } from '../config/deliveryConfig.js';
 
 import { resolveDeliveryRoleCredentials } from '../config/deliveryConfig.js';
-import { DeliveryError, setMachineRequestDiagnostics, type SafeMachineRequestDiagnostics } from '../errors.js';
+import {
+  DeliveryError,
+  setMachineRequestDiagnostics,
+  getRateLimitDiagnostics,
+  type RateLimitDiagnostics,
+  type SafeMachineRequestDiagnostics,
+} from '../errors.js';
 import {
   assertSupportedAuthorHost,
   machineAuthorEligible,
@@ -25,6 +31,8 @@ export interface GitHubClients {
   authenticatedAuthor?: (signal?: AbortSignal) => Promise<{ actorLogin: string; credentialIdentity: string }>;
   graphql: typeof GraphQLType;
   rest: Octokit;
+  /** Last positively identified request limit; retained across legacy helper error wrapping. */
+  rateLimitObservation?: () => RateLimitDiagnostics | undefined;
 }
 
 const authorGitTokens = new WeakMap<GitHubClients, string>();
@@ -337,6 +345,14 @@ function buildClients(
     headers: { authorization: `token ${token}` },
     ...(signal === undefined ? {} : { request: { signal } }),
   });
+  let observedRateLimit: RateLimitDiagnostics | undefined;
+  const observeRateLimit = (error: unknown, graphqlFailure = false) => {
+    observedRateLimit = getRateLimitDiagnostics(error, graphqlFailure) ?? observedRateLimit;
+  };
+  rest.hook.error('request', (error) => {
+    observeRateLimit(error);
+    throw error;
+  });
   if (machineSession)
     rest.hook.error('request', (error, options) => {
       const safe = safeMachineRequestError(error, 'rest.request', restMachineEndpoint(options));
@@ -360,16 +376,16 @@ function buildClients(
     role,
     ...(appActorLogin ? { appActorLogin } : {}),
     ...(authenticatedAuthor ? { authenticatedAuthor } : {}),
-    graphql: machineSession
-      ? new Proxy(rawGraphql, {
-          apply(target, receiver, args: unknown[]) {
-            return (Reflect.apply(target, receiver, args) as Promise<unknown>).catch((error: unknown) => {
-              throw safeMachineRequestError(error, 'graphql.request', 'graphql');
-            });
-          },
-        })
-      : rawGraphql,
+    graphql: new Proxy(rawGraphql, {
+      apply(target, receiver, args: unknown[]) {
+        return (Reflect.apply(target, receiver, args) as Promise<unknown>).catch((error: unknown) => {
+          observeRateLimit(error, true);
+          throw machineSession ? safeMachineRequestError(error, 'graphql.request', 'graphql') : error;
+        });
+      },
+    }),
     rest,
+    rateLimitObservation: () => observedRateLimit,
   };
   if (machineSession) machineClients.add(clients);
   if (role === 'author') authorGitTokens.set(clients, token);
@@ -517,6 +533,9 @@ function safeMachineRequestError(
     status,
     code: ownData(error, 'code'),
     requestId: ownData(headers, 'x-github-request-id'),
+    retryAfter: ownData(headers, 'retry-after'),
+    resetAt: ownData(headers, 'x-ratelimit-reset'),
+    remaining: ownData(headers, 'x-ratelimit-remaining'),
   });
   return safe;
 }

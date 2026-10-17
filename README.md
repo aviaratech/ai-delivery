@@ -301,11 +301,32 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 | Read / check readiness | `issue_info` / `issue_ready_check` | `info --issue N` / `ready:check --issue N` |
 | Create a sized child | `issue_create` | `create --title <title> --fields-file <typed.json> --parent P --priority P2` |
 | Rewrite with prior history | `issue_update` | `update --issue N --fields-file <typed.json> --preserve-history` |
-| Reparent one issue | `issue_update` | `update --issue N --parent P`; repeat separately for each issue |
+| Reparent one issue | `issue_update` | `update --issue N --parent P` |
+| Plan / apply a batch | `issue_batch_update` | `batch:update --items-file <items.json> [--dry-run]` |
 | Record a typed journal | `issue_comment` | See the [typed journal contract](#typed-issue-journals); the MCP call returns the authored comment identity and readback |
 | Close with a reason | `issue_update` | `update --issue N --state closed --close-reason not_planned --superseded-by S` |
 
 Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
+
+Batch input is a UTF-8 JSON array of **1–50** complete `issue_update` inputs;
+MCP takes `{repo, items, dryRun}`. All items use the selected repository, including
+any per-item `repo`. Close, defer/undefer, parent, blockers, typed contract,
+status and history/render-retention fields keep their existing validation and
+configured author requirements. Dry run performs reads and returns `planned`,
+`unchanged` or `failed` results with the desired `changes` and current `readback`;
+it writes no issue fields, metadata, relationships, Project state or comments.
+
+Execution is serial and returns every item in input order as `applied`,
+`unchanged` or `failed`, plus readback and summary counts. Failure can follow a
+partial native write: inspect its readback before retrying. An unavailable
+readback is explicit, never evidence that nothing changed. Rerun the same inputs
+to reconcile actual state; already satisfied fields and related outcomes are
+unchanged, and authored comments/history are deduplicated. This operation has no
+cross-repository transaction or rollback. CLI prints the complete JSON and exits
+nonzero if any item failed. A positively identified GitHub rate limit stops
+further writes and gives every remaining item an explicit failure reason;
+`summary.rateLimits` contains only available numeric retry-after/reset/remaining
+observations. No uncertain mutation is automatically replayed.
 
 Creation includes five status fields: Ready or Draft, last updated in UTC,
 next milestone (default `Not started`), native blocker numbers (or `None`),
@@ -332,7 +353,7 @@ comment. `retainLegacyBody: true` keeps it visible even when history is written.
 Repeated unchanged updates reuse the body and existing exact authored history;
 failed history readback or concurrent content drift refuses the rewrite.
 
-`src/currentTrackingScenario.test.ts` composes these operations through one real SDK client/server session outside Git. Only external GitHub/auth ports are synthetic; settings, discovery, schemas, dispatch and owners run normally. Stored issue fields, parent membership, exact escaped history whitespace, comments, explicit deferral/undeferral, closure and configured Project Done are checked after writes. Invalid schemas and unsupported batch or standalone `issue_defer` requests leave stored state and native write counts unchanged. This synthetic replay does not complete the broader tracking parent or prove a live backlog replay.
+`src/currentTrackingScenario.test.ts` composes these operations through one real SDK client/server session outside Git. Only external GitHub/auth ports are synthetic; settings, discovery, schemas, dispatch and owners run normally. Stored issue fields, parent membership, exact escaped history whitespace, comments, explicit deferral/undeferral, closure and configured Project Done are checked after writes. Invalid schemas and unsupported `issue_batch` alias or standalone `issue_defer` requests leave stored state and native write counts unchanged. This synthetic replay does not complete the broader tracking parent or prove a live backlog replay.
 
 ## Deferral and work-in-progress admission
 

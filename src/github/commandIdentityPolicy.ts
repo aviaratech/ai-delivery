@@ -18,6 +18,7 @@ const AUTHOR_COMMANDS = new Set([
   'finish',
   'start',
   'update',
+  'batch:update',
   'pr:create',
   'pr:merge',
   'worktree',

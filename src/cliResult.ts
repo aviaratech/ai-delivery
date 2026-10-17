@@ -4,6 +4,18 @@ import { getMachineRequestDiagnostics } from './errors.js';
 export function printCommandResult(command: string, value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
   if (
+    command === 'issue_batch_update' &&
+    typeof value === 'object' &&
+    value !== null &&
+    'summary' in value &&
+    typeof value.summary === 'object' &&
+    value.summary !== null &&
+    'failed' in value.summary &&
+    typeof value.summary.failed === 'number' &&
+    value.summary.failed > 0
+  )
+    process.exitCode = 1;
+  if (
     command === 'issue_start' &&
     typeof value === 'object' &&
     value !== null &&
