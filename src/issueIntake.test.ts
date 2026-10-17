@@ -9,7 +9,7 @@ import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
-import { createIssue, updateIssue, canonicalIssueBody, type DeliveryContext } from './issue.js';
+import { createIssue, updateIssue, canonicalIssueBody, renderIssueHistory, type DeliveryContext } from './issue.js';
 import { executeTool, startTrackedIssue } from './dispatch.js';
 import { digestValue } from './delivery/common.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
@@ -17,6 +17,185 @@ import { IssueFields, ReadyIssue, renderIssueBody, parseIssueBody, ISSUE_BODY_MA
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 
 afterEach(() => vi.restoreAllMocks());
+
+test('create renders all five status fields with a UTC timestamp and optional milestone', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-16T20:30:00Z'));
+  for (const draft of [false, true]) {
+    const f = fixture();
+    const input = { ...ready(), draft, status: { nextMilestone: 'Run checks' } };
+    const result = await createIssue(f.context, input);
+    const status = result.body.split('## Status\n\n')[1]!.split('\n\n## Problem')[0];
+    assert.equal(
+      status,
+      `- **State:** ${draft ? 'Draft' : 'Ready'}\n- **Last updated:** 2026-10-16T20:30:00.000Z UTC\n- **Next milestone:** Run checks\n- **Blockers:** None\n- **Latest journal:** None yet`,
+    );
+  }
+  const f = fixture();
+  assert.match((await createIssue(f.context, ready())).body, /\*\*Next milestone:\*\* Not started/u);
+});
+
+test('status-only patches preserve every outside-Status byte including canonical data and start markers', async () => {
+  const f = fixture();
+  const created = await createIssue(f.context, ready());
+  f.live.body =
+    created.body +
+    '\n\n<!-- ai-delivery-start-intent: sha256:' +
+    'a'.repeat(64) +
+    ' -->\n<!-- ai-delivery-start: sha256:' +
+    'b'.repeat(64) +
+    ' -->';
+  const before = f.live.body;
+  const patch = { issueNumber: 17, status: { nextMilestone: 'Await review', blockers: 'None' } };
+  const result = await updateIssue(f.context, patch);
+  const outside = (body: string) => body.replace(/(## Status\n\n)[\s\S]*?(\n\n## Problem)/u, '$1$2');
+  assert.match(result.body, /\*\*Next milestone:\*\* Await review/u);
+  assert.equal(outside(result.body), outside(before));
+  assert.equal((await updateIssue(f.context, patch)).body, result.body);
+  assert.equal(f.comments.length, 0);
+});
+
+test('legacy rendering drops only by explicit retention choice or verified history and does not grow on repeat', async () => {
+  const legacy = 'Retired criterion: accept every invalid identifier.\n';
+  for (const preserveHistory of [undefined, false, true]) {
+    const f = fixture();
+    f.live.body = renderIssueBody({ ...ready(), legacyBody: legacy });
+    const before = f.live.body;
+    const result = await updateIssue(f.context, {
+      issueNumber: 17,
+      ...(preserveHistory === undefined ? {} : { preserveHistory }),
+    });
+    const readable = result.body.split('<!-- ai-delivery:issue-data@1 ')[0]!;
+    assert.equal(readable.includes(legacy), preserveHistory === false);
+    assert.equal(f.comments.length, preserveHistory === false ? 0 : 1);
+    if (preserveHistory !== false) {
+      const retained = f.comments[0]!.body.match(/Body:\n<pre>([\s\S]*)<\/pre>/u)![1]!
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&amp;', '&');
+      assert.equal(retained, before);
+    }
+    const again = await updateIssue(f.context, {
+      issueNumber: 17,
+      ...(preserveHistory === undefined ? {} : { preserveHistory }),
+    });
+    assert.equal(again.body, result.body);
+    assert.equal(f.comments.length, preserveHistory === false ? 0 : 1);
+  }
+  const f = fixture();
+  f.live.body = renderIssueBody({ ...ready(), legacyBody: legacy });
+  const drop = { issueNumber: 17, preserveHistory: false, retainLegacyBody: false };
+  const result = await updateIssue(f.context, drop);
+  assert.ok(!result.body.split('<!-- ai-delivery:issue-data@1 ')[0]!.includes(legacy));
+  assert.equal(f.comments.length, 0);
+});
+
+test('replacement legacy text remains visible until those incoming bytes have native history', async () => {
+  const f = fixture();
+  f.live.body = 'Original operator text.\n';
+  const incoming = 'New operator text that was never in the previous body.\n';
+  const result = await updateIssue(f.context, { issueNumber: 17, body: incoming, ...ready(), preserveHistory: true });
+  assert.ok(result.body.split('<!-- ai-delivery:issue-data@1 ')[0]!.includes(incoming));
+  assert.ok(!f.comments[0]!.body.includes(incoming));
+});
+
+test('default render omission reuses an existing exact authored history snapshot', async () => {
+  const f = fixture();
+  f.live.body = renderIssueBody({ ...ready(), legacyBody: 'Retired synthetic criterion.\n' });
+  const before = f.live.body;
+  const history = renderIssueHistory(f.live.title, before);
+  f.comments.push({
+    id: 91,
+    body: history,
+    html_url: 'https://github.com/example/widget/issues/17#issuecomment-91',
+    user: { login: 'operator' },
+    issue_url: 'https://api.github.com/repos/example/widget/issues/17',
+  });
+  const result = await updateIssue(f.context, { issueNumber: 17 });
+  assert.equal(result.historyComment?.reused, true);
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.comments[0]!.body, history);
+  assert.ok(!result.body.split('<!-- ai-delivery:issue-data@1 ')[0]!.includes('Retired synthetic criterion.'));
+});
+
+test('normal-start recovery preserves legacy rendering across repeated exact retries', async () => {
+  const f = fixture();
+  f.controls.created = false;
+  const request = getAiDeliveryMcpTool('issue_start')!.inputSchema.parse({
+    title: ready().title,
+    body: renderIssueBody({ ...ready(), legacyBody: 'Original operator context.\n' }),
+    issueType: 'Task',
+    points: 2,
+    requestId: 'legacy-status-retry',
+  });
+  await startTrackedIssue(f.context, request);
+  const before = f.live.body;
+  for (let retry = 0; retry < 2; retry++) {
+    const result = await startTrackedIssue(f.context, request);
+    assert.ok('reused' in result && result.reused);
+    assert.equal(f.live.body, before);
+  }
+  assert.equal(f.writes.filter((input) => !('issue_number' in input)).length, 1);
+  assert.equal(f.comments.length, 1);
+});
+
+test('status patches reject secrets, multiline and unknown fields without native writes', async () => {
+  for (const status of [
+    { nextMilestone: 'password=' + 'X'.repeat(16) },
+    { nextMilestone: 'Next\n## Problem' },
+    { unknown: 'unexpected' },
+  ]) {
+    const f = fixture();
+    const patch = { issueNumber: 17, status };
+    await assert.rejects(updateIssue(f.context, patch));
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.comments.length, 0);
+  }
+});
+
+test('status-only patches refuse concurrent native body drift before overwriting it', async () => {
+  const f = fixture();
+  f.controls.driftBeforeUpdate = true;
+  const patch = { issueNumber: 17, status: { nextMilestone: 'Await review' } };
+  await assert.rejects(updateIssue(f.context, patch), /content changed/u);
+  assert.equal(f.live.body, 'Concurrent operator edit');
+  assert.equal(f.writes.length, 0);
+});
+
+test('CLI typed field files reach status privacy validation before configuration', () => {
+  const root = mkdtempSync(join(tmpdir(), 'delivery130-status-'));
+  try {
+    const file = join(root, 'fields.json');
+    writeFileSync(file, JSON.stringify({ ...ready(), status: { nextMilestone: 'password=' + 'X'.repeat(16) } }));
+    const result = spawnSync(
+      process.execPath,
+      [resolve('dist/cli.js'), '--repo', 'example/widget', 'create', '--title', ready().title, '--fields-file', file],
+      { encoding: 'utf8' },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Remove credentials and private keys from public status fields/u);
+    assert.ok(!result.stderr.includes('X'.repeat(16)));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('status updates retain old multiline canonical formatting and reject ambiguous status blocks', async () => {
+  const f = fixture();
+  const data = {
+    ...ready(),
+    acceptanceCriteria: [{ behavior: 'Reject malformed input:\n- Empty input', verifiedBy: 'Regression test.' }],
+  };
+  f.live.body = renderIssueBody(data).replace('  - Empty input\n\n  Verified', '- Empty input\n  Verified');
+  const before = f.live.body.split('\n\n## Problem')[1];
+  const patch = { issueNumber: 17, status: { nextMilestone: '<literal> *text* [link]' } };
+  const result = await updateIssue(f.context, patch);
+  assert.equal(result.body.split('\n\n## Problem')[1], before);
+  assert.match(result.body, /&lt;literal&gt; \\\*text\\\* \\\[link\\\]/u);
+  f.live.body = result.body.replace('- **Blockers:** None', '- **Blockers:** None\n- **Blockers:** Other');
+  const writes = f.writes.length;
+  await assert.rejects(updateIssue(f.context, patch), /unambiguous status/u);
+  assert.equal(f.writes.length, writes);
+});
 
 const ready = () =>
   IssueFields.parse({
@@ -54,6 +233,7 @@ function fixture() {
     ignoreBody: false,
     wrongCreateRepo: false,
     driftAfterHistory: false,
+    driftBeforeUpdate: false,
     created: true,
     blockers: false,
     trackingParent: false,
@@ -72,6 +252,7 @@ function fixture() {
   let status = 'Queued';
   const statusWrites: Record<string, unknown>[] = [];
   const membershipWrites: Record<string, unknown>[] = [];
+  let issueReads = 0;
   const optionId = () => ({ Queued: 'TODO', Active: 'ACTIVE', Waiting: 'BLOCKED', Shipped: 'DONE' })[status];
   const values = () => [
     {
@@ -109,7 +290,10 @@ function fixture() {
       rest: {
         issues: {
           listSubIssues: async () => ({ data: controls.trackingParent ? [{ number: 18 }] : [] }),
-          get: async () => ({ data: { ...live } }),
+          get: async () => {
+            if (controls.driftBeforeUpdate && ++issueReads > 1) live.body = 'Concurrent operator edit';
+            return { data: { ...live } };
+          },
           listForRepo: async () => ({ data: controls.created ? [{ ...live }] : [] }),
           create: async (input: Record<string, unknown>) => {
             writes.push(input);
@@ -314,7 +498,7 @@ test('native create validates first, writes canonical fields, reads back metadat
   assert.equal(f.writes.length, 0);
   const result = await createIssue(f.context, ready());
   assert.equal(f.writes.length, 1);
-  assert.equal(result.body, renderIssueBody(ready()));
+  assert.equal(canonicalIssueBody({ ...ready(), body: result.body }), renderIssueBody(ready()));
   assert.equal(parseIssueBody(result.body, { title: result.created.title }).issue.points, 2);
   assert.deepEqual(result.warnings, []);
   assert.equal(f.getStatus(), 'Queued');
@@ -324,7 +508,7 @@ test('incomplete drafts write parked; reviewer-role writes and wrong native repo
   const f = fixture();
   await createIssue(f.context, { title: 'Investigate invalid widget identifiers', draft: true });
   assert.equal(f.getStatus(), 'Queued');
-  assert.match(f.live.body, /Draft — parked/u);
+  assert.match(f.live.body, /\*\*State:\*\* Draft/u);
   f.controls.role = 'reviewer';
   await assert.rejects(createIssue(f.context, ready()), /author role/u);
   await assert.rejects(updateIssue(f.context, { issueNumber: 17, draft: true }), /author role/u);
@@ -374,7 +558,7 @@ test('legacy replacement updates preserve the actual previous body and diff for 
       outcome: 'Reject invalid input before persistence.',
     });
     assert.equal(patch.conversion, undefined);
-    assert.equal(f.comments.length, 1);
+    assert.equal(f.comments.length, replacement.startsWith(ISSUE_BODY_MARKER) ? 1 : 2);
     assert.equal(parseIssueBody(patch.body, { title: patch.title }).issue.legacyBody, preserved);
   }
 });
@@ -420,11 +604,12 @@ test('normal-start canonical retry body keeps exact intent markers through creat
     points: 2,
     issueType: 'Task',
   });
-  assert.equal(result.body, canonical + footer);
+  assert.equal(canonicalIssueBody({ ...issue, body: result.body }), canonical + footer);
   assert.deepEqual(parseIssueBody(result.body, { title: issue.title }).issue, issue);
 });
 
 test('actual normal-start creation and retry reuse the exact canonical body, branch and authored journal', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-16T20:30:00Z'));
   const f = fixture();
   f.controls.created = false;
   const request = getAiDeliveryMcpTool('issue_start')!.inputSchema.parse({
@@ -448,6 +633,7 @@ test('actual normal-start creation and retry reuse the exact canonical body, bra
     digestValue({ repository: 'example/widget', issueNumber: 17, name: 'issue/17', base: 'a'.repeat(40) }),
   );
   assert.equal(f.comments.length, 1);
+  clock.mockReturnValue(Date.parse('2026-10-17T20:30:00Z'));
   const retry = await startTrackedIssue(f.context, request);
   assert.ok('reused' in retry && retry.reused === true);
   assert.equal(retry.issueNumber, 17);

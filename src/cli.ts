@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
+import { z } from 'zod';
 
 import { printCommandError, printCommandResult } from './cliResult.js';
 import { contextFor, executeTool, type ExecutionContext } from './dispatch.js';
@@ -11,7 +12,7 @@ import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
 import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
-import { IssueWriteSchema } from './issueContract.js';
+import { IssueWriteSchema, IssueStatusPatch } from './issueContract.js';
 
 const program = new Command();
 program
@@ -67,7 +68,9 @@ function body(value: string | undefined, file: string | undefined): string | und
 function fields(file: string | undefined, overrides: Record<string, unknown>): Record<string, unknown> {
   const value: unknown = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
   return {
-    ...IssueWriteSchema.parse(value),
+    ...IssueWriteSchema.extend({ status: IssueStatusPatch.optional(), preserveHistory: z.boolean().optional() }).parse(
+      value,
+    ),
     ...Object.fromEntries(Object.entries(overrides).filter(([, item]) => item !== undefined)),
   };
 }

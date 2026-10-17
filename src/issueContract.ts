@@ -31,7 +31,37 @@ export const IssueFields = z.strictObject({
     .optional(),
   draft: z.boolean().default(false),
   legacyBody: Text.optional(),
+  retainLegacyBody: z.boolean().optional(),
 });
+
+const StatusText = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => !/[\r\n]/u.test(value), 'Use one status line.');
+export const CreateIssueStatus = z.strictObject({ nextMilestone: StatusText.optional() });
+export const IssueStatusPatch = CreateIssueStatus.extend({
+  blockers: StatusText.optional(),
+  latestJournal: StatusText.optional(),
+});
+const IssueStatus = z.strictObject({
+  state: z.enum(['Ready', 'Draft']),
+  lastUpdated: z.iso.datetime(),
+  nextMilestone: StatusText,
+  blockers: StatusText,
+  latestJournal: StatusText,
+});
+export type IssueStatusData = z.infer<typeof IssueStatus>;
+
+export function requireIssueStatus<T extends z.ZodType>(schema: T, value: unknown): z.output<T> {
+  const result = schema.safeParse(value);
+  if (!result.success) throw new IssueValidationError(issueDiagnostics(result.error.issues));
+  if (secrets(result.data))
+    throw new IssueValidationError([
+      hint('secrets', 'status', 'Remove credentials and private keys from public status fields.'),
+    ]);
+  return result.data;
+}
 
 export interface IssueDiagnostic {
   code: string;
@@ -165,6 +195,7 @@ export const IssueWriteFields = {
   context: IssueFields.shape.context.removeDefault().optional(),
   bug: IssueFields.shape.bug,
   draft: IssueFields.shape.draft.removeDefault().optional(),
+  retainLegacyBody: IssueFields.shape.retainLegacyBody,
 };
 export const IssueWriteSchema = z.strictObject(IssueWriteFields);
 
@@ -244,19 +275,43 @@ export function requireIssue(value: unknown): DraftIssueData {
   return result.issue;
 }
 
-export function renderIssueBody(value: DraftIssueData): string {
+const escapeStatus = (value: string): string =>
+  value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replace(/[\\`*_[\]]/gu, '\\$&');
+const unescapeStatus = (value: string): string =>
+  value
+    .replace(/\\([\\`*_[\]])/gu, '$1')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&');
+
+export function renderIssueBody(value: DraftIssueData, status?: IssueStatusData, legacyFormatting = false): string {
   const item = DraftIssue.parse(value);
+  if (status !== undefined) requireIssueStatus(IssueStatus, status);
   const list = (values: string[]): string => (values.length ? values.map((v) => `- ${v}`).join('\n') : '(none)');
   const parts = [
     ISSUE_BODY_MARKER,
     '## Status',
-    item.draft ? 'Draft — parked; not ready to work.' : 'Ready',
+    status === undefined
+      ? item.draft
+        ? 'Draft — parked; not ready to work.'
+        : 'Ready'
+      : `- **State:** ${status.state}\n- **Last updated:** ${status.lastUpdated} UTC\n- **Next milestone:** ${escapeStatus(status.nextMilestone)}\n- **Blockers:** ${escapeStatus(status.blockers)}\n- **Latest journal:** ${escapeStatus(status.latestJournal)}`,
     '## Problem',
     item.problem,
     '## Outcome',
     item.outcome,
     '## Acceptance criteria',
-    item.acceptanceCriteria.map((ac) => `- [ ] ${ac.behavior}\n  Verified by: ${ac.verifiedBy}`).join('\n'),
+    item.acceptanceCriteria
+      .map((ac) =>
+        legacyFormatting
+          ? `- [ ] ${ac.behavior}\n  Verified by: ${ac.verifiedBy}`
+          : `- [ ] ${ac.behavior.replace(/\n/gu, '\n  ')}${ac.behavior.includes('\n') ? '\n' : ''}\n  Verified by: ${ac.verifiedBy.replace(/\n/gu, '\n  ')}`,
+      )
+      .join('\n'),
     '## Out of scope',
     list(item.outOfScope),
     '## Open questions',
@@ -269,7 +324,8 @@ export function renderIssueBody(value: DraftIssueData): string {
       '## Bug',
       `Steps:\n${list(item.bug.steps)}\n\nExpected: ${item.bug.expected}\n\nActual: ${item.bug.actual}\n\nReproducibility: ${item.bug.reproducibility}\n\nEnvironment: ${item.bug.environment}`,
     );
-  if (item.legacyBody !== undefined) parts.push('## Preserved legacy body', item.legacyBody);
+  if (item.legacyBody !== undefined && item.retainLegacyBody !== false)
+    parts.push('## Preserved legacy body', item.legacyBody);
   // Escape comment delimiters without altering decoded data. Exact render equality detects human/payload divergence.
   parts.push(`${DATA_PREFIX}${JSON.stringify(item).replaceAll('<', '\\u003c').replaceAll('>', '\\u003e')} -->`);
   return parts.join('\n\n') + '\n';
@@ -297,7 +353,7 @@ function section(body: string, names: string[]): string {
 export function parseIssueBody(
   body: string,
   metadata: { title: string; points?: number; issueType?: string },
-): { issue: DraftIssueData; legacy: boolean } {
+): { issue: DraftIssueData; legacy: boolean; status?: IssueStatusData; legacyFormatting?: boolean } {
   if (body.trimStart().startsWith(ISSUE_BODY_MARKER)) {
     const start = body.lastIndexOf(DATA_PREFIX);
     const end = body.indexOf(' -->', start);
@@ -313,15 +369,45 @@ export function parseIssueBody(
     }
     const result = validateIssue(decoded, false);
     if (!result.issue) throw new IssueValidationError(result.failures);
+    const displayed = body.slice((ISSUE_BODY_MARKER + '\n\n## Status\n\n').length, body.indexOf('\n\n## Problem\n\n'));
+    let status: IssueStatusData | undefined;
+    if (displayed !== 'Ready' && displayed !== 'Draft — parked; not ready to work.') {
+      const match =
+        /^- \*\*State:\*\* (Ready|Draft)\n- \*\*Last updated:\*\* (\S+) UTC\n- \*\*Next milestone:\*\* ([^\r\n]+)\n- \*\*Blockers:\*\* ([^\r\n]+)\n- \*\*Latest journal:\*\* ([^\r\n]+)$/u.exec(
+          displayed,
+        );
+      if (!match)
+        throw new IssueValidationError([
+          hint('body.canonical', 'status', 'Restore the complete unambiguous status block.'),
+        ]);
+      status = requireIssueStatus(IssueStatus, {
+        state: match[1],
+        lastUpdated: match[2],
+        nextMilestone: unescapeStatus(match[3]!),
+        blockers: unescapeStatus(match[4]!),
+        latestJournal: unescapeStatus(match[5]!),
+      });
+      if (status.state !== (result.issue.draft ? 'Draft' : 'Ready'))
+        throw new IssueValidationError([
+          hint('body.canonical', 'status', 'Status state must agree with the typed draft field.'),
+        ]);
+    }
     const footer = issueStartFooter(body);
+    const canonical = footer ? body.slice(0, -footer.length) : body;
+    const legacyFormatting = renderIssueBody(result.issue, status) !== canonical;
     if (
-      renderIssueBody(result.issue) !== (footer ? body.slice(0, -footer.length) : body) ||
+      (legacyFormatting && renderIssueBody(result.issue, status, true) !== canonical) ||
       result.issue.title !== metadata.title
     )
       throw new IssueValidationError([
         hint('body.canonical', 'body', 'Update typed fields instead of editing only one copy of canonical content.'),
       ]);
-    return { issue: result.issue, legacy: false };
+    return {
+      issue: result.issue,
+      legacy: false,
+      ...(status === undefined ? {} : { status }),
+      ...(legacyFormatting ? { legacyFormatting: true } : {}),
+    };
   }
   const verification = section(body, ['verification', 'validation', 'tests']);
   const acText = section(body, ['acceptance criteria', 'acceptance']);
@@ -366,7 +452,11 @@ export function parseIssueBody(
   return { issue: converted.issue, legacy: true };
 }
 
-export function issueWarnings(issue: DraftIssueData): IssueDiagnostic[] {
+export function issueWarnings(
+  issue: DraftIssueData,
+  status?: IssueStatusData,
+  legacyFormatting = false,
+): IssueDiagnostic[] {
   const warnings: IssueDiagnostic[] = [];
   if (issue.acceptanceCriteria.length > 7)
     warnings.push(
@@ -390,8 +480,9 @@ export function issueWarnings(issue: DraftIssueData): IssueDiagnostic[] {
     warnings.push(
       hint('local-evidence', 'context.evidence', 'Use portable evidence in addition to machine-local paths.'),
     );
-  if (renderIssueBody(issue).length > 3000)
-    warnings.push(hint('body.length', 'body', 'Consider reducing a body over about 3,000 characters.'));
+  const body = renderIssueBody(issue, status, legacyFormatting);
+  if (body.slice(0, body.lastIndexOf(DATA_PREFIX)).length > 4000)
+    warnings.push(hint('body.length', 'body', 'Consider reducing a readable body over 4,000 characters.'));
   return warnings;
 }
 

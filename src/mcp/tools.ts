@@ -2,7 +2,14 @@ import { z } from 'zod';
 import { DeliveryHealthInput } from '../services/deliveryHealthService.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema } from '../issueJournal.js';
-import { IssueFields, IssueWriteFields, ISSUE_JSON_SCHEMAS, issueInputSchema } from '../issueContract.js';
+import {
+  IssueFields,
+  IssueWriteFields,
+  ISSUE_JSON_SCHEMAS,
+  issueInputSchema,
+  CreateIssueStatus,
+  IssueStatusPatch,
+} from '../issueContract.js';
 
 const Positive = z.number().int().positive();
 const Labels = z.array(z.string().trim().min(1));
@@ -175,7 +182,14 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'create',
     description: 'Create a native GitHub tracking issue with configured metadata and relationships',
     issueContract: ISSUE_JSON_SCHEMAS,
-    inputSchema: issueInputSchema(z.strictObject({ ...Tracking, ...IssueWriteFields, title: IssueFields.shape.title })),
+    inputSchema: issueInputSchema(
+      z.strictObject({
+        ...Tracking,
+        ...IssueWriteFields,
+        title: IssueFields.shape.title,
+        status: CreateIssueStatus.optional(),
+      }),
+    ),
   },
   {
     name: 'issue_start',
@@ -214,6 +228,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       z
         .strictObject({
           ...IssueWriteFields,
+          status: IssueStatusPatch.optional(),
           repo: Repo,
           blockedBy: z.array(Positive).optional(),
           blocks: z.array(Positive).optional(),

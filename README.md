@@ -307,6 +307,30 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 
 Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
 
+Creation includes five status fields: Ready or Draft, last updated in UTC,
+next milestone (default `Not started`), native blocker numbers (or `None`),
+and latest journal (`None yet`). Supply `status: {"nextMilestone":"Run checks"}`
+on `issue_create`; `issue_update` also accepts display-only `status.blockers`
+and `status.latestJournal`. The same objects work in CLI `--fields-file` JSON.
+Status values are single lines rendered as literal text. Status-only patches
+preserve every byte outside Status, including canonical data and start markers;
+no-op patches keep the timestamp. Display blockers create no dependency edges:
+use native `blockedBy` for those, and do not combine it with `status.blockers`.
+The nonblocking body-length warning counts readable text, excludes embedded
+issue-data, and triggers strictly above 4,000 characters.
+
+`preserveHistory` controls an authored, exactly read-back snapshot of the prior
+title/body before a rewrite. `retainLegacyBody` independently controls whether
+legacy text appears in the current readable body; it never erases the embedded
+legacy record or native comments. Both may be specified in update field files.
+By default, legacy conversion or first omission preserves native history before
+hiding retired text. Incoming legacy bytes absent from that history stay visible.
+With `preserveHistory: false`, unpreserved legacy text stays visible; an explicit
+`retainLegacyBody: false` deliberately hides it without requesting a history
+comment. `retainLegacyBody: true` keeps it visible even when history is written.
+Repeated unchanged updates reuse the body and existing exact authored history;
+failed history readback or concurrent content drift refuses the rewrite.
+
 `src/currentTrackingScenario.test.ts` composes these operations through one real SDK client/server session outside Git. Only external GitHub/auth ports are synthetic; settings, discovery, schemas, dispatch and owners run normally. Stored issue fields, parent membership, exact escaped history whitespace, comments, closure and configured Project Done are checked after writes. Invalid schemas and unsupported batch/defer requests must leave stored state and native write counts unchanged. Batch operations, trigger-based deferral and WIP enforcement remain unshipped; parking a draft is a separate operation. This synthetic replay does not complete the broader tracking parent or prove a live backlog replay.
 
 ## Blocker overrides and delivery health
