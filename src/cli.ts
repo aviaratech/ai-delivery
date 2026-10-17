@@ -12,7 +12,7 @@ import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
 import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
-import { IssueWriteSchema, IssueStatusPatch } from './issueContract.js';
+import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch } from './issueContract.js';
 
 const program = new Command();
 program
@@ -68,9 +68,11 @@ function body(value: string | undefined, file: string | undefined): string | und
 function fields(file: string | undefined, overrides: Record<string, unknown>): Record<string, unknown> {
   const value: unknown = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
   return {
-    ...IssueWriteSchema.extend({ status: IssueStatusPatch.optional(), preserveHistory: z.boolean().optional() }).parse(
-      value,
-    ),
+    ...IssueWriteSchema.extend({
+      ...IssueDeferralPatch,
+      status: IssueStatusPatch.optional(),
+      preserveHistory: z.boolean().optional(),
+    }).parse(value),
     ...Object.fromEntries(Object.entries(overrides).filter(([, item]) => item !== undefined)),
   };
 }
@@ -260,7 +262,7 @@ program
   .option('--labels <labels>')
   .option('--blocked-by <numbers>')
   .option('--blocks <numbers>', 'Add this issue as a blocker of these dependents')
-  .option('--override-reason <reason>', 'Required explanation when adding a blocker to active work')
+  .option('--override-reason <reason>', 'Capacity override reason, or explanation when adding a blocker to active work')
   .option('--milestone <number>')
   .option('--parent <number>')
   .option('--branch <branch>')
@@ -346,30 +348,51 @@ program
   .option('--close-reason <reason>')
   .option('--superseded-by <number>')
   .option('--park', 'Park execution while retaining the issue worktree')
-  .action(async (o: Record<string, string> & { park?: boolean; preserveHistory?: boolean; draft?: boolean }) =>
-    run(
-      'issue_update',
-      fields(o.fieldsFile, {
-        issueNumber: int(o.issue),
-        title: o.title,
-        ...(o.draft === true ? { draft: true } : {}),
-        body: body(o.body, o.bodyFile),
-        issueType: o.type,
-        points: int(o.points),
-        priority: o.priority,
-        labels: list(o.labels),
-        blockedBy: ints(o.blockedBy),
-        blocks: ints(o.blocks),
-        overrideReason: o.overrideReason,
-        milestone: int(o.milestone),
-        parentIssueNumber: int(o.parent),
-        state: o.state,
-        preserveHistory: o.preserveHistory === true ? true : undefined,
-        closeReason: o.closeReason,
-        supersededBy: int(o.supersededBy),
-        park: o.park === true ? true : undefined,
-      }),
-    ),
+  .option('--defer', 'Defer until an explicit undefer')
+  .option('--defer-until <date>', 'Record an ISO date condition without automatic undeferral')
+  .option('--defer-trigger <text>', 'Record the condition for reconsidering deferred work')
+  .option('--undefer', 'Explicitly clear deferral; draft and park remain unchanged')
+  .action(
+    async (
+      o: Record<string, string> & {
+        park?: boolean;
+        preserveHistory?: boolean;
+        draft?: boolean;
+        defer?: boolean;
+        undefer?: boolean;
+      },
+    ) =>
+      run(
+        'issue_update',
+        fields(o.fieldsFile, {
+          issueNumber: int(o.issue),
+          title: o.title,
+          ...(o.draft === true ? { draft: true } : {}),
+          body: body(o.body, o.bodyFile),
+          issueType: o.type,
+          points: int(o.points),
+          priority: o.priority,
+          labels: list(o.labels),
+          blockedBy: ints(o.blockedBy),
+          blocks: ints(o.blocks),
+          overrideReason: o.overrideReason,
+          milestone: int(o.milestone),
+          parentIssueNumber: int(o.parent),
+          state: o.state,
+          preserveHistory: o.preserveHistory === true ? true : undefined,
+          closeReason: o.closeReason,
+          supersededBy: int(o.supersededBy),
+          park: o.park === true ? true : undefined,
+          defer:
+            o.defer === true || o.deferUntil !== undefined || o.deferTrigger !== undefined
+              ? {
+                  ...(o.deferUntil === undefined ? {} : { until: o.deferUntil }),
+                  ...(o.deferTrigger === undefined ? {} : { trigger: o.deferTrigger }),
+                }
+              : undefined,
+          undefer: o.undefer === true ? true : undefined,
+        }),
+      ),
   );
 
 program

@@ -12,6 +12,21 @@ export function issueStartFooter(body: string): string {
 const Text = z.string();
 const Strings = z.array(Text);
 const AcceptanceCriterion = z.strictObject({ behavior: Text, verifiedBy: Text });
+export const IssueDeferral = z.strictObject({
+  until: z.iso.date().optional(),
+  trigger: z.string().trim().min(1).max(2000).optional(),
+});
+export type IssueDeferralData = z.infer<typeof IssueDeferral>;
+export const IssueDeferralPatch = {
+  defer: IssueDeferral.optional(),
+  undefer: z.literal(true).optional(),
+};
+
+export function requireDeferralPatch(value: { defer?: IssueDeferralData; undefer?: true }): void {
+  const parsed = z.strictObject(IssueDeferralPatch).safeParse(value);
+  if (!parsed.success || (value.defer !== undefined && value.undefer !== undefined))
+    throw new DeliveryError('Choose a valid defer condition or explicit undefer, never both.');
+}
 
 /** Drafts permit incomplete requirements, but never secret-bearing public content. */
 export const IssueFields = z.strictObject({
@@ -30,6 +45,7 @@ export const IssueFields = z.strictObject({
     .strictObject({ steps: Strings, expected: Text, actual: Text, reproducibility: Text, environment: Text })
     .optional(),
   draft: z.boolean().default(false),
+  deferral: IssueDeferral.optional(),
   legacyBody: Text.optional(),
   retainLegacyBody: z.boolean().optional(),
 });
@@ -304,6 +320,7 @@ export function renderIssueBody(value: DraftIssueData, status?: IssueStatusData,
     item.problem,
     '## Outcome',
     item.outcome,
+    ...(item.deferral === undefined ? [] : ['## Deferral', `Deferred: ${JSON.stringify(item.deferral)}`]),
     '## Acceptance criteria',
     item.acceptanceCriteria
       .map((ac) =>

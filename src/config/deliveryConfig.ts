@@ -15,6 +15,24 @@ export const DELIVERY_CONFIG_FILE = 'ai-delivery.config.json';
 export const DELIVERY_POLICY_CONTRACT = 'RepositoryDeliveryPolicy@1';
 
 const Name = z.string().trim().min(1);
+export const WipLimits = z
+  .array(
+    z.strictObject({
+      repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u),
+      name: Name,
+      match: z.union([
+        z.strictObject({ label: Name }),
+        z.strictObject({ field: Name, value: z.union([z.string().min(1), z.number().finite()]) }),
+      ]),
+      limit: z.number().int().nonnegative().safe(),
+    }),
+  )
+  .superRefine((lanes, context) => {
+    const identities = lanes.map((lane) => JSON.stringify([lane.repository.toLowerCase(), lane.name]));
+    if (new Set(identities).size !== identities.length)
+      context.addIssue({ code: 'custom', message: 'WIP lane names must be unique within each repository.' });
+  });
+export type WipLane = z.infer<typeof WipLimits>[number];
 const EnvName = z.string().regex(/^[A-Z][A-Z0-9_]*$/u);
 const PositiveInteger = z.number().int().positive();
 const NativeFieldId = z
@@ -64,6 +82,7 @@ const AuthorRole = z.union([
 
 const DeliveryConfigSchema = z
   .object({
+    wipLimits: WipLimits.optional(),
     commandPolicy: z
       .object({
         checks: z
@@ -222,6 +241,7 @@ export interface LoadedDeliveryConfig {
 }
 export type GitHubDeliveryConfig = Pick<DeliveryConfig, 'roles' | 'repository' | 'native'> & {
   schemaVersion: 'ai-delivery.github@1';
+  wipLimits?: WipLane[] | undefined;
 };
 export interface LoadedGitHubConfig {
   config: GitHubDeliveryConfig;
@@ -231,6 +251,7 @@ export interface LoadedGitHubConfig {
 }
 const UserSettingsSchema = z
   .strictObject({
+    wipLimits: WipLimits.optional(),
     schemaVersion: z.literal('ai-delivery.user@1'),
     roles: z.strictObject({
       author: z.discriminatedUnion('authSource', [AppRole, AuthorRole.options[1]]),
@@ -270,6 +291,7 @@ const UserSettingsSchema = z
   });
 export type UserDeliverySettings = z.infer<typeof UserSettingsSchema>;
 export interface LoadedDeliverySettings {
+  wipLimits?: WipLane[] | undefined;
   roles: DeliveryConfig['roles'];
   configPath: string;
   overrides: DeliveryOverrides;
@@ -335,8 +357,15 @@ export async function loadDeliverySettings(_repositoryRoot?: string): Promise<Lo
       .join('; ');
     throw new DeliveryError(`Invalid user configuration ${path}: ${details}`);
   }
-  const { roles, checkoutRoots, schemaVersion: _schema, ...overrides } = result.data;
-  return { roles, checkoutRoots, configPath: path, overrides, sourceDigest: digestValue(result.data) };
+  const { roles, checkoutRoots, wipLimits, schemaVersion: _schema, ...overrides } = result.data;
+  return {
+    roles,
+    checkoutRoots,
+    ...(wipLimits === undefined ? {} : { wipLimits }),
+    configPath: path,
+    overrides,
+    sourceDigest: digestValue(result.data),
+  };
 }
 
 export async function loadDeliveryConfig(
@@ -384,6 +413,7 @@ export async function loadDeliveryConfig(
     throw error;
   }
   const config: GitHubDeliveryConfig = {
+    ...(settings.wipLimits === undefined ? {} : { wipLimits: settings.wipLimits }),
     schemaVersion: 'ai-delivery.github@1',
     repository: routing.repository,
     roles: settings.roles,

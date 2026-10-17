@@ -332,7 +332,74 @@ comment. `retainLegacyBody: true` keeps it visible even when history is written.
 Repeated unchanged updates reuse the body and existing exact authored history;
 failed history readback or concurrent content drift refuses the rewrite.
 
-`src/currentTrackingScenario.test.ts` composes these operations through one real SDK client/server session outside Git. Only external GitHub/auth ports are synthetic; settings, discovery, schemas, dispatch and owners run normally. Stored issue fields, parent membership, exact escaped history whitespace, comments, closure and configured Project Done are checked after writes. Invalid schemas and unsupported batch/defer requests must leave stored state and native write counts unchanged. Batch operations, trigger-based deferral and WIP enforcement remain unshipped; parking a draft is a separate operation. This synthetic replay does not complete the broader tracking parent or prove a live backlog replay.
+`src/currentTrackingScenario.test.ts` composes these operations through one real SDK client/server session outside Git. Only external GitHub/auth ports are synthetic; settings, discovery, schemas, dispatch and owners run normally. Stored issue fields, parent membership, exact escaped history whitespace, comments, explicit deferral/undeferral, closure and configured Project Done are checked after writes. Invalid schemas and unsupported batch or standalone `issue_defer` requests leave stored state and native write counts unchanged. This synthetic replay does not complete the broader tracking parent or prove a live backlog replay.
+
+## Deferral and work-in-progress admission
+
+`issue_update` accepts `defer: { until?: "YYYY-MM-DD", trigger?: "condition" }`
+or `undefer: true`. An empty `defer: {}` means indefinite manual deferral.
+These inputs are mutually exclusive. Conditions are recorded text and dates:
+passing the date or satisfying the trigger never automatically resumes work.
+Only explicit `undefer` clears deferral; body replacements and unrelated updates
+retain it. `issue_info` and `issue_list` return `deferred` with the recorded
+conditions, or `null` for known undeferred content. If canonical content is
+invalid or a listing omits its body, the field is omitted rather than claiming
+that deferral is absent; inspect the body and readiness diagnostics.
+
+Deferral is independent of `draft` and `park`. `park` still pauses execution as
+a draft, retains host-owned worktree custody, and uses the existing Todo/Blocked
+Project presentation. `undefer` does not clear a parked draft. Deferral alone
+does not release an existing In Progress slot. Readiness and supported `start`
+refuse deferred work, including a past date, before creating a branch or journal.
+The removed `develop` workflow remains removed. Repository labels continue to
+accept any existing native label; unknown labels are refused.
+
+```sh
+ai-delivery --repo example/widget update --issue 17 --defer --defer-trigger 'Upstream ships'
+ai-delivery --repo example/widget update --issue 17 --defer-until 2026-12-01
+ai-delivery --repo example/widget update --issue 17 --undefer
+```
+
+Optional `wipLimits` in the existing operator-owned user JSON declares lanes.
+No target-repository configuration is loaded, and the tool never writes these
+settings. Without this option, capacity admission is unchanged. Each lane names
+its repository, a name unique within that repository, a nonnegative integer
+limit, and exactly one native label or named native issue-field value:
+
+```json
+{
+  "wipLimits": [
+    { "repository": "example/widget", "name": "Review", "match": { "label": "Needs Review" }, "limit": 2 },
+    { "repository": "example/widget", "name": "Urgent", "match": { "field": "Priority", "value": "High" }, "limit": 1 }
+  ]
+}
+```
+
+Label matching follows native case-insensitive label names. Field names and
+string values match exactly; numeric fields compare numbers and multi-select
+fields match a member. Unknown labels/fields, changed identities, malformed or
+unreadable data, repeated/nonadvancing pages and incomplete bounded readback
+refuse admission. Counts include open issues in the selected repository with
+the configured Project's In Progress status. Verified absent membership or an
+explicitly unset native Status consumes no slot; omitted Status evidence refuses. Every matching lane must have
+capacity. An already In Progress target consumes no additional slot on retry.
+
+`start --override-reason <reason>` / `issue_start.overrideReason` can override
+capacity only. The configured authenticated author must record and verify the
+exact issue, Project, native field identity, lane counts/limits and reason in
+an issue comment before advancement. The reason cannot bypass deferral, draft,
+native blockers, tracking-parent eligibility, access or review requirements.
+An uncertain comment acknowledgment is reconciled against the same authored
+comment; a changed observation refuses advancement and requires fresh readback.
+
+Capacity is read completely before branch creation and rechecked immediately
+before Project advancement. GitHub exposes no conditional cross-writer Project
+capacity transaction: these are fresh observed-capacity guards, with no global
+atomic WIP guarantee against concurrent native writers. A later refusal can
+leave the already-linked branch intact; use the returned `safeResume.arguments`
+with its reason and preserve that native identity. Refusals publish no Started
+journal. `src/issueIntake.test.ts` exercises current CLI/MCP/SDK deferral and WIP
+paths with synthetic native ports; it makes no live override or deployment claim.
 
 ## Blocker overrides and delivery health
 
@@ -433,7 +500,7 @@ in linked evidence instead of the summary.
 }
 ```
 
-Successful tracked `issue_start` and `issue_develop` calls publish one start
+Successful tracked `issue_start` calls publish one start
 journal. Scratch work, failed readiness and failed development do not claim a
 start. `issue_finish` publishes closeout only after its existing merge, closure,
 Project and cleanup contracts succeed, with each checkbox acceptance criterion

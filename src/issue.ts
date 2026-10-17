@@ -6,7 +6,7 @@ import type {
   LoadedDeliveryConfig,
   LoadedGitHubConfig,
 } from './config/deliveryConfig.js';
-import { loadDeliveryConfig } from './config/deliveryConfig.js';
+import { loadDeliveryConfig, WipLimits, type WipLane } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/legacy.js';
 import { DeliveryError } from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
@@ -19,6 +19,7 @@ import {
 } from './github/nativeIssueMetadata.js';
 import {
   getIssueProjectStatus,
+  getProjectDeliveryConfiguration,
   type ProjectDeliveryConfiguration,
   projectSettingsFromDeliveryConfig,
   syncIssueProjectStatus,
@@ -31,7 +32,7 @@ import {
   replaceParentIssue,
   resolveNativeRelationshipTargets,
 } from './github/relationships.js';
-import { prepareBlockerGuard } from './services/blockerGuardService.js';
+import { prepareBlockerGuard, OverrideReason } from './services/blockerGuardService.js';
 import { type RepoCoordinates } from './github/repo.js';
 import { evaluateAgentReadiness, type AgentReadinessResult } from './services/agentReadinessService.js';
 import { JournalInputSchema, renderJournal, type JournalInput } from './issueJournal.js';
@@ -52,6 +53,8 @@ import {
   type IssueFieldsInput,
   type IssueDiagnostic,
   type IssueStatusData,
+  type IssueDeferralData,
+  requireDeferralPatch,
 } from './issueContract.js';
 
 export interface IssueCommentReadback {
@@ -73,6 +76,15 @@ export async function commentIssue(
   input: IssueCommentInput,
   lifecycleKey?: string,
 ): Promise<IssueCommentReadback> {
+  return writeAuthenticatedIssueComment(context, input, lifecycleKey);
+}
+
+async function writeAuthenticatedIssueComment(
+  context: DeliveryContext,
+  input: IssueCommentInput,
+  lifecycleKey?: string,
+  rawMarker?: string,
+): Promise<IssueCommentReadback> {
   const accepted =
     'body' in input ? RawIssueCommentSchema.parse(input) : (JournalInputSchema.parse(input) as JournalInput);
   const rawBody = 'body' in accepted ? accepted.body : undefined;
@@ -81,7 +93,7 @@ export async function commentIssue(
   const marker =
     rawBody === undefined
       ? `<!-- ai-delivery:journal@1:${digestValue({ issueNumber: accepted.issueNumber, key: lifecycleKey ?? accepted })} -->`
-      : undefined;
+      : rawMarker;
   const body = rawBody ?? renderJournal(accepted as JournalInput, marker);
   if (body.length > ISSUE_COMMENT_BODY_LIMIT || !body.trim())
     throw new DeliveryError(
@@ -108,8 +120,11 @@ export async function commentIssue(
       matches.push(
         ...batch.filter(
           (comment) =>
-            (marker === undefined ? comment.body === body : comment.body?.endsWith(marker)) &&
-            comment.user?.login.toLowerCase() === actor.toLowerCase(),
+            (marker === undefined
+              ? comment.body === body
+              : rawMarker === undefined
+                ? comment.body?.endsWith(marker)
+                : comment.body?.includes(marker)) && comment.user?.login.toLowerCase() === actor.toLowerCase(),
         ),
       );
       if (batch.length < 100) break;
@@ -117,6 +132,8 @@ export async function commentIssue(
     }
     if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
     const existing = matches[0];
+    if (rawMarker !== undefined && existing && existing.body !== body)
+      throw new DeliveryError('Issue comment conflicts with its authored operation marker.');
     const created =
       existing ??
       (await context.clients.rest.issues.createComment({ ...context.repo, issue_number: input.issueNumber, body }))
@@ -249,6 +266,8 @@ function prepareIssueWrite(
   input: Partial<IssueFieldsInput> & {
     body?: string;
     park?: true;
+    defer?: IssueDeferralData;
+    undefer?: true;
     status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
     blockedBy?: number[];
     preserveHistory?: boolean;
@@ -313,6 +332,11 @@ function prepareIssueWrite(
   );
   const issue = requireIssue({
     ...parsed.issue,
+    // Body replacements and unrelated typed patches cannot implicitly resume deferred work.
+    deferral:
+      input.undefer === true
+        ? undefined
+        : (input.defer ?? (current === undefined ? parsed.issue.deferral : currentParsed?.issue.deferral)),
     ...metadata,
     ...fields,
     title,
@@ -574,6 +598,7 @@ const ListedIssue = z.object({
   number: z.number().int().positive().safe(),
   node_id: z.string().min(1),
   title: z.string(),
+  body: z.string().nullable().optional(),
   state: z.enum(['open', 'closed']),
   labels: z.array(z.union([z.string(), z.object({ name: z.string() })])),
   type: z.object({ name: z.string() }).nullable().optional(),
@@ -581,6 +606,9 @@ const ListedIssue = z.object({
   updated_at: z.iso.datetime({ offset: true }),
 });
 export interface ListedTrackingIssue {
+  nodeId?: string;
+  fieldIds?: Record<string, number>;
+  deferred?: IssueDeferralData | null;
   number: number;
   title: string;
   state: 'open' | 'closed';
@@ -595,14 +623,48 @@ export interface ListedTrackingIssue {
   updatedAt: string;
 }
 
+function capacityNextPage(
+  response: { data: unknown; headers?: { link?: string } },
+  page: number,
+  perPage: number,
+): number | null {
+  if (!Array.isArray(response.data) || response.data.length > perPage)
+    throw new DeliveryError('WIP capacity pagination returned invalid native data.');
+  const link = response.headers?.link;
+  if (link === undefined || link === '') return response.data.length === perPage ? page + 1 : null;
+  const parts = [...link.matchAll(/<([^>]+)>;\s*rel="([^"]+)"/gu)];
+  const next = parts.filter((part) => part[2] === 'next');
+  const residue = link.replace(/<([^>]+)>;\s*rel="([^"]+)"/gu, '').replace(/[,\s]/gu, '');
+  if (
+    !parts.length ||
+    residue ||
+    next.length > 1 ||
+    parts.some((part) => !['first', 'prev', 'next', 'last'].includes(part[2]!))
+  )
+    throw new DeliveryError('WIP capacity native pagination is malformed.');
+  if (!next.length) return null;
+  const url = new URL(next[0]![1]!);
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'api.github.com' ||
+    url.searchParams.get('page') !== String(page + 1) ||
+    url.searchParams.get('per_page') !== String(perPage)
+  )
+    throw new DeliveryError('WIP capacity native pagination did not advance consistently.');
+  return page + 1;
+}
+
 async function issueFieldPages(
   context: DeliveryContext,
   route: string,
   parameters: Record<string, unknown>,
+  maxPages?: number,
 ): Promise<unknown[]> {
   const values: unknown[] = [];
   const seenPages = new Set<string>();
   for (let page = 1; ; page += 1) {
+    if (maxPages !== undefined && page > maxPages)
+      throw new DeliveryError('WIP capacity native field pagination is incomplete.');
     const response = await context.clients.rest.request(route, {
       ...parameters,
       headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
@@ -615,7 +677,8 @@ async function issueFieldPages(
       throw new DeliveryError('Native issue fields repeated a pagination page.');
     seenPages.add(fingerprint);
     values.push(...(response.data as unknown[]));
-    if (response.data.length < 100) return values;
+    if (maxPages === undefined ? response.data.length < 100 : capacityNextPage(response, page, 100) === null)
+      return values;
   }
 }
 
@@ -623,6 +686,7 @@ async function issueFieldPages(
 export async function listIssues(
   context: DeliveryContext,
   input: ListIssuesInput,
+  options: { capacityRead?: boolean } = {},
 ): Promise<{ issues: ListedTrackingIssue[]; page: number; perPage: number; nextPage: number | null }> {
   const page = input.page ?? 1;
   const perPage = input.perPage ?? 30;
@@ -662,24 +726,34 @@ export async function listIssues(
     raw = response.items;
     nextPage = page * perPage < response.total_count ? page + 1 : null;
   } else {
-    raw = (
-      await context.clients.rest.issues.listForRepo({
-        ...context.repo,
-        state: input.state ?? 'open',
-        ...(input.labels === undefined ? {} : { labels: input.labels.join(',') }),
-        ...(input.updatedSince === undefined ? {} : { since: input.updatedSince }),
-        page,
-        per_page: perPage,
-        sort: 'updated',
-        direction: 'desc',
-        headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
-      })
-    ).data;
-    nextPage = raw.length === perPage ? page + 1 : null;
+    const response = await context.clients.rest.issues.listForRepo({
+      ...context.repo,
+      state: input.state ?? 'open',
+      ...(input.labels === undefined ? {} : { labels: input.labels.join(',') }),
+      ...(input.updatedSince === undefined ? {} : { since: input.updatedSince }),
+      page,
+      per_page: perPage,
+      sort: 'updated',
+      direction: 'desc',
+      headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
+    });
+    raw = response.data;
+    nextPage = options.capacityRead
+      ? capacityNextPage(response, page, perPage)
+      : raw.length === perPage
+        ? page + 1
+        : null;
   }
   const catalog = z
     .array(FieldCatalogEntry)
-    .parse(await issueFieldPages(context, 'GET /orgs/{org}/issue-fields', { org: context.config.native.organization }));
+    .parse(
+      await issueFieldPages(
+        context,
+        'GET /orgs/{org}/issue-fields',
+        { org: context.config.native.organization },
+        options.capacityRead ? 20 : undefined,
+      ),
+    );
   if (
     new Set(catalog.map((field) => field.name)).size !== catalog.length ||
     new Set(catalog.map((field) => field.id)).size !== catalog.length
@@ -698,6 +772,20 @@ export async function listIssues(
     )
       throw new DeliveryError('GitHub issue list returned a foreign repository issue.');
     const selectedLabels = current.labels.map((label) => (typeof label === 'string' ? label : label.name));
+    if (options.capacityRead) {
+      const url = new URL(current.html_url);
+      if (url.protocol !== 'https:' || url.hostname !== 'github.com')
+        throw new DeliveryError('WIP capacity issue URL is not the selected GitHub repository.');
+      const native = (await context.clients.rest.issues.get({ ...context.repo, issue_number: current.number })).data;
+      if (
+        'pull_request' in native ||
+        native.number !== current.number ||
+        native.node_id !== current.node_id ||
+        native.html_url !== current.html_url ||
+        native.state !== current.state
+      )
+        throw new DeliveryError('WIP capacity issue identity or state changed during native readback.');
+    }
     if (input.state !== undefined && input.state !== 'all' && current.state !== input.state) continue;
     if (
       (input.labels ?? []).some(
@@ -725,6 +813,7 @@ export async function listIssues(
     const project = await getIssueProjectStatus({
       graphql: context.clients.graphql,
       issueNodeId: current.node_id,
+      ...(options.capacityRead ? { capacityRead: true, maxPages: 20 } : {}),
       org: context.config.native.organization,
       ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
       settings: projectSettingsFromDeliveryConfig(context.config),
@@ -732,10 +821,15 @@ export async function listIssues(
     if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) continue;
     const fields: ListedTrackingIssue['fields'] = Object.fromEntries(catalog.map((field) => [field.name, null]));
     const values = z.array(FieldValueEntry).parse(
-      await issueFieldPages(context, 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values', {
-        ...context.repo,
-        issue_number: current.number,
-      }),
+      await issueFieldPages(
+        context,
+        'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values',
+        {
+          ...context.repo,
+          issue_number: current.number,
+        },
+        options.capacityRead ? 20 : undefined,
+      ),
     );
     const observed = new Set<number>();
     for (const field of values) {
@@ -748,6 +842,15 @@ export async function listIssues(
       )
         throw new DeliveryError('Native issue field readback conflicts with its catalog.');
       observed.add(field.issue_field_id);
+      if (
+        options.capacityRead &&
+        (field.data_type === 'single_select'
+          ? field.single_select_option === undefined && field.value !== null
+          : field.data_type === 'multi_select'
+            ? field.multi_select_options === undefined && field.value !== null
+            : field.value === undefined)
+      )
+        throw new DeliveryError('WIP capacity native field value payload is missing.');
       if (
         ((field.data_type === 'single_select' && !field.single_select_option) ||
           (field.data_type === 'multi_select' && field.multi_select_options === undefined)) &&
@@ -775,6 +878,10 @@ export async function listIssues(
       else throw new DeliveryError('Native issue field has an invalid value type.');
     }
     issues.push({
+      ...(options.capacityRead
+        ? { nodeId: current.node_id, fieldIds: Object.fromEntries(catalog.map((field) => [field.name, field.id])) }
+        : {}),
+      ...deferralReadback(current.body, current.title),
       number: current.number,
       title: current.title,
       state: current.state,
@@ -867,7 +974,9 @@ export async function readIssueClosure(context: DeliveryContext, issueNumber: nu
   };
 }
 
-export interface UpdateIssueInput extends Partial<IssueFieldsInput> {
+export interface UpdateIssueInput extends Omit<Partial<IssueFieldsInput>, 'deferral'> {
+  defer?: IssueDeferralData;
+  undefer?: true;
   status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
   blockedBy?: number[];
   /** Add this issue as a blocker of these dependents without replacing their other blockers. */
@@ -897,6 +1006,11 @@ export interface UpdateIssueResult extends IssueInfo {
 }
 
 export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
+  requireDeferralPatch({
+    ...(input.defer === undefined ? {} : { defer: input.defer }),
+    ...(input.undefer === undefined ? {} : { undefer: input.undefer }),
+  });
+  if ('deferral' in input) throw new DeliveryError('Use defer or undefer to change deferral state.');
   if (context.clients.role !== 'author') throw new DeliveryError('Issue writes require the configured author role.');
   if (
     (input.closeReason !== undefined && !['completed', 'not_planned', 'duplicate'].includes(input.closeReason)) ||
@@ -1164,6 +1278,7 @@ export async function resumeCreatedIssue(context: DeliveryContext, input: Update
 }
 
 export interface IssueInfo {
+  deferred?: IssueDeferralData | null;
   routing?: LoadedDeliveryConfig['routing'];
   blockedBy: number[];
   body: string;
@@ -1203,6 +1318,7 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
     }),
   ]);
   const info: IssueInfo = {
+    ...deferralReadback(issue.body, issue.title),
     ...(context.configuration ? { routing: context.configuration.routing } : {}),
     blockedBy: relationships.blockers.filter((blocker) => blocker.state === 'OPEN').map((blocker) => blocker.number),
     body: issue.body ?? '',
@@ -1222,6 +1338,17 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
     worktree: null,
   };
   return info;
+}
+
+/** Invalid canonical content stays inspectable; omitted state is unknown, never an assertion of undeferred. */
+function deferralReadback(body: string | null | undefined, title: string): { deferred?: IssueDeferralData | null } {
+  if (body === undefined) return {};
+  try {
+    return { deferred: parseIssueBody(body ?? '', { title }).issue.deferral ?? null };
+  } catch (error) {
+    if (!(error instanceof IssueValidationError)) throw error;
+    return {};
+  }
 }
 
 export async function listIssueSubissues(context: DeliveryContext, issueNumber: number): Promise<number[]> {
@@ -1359,7 +1486,7 @@ export async function startIssueBranch(context: DeliveryContext, issueNumber: nu
 }
 
 /** Recheck native eligibility before an explicit start changes its selected Project. */
-export async function startIssueProject(context: DeliveryContext, issueNumber: number) {
+export async function startIssueProject(context: DeliveryContext, issueNumber: number, overrideReason?: string) {
   const readiness = await readyCheck(context, issueNumber);
   if (!readiness.ready) throw new IssueValidationError(readiness.failures);
   const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
@@ -1372,5 +1499,122 @@ export async function startIssueProject(context: DeliveryContext, issueNumber: n
     ...(context.projectConfiguration === undefined ? {} : { configuration: context.projectConfiguration }),
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: 'In Progress',
+    beforeAdvance: async () => {
+      const eligible = await readyCheck(context, issueNumber);
+      if (!eligible.ready) throw new IssueValidationError(eligible.failures);
+      await assertIssueStartCapacity(context, issueNumber, overrideReason, true);
+      const current = await issueInfo(context, issueNumber);
+      if (current.state !== 'open') throw new DeliveryError('Start requires the requested open issue.');
+      const finalEligibility = await readyCheck(context, issueNumber);
+      if (!finalEligibility.ready) throw new IssueValidationError(finalEligibility.failures);
+    },
   });
+}
+
+/** A complete observed-capacity guard, not a cross-writer GitHub transaction. */
+export async function assertIssueStartCapacity(
+  context: DeliveryContext,
+  issueNumber: number,
+  overrideReason?: string,
+  recordOverride = false,
+): Promise<string | undefined> {
+  const lanes = WipLimits.parse(context.config.wipLimits ?? []).filter(
+    (lane) => lane.repository.toLowerCase() === context.config.repository.toLowerCase(),
+  );
+  if (!lanes.length) return undefined;
+  const configuration =
+    context.projectConfiguration ??
+    (await getProjectDeliveryConfiguration({
+      graphql: context.clients.graphql,
+      org: context.config.native.organization,
+      settings: projectSettingsFromDeliveryConfig(context.config),
+    }));
+  const capacityContext = { ...context, projectConfiguration: configuration };
+  const reason = overrideReason === undefined ? undefined : OverrideReason.parse(overrideReason);
+  const publicReason = validateIssue({ title: 'WIP capacity override', legacyBody: reason ?? '', draft: true }, false);
+  if (publicReason.failures.length) throw new IssueValidationError(publicReason.failures);
+  if (context.config.repository.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase())
+    throw new DeliveryError('WIP capacity repository identity disagrees with the selected repository.');
+  const configuredLabels = lanes.flatMap((lane) => ('label' in lane.match ? [lane.match.label] : []));
+  if (configuredLabels.length)
+    await labels(context, [...new Map(configuredLabels.map((label) => [label.toLowerCase(), label])).values()]);
+  const rows: ListedTrackingIssue[] = [];
+  const seen = new Set<number>();
+  for (let page = 1; ; page++) {
+    if (page > 20) throw new DeliveryError('WIP capacity issue pagination is incomplete.');
+    const batch = await listIssues(capacityContext, { state: 'open', page, perPage: 100 }, { capacityRead: true });
+    for (const row of batch.issues) {
+      if (seen.has(row.number)) throw new DeliveryError('WIP capacity repeats a native issue across pages.');
+      seen.add(row.number);
+      rows.push(row);
+    }
+    if (batch.nextPage === null) break;
+    if (batch.nextPage !== page + 1) throw new DeliveryError('WIP capacity pagination did not advance.');
+  }
+  const target = rows.find((row) => row.number === issueNumber);
+  if (!target?.nodeId)
+    throw new DeliveryError('WIP capacity target is missing from the complete native issue readback.');
+  const matches = (lane: WipLane, row: ListedTrackingIssue): boolean => {
+    if ('label' in lane.match) {
+      const selected = lane.match.label;
+      return row.labels.some((label) => label.toLowerCase() === selected.toLowerCase());
+    }
+    const { field, value } = lane.match;
+    if (!row.fieldIds?.[field] || row.fieldIds[field] !== target.fieldIds?.[field] || !Object.hasOwn(row.fields, field))
+      throw new DeliveryError(`WIP capacity native field ${field} is unknown or changed identity.`);
+    const observed = row.fields[field];
+    return Array.isArray(observed) ? typeof value === 'string' && observed.includes(value) : observed === value;
+  };
+  const observations = lanes.flatMap((lane) => {
+    // Validate every configured field across the full snapshot, even when the target does not match it.
+    const matching = rows.filter((row) => matches(lane, row));
+    if (!matches(lane, target)) return [];
+    const count = matching.filter((row) => row.projectStatus === 'In Progress').length;
+    return [
+      {
+        name: lane.name,
+        match: lane.match,
+        ...('field' in lane.match ? { fieldId: target.fieldIds![lane.match.field] } : {}),
+        count,
+        limit: lane.limit,
+      },
+    ];
+  });
+  const exceeded =
+    target.projectStatus === 'In Progress' ? [] : observations.filter((lane) => lane.count + 1 > lane.limit);
+  if (exceeded.length && reason === undefined)
+    throw new DeliveryError(
+      `WIP capacity limit exceeded: ${exceeded.map((lane) => `${lane.name} (${lane.count}/${lane.limit})`).join(', ')}. Supply overrideReason for a recorded capacity exception.`,
+    );
+  const evidence = {
+    schema: 'ai-delivery.wip-override@1',
+    repository: context.config.repository,
+    projectId: configuration.projectId,
+    issue: { number: issueNumber, id: target.nodeId },
+    observedStatus: target.projectStatus,
+    lanes: observations,
+  };
+  if (!evidence.projectId) throw new DeliveryError('WIP capacity configured Project identity is unavailable.');
+  const snapshot = JSON.stringify(evidence);
+  if (exceeded.length && recordOverride) {
+    if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor)
+      throw new DeliveryError('WIP capacity override requires the authenticated configured author.');
+    const author = await context.clients.authenticatedAuthor();
+    if (!author.actorLogin || !author.credentialIdentity)
+      throw new DeliveryError('WIP capacity author identity is incomplete.');
+    const record = { ...evidence, author: author.actorLogin, reason };
+    const marker = `<!-- ai-delivery:wip-override@1:${digestValue(record)} -->`;
+    const body = `WIP capacity override.\n\n\`\`\`json\n${JSON.stringify(record, null, 2)}\n\`\`\`\n\n${marker}`;
+    const publicRecord = validateIssue({ title: 'WIP capacity override', legacyBody: body, draft: true }, false);
+    if (publicRecord.failures.length) throw new IssueValidationError(publicRecord.failures);
+    await writeAuthenticatedIssueComment(context, { issueNumber, body }, undefined, marker);
+    const finalAuthor = await context.clients.authenticatedAuthor();
+    if (finalAuthor.actorLogin !== author.actorLogin || finalAuthor.credentialIdentity !== author.credentialIdentity)
+      throw new DeliveryError('WIP capacity override author changed during comment verification.');
+    if ((await assertIssueStartCapacity(context, issueNumber, reason)) !== snapshot)
+      throw new DeliveryError(
+        'WIP capacity changed while recording the override; inspect native state and resume this issue.',
+      );
+  }
+  return snapshot;
 }

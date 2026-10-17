@@ -36,6 +36,8 @@ export function evaluateAgentReadiness(input: {
       ...(input.points === undefined ? {} : { points: input.points }),
     });
     const result = validateIssue(parsed.issue);
+    if (parsed.issue.deferral !== undefined)
+      add('deferred', 'defer', 'Issue is deferred; explicitly undefer it before starting work.');
     failures.push(...result.failures);
     warnings = issueWarnings(parsed.issue);
     if (!parsed.legacy && input.points !== undefined && parsed.issue.points !== input.points)
