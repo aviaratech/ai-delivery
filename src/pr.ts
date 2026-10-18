@@ -641,100 +641,78 @@ export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' 
   };
 }
 
-const NativeCheckSchema = z.discriminatedUnion('__typename', [
-  z.object({
-    __typename: z.literal('CheckRun'),
-    id: z.string().min(1),
-    name: z.string().min(1),
-    isRequired: z.boolean(),
-    status: z.string(),
-    conclusion: z.string().nullable(),
-  }),
-  z.object({
-    __typename: z.literal('StatusContext'),
-    id: z.string().min(1),
-    context: z.string().min(1),
-    isRequired: z.boolean(),
-    state: z.string(),
-  }),
-]);
-const NativeChecksSchema = z.object({
-  repository: z.object({
-    object: z.object({
-      oid: z.string(),
-      statusCheckRollup: z
-        .object({
-          contexts: z.object({
-            totalCount: z.number().int().nonnegative(),
-            nodes: z.array(NativeCheckSchema).max(100),
-            pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
-          }),
-        })
-        .nullable(),
-    }),
-  }),
-});
-
-/** GitHub computes which check/status contexts are required for this PR. */
-async function readNativeRequiredChecks(context: DeliveryContext, pr: RemotePr) {
-  let cursor: string | null = null;
-  const cursors = new Set<string>();
-  const checks = new Map<string, z.infer<typeof NativeCheckSchema>>();
-  let total: number | undefined;
-  for (let page = 0; page < 20; page++) {
-    const parsed = NativeChecksSchema.safeParse(
-      await context.clients.graphql<unknown>(
-        'query DeliveryRequiredChecks($owner: String!, $name: String!, $number: Int!, $sha: GitObjectID!, $cursor: String) { repository(owner: $owner, name: $name) { object(oid: $sha) { ... on Commit { oid statusCheckRollup { contexts(first: 100, after: $cursor) { totalCount nodes { __typename ... on CheckRun { id name status conclusion isRequired(pullRequestNumber: $number) } ... on StatusContext { id context state isRequired(pullRequestNumber: $number) } } pageInfo { hasNextPage endCursor } } } } } } }',
-        { owner: context.repo.owner, name: context.repo.repo, number: pr.number, sha: pr.head.sha, cursor },
-      ),
-    );
-    if (!parsed.success || parsed.data.repository.object.oid !== pr.head.sha)
-      throw new DeliveryError('Incomplete native GitHub required-check head readback.');
-    const connection = parsed.data.repository.object.statusCheckRollup?.contexts;
-    const count = connection?.totalCount ?? 0;
-    if (total !== undefined && total !== count)
-      throw new DeliveryError('Native check count changed during pagination.');
-    total = count;
-    for (const check of connection?.nodes ?? []) {
-      if (checks.has(check.id)) throw new DeliveryError('Incomplete native check pagination repeats a context.');
-      checks.set(check.id, check);
+/** Enumerate configured requirements even when a check has never reported. */
+async function readRequiredCheckNames(context: DeliveryContext, base: string) {
+  const sources = await branchRuleSources(context, base);
+  const names = new Set<string>();
+  let complete = true;
+  for (const [index, result] of sources.entries()) {
+    if (
+      result.status !== 'fulfilled' ||
+      result.value.status !== 200 ||
+      !result.value.headers ||
+      result.value.headers.link
+    ) {
+      complete = false;
+      continue;
     }
-    if (!connection?.pageInfo.hasNextPage) {
-      if (checks.size !== count) throw new DeliveryError('Incomplete native check context count.');
-      return [...checks.values()]
-        .filter((check) => check.isRequired)
-        .map((check) => ({
-          name: check.__typename === 'CheckRun' ? check.name : check.context,
-          state: check.__typename === 'CheckRun' ? `${check.status}/${check.conclusion ?? 'PENDING'}` : check.state,
-          passed:
-            check.__typename === 'CheckRun'
-              ? check.status === 'COMPLETED' && ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion ?? '')
-              : check.state === 'SUCCESS',
-        }));
+    const data = result.value.data;
+    const lists: unknown[] = [];
+    if (index === 0) {
+      if (!Array.isArray(data)) {
+        complete = false;
+        continue;
+      }
+      for (const rule of data) {
+        if (typeof rule?.type !== 'string') complete = false;
+        if (rule?.type === 'required_status_checks') lists.push(rule.parameters?.required_status_checks);
+      }
+    } else if (Array.isArray(data) || !data || typeof data !== 'object') complete = false;
+    else if (data.required_status_checks === null) lists.push([]);
+    else {
+      const checks = data?.required_status_checks;
+      if (Array.isArray(checks?.checks)) lists.push(checks.checks);
+      if (Array.isArray(checks?.contexts)) lists.push(checks.contexts.map((context: unknown) => ({ context })));
+      if (!Array.isArray(checks?.checks) && !Array.isArray(checks?.contexts)) complete = false;
     }
-    const next = connection.pageInfo.endCursor;
-    if (!next || cursors.has(next)) throw new DeliveryError('Incomplete native check pagination did not advance.');
-    cursors.add(next);
-    cursor = next;
+    for (const list of lists) {
+      const parsed = z.array(z.object({ context: z.string().min(1) })).safeParse(list);
+      if (!parsed.success) complete = false;
+      else for (const check of parsed.data) names.add(check.context);
+    }
   }
-  throw new DeliveryError('Native check pagination exceeds the bounded readback window.');
+  return { names: [...names].sort(), complete };
 }
 
 export async function prChecks(context: DeliveryContext, prNumber: number) {
   const pr = await getPr(context, prNumber);
-  const requiredChecks = await readNativeRequiredChecks(context, pr);
+  const requirements = await readRequiredCheckNames(context, pr.base.ref);
   const [checks, status, reviewState] = await Promise.all([
     context.clients.rest.checks.listForRef({ ...context.repo, ref: pr.head.sha, per_page: 100 }),
-    context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: pr.head.sha }),
+    context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: pr.head.sha, per_page: 100 }),
     readRequiredReviewState(context, prNumber, pr.head.sha),
   ]);
+  const headChecksComplete =
+    checks.data.total_count === checks.data.check_runs.length &&
+    status.data.total_count === status.data.statuses.length;
   return {
     schemaVersion: 'ai-delivery.pr-checks@1' as const,
     prNumber: pr.number,
     headSha: pr.head.sha,
     combinedStatus: status.data.state,
     mergeStateStatus: pr.mergeable_state ?? 'unknown',
-    requiredChecks,
+    requiredCheckDiscovery: requirements.complete ? 'complete' : 'partial',
+    headChecksComplete,
+    requiredChecks: requirements.names.map((name) => {
+      const run = checks.data.check_runs.find((check) => check.name === name);
+      const legacy = status.data.statuses.find((check) => check.context === name);
+      return {
+        name,
+        headState: run
+          ? `${run.status}/${run.conclusion ?? 'pending'}`
+          : (legacy?.state ?? (headChecksComplete ? 'not-reported' : 'unknown')),
+      };
+    }),
     reviewState,
     checkRuns: checks.data.check_runs.map((check) => ({
       name: check.name,
@@ -777,6 +755,21 @@ function completeRulePage(response: { status: number; data: unknown; headers: { 
 /** Absence is proved only by an empty successful first page with no continuation evidence. */
 function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
   return completeRulePage(response) && Array.isArray(response.data) && response.data.length === 0;
+}
+
+function branchRuleSources(context: DeliveryContext, base: string, control?: { signal: AbortSignal }) {
+  return Promise.allSettled([
+    context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+      ...context.repo,
+      branch: base,
+      ...(control === undefined ? {} : { request: { signal: control.signal } }),
+    }),
+    context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
+      ...context.repo,
+      branch: base,
+      ...(control === undefined ? {} : { request: { signal: control.signal } }),
+    }),
+  ]);
 }
 
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
@@ -856,18 +849,7 @@ export async function preflightReviewRoute(
       'Reviewer GitHub App cannot read the selected repository; verify its installation and repository access.',
     );
   }
-  const [rulesetResult, protectionResult] = await Promise.allSettled([
-    context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
-      ...context.repo,
-      branch: base,
-      ...(control === undefined ? {} : { request: { signal: control.signal } }),
-    }),
-    context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
-      ...context.repo,
-      branch: base,
-      ...(control === undefined ? {} : { request: { signal: control.signal } }),
-    }),
-  ]);
+  const [rulesetResult, protectionResult] = await branchRuleSources(context, base, control);
   await check();
   let confirmedUnprotected = false;
   let confirmedRulesetOnly = false;
@@ -1377,7 +1359,6 @@ export async function mergePr(
     refuseClosingDirective(squash!.commit_title);
     refuseClosingDirective(squash!.commit_message);
   }
-  const requiredChecks = await readNativeRequiredChecks(context, pr);
   const decision = await readRequiredReviewState(context, input.prNumber, reviewedHead);
   pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing);
   if (nonClosing) {
@@ -1392,12 +1373,13 @@ export async function mergePr(
     pr.mergeable !== true ||
     !['clean', 'has_hooks', 'unstable'].includes(pr.mergeable_state ?? '') ||
     !decision.observed ||
-    (decision.reviewDecision !== 'APPROVED' && decision.reviewDecision !== null) ||
-    !requiredChecks.every((check) => check.passed)
-  )
+    (decision.reviewDecision !== 'APPROVED' && decision.reviewDecision !== null)
+  ) {
+    const requirements = await readRequiredCheckNames(context, pr.base.ref);
     throw new DeliveryError(
-      `GitHub merge eligibility is ${pr.mergeable_state ?? 'unknown'}; review eligibility is ${decision.status}. Required checks: ${requiredChecks.map((check) => `${check.name}: ${check.state}`).join(', ') || 'none observed'}. ${decision.nextAction}`,
+      `GitHub merge eligibility is ${pr.mergeable_state ?? 'unknown'}; review eligibility is ${decision.status}. Required checks: ${requirements.names.join(', ') || (requirements.complete ? 'none' : 'unknown')}; requirement discovery is ${requirements.complete ? 'complete' : 'partial'}. ${decision.nextAction}`,
     );
+  }
   const currentBase = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data
     .object.sha;
   if (!validSha(currentBase) || currentBase !== pr.base.sha)

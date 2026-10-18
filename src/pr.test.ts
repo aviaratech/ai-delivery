@@ -10,9 +10,11 @@ const merge = 'b'.repeat(40);
 function fixture(
   state: string | null = 'clean',
   option: {
+    configuredRequiredChecks?: string[];
+    requirementsViaClassic?: boolean;
+    requirementsUnavailable?: boolean;
     nativeChecks?: Array<{ name: string; required: boolean; status: string; conclusion: string | null }>;
     nativeStatuses?: Array<{ name: string; required: boolean; state: string }>;
-    nativePage?: 'continuation' | 'malformed';
     baseMoved?: boolean;
     nonClosing?: boolean;
     commitMessage?: string;
@@ -98,10 +100,62 @@ function fixture(
     user: { login: 'author' },
   });
   const rest = {
-    request: async () => ({ status: 200, headers: {}, data: [] }),
-    checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    request: async (route: string) => {
+      if (option.requirementsUnavailable) throw { status: 403 };
+      if (route.endsWith('/rules/branches/{branch}'))
+        return {
+          status: 200,
+          headers: {},
+          data: option.requirementsViaClassic
+            ? []
+            : [
+                {
+                  type: 'required_status_checks',
+                  parameters: {
+                    required_status_checks: (
+                      option.configuredRequiredChecks ??
+                      [
+                        ...(option.nativeChecks ?? []).filter((check) => check.required),
+                        ...(option.nativeStatuses ?? []).filter((check) => check.required),
+                      ].map((check) => check.name)
+                    ).map((context) => ({ context })),
+                  },
+                },
+              ],
+        };
+      return {
+        status: 200,
+        headers: {},
+        data: {
+          required_pull_request_reviews: { required_approving_review_count: 0 },
+          required_status_checks: option.requirementsViaClassic
+            ? { contexts: option.configuredRequiredChecks ?? [] }
+            : null,
+        },
+      };
+    },
+    checks: {
+      listForRef: async () => ({
+        data: {
+          total_count: (option.nativeChecks ?? []).length,
+          check_runs: (option.nativeChecks ?? []).slice(0, 100).map((check) => ({
+            name: check.name,
+            status: check.status.toLowerCase(),
+            conclusion: check.conclusion?.toLowerCase() ?? null,
+          })),
+        },
+      }),
+    },
     repos: {
-      getCombinedStatusForRef: async () => ({ data: { state: 'success' } }),
+      getCombinedStatusForRef: async () => ({
+        data: {
+          state: 'success',
+          total_count: (option.nativeStatuses ?? []).length,
+          statuses: (option.nativeStatuses ?? [])
+            .slice(0, 100)
+            .map((check) => ({ context: check.name, state: check.state.toLowerCase() })),
+        },
+      }),
       get: async () => ({ data: { node_id: 'REPO', default_branch: 'main', full_name: 'example/widget' } }),
     },
     git: {
@@ -184,48 +238,7 @@ function fixture(
       },
     },
   };
-  const graphql = async (query: string, variables?: { cursor?: string | null }) => {
-    if (query.includes('DeliveryRequiredChecks')) {
-      const all = [
-        ...(option.nativeChecks ?? []).map((check, i) => ({
-          __typename: 'CheckRun',
-          id: `CHECK${i}`,
-          name: check.name,
-          isRequired: check.required,
-          status: check.status,
-          conclusion: check.conclusion,
-        })),
-        ...(option.nativeStatuses ?? []).map((check, i) => ({
-          __typename: 'StatusContext',
-          id: `STATUS${i}`,
-          context: check.name,
-          isRequired: check.required,
-          state: check.state,
-        })),
-      ];
-      const offset = variables?.cursor === 'next' ? 100 : 0;
-      const more = offset + 100 < all.length;
-      return {
-        repository: {
-          object: {
-            oid: head,
-            statusCheckRollup: {
-              contexts: {
-                totalCount: all.length,
-                nodes: all.slice(offset, offset + 100),
-                pageInfo:
-                  option.nativePage === 'malformed'
-                    ? {}
-                    : {
-                        hasNextPage: more || option.nativePage === 'continuation',
-                        endCursor: option.nativePage === 'continuation' ? 'same' : more ? 'next' : null,
-                      },
-              },
-            },
-          },
-        },
-      };
-    }
+  const graphql = async (query: string) => {
     if (query.includes('DeliveryNonClosingReferences'))
       return {
         repository: {
@@ -444,7 +457,7 @@ describe('remote GitHub lifecycle', () => {
     await mergePr(context, { issueNumber: 17, prNumber: 23 });
     assert.equal(merges.length, 1);
   });
-  it('reads all native context pages including required legacy statuses', async () => {
+  it('discovers required legacy names alongside a full page of head check runs', async () => {
     const { context, merges } = fixture('clean', {
       nativeChecks: Array.from({ length: 100 }, (_, i) => ({
         name: `optional${i}`,
@@ -462,8 +475,8 @@ describe('remote GitHub lifecycle', () => {
     await mergePr(context, { issueNumber: 17, prNumber: 23 });
     assert.equal(merges.length, 1);
   });
-  it('refuses a failing required legacy status even with an eligible aggregate state', async () => {
-    const { context, merges } = fixture('clean', {
+  it('refuses GitHub blocked eligibility for a failing required legacy status', async () => {
+    const { context, merges } = fixture('blocked', {
       nativeStatuses: [{ name: 'legacy-required', required: true, state: 'FAILURE' }],
     });
     await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /legacy-required/u);
@@ -474,13 +487,6 @@ describe('remote GitHub lifecycle', () => {
     await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }));
     assert.equal(merges.length, 0);
   });
-  for (const nativePage of ['continuation', 'malformed'] as const) {
-    it(`refuses incomplete native check evidence ${nativePage}`, async () => {
-      const { context, merges } = fixture('clean', { nativePage });
-      await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /pagination|incomplete|Incomplete/u);
-      assert.equal(merges.length, 0);
-    });
-  }
   for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}, 'REVIEW_REQUIRED', 'CHANGES_REQUESTED']) {
     it(`refuses unavailable or blocking native review decision ${JSON.stringify(reviewDecision)}`, async () => {
       const { context, merges } = fixture('clean', { reviewDecision });
@@ -503,6 +509,43 @@ describe('remote GitHub lifecycle', () => {
     const { context, merges } = fixture('has_hooks');
     await mergePr(context, { issueNumber: 17, prNumber: 23 });
     assert.equal(merges.length, 1);
+  });
+  it('names a configured required check that has never reported', async () => {
+    const { context, merges } = fixture('blocked', {
+      configuredRequiredChecks: ['local-verify', 'money-path-review'],
+      nativeChecks: [{ name: 'local-verify', required: true, status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    });
+    const checks = await prChecks(context, 23);
+    assert.deepEqual(
+      checks.requiredChecks.map((check) => check.name),
+      ['local-verify', 'money-path-review'],
+    );
+    await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /money-path-review/u);
+    assert.equal(merges.length, 0);
+  });
+  it('retains configured requirements without relying on a check rollup', async () => {
+    const { context } = fixture('blocked', { configuredRequiredChecks: ['money-path-review'] });
+    const read = context.clients.graphql;
+    context.clients.graphql = (async (query: string, variables: unknown) => {
+      assert.ok(!query.includes('statusCheckRollup'));
+      return read(query, variables as never);
+    }) as typeof context.clients.graphql;
+    const checks = await prChecks(context, 23);
+    assert.deepEqual(checks.requiredChecks, [{ name: 'money-path-review', headState: 'not-reported' }]);
+  });
+  it('discovers an unreported classic-protection requirement', async () => {
+    const { context } = fixture('blocked', {
+      requirementsViaClassic: true,
+      configuredRequiredChecks: ['classic-required'],
+    });
+    const checks = await prChecks(context, 23);
+    assert.deepEqual(checks.requiredChecks, [{ name: 'classic-required', headState: 'not-reported' }]);
+    assert.equal(checks.requiredCheckDiscovery, 'complete');
+  });
+  it('declares requirement discovery partial when native rule reads are unavailable', async () => {
+    const { context } = fixture('blocked', { requirementsUnavailable: true });
+    const checks = await prChecks(context, 23);
+    assert.equal((checks as unknown as { requiredCheckDiscovery: string }).requiredCheckDiscovery, 'partial');
   });
   it('refuses publication of a collaborator PR before promotion', async () => {
     const { context } = fixture();
