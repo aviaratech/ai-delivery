@@ -149,7 +149,9 @@ function fixture(
     repos: {
       getCombinedStatusForRef: async () => ({
         data: {
-          state: 'success',
+          state: (option.nativeStatuses ?? []).some((check) => ['FAILURE', 'ERROR'].includes(check.state))
+            ? 'failure'
+            : 'success',
           total_count: (option.nativeStatuses ?? []).length,
           statuses: (option.nativeStatuses ?? [])
             .slice(0, 100)
@@ -541,6 +543,20 @@ describe('remote GitHub lifecycle', () => {
     const checks = await prChecks(context, 23);
     assert.deepEqual(checks.requiredChecks, [{ name: 'classic-required', headState: 'not-reported' }]);
     assert.equal(checks.requiredCheckDiscovery, 'complete');
+  });
+  it('preserves a failing legacy status beside a successful same-name required check run', async () => {
+    const { context, merges } = fixture('blocked', {
+      nativeChecks: [{ name: 'money-path-review', required: true, status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      nativeStatuses: [{ name: 'money-path-review', required: true, state: 'FAILURE' }],
+    });
+    const checks = await prChecks(context, 23);
+    assert.equal(checks.headChecksComplete, true);
+    assert.equal(checks.combinedStatus, 'failure');
+    assert.equal(checks.requiredChecks.length, 1);
+    assert.match(checks.requiredChecks[0]!.headState, /success/u);
+    assert.match(checks.requiredChecks[0]!.headState, /failure/u);
+    await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /money-path-review/u);
+    assert.equal(merges.length, 0);
   });
   it('declares requirement discovery partial when native rule reads are unavailable', async () => {
     const { context } = fixture('blocked', { requirementsUnavailable: true });

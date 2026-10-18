@@ -704,14 +704,13 @@ export async function prChecks(context: DeliveryContext, prNumber: number) {
     requiredCheckDiscovery: requirements.complete ? 'complete' : 'partial',
     headChecksComplete,
     requiredChecks: requirements.names.map((name) => {
-      const run = checks.data.check_runs.find((check) => check.name === name);
-      const legacy = status.data.statuses.find((check) => check.context === name);
-      return {
-        name,
-        headState: run
-          ? `${run.status}/${run.conclusion ?? 'pending'}`
-          : (legacy?.state ?? (headChecksComplete ? 'not-reported' : 'unknown')),
-      };
+      const states = [
+        ...checks.data.check_runs
+          .filter((check) => check.name === name)
+          .map((check) => `check: ${check.status}/${check.conclusion ?? 'pending'}`),
+        ...status.data.statuses.filter((check) => check.context === name).map((check) => `status: ${check.state}`),
+      ];
+      return { name, headState: states.join('; ') || (headChecksComplete ? 'not-reported' : 'unknown') };
     }),
     reviewState,
     checkRuns: checks.data.check_runs.map((check) => ({
