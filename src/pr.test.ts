@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'vitest';
-import { publishPr, mergePr, finishIssue } from './pr.js';
+import { publishPr, mergePr, finishIssue, prChecks } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
-import { readRequiredReviewState } from './review.js';
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
@@ -11,30 +10,23 @@ const merge = 'b'.repeat(40);
 function fixture(
   state: string | null = 'clean',
   option: {
+    nativeChecks?: Array<{ name: string; required: boolean; status: string; conclusion: string | null }>;
+    nativeStatuses?: Array<{ name: string; required: boolean; state: string }>;
+    nativePage?: 'continuation' | 'malformed';
     baseMoved?: boolean;
     nonClosing?: boolean;
     commitMessage?: string;
     retainedIssueDrift?: boolean;
     mergeAckLost?: boolean;
-    reviewMoved?: boolean;
     headMoved?: boolean;
     reviewDecision?: unknown;
-    reviewPolicy?: 'legacy' | 'ruleset';
-    requiredApprovals?: unknown;
-    classicApprovals?: unknown;
-    classicStatus?: number;
-    rulePage?: 'missing-headers' | 'non-200' | 'continuation';
-    ruleVisibility?: 'partial' | 'unknown' | 'permission-404' | 'generic-404';
     decisionUnavailable?: boolean;
     decisionHeadMoved?: boolean;
     baseChangedAfterDecision?: 'name' | 'sha';
-    reviewAccessActor?: string;
     unrelatedBranch?: boolean;
     failedClose?: boolean;
     deletedAfterMerge?: boolean;
     wrongClosingIssue?: boolean;
-    reviewCannotPush?: boolean;
-    reviewAccessUnknown?: boolean;
     reviewBinding?:
       | 'stale-head'
       | 'wrong-tree'
@@ -95,7 +87,7 @@ function fixture(
     draft: publicationDraft ?? false,
     merged,
     merge_commit_sha: merged ? merge : null,
-    mergeable: state === 'clean',
+    mergeable: state === 'clean' || state === 'unstable' || state === 'has_hooks',
     mergeable_state: state,
     head: { sha: head, ref: 'issue/17', repo: { full_name: 'example/widget' } },
     base: {
@@ -106,79 +98,12 @@ function fixture(
     user: { login: 'author' },
   });
   const rest = {
-    request: async (route: string) => {
-      if (!option.reviewPolicy) return { data: [] };
-      const count = Object.hasOwn(option, 'requiredApprovals') ? option.requiredApprovals : 0;
-      if (option.ruleVisibility === 'unknown') throw { status: 403 };
-      if (route.endsWith('/rules/branches/{branch}')) {
-        if (option.ruleVisibility === 'partial') throw { status: 403 };
-        return {
-          status: option.rulePage === 'non-200' ? 500 : 200,
-          ...(option.rulePage === 'missing-headers'
-            ? {}
-            : {
-                headers:
-                  option.rulePage === 'continuation' ? { link: '<https://api.github.com/next>; rel="next"' } : {},
-              }),
-          data:
-            option.reviewPolicy === 'ruleset'
-              ? [
-                  {
-                    type: 'pull_request',
-                    ruleset_id: 41,
-                    ruleset_source_type: 'Repository',
-                    ruleset_source: 'example/widget',
-                    parameters: { required_approving_review_count: count },
-                  },
-                  {
-                    type: 'required_status_checks',
-                    ruleset_id: 41,
-                    ruleset_source_type: 'Repository',
-                    ruleset_source: 'example/widget',
-                    parameters: {
-                      required_status_checks: [{ context: 'local-verify' }, { context: 'money-path-review' }],
-                    },
-                  },
-                ]
-              : [],
-        };
-      }
-      if (route.endsWith('/protection')) {
-        if (option.ruleVisibility === 'permission-404' || option.ruleVisibility === 'generic-404')
-          throw {
-            status: 404,
-            response: {
-              status: option.ruleVisibility === 'permission-404' ? 403 : 404,
-              data: { message: option.ruleVisibility === 'generic-404' ? 'Not Found' : 'Branch not protected' },
-            },
-          };
-        if (option.reviewPolicy === 'ruleset' && !Object.hasOwn(option, 'classicApprovals'))
-          throw { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } };
-        return {
-          status: option.classicStatus ?? 200,
-          headers: {},
-          data: {
-            required_pull_request_reviews: {
-              required_approving_review_count: Object.hasOwn(option, 'classicApprovals')
-                ? option.classicApprovals
-                : count,
-            },
-          },
-        };
-      }
-      if (route.endsWith('/rulesets'))
-        return {
-          status: 200,
-          headers: {},
-          data: [{ id: 41, source_type: 'Repository', source: 'example/widget', enforcement: 'active' }],
-        };
-      if (route.endsWith('/branches/{branch}'))
-        return { status: 200, data: { name: 'main', protected: true, protection: { enabled: false } } };
-      if (route === 'GET /repos/{owner}/{repo}')
-        return { status: 200, data: { full_name: 'example/widget', permissions: { push: true } } };
-      throw new Error(`Unexpected fictional rule route ${route}`);
+    request: async () => ({ status: 200, headers: {}, data: [] }),
+    checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    repos: {
+      getCombinedStatusForRef: async () => ({ data: { state: 'success' } }),
+      get: async () => ({ data: { node_id: 'REPO', default_branch: 'main', full_name: 'example/widget' } }),
     },
-    repos: { get: async () => ({ data: { node_id: 'REPO', default_branch: 'main', full_name: 'example/widget' } }) },
     git: {
       getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
       getRef: async ({ ref }: { ref: string }) => ({
@@ -213,7 +138,7 @@ function fixture(
         data: {
           id: 99,
           user: { login: 'reviewer[bot]' },
-          state: option.reviewMoved ? 'DISMISSED' : 'APPROVED',
+          state: 'APPROVED',
           commit_id: head,
           body: reviewBody,
           html_url: 'https://github.com/example/widget/pull/23#pullrequestreview-99',
@@ -259,7 +184,48 @@ function fixture(
       },
     },
   };
-  const graphql = async (query: string) => {
+  const graphql = async (query: string, variables?: { cursor?: string | null }) => {
+    if (query.includes('DeliveryRequiredChecks')) {
+      const all = [
+        ...(option.nativeChecks ?? []).map((check, i) => ({
+          __typename: 'CheckRun',
+          id: `CHECK${i}`,
+          name: check.name,
+          isRequired: check.required,
+          status: check.status,
+          conclusion: check.conclusion,
+        })),
+        ...(option.nativeStatuses ?? []).map((check, i) => ({
+          __typename: 'StatusContext',
+          id: `STATUS${i}`,
+          context: check.name,
+          isRequired: check.required,
+          state: check.state,
+        })),
+      ];
+      const offset = variables?.cursor === 'next' ? 100 : 0;
+      const more = offset + 100 < all.length;
+      return {
+        repository: {
+          object: {
+            oid: head,
+            statusCheckRollup: {
+              contexts: {
+                totalCount: all.length,
+                nodes: all.slice(offset, offset + 100),
+                pageInfo:
+                  option.nativePage === 'malformed'
+                    ? {}
+                    : {
+                        hasNextPage: more || option.nativePage === 'continuation',
+                        endCursor: option.nativePage === 'continuation' ? 'same' : more ? 'next' : null,
+                      },
+              },
+            },
+          },
+        },
+      };
+    }
     if (query.includes('DeliveryNonClosingReferences'))
       return {
         repository: {
@@ -321,26 +287,6 @@ function fixture(
                 },
               ],
               pageInfo: { hasNextPage: false, endCursor: null },
-            },
-          },
-        },
-      };
-    if (query.includes('DeliveryReviewAccess'))
-      return {
-        repository: {
-          pullRequest: {
-            reviews: {
-              nodes: option.reviewAccessUnknown
-                ? []
-                : [
-                    {
-                      fullDatabaseId: 99,
-                      author: { login: option.reviewAccessActor ?? 'reviewer' },
-                      authorCanPushToRepository: option.reviewCannotPush !== true,
-                      commit: { oid: head },
-                      state: 'APPROVED',
-                    },
-                  ],
             },
           },
         },
@@ -423,133 +369,17 @@ function fixture(
 }
 
 describe('remote GitHub lifecycle', () => {
-  for (const unknownCount of [undefined, null, '1']) {
-    for (const source of ['classic', 'ruleset'] as const) {
-      it(`refuses mixed zero/null with unknown ${source} count ${String(unknownCount)}`, async () => {
-        const { context, merges, closes } = fixture('clean', {
-          reviewPolicy: 'ruleset',
-          reviewDecision: null,
-          requiredApprovals: source === 'ruleset' ? unknownCount : 0,
-          classicApprovals: source === 'classic' ? unknownCount : 0,
-        });
-        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-        assert.equal(merges.length, 0);
-        assert.equal(closes(), 0);
-      });
-    }
-  }
-  for (const rulePage of ['missing-headers', 'non-200', 'continuation'] as const) {
-    it(`refuses mixed zero/null with incomplete applicable rule page ${rulePage}`, async () => {
-      const { context, merges, closes } = fixture('clean', {
-        reviewPolicy: 'ruleset',
-        reviewDecision: null,
-        classicApprovals: 0,
-        rulePage,
-      });
-      await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-      assert.equal(merges.length, 0);
-      assert.equal(closes(), 0);
-    });
-  }
-  it('refuses mixed zero/null with a fulfilled non-successful classic response', async () => {
-    const { context, merges, closes } = fixture('clean', {
-      reviewPolicy: 'ruleset',
-      reviewDecision: null,
-      classicApprovals: 0,
-      classicStatus: 500,
-    });
-    await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-    assert.equal(merges.length, 0);
-    assert.equal(closes(), 0);
-  });
-  it('merges mixed zero/null only when both complete policy sources explicitly require zero', async () => {
-    const { context, merges, closes } = fixture('clean', {
-      reviewPolicy: 'ruleset',
-      reviewDecision: null,
-      classicApprovals: 0,
-    });
-    await finishIssue(context, { issueNumber: 17, prNumber: 23 });
+  it('uses native eligibility without comparing historical artifact identity', async () => {
+    const { context, merges } = fixture('clean', { reviewBinding: 'stale-head' });
+    await mergePr(context, { issueNumber: 17, prNumber: 23, reviewedHeadSha: head });
     assert.equal(merges.length, 1);
     assert.equal(merges[0]?.sha, head);
-    assert.equal(closes(), 1);
   });
-  for (const reviewPolicy of ['legacy', 'ruleset'] as const) {
-    it(`merges complete ${reviewPolicy} zero required reviews with observed null and a qualifying exact-head App approval`, async () => {
-      const { context, merges, closes } = fixture('clean', { reviewPolicy, reviewDecision: null });
-      const decision = await readRequiredReviewState(context, 23, head, { id: 99, login: 'reviewer[bot]' });
-      assert.equal(decision.reviewDecision, null);
-      assert.equal(decision.status, 'unknown');
-      assert.equal(decision.submittedReviewAuthorCanPushToRepository, true);
-      const preview = await mergePr(context, { issueNumber: 17, prNumber: 23, reviewedHeadSha: head, dryRun: true });
-      assert.equal(preview.headSha, head);
-      assert.equal(merges.length, 0);
-      assert.equal(closes(), 0);
-      await finishIssue(context, { issueNumber: 17, prNumber: 23, reviewedHeadSha: head });
-      assert.equal(merges.length, 1);
-      assert.equal(merges[0]?.sha, head);
-      assert.equal(closes(), 1);
-    });
-
-    for (const requiredApprovals of [undefined, null, -1, 1, '0', false, {}]) {
-      it(`refuses ${reviewPolicy} null decision with unconfirmed zero count ${JSON.stringify(requiredApprovals)}`, async () => {
-        const { context, merges, closes } = fixture('clean', { reviewPolicy, requiredApprovals, reviewDecision: null });
-        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-        assert.equal(merges.length, 0);
-        assert.equal(closes(), 0);
-      });
-    }
-    for (const ruleVisibility of ['partial', 'unknown', 'permission-404', 'generic-404'] as const) {
-      it(`refuses ${reviewPolicy} zero/null with ${ruleVisibility} visibility`, async () => {
-        const { context, merges, closes } = fixture('clean', { reviewPolicy, ruleVisibility, reviewDecision: null });
-        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-        assert.equal(merges.length, 0);
-        assert.equal(closes(), 0);
-      });
-    }
-    for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}]) {
-      it(`refuses ${reviewPolicy} zero reviews with missing or malformed decision ${JSON.stringify(reviewDecision)}`, async () => {
-        const { context, merges, closes } = fixture('clean', { reviewPolicy, reviewDecision });
-        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-        assert.equal(merges.length, 0);
-        assert.equal(closes(), 0);
-      });
-    }
-    for (const guard of [
-      { decisionUnavailable: true },
-      { decisionHeadMoved: true },
-      { baseMoved: true },
-      { baseChangedAfterDecision: 'name' },
-      { baseChangedAfterDecision: 'sha' },
-      { headMoved: true },
-      { reviewMoved: true },
-      { reviewCannotPush: true },
-      { reviewAccessUnknown: true },
-      { reviewAccessActor: 'foreign-reviewer' },
-      { reviewBinding: 'stale-head' },
-      { reviewBinding: 'wrong-tree' },
-      { reviewBinding: 'wrong-scope' },
-      { reviewBinding: 'invalid-digest' },
-      { reviewBinding: 'marker-only' },
-      { reviewBinding: 'wrong-issue' },
-      { reviewBinding: 'wrong-pr' },
-      { reviewBinding: 'wrong-role' },
-    ] as const) {
-      it(`preserves ${reviewPolicy} zero/null merge guard ${JSON.stringify(guard)}`, async () => {
-        const { context, merges, closes } = fixture('clean', { ...guard, reviewPolicy, reviewDecision: null });
-        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-        assert.equal(merges.length, 0);
-        assert.equal(closes(), 0);
-      });
-    }
-    for (const state of [null, 'unknown', 'blocked', 'unstable', 'behind', 'dirty']) {
-      it(`refuses ${reviewPolicy} zero/null with non-CLEAN native check and merge state ${String(state)}`, async () => {
-        const { context, merges, closes } = fixture(state, { reviewPolicy, reviewDecision: null });
-        await assert.rejects(finishIssue(context, { issueNumber: 17, prNumber: 23 }));
-        assert.equal(merges.length, 0);
-        assert.equal(closes(), 0);
-      });
-    }
-  }
+  it('accepts native PR association despite a superseded linked branch snapshot', async () => {
+    const { context, merges } = fixture('clean', { unrelatedBranch: true });
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges.length, 1);
+  });
 
   for (const reviewBinding of [
     'stale-head',
@@ -561,23 +391,119 @@ describe('remote GitHub lifecycle', () => {
     'wrong-pr',
     'wrong-role',
   ] as const) {
-    it(`refuses ${reviewBinding} artifact binding despite remapped current API commit and CLEAN approval`, async () => {
-      const { context, merges, closes } = fixture('clean', { reviewBinding });
-      await assert.rejects(
-        finishIssue(context, { issueNumber: 17, prNumber: 23 }),
-        /artifact|binding|review|scope|tree/u,
-      );
-      assert.equal(merges.length, 0);
-      assert.equal(closes(), 0);
+    it(`defers ${reviewBinding} historical review eligibility to GitHub`, async () => {
+      const { context, merges } = fixture('clean', { reviewBinding });
+      context.clients.rest.pulls.listReviews = (async () => {
+        throw new Error('Historical review comparison must not run');
+      }) as unknown as typeof context.clients.rest.pulls.listReviews;
+      context.clients.rest.git.getCommit = (async () => {
+        throw new Error('Historical tree comparison must not run');
+      }) as unknown as typeof context.clients.rest.git.getCommit;
+      context.clients.rest.pulls.listFiles = (async () => {
+        throw new Error('Historical diff comparison must not run');
+      }) as unknown as typeof context.clients.rest.pulls.listFiles;
+      await mergePr(context, { issueNumber: 17, prNumber: 23 });
+      assert.equal(merges.length, 1);
     });
   }
-  for (const option of [{ reviewCannotPush: true }, { reviewAccessUnknown: true }]) {
-    it(`refuses an unqualified App review despite aggregate human approval: ${JSON.stringify(option)}`, async () => {
+  it('merges a native zero-review decision without requiring an extra App approval', async () => {
+    const { context, merges } = fixture('clean', { reviewDecision: null });
+    delete context.reviewerClients;
+    context.clients.rest.pulls.listReviews = (async () => {
+      throw new Error('Extra approval must not be required');
+    }) as unknown as typeof context.clients.rest.pulls.listReviews;
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges.length, 1);
+  });
+  for (const [status, conclusion] of [
+    ['IN_PROGRESS', null],
+    ['COMPLETED', 'FAILURE'],
+    ['COMPLETED', 'TIMED_OUT'],
+  ] as const) {
+    it(`names the required native money-path-review blocker ${status}/${conclusion}`, async () => {
+      const { context, merges } = fixture('blocked', {
+        nativeChecks: [{ name: 'money-path-review', required: true, status, conclusion }],
+      });
+      await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /money-path-review/u);
+      assert.equal(merges.length, 0);
+    });
+  }
+  it('reports discovered required check names and permits a failed optional check', async () => {
+    const { context, merges } = fixture('unstable', {
+      nativeChecks: [
+        { name: 'local-verify', required: true, status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'money-path-review', required: true, status: 'COMPLETED', conclusion: 'NEUTRAL' },
+        { name: 'optional', required: false, status: 'COMPLETED', conclusion: 'FAILURE' },
+      ],
+    });
+    const checks = await prChecks(context, 23);
+    assert.deepEqual(
+      (checks as unknown as { requiredChecks: Array<{ name: string }> }).requiredChecks.map((check) => check.name),
+      ['local-verify', 'money-path-review'],
+    );
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges.length, 1);
+  });
+  it('reads all native context pages including required legacy statuses', async () => {
+    const { context, merges } = fixture('clean', {
+      nativeChecks: Array.from({ length: 100 }, (_, i) => ({
+        name: `optional${i}`,
+        required: false,
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+      })),
+      nativeStatuses: [{ name: 'legacy-required', required: true, state: 'SUCCESS' }],
+    });
+    const checks = await prChecks(context, 23);
+    assert.deepEqual(
+      checks.requiredChecks.map((check) => check.name),
+      ['legacy-required'],
+    );
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges.length, 1);
+  });
+  it('refuses a failing required legacy status even with an eligible aggregate state', async () => {
+    const { context, merges } = fixture('clean', {
+      nativeStatuses: [{ name: 'legacy-required', required: true, state: 'FAILURE' }],
+    });
+    await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /legacy-required/u);
+    assert.equal(merges.length, 0);
+  });
+  it('refuses unavailable review decision readback even when GitHub REST is clean', async () => {
+    const { context, merges } = fixture('clean', { decisionUnavailable: true });
+    await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }));
+    assert.equal(merges.length, 0);
+  });
+  for (const nativePage of ['continuation', 'malformed'] as const) {
+    it(`refuses incomplete native check evidence ${nativePage}`, async () => {
+      const { context, merges } = fixture('clean', { nativePage });
+      await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /pagination|incomplete|Incomplete/u);
+      assert.equal(merges.length, 0);
+    });
+  }
+  for (const reviewDecision of [undefined, 'UNKNOWN', false, 0, {}, 'REVIEW_REQUIRED', 'CHANGES_REQUESTED']) {
+    it(`refuses unavailable or blocking native review decision ${JSON.stringify(reviewDecision)}`, async () => {
+      const { context, merges } = fixture('clean', { reviewDecision });
+      await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }));
+      assert.equal(merges.length, 0);
+    });
+  }
+  for (const option of [
+    { decisionHeadMoved: true },
+    { baseChangedAfterDecision: 'name' },
+    { baseChangedAfterDecision: 'sha' },
+  ] as const) {
+    it(`refuses native head/base decision drift ${JSON.stringify(option)}`, async () => {
       const { context, merges } = fixture('clean', option);
-      await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /qualifying|count|eligible/u);
+      await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }));
       assert.equal(merges.length, 0);
     });
   }
+  it('accepts GitHub passing eligibility with native pre-receive hooks', async () => {
+    const { context, merges } = fixture('has_hooks');
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges.length, 1);
+  });
   it('refuses publication of a collaborator PR before promotion', async () => {
     const { context } = fixture();
     context.clients.rest.pulls.list = (async () => ({
@@ -621,7 +547,7 @@ describe('remote GitHub lifecycle', () => {
     assert.equal((result as { prNumber: number }).prNumber, 23);
   });
 
-  for (const state of ['blocked', 'behind', 'dirty', 'unstable', null]) {
+  for (const state of ['blocked', 'behind', 'dirty', 'unknown', null]) {
     it(`refuses GitHub merge eligibility ${String(state)} without a local receipt fallback`, async () => {
       const { context, merges } = fixture(state);
       await assert.rejects(mergePr(context, { issueNumber: 17, prNumber: 23 }), /GitHub|mergeable|clean|CLEAN/u);
@@ -645,11 +571,9 @@ describe('remote GitHub lifecycle', () => {
   });
   for (const [name, option] of [
     ['moved base', { baseMoved: true }],
-    ['dismissed review readback', { reviewMoved: true }],
     ['moved reviewed head', { headMoved: true }],
     ['unknown decision', { reviewDecision: 'UNKNOWN' }],
     ['required review', { reviewDecision: 'REVIEW_REQUIRED' }],
-    ['unrelated linked branch', { unrelatedBranch: true }],
   ] as const) {
     it(`refuses ${name} without merge or issue closure`, async () => {
       const { context, merges, closes } = fixture('clean', option);
@@ -712,8 +636,6 @@ describe('retained issue guarded squash delivery', () => {
     assert.equal(closes(), 0);
   });
   for (const option of [
-    { reviewCannotPush: true },
-    { reviewAccessUnknown: true },
     { reviewDecision: 'REVIEW_REQUIRED' },
     { baseMoved: true },
     { headMoved: true },

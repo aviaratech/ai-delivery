@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { DeliveryError } from './errors.js';
 import * as githubClients from './github/client.js';
 import type { GitHubClients } from './github/client.js';
@@ -27,13 +28,7 @@ import {
   registerInvestigationCustody,
   type InvestigationPreparation,
 } from './services/worktreeRegistry.js';
-import {
-  parseGitHubReviewArtifact,
-  parseReviewArtifact,
-  readGitHubPrScopeHash,
-  readRequiredReviewState,
-  submitReview,
-} from './review.js';
+import { parseReviewArtifact, readRequiredReviewState, submitReview } from './review.js';
 
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
@@ -585,14 +580,6 @@ async function verifyIssuePr(context: DeliveryContext, issueNumber: number, prNu
   if (nonClosing) await verifyNonClosingReference(context, issueNumber, pr);
   else await verifyPrIssueAssociation(context, prNumber, issueNumber);
   if (!pr.merged) {
-    // GitHub replaces the issue's branch connection with its PR on publication.
-    // Existing connections remain consistency evidence, never a fallback authority.
-    const branches = await linkedIssueBranches(context, issueNumber);
-    if (branches.length > 0) {
-      const matches = branches.filter((branch) => branch.name === pr.head.ref);
-      if (matches.length !== 1 || matches[0]!.sha !== pr.head.sha)
-        throw new DeliveryError('Native linked issue branches conflict with the exact PR head/ref.');
-    }
     const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.head.ref}` })).data;
     if (ref.ref !== `refs/heads/${pr.head.ref}` || ref.object.type !== 'commit' || ref.object.sha !== pr.head.sha)
       throw new DeliveryError('Current remote PR head/ref readback is incomplete or has moved.');
@@ -654,8 +641,88 @@ export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' 
   };
 }
 
+const NativeCheckSchema = z.discriminatedUnion('__typename', [
+  z.object({
+    __typename: z.literal('CheckRun'),
+    id: z.string().min(1),
+    name: z.string().min(1),
+    isRequired: z.boolean(),
+    status: z.string(),
+    conclusion: z.string().nullable(),
+  }),
+  z.object({
+    __typename: z.literal('StatusContext'),
+    id: z.string().min(1),
+    context: z.string().min(1),
+    isRequired: z.boolean(),
+    state: z.string(),
+  }),
+]);
+const NativeChecksSchema = z.object({
+  repository: z.object({
+    object: z.object({
+      oid: z.string(),
+      statusCheckRollup: z
+        .object({
+          contexts: z.object({
+            totalCount: z.number().int().nonnegative(),
+            nodes: z.array(NativeCheckSchema).max(100),
+            pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+          }),
+        })
+        .nullable(),
+    }),
+  }),
+});
+
+/** GitHub computes which check/status contexts are required for this PR. */
+async function readNativeRequiredChecks(context: DeliveryContext, pr: RemotePr) {
+  let cursor: string | null = null;
+  const cursors = new Set<string>();
+  const checks = new Map<string, z.infer<typeof NativeCheckSchema>>();
+  let total: number | undefined;
+  for (let page = 0; page < 20; page++) {
+    const parsed = NativeChecksSchema.safeParse(
+      await context.clients.graphql<unknown>(
+        'query DeliveryRequiredChecks($owner: String!, $name: String!, $number: Int!, $sha: GitObjectID!, $cursor: String) { repository(owner: $owner, name: $name) { object(oid: $sha) { ... on Commit { oid statusCheckRollup { contexts(first: 100, after: $cursor) { totalCount nodes { __typename ... on CheckRun { id name status conclusion isRequired(pullRequestNumber: $number) } ... on StatusContext { id context state isRequired(pullRequestNumber: $number) } } pageInfo { hasNextPage endCursor } } } } } } }',
+        { owner: context.repo.owner, name: context.repo.repo, number: pr.number, sha: pr.head.sha, cursor },
+      ),
+    );
+    if (!parsed.success || parsed.data.repository.object.oid !== pr.head.sha)
+      throw new DeliveryError('Incomplete native GitHub required-check head readback.');
+    const connection = parsed.data.repository.object.statusCheckRollup?.contexts;
+    const count = connection?.totalCount ?? 0;
+    if (total !== undefined && total !== count)
+      throw new DeliveryError('Native check count changed during pagination.');
+    total = count;
+    for (const check of connection?.nodes ?? []) {
+      if (checks.has(check.id)) throw new DeliveryError('Incomplete native check pagination repeats a context.');
+      checks.set(check.id, check);
+    }
+    if (!connection?.pageInfo.hasNextPage) {
+      if (checks.size !== count) throw new DeliveryError('Incomplete native check context count.');
+      return [...checks.values()]
+        .filter((check) => check.isRequired)
+        .map((check) => ({
+          name: check.__typename === 'CheckRun' ? check.name : check.context,
+          state: check.__typename === 'CheckRun' ? `${check.status}/${check.conclusion ?? 'PENDING'}` : check.state,
+          passed:
+            check.__typename === 'CheckRun'
+              ? check.status === 'COMPLETED' && ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion ?? '')
+              : check.state === 'SUCCESS',
+        }));
+    }
+    const next = connection.pageInfo.endCursor;
+    if (!next || cursors.has(next)) throw new DeliveryError('Incomplete native check pagination did not advance.');
+    cursors.add(next);
+    cursor = next;
+  }
+  throw new DeliveryError('Native check pagination exceeds the bounded readback window.');
+}
+
 export async function prChecks(context: DeliveryContext, prNumber: number) {
-  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+  const pr = await getPr(context, prNumber);
+  const requiredChecks = await readNativeRequiredChecks(context, pr);
   const [checks, status, reviewState] = await Promise.all([
     context.clients.rest.checks.listForRef({ ...context.repo, ref: pr.head.sha, per_page: 100 }),
     context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: pr.head.sha }),
@@ -666,6 +733,8 @@ export async function prChecks(context: DeliveryContext, prNumber: number) {
     prNumber: pr.number,
     headSha: pr.head.sha,
     combinedStatus: status.data.state,
+    mergeStateStatus: pr.mergeable_state ?? 'unknown',
+    requiredChecks,
     reviewState,
     checkRuns: checks.data.check_runs.map((check) => ({
       name: check.name,
@@ -1250,17 +1319,6 @@ export async function submitFormalReview(
   }
   return result;
 }
-async function allReviews(context: DeliveryContext, prNumber: number) {
-  const reviews: Awaited<ReturnType<typeof context.clients.rest.pulls.listReviews>>['data'] = [];
-  for (let page = 1; page <= 20; page++) {
-    const batch = (
-      await context.clients.rest.pulls.listReviews({ ...context.repo, pull_number: prNumber, page, per_page: 100 })
-    ).data;
-    reviews.push(...batch);
-    if (batch.length < 100) return reviews;
-  }
-  throw new DeliveryError('GitHub review history exceeds the bounded readback window.');
-}
 export async function mergePr(
   context: DeliveryContext,
   input: {
@@ -1301,77 +1359,10 @@ export async function mergePr(
     throw new DeliveryError('Requested reviewed head differs from the GitHub PR.');
   if (pr.merged && pr.state === 'closed' && validSha(pr.merge_commit_sha))
     return { mergeSha: pr.merge_commit_sha, headSha: pr.head.sha, reused: true };
-  const route = await preflightReviewRoute(context, pr.base.ref);
-  if (route.approvalEligibility === 'insufficient-permission')
-    throw new DeliveryError('Configured reviewer App is ineligible for the required approval.');
   if (pr.state !== 'open' || pr.draft) throw new DeliveryError('GitHub PR must be open and ready for merge.');
-  const reviewer =
-    context.reviewerClients ??
-    (await githubClients.createDeliveryGitHubClients({
-      config: context.config,
-      identity: context.config.roles.reviewer.identity,
-      role: 'reviewer',
-      selectedAuthor: context.clients,
-    }));
-  if (reviewer.role !== 'reviewer' || reviewer.authSource !== 'app' || !reviewer.appActorLogin)
-    throw new DeliveryError('Independent reviewer App route is unavailable.');
-  const actor = await reviewer.appActorLogin();
-  if (!pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase())
-    throw new DeliveryError('Reviewer App must differ from the PR author.');
-  const reviews = (await allReviews(context, input.prNumber)).filter(
-    (review) =>
-      review.user?.login.toLowerCase() === actor.toLowerCase() &&
-      review.commit_id === pr.head.sha &&
-      review.state === 'APPROVED' &&
-      /<!-- ai-delivery-review-artifact: sha256:[a-f0-9]{64} -->/u.test(review.body ?? ''),
-  );
-  if (reviews.length !== 1)
-    throw new DeliveryError('GitHub requires one unambiguous exact-head independent App review.');
-  const approved = reviews[0]!;
-  const readReview = (
-    await context.clients.rest.pulls.getReview({ ...context.repo, pull_number: input.prNumber, review_id: approved.id })
-  ).data;
-  if (
-    readReview.id !== approved.id ||
-    readReview.state !== 'APPROVED' ||
-    readReview.commit_id !== pr.head.sha ||
-    readReview.user?.login.toLowerCase() !== actor.toLowerCase() ||
-    readReview.body !== approved.body
-  )
-    throw new DeliveryError('Independent GitHub review readback changed or was dismissed.');
-  const artifact = parseGitHubReviewArtifact(readReview.body);
-  if (
-    artifact.verdict !== 'approve' ||
-    artifact.issueNumber !== input.issueNumber ||
-    (artifact.prNumber !== null && artifact.prNumber !== input.prNumber) ||
-    artifact.authorIdentity !== context.config.roles.author.identity ||
-    artifact.reviewerIdentity !== context.config.roles.reviewer.identity ||
-    artifact.head.sha !== pr.head.sha
-  )
-    throw new DeliveryError('Independent review artifact binding is stale, foreign or rejected.');
-  const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: pr.head.sha })).data;
-  if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
-    throw new DeliveryError('Independent review tree differs from the remote commit.');
-  if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, input.prNumber, pr.changed_files)))
-    throw new DeliveryError('Independent review scope differs from the remote PR diff.');
-  const reviewedHead = artifact.head.sha;
-  if (input.reviewedHeadSha !== undefined && input.reviewedHeadSha !== reviewedHead)
-    throw new DeliveryError('Requested reviewed head differs from the independent GitHub review.');
-  const decision = await readRequiredReviewState(context, input.prNumber, reviewedHead!, {
-    id: approved.id,
-    login: actor,
-  });
-  if (decision.submittedReviewAuthorCanPushToRepository !== true)
-    throw new DeliveryError('Specific reviewer App approval is not verifiably qualifying for required review.');
-  // Unavailable or malformed decisions carry no qualifying review-access
-  // evidence. An observed null may accompany an independently confirmed zero.
-  const noReviewsRequired =
-    decision.status === 'unknown' &&
-    decision.reviewDecision === null &&
-    route.rules.visibility === 'complete' &&
-    route.rules.observedRequiredApprovals === 0;
-  if (decision.status !== 'satisfied' && !noReviewsRequired)
-    throw new DeliveryError(`GitHub review eligibility is ${decision.status}: ${decision.nextAction}`);
+  if (pr.user.login.toLowerCase() !== author.actorLogin.toLowerCase())
+    throw new DeliveryError('Merge requires the configured PR author.');
+  const reviewedHead = pr.head.sha;
   const blockers = await getNativeBlockerRelationships({
     graphql: context.clients.graphql,
     issueNumber: input.issueNumber,
@@ -1386,22 +1377,31 @@ export async function mergePr(
     refuseClosingDirective(squash!.commit_title);
     refuseClosingDirective(squash!.commit_message);
   }
-  if (noReviewsRequired && (pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha))
-    throw new DeliveryError('GitHub base changed; refresh the zero-review requirement observation before merge.');
+  const requiredChecks = await readNativeRequiredChecks(context, pr);
+  const decision = await readRequiredReviewState(context, input.prNumber, reviewedHead);
+  pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing);
+  if (nonClosing) {
+    sameReferencePr(initialPr, pr);
+    sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
+  }
+  if (pr.head.sha !== reviewedHead || pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha)
+    throw new DeliveryError('GitHub head/base changed; refresh native merge eligibility.');
   if (
-    pr.head.sha !== reviewedHead ||
     pr.state !== 'open' ||
     pr.draft ||
     pr.mergeable !== true ||
-    pr.mergeable_state !== 'clean'
+    !['clean', 'has_hooks', 'unstable'].includes(pr.mergeable_state ?? '') ||
+    !decision.observed ||
+    (decision.reviewDecision !== 'APPROVED' && decision.reviewDecision !== null) ||
+    !requiredChecks.every((check) => check.passed)
   )
     throw new DeliveryError(
-      `GitHub merge eligibility is ${pr.mergeable_state ?? 'unknown'}; CLEAN at the reviewed head is required.`,
+      `GitHub merge eligibility is ${pr.mergeable_state ?? 'unknown'}; review eligibility is ${decision.status}. Required checks: ${requiredChecks.map((check) => `${check.name}: ${check.state}`).join(', ') || 'none observed'}. ${decision.nextAction}`,
     );
   const currentBase = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data
     .object.sha;
   if (!validSha(currentBase) || currentBase !== pr.base.sha)
-    throw new DeliveryError('GitHub base moved; refresh clean eligibility and independent review before merge.');
+    throw new DeliveryError('GitHub base moved; refresh native merge eligibility before merge.');
   if (input.dryRun)
     return {
       dryRun: true,

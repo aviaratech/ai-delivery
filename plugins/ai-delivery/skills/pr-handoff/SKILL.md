@@ -22,7 +22,7 @@ Fictional `example/widget` PR23 at reviewed head H and base B illustrates these 
 - A lead quotes approval with a source ID: retain it as relayed evidence and resolve original scope when needed; the quote is neither local authentication nor an execution receipt.
 - Checks, App access and review dry-run pass with no verified operator grant: submission remains pending and no approval has counted.
 - Delegation and its admitted retry are refused: preserve both undelivered attempts, stop dependent writes and make the single precise native-user request without changing actor or route.
-- The original operator grant covers App submission and promotion: resume only pending admitted operations, read back the exact review and counted approval before promotion, and reconcile an uncertain acknowledgement before retrying. Merge needs its own coverage within the grant and the existing exact-head, current-base, protection, checks, association, serial-lane and CLEAN guards. Changed source requires fresh verification/review and reconciliation of authority scope.
+- The original operator grant covers App submission and promotion: resume only pending admitted operations, read back the exact review and counted approval before promotion, and reconcile an uncertain acknowledgement before retrying. Merge needs its own coverage within the grant and the existing exact-head, current-base, protection, checks, association, serial-lane and native GitHub eligibility guards. Changed source requires fresh verification/review and reconciliation of authority scope.
 
 
 Run contributor checks through the repository's normal workflow. Keep the resulting commit unchanged through publication and independent review; a changed head requires fresh checks and review.
@@ -31,7 +31,7 @@ Call `issue_pr_create` with explicit `repo`, issue number, a non-empty body and 
 
 Obtain a read-only independent review of the exact remote commit, tree and complete diff. Submit its artifact with `issue_pr_review` using the configured reviewer App. A matching review is reused. Inspect GitHub's live required-review decision and checks; submission alone does not prove the approval counted. Resolve stale/dismissed reviews, blockers, failed checks and moved heads or bases without relaxing protection.
 
-Promote the unchanged PR using `issue_pr_create` with `draft: false`. Finish only with satisfied GitHub requirements and fresh CLEAN eligibility. The merge mutation uses the independently reviewed SHA; finish confirms the intended PR merged before closing its issue. Hosts retain responsibility for local worktree cleanup.
+Promote the unchanged PR using `issue_pr_create` with `draft: false`. Finish only with fresh native GitHub eligibility at the exact head and current base. GitHub owns required checks, review counts, stale-review dismissal and configured up-to-date rules. `pr:checks` reports native required check names/statuses; resolve BLOCKED, BEHIND, conflicts, unknown or incomplete evidence before mutation. A zero-review rule does not require an extra App approval; an optional failed check does not become required. The merge mutation uses the independently reviewed SHA; finish confirms the intended PR merged before closing its issue. Hosts retain responsibility for local worktree cleanup.
 
 ```sh
 ai-delivery --repo <owner/name> pr:create --issue <number> --body-file ./pr-body.md --dry-run
@@ -43,4 +43,4 @@ ai-delivery --repo <owner/name> pr:checks --pr <number>
 ai-delivery --repo <owner/name> finish --issue <number> --pr <number> --reviewed-head <reviewed-sha>
 ```
 
-CLI `--artifact` is a UTF-8 JSON file path. MCP takes the JSON content. Never fabricate effective model metadata or historical policy/evidence receipts. The artifact and counted independent App approval must bind the exact delivered head.
+CLI `--artifact` is a UTF-8 JSON file path. MCP takes the JSON content. Never fabricate effective model metadata or historical policy/evidence receipts. Validate the supplied artifact against the exact remote commit/tree/diff before App submission and verify its review readback. Merge then follows GitHub’s current eligibility without rechecking historical embedded artifact identities or publication lineage. Repository-specific independent review requirements still apply.

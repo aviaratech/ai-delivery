@@ -168,12 +168,16 @@ test('reviewer App bot recovers a matching remote marker without another review'
   }
 });
 
-test('reviewer refuses another exact-head artifact before creating a conflicting approval', async () => {
+test('reviewer submits a fresh exact-head artifact despite a historical remapped approval', async () => {
   const state = fixture({ existingReview: true });
   try {
-    state.reviews[0]!.body = marker(`sha256:${'e'.repeat(64)}`);
-    await assert.rejects(state.submit(), /conflict/u);
-    assert.equal(state.created, 0);
+    const { artifactId: _artifactId, ...original } = state.artifact;
+    const oldContent = { ...original, head: { sha: 'e'.repeat(40), tree: 'f'.repeat(40) } };
+    const oldArtifact = ReviewArtifactSchema.parse({ ...oldContent, artifactId: digestValue(oldContent) });
+    state.reviews[0]!.body = `${marker(oldArtifact.artifactId)}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(oldArtifact)).toString('base64url')} -->`;
+    assert.equal(state.reviews[0]!.commit_id, state.artifact.head.sha);
+    await state.submit();
+    assert.equal(state.created, 1);
   } finally {
     rmSync(state.root, { recursive: true, force: true });
   }
