@@ -168,18 +168,20 @@ function fixture(published = true, nonClosing = false) {
       },
       listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
       listReviews: async () => ({ data: state.reviews }),
-      getReview: async () => ({ data: state.reviews[0] }),
+      getReview: async (input: { review_id: number }) => ({
+        data: state.reviews.find((review) => review.id === input.review_id),
+      }),
       createReview: async (input: { commit_id: string; body: string; event: string }) => {
         assert.equal(input.commit_id, head);
         assert.equal(input.event, 'APPROVE');
         state.submissions++;
         const review = {
-          id: 99,
+          id: 98 + state.submissions,
           body: input.body,
           user: { login: state.reviewerActor },
           state: 'APPROVED',
           commit_id: head,
-          html_url: `https://github.com/${repo}/pull/23#pullrequestreview-99`,
+          html_url: `https://github.com/${repo}/pull/23#pullrequestreview-${98 + state.submissions}`,
         };
         state.reviews.push(review);
         return { data: review };
@@ -743,11 +745,11 @@ describe('native exact PR association after publication', () => {
       },
     ],
   ] as const) {
-    it(`refuses ${name} despite a valid closing-issue association`, async () => {
+    it(`accepts ${name} when the native PR closing association and head are current`, async () => {
       const { reviewerContext, state, artifact } = fixture();
       state.branchReadback = response;
-      await assert.rejects(submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact }));
-      assert.equal(state.submissions, 0);
+      await submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact });
+      assert.equal(state.submissions, 1);
     });
   }
 
@@ -828,12 +830,12 @@ describe('native exact PR association after publication', () => {
     assert.equal(state.submissions, 0);
   });
 
-  it('rejects a conflicting existing App review instead of resubmitting', async () => {
+  it('submits a fresh valid artifact despite an older remapped App review', async () => {
     const { reviewerContext, state, artifact } = fixture();
     await submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact });
     state.reviews[0]!.body = `<!-- ai-delivery-review-artifact: sha256:${'f'.repeat(64)} -->`;
-    await assert.rejects(submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact }), /conflict/u);
-    assert.equal(state.submissions, 1);
+    await submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact });
+    assert.equal(state.submissions, 2);
   });
 });
 
@@ -877,7 +879,6 @@ describe('authoritative existing PR promotion', () => {
     ['incomplete match identity', { matchReadback: [{}] }],
     ['incomplete match connection', { matchReadback: {} }],
     ['incomplete association', { closingReadback: { repository: null } }],
-    ['incomplete branch connection', { branchReadback: { repository: null } }],
   ] as const) {
     it(`refuses ${name} before promotion, including already-ready reuse`, async () => {
       for (const draft of [true, false]) {

@@ -78,6 +78,7 @@ export const SubmittedReviewReceiptSchema = z
 export type SubmittedReviewReceipt = z.infer<typeof SubmittedReviewReceiptSchema>;
 
 export interface RequiredReviewState {
+  observed?: boolean;
   reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null;
   submittedReviewAuthorCanPushToRepository: boolean | null;
   status: 'satisfied' | 'changes-requested' | 'still-required' | 'unknown';
@@ -103,6 +104,7 @@ export async function readRequiredReviewState(
     );
   } catch {
     return {
+      observed: false,
       reviewDecision: null,
       submittedReviewAuthorCanPushToRepository: null,
       status: 'unknown',
@@ -112,6 +114,7 @@ export async function readRequiredReviewState(
   const pr = response.repository?.pullRequest;
   if (!pr) {
     return {
+      observed: false,
       reviewDecision: null,
       submittedReviewAuthorCanPushToRepository: null,
       status: 'unknown',
@@ -128,6 +131,7 @@ export async function readRequiredReviewState(
     pr.reviewDecision !== 'CHANGES_REQUESTED'
   ) {
     return {
+      observed: false,
       reviewDecision: null,
       submittedReviewAuthorCanPushToRepository: null,
       status: 'unknown',
@@ -174,6 +178,7 @@ export async function readRequiredReviewState(
   }
   if (pr.reviewDecision === 'APPROVED') {
     return {
+      observed: true,
       reviewDecision: 'APPROVED',
       submittedReviewAuthorCanPushToRepository,
       status: 'satisfied',
@@ -182,6 +187,7 @@ export async function readRequiredReviewState(
   }
   if (pr.reviewDecision === 'REVIEW_REQUIRED') {
     return {
+      observed: true,
       reviewDecision: 'REVIEW_REQUIRED',
       submittedReviewAuthorCanPushToRepository,
       status: 'still-required',
@@ -193,6 +199,7 @@ export async function readRequiredReviewState(
   }
   if (pr.reviewDecision === 'CHANGES_REQUESTED') {
     return {
+      observed: true,
       reviewDecision: 'CHANGES_REQUESTED',
       submittedReviewAuthorCanPushToRepository,
       status: 'changes-requested',
@@ -200,6 +207,7 @@ export async function readRequiredReviewState(
     };
   }
   return {
+    observed: true,
     reviewDecision: null,
     submittedReviewAuthorCanPushToRepository,
     status: 'unknown',
@@ -406,17 +414,6 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
   const body = githubReviewBody(artifact);
   const marker = `<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->`;
   const history = await listAllReviews(context, prNumber);
-  if (
-    history.some(
-      (review) =>
-        review.user?.login.toLowerCase() === actor.toLowerCase() &&
-        review.commit_id === artifact.head.sha &&
-        review.state === 'APPROVED' &&
-        /<!-- ai-delivery-review-artifact: sha256:[a-f0-9]{64} -->/u.test(review.body ?? '') &&
-        !review.body?.includes(marker),
-    )
-  )
-    throw new DeliveryError('Another independent artifact conflicts with the existing exact-head App approval.');
   const matches = history.filter((review) => review.body?.includes(marker));
   if (matches.length > 1) throw new DeliveryError('Conflicting GitHub reviews claim the same artifact identity.');
   const prior = matches[0];

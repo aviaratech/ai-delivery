@@ -372,6 +372,27 @@ function boundedOperationCause(operationFailure: unknown, prior: PropertyDescrip
           message,
         );
         detail += `; observation=${code?.[1] ?? 'UNKNOWN'}`;
+        try {
+          const metadata: unknown = JSON.parse(
+            message
+              .slice('Owned process resource observation failed. '.length)
+              .replace(/ Output-gate retirement: wrappedOperation=(?:completed|failed)\.$/u, ''),
+          );
+          if (metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata)) {
+            const numbers = ['elapsedMs', 'stdoutBytes', 'completeLines'].map((key) => {
+              const field = Object.getOwnPropertyDescriptor(metadata, key);
+              return field && 'value' in field ? (field.value as unknown) : undefined;
+            });
+            if (
+              numbers.every(
+                (value): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0,
+              )
+            )
+              detail += `; elapsedMs=${numbers[0]!}; stdoutBytes=${numbers[1]!}; completeLines=${numbers[2]!}`;
+          }
+        } catch {
+          // Malformed diagnostic metadata must not replace the original retirement failure.
+        }
       }
     }
   }
@@ -745,6 +766,7 @@ class ProcessSnapshotError extends DeliveryError {}
 
 export function processSnapshot(): Map<number, ObservedProcess> {
   const psPath = existsSync('/usr/bin/ps') ? '/usr/bin/ps' : '/bin/ps';
+  const started = performance.now();
   const result = spawnSync(psPath, ['-A', '-o', 'pid=,ppid=,pgid=,rss=,stat=,lstart='], {
     encoding: 'utf8',
     env: { ...process.env, LC_ALL: 'C' },
@@ -752,6 +774,10 @@ export function processSnapshot(): Map<number, ObservedProcess> {
     timeout: 1_000,
   });
   if (result.status !== 0 || result.error || result.signal || !result.stdout.endsWith('\n')) {
+    const elapsedMs = Math.round(performance.now() - started);
+    const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+    let completeLines = 0;
+    for (let index = 0; index < stdout.length; index++) if (stdout.charCodeAt(index) === 10) completeLines++;
     const code = (result.error as NodeJS.ErrnoException | undefined)?.code;
     const signal = result.signal;
     // Only fixed labels, bounded numbers and completeness flags leave this observation.
@@ -773,6 +799,9 @@ export function processSnapshot(): Map<number, ObservedProcess> {
             : 'other',
       stdoutPresent: typeof result.stdout === 'string',
       stdoutTerminated: typeof result.stdout === 'string' && result.stdout.endsWith('\n'),
+      elapsedMs,
+      stdoutBytes: Buffer.byteLength(stdout),
+      completeLines,
     };
     throw new ProcessSnapshotError(`Owned process resource observation failed. ${JSON.stringify(metadata)}`);
   }
