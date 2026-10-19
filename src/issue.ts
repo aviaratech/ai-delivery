@@ -1044,7 +1044,7 @@ interface IncompleteIssueUpdateResult {
     closure?: UpdateIssueResult['closure'];
     historyComment?: IssueCommentReadback;
   };
-  project: { status: 'pending' | 'unknown'; desiredStatus: string; reason: 'archived' | 'unavailable' };
+  project: { status: 'pending' | 'unknown'; desiredStatus: string | null; reason: 'archived' | 'unavailable' };
   recovery: { tool: 'issue_batch_update'; instruction: string };
 }
 
@@ -1423,7 +1423,7 @@ async function applyIssueUpdate(
           localBatchFailureReason(error) === 'The issue delivery Project item is archived and cannot be updated.'
             ? 'pending'
             : 'unknown',
-        desiredStatus: status,
+        desiredStatus: input.blockedBy === undefined ? status : null,
         reason:
           localBatchFailureReason(error) === 'The issue delivery Project item is archived and cannot be updated.'
             ? 'archived'
@@ -1444,6 +1444,10 @@ async function applyIssueUpdate(
           throw new DeliveryError('Issue update readback disagrees with the requested content or state.');
         if (historyBody !== undefined && !(await hasUpdateComment(context, input.issueNumber, historyBody)))
           throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
+        result.project.desiredStatus = updateProjectStatus(
+          { ...native.readback, projectStatus: plan.currentContent.projectStatus },
+          input,
+        );
         result.native = {
           ...result.native,
           status: 'confirmed',

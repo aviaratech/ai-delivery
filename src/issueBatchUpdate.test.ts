@@ -44,6 +44,8 @@ function batchFixture() {
     archived: false,
     archiveAfterWrite: false,
     loseProjectAck: false,
+    projectUnavailableAfterDependency: false,
+    nativeUnavailableAfterDependency: false,
   };
   const reads = new Map<number, number>();
   const metadata = new Map<number, Record<string, string>>();
@@ -86,6 +88,8 @@ function batchFixture() {
       rest: {
         issues: {
           get: async ({ issue_number }: { issue_number: number }) => {
+            if (controls.nativeUnavailableAfterDependency && writes.includes('dependency'))
+              throw new Error('PRIVATE_NATIVE_READ_FAILURE');
             reads.set(issue_number, (reads.get(issue_number) ?? 0) + 1);
             if (controls.failReadback === issue_number && writes.includes(`update:${issue_number}`))
               throw new Error('Synthetic readback transport failure');
@@ -205,6 +209,12 @@ function batchFixture() {
         },
       },
       graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (
+          controls.projectUnavailableAfterDependency &&
+          writes.includes('dependency') &&
+          query.includes('ProjectDelivery')
+        )
+          throw new Error('PRIVATE_PROJECT_READ_FAILURE');
         const numeric = variables.number ?? variables.issueNumber;
         const nodeId = variables.issueNodeId ?? variables.itemId ?? '1';
         const number =
@@ -610,6 +620,43 @@ test('lost Project acknowledgement is incomplete until a read-only batch reconci
   assert.equal((await runBatch(input)).summary.unchanged, 1);
   assert.deepEqual(f.writes, writes);
   assert.deepEqual(f.comments, comments);
+});
+
+test.each(['add', 'remove'] as const)(
+  'remaining Project target reflects the committed %s blocker change after Project reads fail',
+  async (action) => {
+    const f = batchFixture();
+    f.controls.projectUnavailableAfterDependency = true;
+    f.statuses.set(1, action === 'remove' ? 'Waiting' : 'Queued');
+    if (action === 'remove') f.blockers.set(1, [2]);
+    const blockers = action === 'remove' ? [] : [2];
+    const first = await runBatch({ items: [{ issueNumber: 1, blockedBy: blockers }] });
+    const partial = first.results[0]!.incomplete;
+    assert.equal(first.summary.failed, 1);
+    assert.equal(partial?.native.status, 'confirmed');
+    assert.deepEqual(partial?.native.readback?.blockedBy, blockers);
+    assert.equal(partial?.project.desiredStatus, action === 'remove' ? 'Todo' : 'Blocked');
+    assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+    const nativeWrites = f.writes.filter((write) => write !== 'project');
+    f.controls.projectUnavailableAfterDependency = false;
+    assert.equal((await runBatch({ items: [{ issueNumber: 1, blockedBy: blockers }] })).summary.applied, 1);
+    assert.deepEqual(
+      f.writes.filter((write) => write !== 'project'),
+      nativeWrites,
+    );
+  },
+);
+
+test('unknown native blocker evidence does not claim a stale remaining Project target', async () => {
+  const f = batchFixture();
+  f.blockers.set(1, [2]);
+  f.statuses.set(1, 'Waiting');
+  f.controls.nativeUnavailableAfterDependency = true;
+  const first = await runBatch({ items: [{ issueNumber: 1, blockedBy: [] }] });
+  const partial = first.results[0]!.incomplete;
+  assert.equal(partial?.native.status, 'unknown');
+  assert.equal(partial?.project.desiredStatus, null);
+  assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
 });
 
 test('MCP serializes the actual incomplete update payload with error semantics', async () => {
