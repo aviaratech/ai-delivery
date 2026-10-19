@@ -19,6 +19,10 @@ import {
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
 import {
   NATIVE_ISSUE_API_VERSION,
+  applyNativeIssueDates,
+  prepareNativeIssueDates,
+  parseConfiguredNativeIssueMetadata,
+  type NativeIssueDatePatch,
   clearConfiguredNativeIssuePoints,
   getConfiguredNativeIssueMetadata,
   nativeIssueSettingsFromDeliveryConfig,
@@ -266,7 +270,7 @@ async function labels(context: DeliveryContext, input: readonly string[] | undef
   throw new DeliveryError('Repository label listing exceeds the bounded readback window.');
 }
 
-export interface CreateIssueInput extends Partial<IssueFieldsInput> {
+export interface CreateIssueInput extends Partial<IssueFieldsInput>, NativeIssueDatePatch {
   status?: { nextMilestone?: string };
   blockedBy?: number[];
   /** Add this issue as a blocker of these dependents without replacing their other blockers. */
@@ -460,6 +464,7 @@ export async function createIssue(
 }> {
   if (context.clients.role !== 'author') throw new DeliveryError('Issue writes require the configured author role.');
   const prepared = prepareIssueWrite(input);
+  const dateChanges = await prepareIssueDates(context, input);
   input = {
     ...input,
     title: prepared.issue.title,
@@ -528,6 +533,7 @@ export async function createIssue(
         rest: clients.rest,
         settings: nativeIssueSettingsFromDeliveryConfig(config),
       });
+    await applyNativeIssueDates({ changes: dateChanges, issueNumber, ...repo, rest: clients.rest });
     if (input.parentIssueNumber !== undefined)
       await replaceParentIssue({
         graphql: clients.graphql,
@@ -709,6 +715,111 @@ async function issueFieldPages(
   }
 }
 
+async function readIssueFieldCatalog(context: DeliveryContext, capacityRead = false) {
+  const catalog = z
+    .array(FieldCatalogEntry)
+    .parse(
+      await issueFieldPages(
+        context,
+        'GET /orgs/{org}/issue-fields',
+        { org: context.config.native.organization },
+        capacityRead ? 20 : undefined,
+      ),
+    );
+  if (
+    new Set(catalog.map((field) => field.name)).size !== catalog.length ||
+    new Set(catalog.map((field) => field.id)).size !== catalog.length
+  )
+    throw new DeliveryError('Native issue field catalog has duplicate identities or names.');
+  return catalog;
+}
+
+async function readIssueFields(
+  context: DeliveryContext,
+  issueNumber: number,
+  catalog: Awaited<ReturnType<typeof readIssueFieldCatalog>>,
+  capacityRead = false,
+) {
+  const fields: ListedTrackingIssue['fields'] = Object.fromEntries(catalog.map((field) => [field.name, null]));
+  const values = z.array(FieldValueEntry).parse(
+    await issueFieldPages(
+      context,
+      'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values',
+      {
+        ...context.repo,
+        issue_number: issueNumber,
+      },
+      capacityRead ? 20 : undefined,
+    ),
+  );
+  const observed = new Set<number>();
+  for (const field of values) {
+    const definition = catalog.find((candidate) => candidate.id === field.issue_field_id);
+    if (
+      !definition ||
+      definition.name !== field.issue_field_name ||
+      definition.data_type !== field.data_type ||
+      observed.has(field.issue_field_id)
+    )
+      throw new DeliveryError('Native issue field readback conflicts with its catalog.');
+    observed.add(field.issue_field_id);
+    if (
+      capacityRead &&
+      (field.data_type === 'single_select'
+        ? field.single_select_option === undefined && field.value !== null
+        : field.data_type === 'multi_select'
+          ? field.multi_select_options === undefined && field.value !== null
+          : field.value === undefined)
+    )
+      throw new DeliveryError('WIP capacity native field value payload is missing.');
+    // Existing issue-info metadata accepts configured option names as raw values.
+    // Preserve that exact compatibility without treating numeric option IDs as names.
+    const configuredOptionName =
+      !capacityRead &&
+      field.data_type === 'single_select' &&
+      typeof field.value === 'string' &&
+      ((field.issue_field_name === context.config.native.points.name &&
+        String(field.issue_field_id) === context.config.native.points.databaseId &&
+        context.config.native.points.values.includes(field.value)) ||
+        (field.issue_field_name === context.config.native.priority.name &&
+          String(field.issue_field_id) === context.config.native.priority.databaseId &&
+          context.config.native.priority.values.includes(field.value)))
+        ? field.value
+        : undefined;
+    if (
+      ((field.data_type === 'single_select' && !field.single_select_option && configuredOptionName === undefined) ||
+        (field.data_type === 'multi_select' && field.multi_select_options === undefined)) &&
+      field.value !== null &&
+      field.value !== undefined
+    )
+      throw new DeliveryError('Native select field omitted its named option readback.');
+    const value =
+      field.data_type === 'single_select'
+        ? (field.single_select_option?.name ?? configuredOptionName ?? null)
+        : field.data_type === 'multi_select'
+          ? field.multi_select_options?.map((option) => option.name)
+          : field.value;
+    if (field.data_type === 'date' && value !== null && value !== undefined && !z.iso.date().safeParse(value).success)
+      throw new DeliveryError('Native date field has an invalid date value.');
+    if (value === null || value === undefined) fields[definition.name] = null;
+    else if (
+      field.data_type === 'number'
+        ? typeof value === 'number' && Number.isFinite(value)
+        : field.data_type === 'multi_select'
+          ? Array.isArray(value)
+          : typeof value === 'string'
+    )
+      fields[definition.name] = value as string | number | string[];
+    else throw new DeliveryError('Native issue field has an invalid value type.');
+  }
+  return { fields, values, catalog };
+}
+
+async function prepareIssueDates(context: DeliveryContext, patch: NativeIssueDatePatch) {
+  if (patch.startDate === undefined && patch.targetDate === undefined) return [];
+  return prepareNativeIssueDates(patch, await readIssueFieldCatalog(context));
+}
+
 /** A bounded GitHub page; local filters can produce an empty page with a nextPage. */
 export async function listIssues(
   context: DeliveryContext,
@@ -771,21 +882,7 @@ export async function listIssues(
         ? page + 1
         : null;
   }
-  const catalog = z
-    .array(FieldCatalogEntry)
-    .parse(
-      await issueFieldPages(
-        context,
-        'GET /orgs/{org}/issue-fields',
-        { org: context.config.native.organization },
-        options.capacityRead ? 20 : undefined,
-      ),
-    );
-  if (
-    new Set(catalog.map((field) => field.name)).size !== catalog.length ||
-    new Set(catalog.map((field) => field.id)).size !== catalog.length
-  )
-    throw new DeliveryError('Native issue field catalog has duplicate identities or names.');
+  const catalog = await readIssueFieldCatalog(context, options.capacityRead);
   const issues: ListedTrackingIssue[] = [];
   const seen = new Set<number>();
   for (const entry of raw) {
@@ -846,64 +943,7 @@ export async function listIssues(
       settings: projectSettingsFromDeliveryConfig(context.config),
     });
     if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) continue;
-    const fields: ListedTrackingIssue['fields'] = Object.fromEntries(catalog.map((field) => [field.name, null]));
-    const values = z.array(FieldValueEntry).parse(
-      await issueFieldPages(
-        context,
-        'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values',
-        {
-          ...context.repo,
-          issue_number: current.number,
-        },
-        options.capacityRead ? 20 : undefined,
-      ),
-    );
-    const observed = new Set<number>();
-    for (const field of values) {
-      const definition = catalog.find((candidate) => candidate.id === field.issue_field_id);
-      if (
-        !definition ||
-        definition.name !== field.issue_field_name ||
-        definition.data_type !== field.data_type ||
-        observed.has(field.issue_field_id)
-      )
-        throw new DeliveryError('Native issue field readback conflicts with its catalog.');
-      observed.add(field.issue_field_id);
-      if (
-        options.capacityRead &&
-        (field.data_type === 'single_select'
-          ? field.single_select_option === undefined && field.value !== null
-          : field.data_type === 'multi_select'
-            ? field.multi_select_options === undefined && field.value !== null
-            : field.value === undefined)
-      )
-        throw new DeliveryError('WIP capacity native field value payload is missing.');
-      if (
-        ((field.data_type === 'single_select' && !field.single_select_option) ||
-          (field.data_type === 'multi_select' && field.multi_select_options === undefined)) &&
-        field.value !== null &&
-        field.value !== undefined
-      )
-        throw new DeliveryError('Native select field omitted its named option readback.');
-      const value =
-        field.data_type === 'single_select'
-          ? (field.single_select_option?.name ?? null)
-          : field.data_type === 'multi_select'
-            ? field.multi_select_options?.map((option) => option.name)
-            : field.value;
-      if (field.data_type === 'date' && value !== null && value !== undefined && !z.iso.date().safeParse(value).success)
-        throw new DeliveryError('Native date field has an invalid date value.');
-      if (value === null || value === undefined) fields[definition.name] = null;
-      else if (
-        field.data_type === 'number'
-          ? typeof value === 'number' && Number.isFinite(value)
-          : field.data_type === 'multi_select'
-            ? Array.isArray(value)
-            : typeof value === 'string'
-      )
-        fields[definition.name] = value as string | number | string[];
-      else throw new DeliveryError('Native issue field has an invalid value type.');
-    }
+    const { fields } = await readIssueFields(context, current.number, catalog, options.capacityRead);
     issues.push({
       ...(options.capacityRead
         ? { nodeId: current.node_id, fieldIds: Object.fromEntries(catalog.map((field) => [field.name, field.id])) }
@@ -1001,7 +1041,7 @@ export async function readIssueClosure(context: DeliveryContext, issueNumber: nu
   };
 }
 
-export interface UpdateIssueInput extends Omit<Partial<IssueFieldsInput>, 'deferral'> {
+export interface UpdateIssueInput extends Omit<Partial<IssueFieldsInput>, 'deferral'>, NativeIssueDatePatch {
   defer?: IssueDeferralData;
   undefer?: true;
   status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
@@ -1093,6 +1133,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   )
     throw new DeliveryError('A superseding issue must be a different positive issue number.');
   const { clients, config, repo } = context;
+  const dateChanges = await prepareIssueDates(context, input);
   const currentContent = await issueInfo(context, input.issueNumber);
   const prepared = prepareIssueWrite(input, currentContent);
   input = {
@@ -1243,6 +1284,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     assertClosure,
     currentContent,
     nativeTarget: { nodeId: target.node_id, url: target.html_url },
+    dateChanges,
     priorContent,
     historyBody,
     closureBody,
@@ -1329,6 +1371,12 @@ async function applyIssueUpdate(
       rest: clients.rest,
       settings: nativeIssueSettingsFromDeliveryConfig(config),
     });
+  await applyNativeIssueDates({
+    changes: plan.dateChanges.filter((change) => pending(change.name === 'Start date' ? 'startDate' : 'targetDate')),
+    issueNumber: input.issueNumber,
+    ...repo,
+    rest: clients.rest,
+  });
   if (input.parentIssueNumber !== undefined && pending('parentIssueNumber'))
     await replaceParentIssue({
       graphql: clients.graphql,
@@ -1629,6 +1677,8 @@ async function desiredUpdateValues(
     'issueType',
     'points',
     'priority',
+    'startDate',
+    'targetDate',
     'milestone',
     'state',
     'parentIssueNumber',
@@ -1892,6 +1942,9 @@ export interface IssueInfo {
   issueType: string | null;
   labels: string[];
   milestone: number | null;
+  fields: ListedTrackingIssue['fields'];
+  startDate?: string | null;
+  targetDate?: string | null;
   parentIssueNumber: number | null;
   points?: number;
   priority?: string;
@@ -1924,14 +1977,8 @@ async function readIssueInfo(
         `/${repo.owner}/${repo.repo}/issues/${String(issueNumber)}`.toLowerCase())
   )
     throw new DeliveryError('Native closure readback returned a foreign issue identity.');
-  const [metadata, relationships, project] = await Promise.all([
-    getConfiguredNativeIssueMetadata({
-      issueNumber,
-      owner: repo.owner,
-      repo: repo.repo,
-      rest: clients.rest,
-      settings: nativeIssueSettingsFromDeliveryConfig(config),
-    }),
+  const [nativeFields, relationships, project] = await Promise.all([
+    readIssueFieldCatalog(context).then((catalog) => readIssueFields(context, issueNumber, catalog)),
     getNativeBlockerRelationships({ graphql: clients.graphql, issueNumber, repo }),
     includeProject
       ? getIssueProjectStatus({
@@ -1943,6 +1990,10 @@ async function readIssueInfo(
         })
       : Promise.resolve(null),
   ]);
+  const metadata = parseConfiguredNativeIssueMetadata(
+    nativeFields.values,
+    nativeIssueSettingsFromDeliveryConfig(config),
+  );
   const info: IssueInfo = {
     ...deferralReadback(issue.body, issue.title),
     ...(context.configuration ? { routing: context.configuration.routing } : {}),
@@ -1954,6 +2005,13 @@ async function readIssueInfo(
       typeof label === 'string' ? [label] : label.name === undefined ? [] : [label.name],
     ),
     milestone: issue.milestone?.number ?? null,
+    fields: nativeFields.fields,
+    ...(nativeFields.catalog.some((field) => field.name === 'Start date' && field.data_type === 'date')
+      ? { startDate: nativeFields.fields['Start date'] as string | null }
+      : {}),
+    ...(nativeFields.catalog.some((field) => field.name === 'Target date' && field.data_type === 'date')
+      ? { targetDate: nativeFields.fields['Target date'] as string | null }
+      : {}),
     parentIssueNumber: relationships.parentNumber,
     ...(metadata.points === undefined ? {} : { points: metadata.points }),
     ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),

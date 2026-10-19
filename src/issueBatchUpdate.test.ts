@@ -33,6 +33,7 @@ function batchFixture() {
     }),
   );
   const writes: string[] = [];
+  const dateWrites: number[][] = [];
   const controls = {
     failAfterWrite: 0,
     failReadback: 0,
@@ -57,9 +58,10 @@ function batchFixture() {
   const duplicates = new Map<number, number>();
   const fieldValues = (number: number) =>
     Object.entries(metadata.get(number) ?? {}).map(([id, value]) => ({
-      data_type: 'single_select',
+      data_type: Number(id) >= 103 ? 'date' : 'single_select',
       issue_field_id: Number(id),
-      issue_field_name: id === '101' ? 'Estimate' : 'Urgency',
+      issue_field_name:
+        id === '101' ? 'Estimate' : id === '102' ? 'Urgency' : id === '103' ? 'Start date' : 'Target date',
       value,
     }));
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
@@ -185,19 +187,25 @@ function batchFixture() {
         ) => {
           if (route.startsWith('GET /orgs'))
             return {
-              data: Object.values(syntheticDiscoveryConfig.native)
-                .filter(
-                  (field): field is typeof syntheticDiscoveryConfig.native.points =>
-                    typeof field === 'object' && field !== null && 'databaseId' in field,
-                )
-                .map((field) => ({
-                  id: Number(field.databaseId),
-                  name: field.name,
-                  data_type: 'single_select',
-                  options: field.values.map((name) => ({ name })),
-                })),
+              data: [
+                ...Object.values(syntheticDiscoveryConfig.native)
+                  .filter(
+                    (field): field is typeof syntheticDiscoveryConfig.native.points =>
+                      typeof field === 'object' && field !== null && 'databaseId' in field,
+                  )
+                  .map((field) => ({
+                    id: Number(field.databaseId),
+                    name: field.name,
+                    data_type: 'single_select',
+                    options: field.values.map((name) => ({ name })),
+                  })),
+                { id: 103, name: 'Start date', data_type: 'date' },
+                { id: 104, name: 'Target date', data_type: 'date' },
+              ],
             };
           if (route.startsWith('POST ')) {
+            const dates = params.issue_field_values!.filter((value) => value.field_id >= 103);
+            if (dates.length) dateWrites.push(dates.map((value) => value.field_id));
             writes.push('metadata');
             metadata.set(params.issue_number, {
               ...metadata.get(params.issue_number),
@@ -205,6 +213,7 @@ function batchFixture() {
             });
           }
           if (route.startsWith('DELETE ')) {
+            if (params.issue_field_id! >= 103) dateWrites.push([params.issue_field_id!]);
             writes.push('metadata');
             delete metadata.get(params.issue_number)![String(params.issue_field_id)];
           }
@@ -351,7 +360,7 @@ function batchFixture() {
     roles: { author: { identity: 'host-author', authSource: 'personal' }, reviewer: { identity: 'app-reviewer' } },
   } as never);
   vi.spyOn(issue, 'loadDeliveryContext').mockResolvedValue(context);
-  return { context, rows, writes, comments, controls, metadata, parents, blockers, statuses };
+  return { context, rows, writes, dateWrites, comments, controls, metadata, parents, blockers, statuses };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -615,6 +624,71 @@ test('archived partial closure resumes only Project work after separate restorat
   assert.deepEqual(f.rows.get(1)!.labels, ['enhancement']);
   assert.deepEqual(f.rows.get(2), unrelated);
 });
+
+test('archived date and parent updates resume only Project work without replaying committed native fields', async () => {
+  const f = batchFixture();
+  f.metadata.set(1, { '104': '2028-03-31' });
+  f.controls.archiveAfterWrite = true;
+  const input = {
+    items: [
+      {
+        issueNumber: 1,
+        title: 'Dated item',
+        startDate: '2028-02-29',
+        targetDate: null,
+        parentIssueNumber: 5,
+        preserveHistory: true,
+      },
+    ],
+  };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  assert.equal(first.results[0]!.incomplete?.native.status, 'confirmed');
+  assert.equal(first.results[0]!.incomplete?.native.readback?.startDate, '2028-02-29');
+  assert.equal(first.results[0]!.incomplete?.native.readback?.targetDate, null);
+  const nativeWrites = f.writes.filter((write) => write !== 'project');
+  const comments = structuredClone(f.comments);
+  assert.equal((await runBatch(input)).summary.failed, 1);
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  f.controls.archiveAfterWrite = false;
+  f.controls.archived = false; // Separately authorized restoration, outside recovery.
+  const resumed = await runBatch(input);
+  assert.equal(resumed.summary.applied, 1);
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  assert.deepEqual(f.comments, comments);
+  assert.deepEqual(f.dateWrites, [[103], [104]]);
+  assert.equal(f.parents.get(1), 5);
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+});
+
+for (const [committedId, pendingId] of [
+  [103, 104],
+  [104, 103],
+]) {
+  test(`mixed date retry writes only pending field ${pendingId} and preserves committed field ${committedId}`, async () => {
+    const f = batchFixture();
+    f.metadata.set(1, { [committedId!]: '2028-02-29', [pendingId!]: '2028-03-31' });
+    const first = await runBatch({
+      items: [
+        {
+          issueNumber: 1,
+          startDate: committedId === 103 ? '2028-02-29' : null,
+          targetDate: committedId === 104 ? '2028-02-29' : null,
+        },
+      ],
+    });
+    assert.equal(first.summary.applied, 1);
+    assert.deepEqual(f.dateWrites, [[pendingId]]);
+    assert.equal(f.metadata.get(1)![String(committedId)], '2028-02-29');
+    assert.equal(f.metadata.get(1)![String(pendingId)], undefined);
+  });
+}
 
 test('lost Project acknowledgement is incomplete until a read-only batch reconciliation proves a no-op', async () => {
   const f = batchFixture();
