@@ -63,6 +63,13 @@ export function entrypointClients(head: string) {
   };
   const request = async (route: string, input: unknown) => {
     record(route, input);
+    if (route === 'GET /orgs/{org}/issue-fields')
+      return {
+        data: [
+          { id: 101, name: 'Estimate', data_type: 'single_select' },
+          { id: 102, name: 'Urgency', data_type: 'single_select' },
+        ],
+      };
     if (route === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values')
       return {
         data: [

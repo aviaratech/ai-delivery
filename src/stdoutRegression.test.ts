@@ -89,6 +89,28 @@ function fixture(developmentFails = false): { context: DeliveryContext; cleanup:
     type: { name: 'Task' },
   };
   const rest = new Octokit();
+  rest.request = (async (route: string) => {
+    if (route === 'GET /orgs/{org}/issue-fields')
+      return {
+        data: [
+          { id: 101, name: 'Estimate', data_type: 'single_select' },
+          { id: 102, name: 'Urgency', data_type: 'single_select' },
+        ],
+      };
+    if (route === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values')
+      return {
+        data: [
+          {
+            issue_field_id: 101,
+            issue_field_name: 'Estimate',
+            data_type: 'single_select',
+            value: '2',
+            single_select_option: { name: '2' },
+          },
+        ],
+      };
+    throw new Error(`Unexpected synthetic stdout REST operation: ${route}`);
+  }) as typeof rest.request;
   Object.assign(rest.issues, {
     get: async ({ issue_number }: { issue_number: number }) => ({
       data:
