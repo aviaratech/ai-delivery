@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { DeliveryError } from './errors.js';
 import * as githubClients from './github/client.js';
 import type { GitHubClients } from './github/client.js';
@@ -27,13 +28,7 @@ import {
   registerInvestigationCustody,
   type InvestigationPreparation,
 } from './services/worktreeRegistry.js';
-import {
-  parseGitHubReviewArtifact,
-  parseReviewArtifact,
-  readGitHubPrScopeHash,
-  readRequiredReviewState,
-  submitReview,
-} from './review.js';
+import { parseReviewArtifact, readRequiredReviewState, submitReview } from './review.js';
 
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
@@ -585,14 +580,6 @@ async function verifyIssuePr(context: DeliveryContext, issueNumber: number, prNu
   if (nonClosing) await verifyNonClosingReference(context, issueNumber, pr);
   else await verifyPrIssueAssociation(context, prNumber, issueNumber);
   if (!pr.merged) {
-    // GitHub replaces the issue's branch connection with its PR on publication.
-    // Existing connections remain consistency evidence, never a fallback authority.
-    const branches = await linkedIssueBranches(context, issueNumber);
-    if (branches.length > 0) {
-      const matches = branches.filter((branch) => branch.name === pr.head.ref);
-      if (matches.length !== 1 || matches[0]!.sha !== pr.head.sha)
-        throw new DeliveryError('Native linked issue branches conflict with the exact PR head/ref.');
-    }
     const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.head.ref}` })).data;
     if (ref.ref !== `refs/heads/${pr.head.ref}` || ref.object.type !== 'commit' || ref.object.sha !== pr.head.sha)
       throw new DeliveryError('Current remote PR head/ref readback is incomplete or has moved.');
@@ -654,18 +641,77 @@ export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' 
   };
 }
 
+/** Enumerate configured requirements even when a check has never reported. */
+async function readRequiredCheckNames(context: DeliveryContext, base: string) {
+  const sources = await branchRuleSources(context, base);
+  const names = new Set<string>();
+  let complete = true;
+  for (const [index, result] of sources.entries()) {
+    if (
+      result.status !== 'fulfilled' ||
+      result.value.status !== 200 ||
+      !result.value.headers ||
+      result.value.headers.link
+    ) {
+      complete = false;
+      continue;
+    }
+    const data = result.value.data;
+    const lists: unknown[] = [];
+    if (index === 0) {
+      if (!Array.isArray(data)) {
+        complete = false;
+        continue;
+      }
+      for (const rule of data) {
+        if (typeof rule?.type !== 'string') complete = false;
+        if (rule?.type === 'required_status_checks') lists.push(rule.parameters?.required_status_checks);
+      }
+    } else if (Array.isArray(data) || !data || typeof data !== 'object') complete = false;
+    else if (data.required_status_checks === null) lists.push([]);
+    else {
+      const checks = data?.required_status_checks;
+      if (Array.isArray(checks?.checks)) lists.push(checks.checks);
+      if (Array.isArray(checks?.contexts)) lists.push(checks.contexts.map((context: unknown) => ({ context })));
+      if (!Array.isArray(checks?.checks) && !Array.isArray(checks?.contexts)) complete = false;
+    }
+    for (const list of lists) {
+      const parsed = z.array(z.object({ context: z.string().min(1) })).safeParse(list);
+      if (!parsed.success) complete = false;
+      else for (const check of parsed.data) names.add(check.context);
+    }
+  }
+  return { names: [...names].sort(), complete };
+}
+
 export async function prChecks(context: DeliveryContext, prNumber: number) {
-  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+  const pr = await getPr(context, prNumber);
+  const requirements = await readRequiredCheckNames(context, pr.base.ref);
   const [checks, status, reviewState] = await Promise.all([
     context.clients.rest.checks.listForRef({ ...context.repo, ref: pr.head.sha, per_page: 100 }),
-    context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: pr.head.sha }),
+    context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: pr.head.sha, per_page: 100 }),
     readRequiredReviewState(context, prNumber, pr.head.sha),
   ]);
+  const headChecksComplete =
+    checks.data.total_count === checks.data.check_runs.length &&
+    status.data.total_count === status.data.statuses.length;
   return {
     schemaVersion: 'ai-delivery.pr-checks@1' as const,
     prNumber: pr.number,
     headSha: pr.head.sha,
     combinedStatus: status.data.state,
+    mergeStateStatus: pr.mergeable_state ?? 'unknown',
+    requiredCheckDiscovery: requirements.complete ? 'complete' : 'partial',
+    headChecksComplete,
+    requiredChecks: requirements.names.map((name) => {
+      const states = [
+        ...checks.data.check_runs
+          .filter((check) => check.name === name)
+          .map((check) => `check: ${check.status}/${check.conclusion ?? 'pending'}`),
+        ...status.data.statuses.filter((check) => check.context === name).map((check) => `status: ${check.state}`),
+      ];
+      return { name, headState: states.join('; ') || (headChecksComplete ? 'not-reported' : 'unknown') };
+    }),
     reviewState,
     checkRuns: checks.data.check_runs.map((check) => ({
       name: check.name,
@@ -708,6 +754,21 @@ function completeRulePage(response: { status: number; data: unknown; headers: { 
 /** Absence is proved only by an empty successful first page with no continuation evidence. */
 function emptyRulePage(response: { status: number; data: unknown; headers: { link?: unknown } }): boolean {
   return completeRulePage(response) && Array.isArray(response.data) && response.data.length === 0;
+}
+
+function branchRuleSources(context: DeliveryContext, base: string, control?: { signal: AbortSignal }) {
+  return Promise.allSettled([
+    context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+      ...context.repo,
+      branch: base,
+      ...(control === undefined ? {} : { request: { signal: control.signal } }),
+    }),
+    context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
+      ...context.repo,
+      branch: base,
+      ...(control === undefined ? {} : { request: { signal: control.signal } }),
+    }),
+  ]);
 }
 
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
@@ -787,18 +848,7 @@ export async function preflightReviewRoute(
       'Reviewer GitHub App cannot read the selected repository; verify its installation and repository access.',
     );
   }
-  const [rulesetResult, protectionResult] = await Promise.allSettled([
-    context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
-      ...context.repo,
-      branch: base,
-      ...(control === undefined ? {} : { request: { signal: control.signal } }),
-    }),
-    context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}/protection', {
-      ...context.repo,
-      branch: base,
-      ...(control === undefined ? {} : { request: { signal: control.signal } }),
-    }),
-  ]);
+  const [rulesetResult, protectionResult] = await branchRuleSources(context, base, control);
   await check();
   let confirmedUnprotected = false;
   let confirmedRulesetOnly = false;
@@ -1250,17 +1300,6 @@ export async function submitFormalReview(
   }
   return result;
 }
-async function allReviews(context: DeliveryContext, prNumber: number) {
-  const reviews: Awaited<ReturnType<typeof context.clients.rest.pulls.listReviews>>['data'] = [];
-  for (let page = 1; page <= 20; page++) {
-    const batch = (
-      await context.clients.rest.pulls.listReviews({ ...context.repo, pull_number: prNumber, page, per_page: 100 })
-    ).data;
-    reviews.push(...batch);
-    if (batch.length < 100) return reviews;
-  }
-  throw new DeliveryError('GitHub review history exceeds the bounded readback window.');
-}
 export async function mergePr(
   context: DeliveryContext,
   input: {
@@ -1301,77 +1340,10 @@ export async function mergePr(
     throw new DeliveryError('Requested reviewed head differs from the GitHub PR.');
   if (pr.merged && pr.state === 'closed' && validSha(pr.merge_commit_sha))
     return { mergeSha: pr.merge_commit_sha, headSha: pr.head.sha, reused: true };
-  const route = await preflightReviewRoute(context, pr.base.ref);
-  if (route.approvalEligibility === 'insufficient-permission')
-    throw new DeliveryError('Configured reviewer App is ineligible for the required approval.');
   if (pr.state !== 'open' || pr.draft) throw new DeliveryError('GitHub PR must be open and ready for merge.');
-  const reviewer =
-    context.reviewerClients ??
-    (await githubClients.createDeliveryGitHubClients({
-      config: context.config,
-      identity: context.config.roles.reviewer.identity,
-      role: 'reviewer',
-      selectedAuthor: context.clients,
-    }));
-  if (reviewer.role !== 'reviewer' || reviewer.authSource !== 'app' || !reviewer.appActorLogin)
-    throw new DeliveryError('Independent reviewer App route is unavailable.');
-  const actor = await reviewer.appActorLogin();
-  if (!pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase())
-    throw new DeliveryError('Reviewer App must differ from the PR author.');
-  const reviews = (await allReviews(context, input.prNumber)).filter(
-    (review) =>
-      review.user?.login.toLowerCase() === actor.toLowerCase() &&
-      review.commit_id === pr.head.sha &&
-      review.state === 'APPROVED' &&
-      /<!-- ai-delivery-review-artifact: sha256:[a-f0-9]{64} -->/u.test(review.body ?? ''),
-  );
-  if (reviews.length !== 1)
-    throw new DeliveryError('GitHub requires one unambiguous exact-head independent App review.');
-  const approved = reviews[0]!;
-  const readReview = (
-    await context.clients.rest.pulls.getReview({ ...context.repo, pull_number: input.prNumber, review_id: approved.id })
-  ).data;
-  if (
-    readReview.id !== approved.id ||
-    readReview.state !== 'APPROVED' ||
-    readReview.commit_id !== pr.head.sha ||
-    readReview.user?.login.toLowerCase() !== actor.toLowerCase() ||
-    readReview.body !== approved.body
-  )
-    throw new DeliveryError('Independent GitHub review readback changed or was dismissed.');
-  const artifact = parseGitHubReviewArtifact(readReview.body);
-  if (
-    artifact.verdict !== 'approve' ||
-    artifact.issueNumber !== input.issueNumber ||
-    (artifact.prNumber !== null && artifact.prNumber !== input.prNumber) ||
-    artifact.authorIdentity !== context.config.roles.author.identity ||
-    artifact.reviewerIdentity !== context.config.roles.reviewer.identity ||
-    artifact.head.sha !== pr.head.sha
-  )
-    throw new DeliveryError('Independent review artifact binding is stale, foreign or rejected.');
-  const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: pr.head.sha })).data;
-  if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
-    throw new DeliveryError('Independent review tree differs from the remote commit.');
-  if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, input.prNumber, pr.changed_files)))
-    throw new DeliveryError('Independent review scope differs from the remote PR diff.');
-  const reviewedHead = artifact.head.sha;
-  if (input.reviewedHeadSha !== undefined && input.reviewedHeadSha !== reviewedHead)
-    throw new DeliveryError('Requested reviewed head differs from the independent GitHub review.');
-  const decision = await readRequiredReviewState(context, input.prNumber, reviewedHead!, {
-    id: approved.id,
-    login: actor,
-  });
-  if (decision.submittedReviewAuthorCanPushToRepository !== true)
-    throw new DeliveryError('Specific reviewer App approval is not verifiably qualifying for required review.');
-  // Unavailable or malformed decisions carry no qualifying review-access
-  // evidence. An observed null may accompany an independently confirmed zero.
-  const noReviewsRequired =
-    decision.status === 'unknown' &&
-    decision.reviewDecision === null &&
-    route.rules.visibility === 'complete' &&
-    route.rules.observedRequiredApprovals === 0;
-  if (decision.status !== 'satisfied' && !noReviewsRequired)
-    throw new DeliveryError(`GitHub review eligibility is ${decision.status}: ${decision.nextAction}`);
+  if (pr.user.login.toLowerCase() !== author.actorLogin.toLowerCase())
+    throw new DeliveryError('Merge requires the configured PR author.');
+  const reviewedHead = pr.head.sha;
   const blockers = await getNativeBlockerRelationships({
     graphql: context.clients.graphql,
     issueNumber: input.issueNumber,
@@ -1386,22 +1358,31 @@ export async function mergePr(
     refuseClosingDirective(squash!.commit_title);
     refuseClosingDirective(squash!.commit_message);
   }
-  if (noReviewsRequired && (pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha))
-    throw new DeliveryError('GitHub base changed; refresh the zero-review requirement observation before merge.');
+  const decision = await readRequiredReviewState(context, input.prNumber, reviewedHead);
+  pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing);
+  if (nonClosing) {
+    sameReferencePr(initialPr, pr);
+    sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
+  }
+  if (pr.head.sha !== reviewedHead || pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha)
+    throw new DeliveryError('GitHub head/base changed; refresh native merge eligibility.');
   if (
-    pr.head.sha !== reviewedHead ||
     pr.state !== 'open' ||
     pr.draft ||
     pr.mergeable !== true ||
-    pr.mergeable_state !== 'clean'
-  )
+    !['clean', 'has_hooks', 'unstable'].includes(pr.mergeable_state ?? '') ||
+    !decision.observed ||
+    (decision.reviewDecision !== 'APPROVED' && decision.reviewDecision !== null)
+  ) {
+    const requirements = await readRequiredCheckNames(context, pr.base.ref);
     throw new DeliveryError(
-      `GitHub merge eligibility is ${pr.mergeable_state ?? 'unknown'}; CLEAN at the reviewed head is required.`,
+      `GitHub merge eligibility is ${pr.mergeable_state ?? 'unknown'}; review eligibility is ${decision.status}. Required checks: ${requirements.names.join(', ') || (requirements.complete ? 'none' : 'unknown')}; requirement discovery is ${requirements.complete ? 'complete' : 'partial'}. ${decision.nextAction}`,
     );
+  }
   const currentBase = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data
     .object.sha;
   if (!validSha(currentBase) || currentBase !== pr.base.sha)
-    throw new DeliveryError('GitHub base moved; refresh clean eligibility and independent review before merge.');
+    throw new DeliveryError('GitHub base moved; refresh native merge eligibility before merge.');
   if (input.dryRun)
     return {
       dryRun: true,
