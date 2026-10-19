@@ -1735,7 +1735,26 @@ async function assertRetirementErrorBoundaries(error: Error, repoRoot: string, f
   }
 }
 
-for (const fault of ['installer', 'accessors', 'cycle', 'proxy'] as const) {
+for (const fault of [
+  'installer',
+  'accessors',
+  'cycle',
+  'proxy',
+  'observer',
+  'observer-zero',
+  'observer-retired',
+  'observer-missing',
+  'observer-negative',
+  'observer-fractional',
+  'observer-unsafe',
+  'observer-nonfinite',
+  'observer-string',
+  'observer-array',
+  'observer-malformed',
+  'observer-trailing',
+  'inherited-message',
+  'proxy-root',
+] as const) {
   test(`output retirement retains a bounded operation cause without exposing ${fault} failure data`, async () => {
     const api = await producer();
     const f = await fixture();
@@ -1746,6 +1765,59 @@ for (const fault of ['installer', 'accessors', 'cycle', 'proxy'] as const) {
     const primary = new Error('Synthetic retirement refusal', { cause: prior });
     let reads = 0;
     let operation: unknown = new Error(secret.repeat(2048));
+    let expectedNumbers: string | undefined;
+    if (fault.startsWith('observer') || fault === 'inherited-message' || fault === 'proxy-root') {
+      const metadata: Record<string, unknown> = {
+        errorCode: 'ETIMEDOUT',
+        elapsedMs: 1001,
+        stdoutBytes: 57,
+        completeLines: 1,
+        rawRows: secret,
+        argv: [secret],
+      };
+      if (fault === 'observer-missing') {
+        delete metadata.completeLines;
+        Object.defineProperty(metadata, '__proto__', { value: { completeLines: 1 }, enumerable: true });
+      } else if (fault === 'observer-negative') metadata.elapsedMs = -1;
+      else if (fault === 'observer-fractional') metadata.stdoutBytes = 0.5;
+      else if (fault === 'observer-unsafe') metadata.completeLines = Number.MAX_SAFE_INTEGER + 1;
+      else if (fault === 'observer-nonfinite') metadata.elapsedMs = Infinity;
+      else if (fault === 'observer-string') metadata.stdoutBytes = '57';
+      else if (fault === 'observer-zero') {
+        metadata.elapsedMs = 0;
+        metadata.stdoutBytes = 0;
+        metadata.completeLines = 0;
+      }
+      let payload = JSON.stringify(fault === 'observer-array' ? [metadata] : metadata);
+      if (fault === 'observer-malformed') payload = `{"errorCode":"ETIMEDOUT","rawRows":"${secret}"`;
+      else if (fault === 'observer-trailing') payload += secret;
+      else if (fault === 'observer-retired') payload += ' Output-gate retirement: wrappedOperation=failed.';
+      const message = 'Owned process resource observation failed. ' + payload;
+      operation = new Error(message);
+      if (fault === 'observer' || fault === 'observer-retired')
+        expectedNumbers = 'elapsedMs=1001; stdoutBytes=57; completeLines=1';
+      else if (fault === 'observer-zero') expectedNumbers = 'elapsedMs=0; stdoutBytes=0; completeLines=0';
+      if (fault === 'inherited-message') {
+        Reflect.deleteProperty(operation as Error, 'message');
+        Object.setPrototypeOf(
+          operation,
+          Object.create(Error.prototype, {
+            message: {
+              get: () => {
+                reads++;
+                throw new Error(message);
+              },
+            },
+          }) as object,
+        );
+      } else if (fault === 'proxy-root') {
+        const trap = (): never => {
+          reads++;
+          throw new Error(secret);
+        };
+        operation = new Proxy(operation as Error, { get: trap, ownKeys: trap, getOwnPropertyDescriptor: trap });
+      }
+    }
     if (fault === 'accessors') {
       operation = Object.defineProperties(new Error(), {
         message: {
@@ -1810,6 +1882,9 @@ for (const fault of ['installer', 'accessors', 'cycle', 'proxy'] as const) {
       assert.ok(cause instanceof Error);
       assert.match(cause.message, /^Wrapped operation failed/u);
       if (fault === 'installer') assert.match(cause.message, /exit=7/u);
+      if (fault.startsWith('observer')) assert.match(cause.message, /observation=ETIMEDOUT/u);
+      if (expectedNumbers === undefined) assert.doesNotMatch(cause.message, /elapsedMs=|stdoutBytes=|completeLines=/u);
+      else assert.ok(cause.message.includes(expectedNumbers));
       assert.ok(cause.message.length < 1024);
       assert.equal(cause.message.includes(secret), false);
       assert.equal(
@@ -1823,6 +1898,72 @@ for (const fault of ['installer', 'accessors', 'cycle', 'proxy'] as const) {
       assert.equal(existsSync(f.input.runtimeDirectory), false);
       if (fault === 'installer') assert.equal(readFileSync(f.counter, 'utf8'), 'x');
       else assert.equal(existsSync(f.counter), false);
+    } finally {
+      retirementFailure.directory = '';
+      retirementFailure.error = undefined;
+      injected.mockRestore();
+      f.cleanup();
+    }
+  });
+}
+
+for (const shape of ['nonextensible', 'readonly', 'accessor', 'mutable-nonextensible'] as const) {
+  test(`output retirement preserves primary cause descriptors for ${shape} errors`, async () => {
+    const api = await producer();
+    const f = await fixture();
+    const secret = 'fictional_descriptor_credential';
+    const prior = new Error(secret);
+    const primary = new Error('Synthetic retirement refusal');
+    let reads = 0;
+    if (shape === 'readonly')
+      Object.defineProperty(primary, 'cause', { value: prior, configurable: false, writable: false, enumerable: true });
+    else if (shape === 'accessor')
+      Object.defineProperty(primary, 'cause', {
+        configurable: true,
+        get: () => {
+          reads++;
+          throw new Error(secret);
+        },
+      });
+    else if (shape === 'mutable-nonextensible')
+      Object.defineProperty(primary, 'cause', { value: prior, configurable: false, writable: true, enumerable: true });
+    if (shape === 'nonextensible' || shape === 'mutable-nonextensible') Object.preventExtensions(primary);
+    const before = Object.getOwnPropertyDescriptor(primary, 'cause');
+    const operation = new Error(
+      'Owned process resource observation failed. {"errorCode":"ETIMEDOUT","elapsedMs":1001,"stdoutBytes":57,"completeLines":1}',
+    );
+    const write = atomicJson.writePrivateJsonFileAtomically;
+    const injected = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+      if (path === join(f.input.runtimeDirectory, 'runtime-stage.json')) throw operation;
+      write(path, value);
+    });
+    try {
+      retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
+      retirementFailure.error = primary;
+      retirementFailure.hits = 0;
+      let received: unknown;
+      try {
+        await api.stageRuntime(f.input);
+      } catch (error) {
+        received = error;
+      }
+      assert.equal(received, primary);
+      assert.equal(primary.message, 'Synthetic retirement refusal');
+      assert.equal(retirementFailure.hits, 1);
+      const after = Object.getOwnPropertyDescriptor(primary, 'cause');
+      if (shape === 'mutable-nonextensible') {
+        assert.ok(after?.value instanceof Error);
+        assert.notEqual(after.value, prior);
+        assert.match(after.value.message, /elapsedMs=1001; stdoutBytes=57; completeLines=1/u);
+        assert.equal(Object.getOwnPropertyDescriptor(after.value, 'cause')?.value, prior);
+        assert.deepEqual({ ...after, value: undefined }, { ...before, value: undefined });
+      } else assert.deepEqual(after, before);
+      assert.equal(Object.isExtensible(primary), shape === 'readonly' || shape === 'accessor');
+      assert.equal(reads, 0);
+      await assertRetirementErrorBoundaries(primary, f.root, [secret]);
+      assert.equal(reads, 0);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(existsSync(f.counter), false);
     } finally {
       retirementFailure.directory = '';
       retirementFailure.error = undefined;
