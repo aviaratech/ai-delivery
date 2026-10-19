@@ -153,6 +153,7 @@ globalThis.fetch=async(url,init)=>{
   }
   else if(path.includes('/issues/comments/'))data=comments.find(comment=>comment.id===Number(path.split('/').at(-1)));
   else if(path.endsWith('/labels'))data=[{name:'enhancement'},{name:'bug'}];
+  else if(path==='/repos/example/b/issues/17/sub_issues'&&method==='GET')data=[];
   else if(path.endsWith('/issue-fields'))data=fields;
   else if(path.endsWith('/issue-field-values')){
     if(method==='POST')fieldValues=json.issue_field_values.map(entry=>({issue_field_id:entry.field_id,issue_field_name:fields.find(field=>field.id===entry.field_id).name,data_type:'single_select',value:entry.value}));
