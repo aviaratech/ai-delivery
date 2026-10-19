@@ -486,10 +486,25 @@ test('runtime-stage unavailable initial controller observation refuses preflight
           maxNewOutputBytes: 128 * 1024 ** 2,
         },
       }),
-      {
-        name: 'DeliveryError',
-        message:
-          'Owned process resource observation failed. {"status":null,"errorCode":"ETIMEDOUT","signal":"SIGTERM","stdoutPresent":true,"stdoutTerminated":false}',
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.name, 'DeliveryError');
+        const prefix = 'Owned process resource observation failed. ';
+        assert.ok(error.message.startsWith(prefix));
+        const metadata = JSON.parse(error.message.slice(prefix.length)) as Record<string, unknown>;
+        assert.ok(typeof metadata.elapsedMs === 'number' && Number.isSafeInteger(metadata.elapsedMs));
+        assert.ok(metadata.elapsedMs >= 0);
+        assert.deepEqual(metadata, {
+          status: null,
+          errorCode: 'ETIMEDOUT',
+          signal: 'SIGTERM',
+          stdoutPresent: true,
+          stdoutTerminated: false,
+          elapsedMs: metadata.elapsedMs,
+          stdoutBytes: 0,
+          completeLines: 0,
+        });
+        return true;
       },
     );
     assert.equal(actors.authorCalls, 0, 'unavailable observation must refuse before authenticated preflight');
