@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
 import { DeliveryHealthInput } from '../services/deliveryHealthService.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema } from '../issueJournal.js';
@@ -26,6 +27,7 @@ const IssueUpdateInput = issueInputSchema(
   z
     .strictObject({
       ...IssueWriteFields,
+      ...NativeIssueDateFields,
       status: IssueStatusPatch.optional(),
       repo: Repo,
       blockedBy: z.array(Positive).optional(),
@@ -224,6 +226,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     inputSchema: issueInputSchema(
       z.strictObject({
         ...Tracking,
+        ...NativeIssueDateFields,
         ...IssueWriteFields,
         title: IssueFields.shape.title,
         status: CreateIssueStatus.optional(),

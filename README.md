@@ -308,6 +308,25 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 
 Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
 
+`issue_create` and `issue_update` also accept optional native `startDate` and
+`targetDate` values, including in CLI `--fields-file` JSON. They resolve the
+organization fields named **Start date** and **Target date** without caller IDs.
+Dates must be calendar-valid `YYYY-MM-DD` strings. Omit a property to preserve
+its current value; use `null` to clear only that date. For example, an update
+file containing `{"startDate":"2028-02-29","targetDate":null}` sets the start
+date and clears the target. Missing, duplicate or incompatible requested date
+fields refuse before mutation; calls without date properties do not require
+those organization fields. Existing Points/Priority and other field values
+are preserved. This adds no date fields to the organization.
+
+`issue_info.fields` returns the same supported organization field names and
+values as `issue_list`, including text, number, date and named single/multi-select
+values; unset fields are `null`. The existing top-level Points/Priority readback
+remains, with `startDate`/`targetDate` aliases when their date fields exist.
+Setting fields uses additive native updates; clearing an already unset date is
+idempotent. A creation failure after a native issue exists reports that known
+issue so recovery never creates a replacement.
+
 Batch input is a UTF-8 JSON array of **1–50** complete `issue_update` inputs;
 MCP takes `{repo, items, dryRun}`. All items use the selected repository, including
 any per-item `repo`. Close, defer/undefer, parent, blockers, typed contract,

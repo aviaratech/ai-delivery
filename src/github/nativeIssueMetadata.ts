@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { DeliveryConfig } from '../config/deliveryConfig.js';
 
 import { DeliveryError } from '../errors.js';
@@ -374,4 +375,86 @@ function resolveSingleSelectField({
     }
   }
   return { dataType: 'single_select', id: field.id as number, name };
+}
+
+/** Optional native fields: omission preserves, null clears only the named field. */
+export const NativeIssueDateFields = {
+  startDate: z.iso.date().nullable().optional(),
+  targetDate: z.iso.date().nullable().optional(),
+};
+export interface NativeIssueDatePatch {
+  startDate?: string | null;
+  targetDate?: string | null;
+}
+export interface NativeIssueDateChange {
+  fieldId: number;
+  name: string;
+  value: string | null;
+}
+
+export function prepareNativeIssueDates(
+  patch: NativeIssueDatePatch,
+  catalog: readonly { id: number; name: string; data_type: string }[],
+): NativeIssueDateChange[] {
+  return (['startDate', 'targetDate'] as const).flatMap((key) => {
+    const value = patch[key];
+    if (value === undefined) return [];
+    NativeIssueDateFields[key].parse(value);
+    const name = key === 'startDate' ? 'Start date' : 'Target date';
+    const matches = catalog.filter((field) => field.name === name);
+    if (matches.length !== 1 || matches[0]!.data_type !== 'date')
+      throw new DeliveryError(`Expected one configured native date field named ${name}.`);
+    return [{ fieldId: matches[0]!.id, name, value }];
+  });
+}
+
+export async function applyNativeIssueDates(input: {
+  changes: readonly NativeIssueDateChange[];
+  issueNumber: number;
+  owner: string;
+  repo: string;
+  rest: NativeIssueMetadataRest;
+}): Promise<void> {
+  if (!input.changes.length) return;
+  const parameters = { headers: apiHeaders, issue_number: input.issueNumber, owner: input.owner, repo: input.repo };
+  const read = async () => {
+    const response = await input.rest.request(
+      'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values',
+      parameters,
+    );
+    if (!Array.isArray(response.data)) throw new DeliveryError('Incomplete native date field readback.');
+    return response.data as RawIssueFieldValue[];
+  };
+  const selected = (values: RawIssueFieldValue[], change: NativeIssueDateChange) => {
+    const matches = values.filter((field) => field.issue_field_id === change.fieldId);
+    if (
+      matches.length > 1 ||
+      matches.some((field) => field.issue_field_name !== change.name || field.data_type !== 'date')
+    )
+      throw new DeliveryError(`Native ${change.name} readback conflicts with its configured identity.`);
+    return matches[0];
+  };
+  const before = await read();
+  for (const change of input.changes) selected(before, change);
+  const additions = input.changes.filter((change) => change.value !== null);
+  if (additions.length)
+    await input.rest.request('POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values', {
+      ...parameters,
+      issue_field_values: additions.map((change) => ({ field_id: change.fieldId, value: change.value })),
+    });
+  for (const change of input.changes) {
+    if (change.value === null && selected(before, change)?.value != null)
+      await input.rest.request(
+        'DELETE /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values/{issue_field_id}',
+        {
+          ...parameters,
+          issue_field_id: change.fieldId,
+        },
+      );
+  }
+  const after = await read();
+  for (const change of input.changes) {
+    if ((selected(after, change)?.value ?? null) !== change.value)
+      throw new DeliveryError(`Native ${change.name} readback differs from the requested date.`);
+  }
 }
