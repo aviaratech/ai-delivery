@@ -13,6 +13,7 @@ import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration
 import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
 import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch } from './issueContract.js';
+import { NativeIssueDateFields } from './github/nativeIssueMetadata.js';
 
 const program = new Command();
 program
@@ -69,6 +70,7 @@ function fields(file: string | undefined, overrides: Record<string, unknown>): R
   const value: unknown = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
   return {
     ...IssueWriteSchema.extend({
+      ...NativeIssueDateFields,
       ...IssueDeferralPatch,
       status: IssueStatusPatch.optional(),
       preserveHistory: z.boolean().optional(),
