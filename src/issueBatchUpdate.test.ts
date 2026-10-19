@@ -46,6 +46,8 @@ function batchFixture() {
     loseProjectAck: false,
     projectUnavailableAfterDependency: false,
     nativeUnavailableAfterDependency: false,
+    moveProjectToTodoAfterWrite: false,
+    projectReadsAfterWrite: 0,
   };
   const reads = new Map<number, number>();
   const metadata = new Map<number, Record<string, string>>();
@@ -131,6 +133,7 @@ function batchFixture() {
           }),
           update: async ({ issue_number, ...patch }: { issue_number: number; [key: string]: unknown }) => {
             writes.push(`update:${issue_number}`);
+            if (controls.moveProjectToTodoAfterWrite) statuses.set(issue_number, 'Queued');
             if (controls.archiveAfterWrite) controls.archived = true;
             if (controls.rateLimited === issue_number)
               throw Object.assign(new Error('PRIVATE_REMOTE_CONTENT'), {
@@ -209,6 +212,13 @@ function batchFixture() {
         },
       },
       graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (
+          controls.moveProjectToTodoAfterWrite &&
+          writes.includes('update:1') &&
+          query.includes('ProjectDeliveryItems') &&
+          ++controls.projectReadsAfterWrite === 2
+        )
+          throw new Error('PRIVATE_SYNC_READ_FAILURE');
         if (
           controls.projectUnavailableAfterDependency &&
           writes.includes('dependency') &&
@@ -657,6 +667,21 @@ test('unknown native blocker evidence does not claim a stale remaining Project t
   assert.equal(partial?.native.status, 'unknown');
   assert.equal(partial?.project.desiredStatus, null);
   assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+});
+
+test('a successful newer Project observation is retained when the subsequent synchronization fails', async () => {
+  const f = batchFixture();
+  f.controls.moveProjectToTodoAfterWrite = true;
+  const input = { items: [{ issueNumber: 1, status: { latestJournal: 'Native journal updated' } }] };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  const partial = first.results[0]!.incomplete;
+  assert.equal(partial?.native.status, 'confirmed');
+  assert.equal(partial?.project.desiredStatus, 'Todo');
+  assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+  const writes = [...f.writes];
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+  assert.deepEqual(f.writes, writes);
 });
 
 test('MCP serializes the actual incomplete update payload with error semantics', async () => {

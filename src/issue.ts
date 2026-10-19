@@ -1375,9 +1375,11 @@ async function applyIssueUpdate(
     input,
   );
   let readback: IssueInfo;
+  let latestProjectStatus = plan.currentContent.projectStatus;
   const priorRateObservation = clients.rateLimitObservation?.();
   try {
     const info = await issueInfo(context, input.issueNumber);
+    latestProjectStatus = info.projectStatus;
     status = updateProjectStatus(info, input);
     const target = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
     if (
@@ -1445,7 +1447,7 @@ async function applyIssueUpdate(
         if (historyBody !== undefined && !(await hasUpdateComment(context, input.issueNumber, historyBody)))
           throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
         result.project.desiredStatus = updateProjectStatus(
-          { ...native.readback, projectStatus: plan.currentContent.projectStatus },
+          { ...native.readback, projectStatus: latestProjectStatus },
           input,
         );
         result.native = {
