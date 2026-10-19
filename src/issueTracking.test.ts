@@ -47,6 +47,7 @@ function updateFixture() {
       },
       rest: {
         issues: {
+          listSubIssues: async () => ({ data: [] }),
           get: async (input: { issue_number: number }) => ({
             data:
               input.issue_number === 17

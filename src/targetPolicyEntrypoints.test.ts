@@ -28,6 +28,18 @@ const info = (v: Record<string, unknown>) => {
   assert.equal(v.parentIssueNumber, 11);
   assert.deepEqual(v.blockedBy, [13]);
   assert.equal(v.worktree, null);
+  assert.deepEqual(v.childProgress, {
+    childCount: 2,
+    closedChildCount: 1,
+    percentClosed: 50,
+    pointsTotal: 4,
+    inProgressChildren: [19],
+    nextTargetDate: null,
+    missingPoints: [],
+    missingProjectStatus: [],
+    undatedOpenChildren: [19],
+    targetDateConfigured: false,
+  });
 };
 const scenarios: Scenario[] = [
   { name: 'CLI info', mode: 'cli', args: ['info', '--issue', '17'], witness: 'issues.get', verify: info },
@@ -294,7 +306,14 @@ for (const kind of ['tracked', 'edited'] as const satisfies readonly EntrypointP
           if (input && 'owner' in input) assert.equal(input.owner, 'example');
           if (input && 'repo' in input) assert.equal(input.repo, 'widget');
           if (input && 'name' in input) assert.equal(input.name, 'widget');
-          if (input && 'issue_number' in input) assert.equal(input.issue_number, 17);
+          if (input && 'issue_number' in input) {
+            if (call.name === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values')
+              assert.ok(
+                [17, 18, 19].includes(input.issue_number as number),
+                'Only parent and declared direct children may supply fields',
+              );
+            else assert.equal(input.issue_number, 17);
+          }
           if (input && 'pull_number' in input) assert.equal(input.pull_number, 23);
           if (call.name === 'checks.listForRef' || call.name === 'repos.getCombinedStatusForRef')
             assert.equal(input?.ref, f.head);

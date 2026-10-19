@@ -32,6 +32,7 @@ export function entrypointClients(head: string) {
   const record = (name: string, input: unknown = null) => calls.push({ name, input });
   const page = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } });
   const issue = {
+    id: 117,
     number: 17,
     node_id: 'ISSUE17',
     title: 'Fictional widget',
@@ -39,7 +40,18 @@ export function entrypointClients(head: string) {
     state: 'open',
     type: { name: 'Task' },
     html_url: 'https://github.com/example/widget/issues/17',
+    url: 'https://api.github.com/repos/example/widget/issues/17',
+    repository_url: 'https://api.github.com/repos/example/widget',
   };
+  const children = [19, 18].map((number) => ({
+    ...issue,
+    id: 100 + number,
+    number,
+    node_id: `ISSUE${number}`,
+    state: number === 18 ? 'closed' : 'open',
+    html_url: `https://github.com/example/widget/issues/${number}`,
+    url: `https://api.github.com/repos/example/widget/issues/${number}`,
+  }));
   const pr = {
     number: 23,
     state: 'open',
@@ -96,7 +108,7 @@ export function entrypointClients(head: string) {
   };
   const listSubIssues = async (input: unknown) => {
     record('issues.listSubIssues', input);
-    return { data: [{ number: 19 }, { number: 18 }] };
+    return { data: children };
   };
   const listPulls = async (input: unknown) => {
     record('pulls.list', input);
@@ -142,7 +154,27 @@ export function entrypointClients(head: string) {
   const graphql = async (query: string, input: Record<string, unknown> = {}) => {
     record(query.match(/(?:query|mutation)\s+(\w+)/u)?.[1] ?? 'relationships', input);
     if (query.includes('ProjectDeliveryItems'))
-      return { organization: { projectV2: { id: 'PROJECT-1', items: page([item]) } } };
+      return {
+        organization: {
+          projectV2: {
+            id: 'PROJECT-1',
+            number: 1,
+            items: page([
+              item,
+              ...children.map((child) => ({
+                ...item,
+                id: `ITEM${child.number}`,
+                content: { __typename: 'Issue', id: child.node_id },
+                fieldValueByName: {
+                  ...item.fieldValueByName,
+                  optionId: child.number === 18 ? 'STATUS-3' : 'STATUS-1',
+                  name: child.number === 18 ? 'Shipped' : 'Active',
+                },
+              })),
+            ]),
+          },
+        },
+      };
     if (query.includes('blockedBy(first:'))
       return {
         repository: {

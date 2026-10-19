@@ -585,7 +585,11 @@ async function findIssueProjectItem(
       if (item !== null && item.contentId === input.issueNodeId) matches.push(item);
     }
     const pageInfo = requireRecord(items.pageInfo, 'GitHub omitted delivery Project item pagination.');
-    if (input.capacityRead && typeof pageInfo.hasNextPage !== 'boolean')
+    if (
+      input.capacityRead &&
+      (typeof pageInfo.hasNextPage !== 'boolean' ||
+        (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== 'string'))
+    )
       throw new DeliveryError('WIP capacity Project pagination is incomplete.');
     hasNextPage = pageInfo.hasNextPage === true;
     const nextCursor = typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null;
