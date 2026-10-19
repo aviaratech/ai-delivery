@@ -299,11 +299,11 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
           [1, 2, 3],
         );
       }
-      f.reviews.length = 0;
+      f.state.reviewDecision = 'REVIEW_REQUIRED';
       const refused = await connection.call('issue_pr_merge', { issueNumber: 17, prNumber: 23 });
       assert.equal(refused.response.isError, true);
       assert.match(refused.text, /qualifying|review|approval/u);
-      assert.ok(f.calls.some((c) => c.name === 'pulls.listReviews'));
+      assert.ok(f.calls.some((c) => c.name === 'DeliveryReviewDecision'));
       assert.equal(
         f.calls.some((c) => c.name === 'pulls.merge'),
         false,
