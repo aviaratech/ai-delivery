@@ -41,6 +41,9 @@ function batchFixture() {
     ignoreLabels: false,
     parentRepository: 'example/widget',
     parentNodeId: '',
+    archived: false,
+    archiveAfterWrite: false,
+    loseProjectAck: false,
   };
   const reads = new Map<number, number>();
   const metadata = new Map<number, Record<string, string>>();
@@ -124,6 +127,7 @@ function batchFixture() {
           }),
           update: async ({ issue_number, ...patch }: { issue_number: number; [key: string]: unknown }) => {
             writes.push(`update:${issue_number}`);
+            if (controls.archiveAfterWrite) controls.archived = true;
             if (controls.rateLimited === issue_number)
               throw Object.assign(new Error('PRIVATE_REMOTE_CONTENT'), {
                 status: 429,
@@ -262,7 +266,7 @@ function batchFixture() {
                 items: {
                   nodes: [...rows.keys()].map((n) => ({
                     id: `ITEM${n}`,
-                    isArchived: false,
+                    isArchived: controls.archived,
                     content: { id: `ISSUE${n}` },
                     fieldValueByName: {
                       name: statuses.get(n),
@@ -293,6 +297,10 @@ function batchFixture() {
                   ? 'Active'
                   : 'Queued',
           );
+          if (controls.loseProjectAck) {
+            controls.loseProjectAck = false;
+            throw new Error('PRIVATE_PROJECT_ACK');
+          }
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: `ITEM${number}` } } };
         }
         if (query.includes('ProjectDeliveryItemReadback'))
@@ -532,10 +540,106 @@ test('lost acknowledgement exposes partial state and a rerun completes remaining
   );
   assert.equal(second.results[0]!.readback!.projectStatus, 'Todo');
   assert.equal(f.comments.length, historyCount);
+  assert.equal(
+    f.writes.filter((write) => write.startsWith('update:1')).length,
+    1,
+    'recovery must not replay the committed native update',
+  );
   assert.deepEqual(
     (await runBatch(input)).results.map((item) => item.status),
     ['unchanged', 'unchanged'],
   );
+});
+
+test('archived partial closure resumes only Project work after separate restoration and then becomes a no-op', async () => {
+  const f = batchFixture();
+  const unrelated = structuredClone(f.rows.get(2));
+  f.rows.get(1)!.labels.push('enhancement');
+  f.controls.archiveAfterWrite = true;
+  const input = {
+    items: [
+      {
+        issueNumber: 1,
+        title: 'Closed item',
+        state: 'closed' as const,
+        closeReason: 'not_planned' as const,
+        preserveHistory: true,
+      },
+    ],
+  };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  assert.equal(f.rows.get(1)!.state, 'closed');
+  const nativeWrites = f.writes.filter((write) => write !== 'project');
+  const comments = structuredClone(f.comments);
+  const archived = await runBatch(input);
+  assert.equal(archived.summary.failed, 1);
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  assert.deepEqual(f.comments, comments);
+  f.controls.archiveAfterWrite = false;
+  f.controls.archived = false; // A separately authorized restoration, outside recovery.
+  const resumed = await runBatch(input);
+  assert.equal(resumed.summary.applied, 1);
+  assert.equal(resumed.results[0]!.readback!.projectStatus, 'Done');
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  assert.deepEqual(f.comments, comments);
+  const count = f.writes.length;
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+  assert.equal(f.writes.length, count);
+  assert.deepEqual(f.rows.get(1)!.labels, ['enhancement']);
+  assert.deepEqual(f.rows.get(2), unrelated);
+});
+
+test('lost Project acknowledgement is incomplete until a read-only batch reconciliation proves a no-op', async () => {
+  const f = batchFixture();
+  f.controls.loseProjectAck = true;
+  const input = { items: [{ issueNumber: 1, state: 'closed' as const, closeReason: 'completed' as const }] };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  assert.equal(first.results[0]!.incomplete?.native.status, 'confirmed');
+  assert.equal(first.results[0]!.incomplete?.project.status, 'unknown');
+  assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+  const writes = [...f.writes];
+  const comments = structuredClone(f.comments);
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+  assert.deepEqual(f.writes, writes);
+  assert.deepEqual(f.comments, comments);
+});
+
+test('MCP serializes the actual incomplete update payload with error semantics', async () => {
+  const f = batchFixture();
+  f.controls.archiveAfterWrite = true;
+  const server = createAiDeliveryMcpServer({ repoRoot: '/synthetic', identity: 'host-author' });
+  const client = new Client({ name: 'partial-update-synthetic', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({
+      name: 'issue_update',
+      arguments: { repo: 'example/widget', issueNumber: 1, state: 'closed', closeReason: 'completed' },
+    });
+    assert.equal(result.isError, true);
+    const content = result.content as { type: string; text: string }[];
+    const partial = JSON.parse(content[0]!.text) as {
+      status: string;
+      native: { status: string; readback: issue.IssueInfo };
+      project: { desiredStatus: string };
+    };
+    assert.equal(partial.status, 'update-incomplete');
+    assert.equal(partial.native.status, 'confirmed');
+    assert.equal(partial.native.readback.state, 'closed');
+    assert.equal(partial.project.desiredStatus, 'Done');
+  } finally {
+    await client.close();
+    await server.close();
+  }
 });
 
 test('dry run plans close, defer, metadata, parent Points and dependency side effects without writes', async () => {

@@ -389,6 +389,21 @@ export async function restoreIssueProjectItem(
   return { archived: false, itemId: item.id };
 }
 
+/** Read-only preflight; the later synchronization still checks for archive races. */
+export async function assertIssueProjectWritable(input: ProjectDeliveryInput): Promise<void> {
+  const configuration =
+    input.configuration ??
+    (await getProjectDeliveryConfiguration({
+      ...input,
+      settings: requireProjectSettings(input.settings),
+      requireWritable: true,
+    }));
+  assertWritableConfiguration(configuration);
+  const item = await findIssueProjectItem({ ...input, configuration });
+  if (item?.archived === true)
+    throw new DeliveryError('The issue delivery Project item is archived and cannot be updated.');
+}
+
 export async function syncIssueProjectStatus(
   input: ProjectDeliveryInput & { status: ProjectDeliveryStatus; beforeAdvance?: () => Promise<void> },
 ): Promise<ProjectDeliveryStatusReadback> {

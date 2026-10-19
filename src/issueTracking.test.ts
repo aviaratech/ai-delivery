@@ -30,6 +30,15 @@ function updateFixture() {
     targetPr: false,
     reason: null as string | null,
     duplicate: null as number | null,
+    archived: false,
+    archiveAfterUpdate: false,
+    projectUnavailableAfterUpdate: false,
+    nativeUnavailableAfterUpdate: false,
+    foreignAfterUpdate: false,
+    wrongNodeAfterUpdate: false,
+    driftAfterUpdate: false,
+    projectFailure: '' as '' | 'rate-limit' | 'cancel',
+    nativeReadsAfterUpdate: 0,
   };
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
   const updates: Record<string, unknown>[] = [];
@@ -47,17 +56,28 @@ function updateFixture() {
       },
       rest: {
         issues: {
-          get: async (input: { issue_number: number }) => ({
-            data:
-              input.issue_number === 17
-                ? { ...live }
-                : {
-                    number: input.issue_number,
-                    id: 118,
-                    html_url: `https://github.com/example/widget/issues/${String(input.issue_number)}`,
-                    ...(controls.targetPr ? { pull_request: {} } : {}),
-                  },
-          }),
+          get: async (input: { issue_number: number }) => {
+            if (updates.length) controls.nativeReadsAfterUpdate++;
+            if (updates.length && controls.nativeUnavailableAfterUpdate) throw new Error('Native unavailable');
+            return {
+              data:
+                input.issue_number === 17
+                  ? {
+                      ...live,
+                      ...(updates.length && controls.wrongNodeAfterUpdate ? { node_id: 'FOREIGN_ISSUE' } : {}),
+                      ...(updates.length && controls.foreignAfterUpdate
+                        ? { html_url: 'https://github.com/other/widget/issues/17' }
+                        : {}),
+                      ...(updates.length && controls.driftAfterUpdate ? { body: 'Concurrent later edit' } : {}),
+                    }
+                  : {
+                      number: input.issue_number,
+                      id: 118,
+                      html_url: `https://github.com/example/widget/issues/${String(input.issue_number)}`,
+                      ...(controls.targetPr ? { pull_request: {} } : {}),
+                    },
+            };
+          },
           listComments: async () => ({ data: comments }),
           createComment: async (input: { body: string }) => {
             events.push('comment');
@@ -86,6 +106,7 @@ function updateFixture() {
             events.push('update');
             updates.push(input);
             if (controls.failUpdate) throw new Error('Update unavailable');
+            if (controls.archiveAfterUpdate) controls.archived = true;
             if (typeof input.title === 'string') live.title = input.title;
             if (typeof input.body === 'string') live.body = input.body;
             if (!controls.ignoreClosure && typeof input.state === 'string') {
@@ -102,6 +123,15 @@ function updateFixture() {
         request: async () => ({ data: [] }),
       },
       graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (query.includes('ProjectDelivery') && updates.length && controls.projectFailure) {
+          if (controls.projectFailure === 'cancel') throw new DOMException('Cancelled', 'AbortError');
+          throw Object.assign(new Error('PRIVATE_RATE_CONTENT'), {
+            status: 429,
+            response: { headers: { 'retry-after': '60' } },
+          });
+        }
+        if (query.includes('ProjectDelivery') && updates.length && controls.projectUnavailableAfterUpdate)
+          throw new Error('PRIVATE_REMOTE_CONTENT');
         if (query.includes('IssueClosureReadback'))
           return {
             repository: {
@@ -131,7 +161,7 @@ function updateFixture() {
                   nodes: [
                     {
                       id: 'ITEM17',
-                      isArchived: false,
+                      isArchived: controls.archived,
                       content: { id: 'ISSUE17' },
                       fieldValueByName: {
                         name: projectStatus,
@@ -145,6 +175,7 @@ function updateFixture() {
             },
           };
         if (query.includes('UpdateProjectDeliveryStatus')) {
+          events.push('project-update');
           projectStatus =
             variables.optionId === 'DONE' ? 'Shipped' : variables.optionId === 'TODO' ? 'Queued' : 'Active';
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
@@ -202,6 +233,135 @@ test('history preserves exact prior content before a rewrite and retries a faile
     fixture.cleanup();
   }
 });
+
+test('initially archived issue update refuses before history, closure or native writes', async () => {
+  const f = updateFixture();
+  try {
+    f.controls.archived = true;
+    await assert.rejects(
+      issue.updateIssue(f.context, {
+        issueNumber: 17,
+        body: 'Replacement',
+        draft: true,
+        preserveHistory: true,
+        state: 'closed',
+        closeReason: 'not_planned',
+      }),
+      /archived/u,
+    );
+    assert.deepEqual(f.updates, []);
+    assert.deepEqual(f.comments, []);
+    assert.equal(f.events.includes('project-update'), false);
+    assert.equal(f.live.state, 'open');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['archive', 'unavailable'] as const)(
+  'post-commit %s reports confirmed native content and closure separately from pending Project work',
+  async (failure) => {
+    const f = updateFixture();
+    try {
+      f.controls.archiveAfterUpdate = failure === 'archive';
+      f.controls.projectUnavailableAfterUpdate = failure === 'unavailable';
+      await assert.rejects(
+        issue.updateIssue(f.context, {
+          issueNumber: 17,
+          body: 'Replacement',
+          draft: true,
+          preserveHistory: true,
+          state: 'closed',
+          closeReason: 'not_planned',
+        }),
+        (error: unknown) => {
+          const result = (
+            error as {
+              result: {
+                status: string;
+                native: {
+                  status: string;
+                  repository: string;
+                  readback: issue.IssueInfo;
+                  closure: issue.IssueClosureReadback;
+                  historyComment: issue.IssueCommentReadback;
+                };
+                project: { status: string; desiredStatus: string };
+                recovery: { tool: string };
+              };
+            }
+          ).result;
+          assert.equal(result.status, 'update-incomplete');
+          assert.equal(result.native.status, 'confirmed');
+          assert.equal(result.native.repository, 'example/widget');
+          assert.equal(result.native.readback.state, 'closed');
+          assert.match(result.native.readback.body, /Replacement/u);
+          assert.equal(result.native.closure.closeReason, 'not_planned');
+          assert.equal(result.native.historyComment.commentId, 91);
+          assert.equal(result.project.status, failure === 'archive' ? 'pending' : 'unknown');
+          assert.equal(result.project.desiredStatus, 'Done');
+          assert.equal(result.recovery.tool, 'issue_batch_update');
+          assert.equal(JSON.stringify(result).includes('PRIVATE_'), false);
+          return true;
+        },
+      );
+      assert.equal(f.updates.length, 1);
+      assert.equal(f.comments.length, 2);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['unavailable', 'foreign', 'drift', 'node'] as const)(
+  'post-commit native %s evidence remains unknown',
+  async (failure) => {
+    const f = updateFixture();
+    try {
+      f.controls.archiveAfterUpdate = true;
+      f.controls.nativeUnavailableAfterUpdate = failure === 'unavailable';
+      f.controls.foreignAfterUpdate = failure === 'foreign';
+      f.controls.wrongNodeAfterUpdate = failure === 'node';
+      f.controls.driftAfterUpdate = failure === 'drift';
+      await assert.rejects(
+        issue.updateIssue(f.context, { issueNumber: 17, body: 'Replacement', draft: true }),
+        (error: unknown) => {
+          const result = (error as { result: { native: { status: string; readback: unknown } } }).result;
+          assert.equal(result.native.status, 'unknown');
+          assert.equal(result.native.readback, null);
+          return true;
+        },
+      );
+      assert.equal(f.updates.length, 1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['rate-limit', 'cancel'] as const)(
+  'post-commit %s defers native readback without another request',
+  async (failure) => {
+    const f = updateFixture();
+    try {
+      f.controls.projectFailure = failure;
+      await assert.rejects(
+        issue.updateIssue(f.context, { issueNumber: 17, body: 'Replacement', draft: true }),
+        (error: unknown) => {
+          const partial = issue.getIncompleteIssueUpdate(error);
+          assert.equal(partial?.native.status, 'unknown');
+          assert.equal(partial?.native.readback, null);
+          if (failure === 'rate-limit') assert.equal(partial?.rateLimit?.retryAfterSeconds, 60);
+          assert.equal(JSON.stringify(partial).includes('PRIVATE_'), false);
+          return true;
+        },
+      );
+      assert.equal(f.controls.nativeReadsAfterUpdate, 1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test('history overflow, invalid metadata, failed comment readback and concurrent edits prevent rewrites', async () => {
   for (const failure of ['overflow', 'labels', 'readback', 'drift'] as const) {

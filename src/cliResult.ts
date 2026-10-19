@@ -1,4 +1,5 @@
 import { getMachineRequestDiagnostics } from './errors.js';
+import { getIncompleteIssueUpdate } from './issue.js';
 
 /** Keep a recoverable start failure machine-readable while signalling shell failure. */
 export function printCommandResult(command: string, value: unknown): void {
@@ -27,6 +28,12 @@ export function printCommandResult(command: string, value: unknown): void {
 }
 
 export function printCommandError(error: unknown): void {
+  const incomplete = getIncompleteIssueUpdate(error);
+  if (incomplete !== undefined) {
+    process.stdout.write(`${JSON.stringify(incomplete, null, 2)}\n`);
+    process.exitCode = 1;
+    return;
+  }
   const diagnostic = getMachineRequestDiagnostics(error);
   if (diagnostic)
     process.stderr.write(
