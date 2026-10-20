@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { createRequire, findPackageJSON } from 'node:module';
 import { types } from 'node:util';
 import {
   closeSync,
@@ -1302,7 +1302,15 @@ function producerContent(root: string) {
       try {
         resolved = require.resolve(`${name}/package.json`);
       } catch {
-        resolved = require.resolve(name);
+        try {
+          resolved = require.resolve(name);
+        } catch (error) {
+          if (!types.isNativeError(error) || Reflect.get(error, 'code') !== 'ERR_PACKAGE_PATH_NOT_EXPORTED')
+            throw error;
+          const manifest = findPackageJSON(name, manifestPath);
+          if (!manifest) throw error;
+          resolved = manifest;
+        }
       }
       let directory = dirname(resolved);
       for (;;) {
