@@ -2789,12 +2789,17 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
               writeFileSync(tracePath, Buffer.alloc(64 * 1024 + 1, 32));
               sharedOutputRead.path = tracePath;
             } else if (traceFault.startsWith('completion-')) {
-              const completed = phases.find((entry) => entry.unit !== undefined && entry.event === 'end');
-              assert.ok(completed?.unit, 'A completion fault needs a real successful delegated unit first');
+              const source = phases.find((entry) =>
+                traceFault === 'completion-malformed'
+                  ? entry.unit?.kind === 'installer' && entry.event === 'start' && pendingUnits.has(entry.phase)
+                  : entry.unit !== undefined && entry.event === 'end',
+              );
+              assert.ok(source?.unit, 'A completion fault needs its matching real delegated unit first');
               const injected: CliPhase = {
-                ...completed,
+                ...source,
+                event: 'end',
                 atMs: phases.at(-1)!.atMs + 0.001,
-                unit: { ...completed.unit },
+                unit: { ...source.unit },
               };
               if (traceFault === 'completion-unmatched') {
                 injected.unit!.call++;
@@ -3618,6 +3623,7 @@ test.each([
       failure = error as CliCaseFailure;
     }
     assert.ok(failure?.receiptFailure, 'Unavailable phase evidence was accepted');
+    if (fault === 'completion-malformed') assert.match(failure.receiptFailure, /CLI unit result binding is invalid/u);
     assert.equal(failure.nativeIdle, true);
     assert.equal(failure.traceFaultInjected, true, 'The real pending CLI trace fault did not execute');
     assert.equal(existsSync(failure.root), true, 'Untrusted phase evidence was discarded before recovery');
