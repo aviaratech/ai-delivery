@@ -138,6 +138,7 @@ const actors = vi.hoisted(() => ({
   authorStarted: false,
   authorAborted: false,
   pauseAuthor: false,
+  authorDelayMs: 4_000,
 }));
 // Only GitHub HTTP/authentication is synthetic. Resolver, process ownership and file operations are real.
 vi.mock('./github/client.js', async (original) => ({
@@ -159,7 +160,7 @@ vi.mock('./github/client.js', async (original) => ({
       if (actors.pauseAuthor) {
         await new Promise<void>((resolve, reject) => {
           // A delayed HTTP response bounds this fixture's request, not the stage's elapsed duration.
-          const response = setTimeout(resolve, 4_000);
+          const response = setTimeout(resolve, actors.authorDelayMs);
           const abort = () => {
             clearTimeout(response);
             actors.authorAborted = true;
@@ -239,6 +240,7 @@ async function fixture(native = false, parent = tmpdir()) {
   actors.authorStarted = false;
   actors.authorAborted = false;
   actors.pauseAuthor = false;
+  actors.authorDelayMs = 4_000;
   const base = realpathSync(mkdtempSync(join(parent, 'ai-delivery-setup-')));
   const root = join(base, 'consumer');
   mkdirSync(root);
@@ -316,7 +318,7 @@ async function fixture(native = false, parent = tmpdir()) {
   // Synthetic installer boundary: the real owned command copies fixture bytes; no process manager is mocked.
   writeFileSync(
     join(bin, 'npm'),
-    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-settings'))},JSON.stringify({args,cwd:process.cwd(),TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP}));\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nconst dependency={'@aviaratech/ai-delivery':'file:reviewed-archive.tgz'};fs.writeFileSync(path.join(prefix,'package.json'),JSON.stringify({dependencies:dependency}));\nif(!args.includes('--package-lock=false')){const targetPackage=JSON.parse(fs.readFileSync(path.join(target,'package.json'),'utf8')),integrity='sha512-'+require('node:crypto').createHash('sha512').update(fs.readFileSync(archive)).digest('base64');fs.writeFileSync(path.join(prefix,'package-lock.json'),JSON.stringify({lockfileVersion:3,packages:{'':{dependencies:dependency},'node_modules/@aviaratech/ai-delivery':{version:targetPackage.version,resolved:'file:reviewed-archive.tgz',integrity}}}));}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nconst logs=${JSON.stringify(join(base, 'log-bytes'))};\nif(fs.existsSync(logs))process.stdout.write(Buffer.alloc(Number(fs.readFileSync(logs,'utf8')),65),()=>{if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);});\nelse if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nconst memory=${JSON.stringify(join(base, 'memory-bytes'))};\nif(fs.existsSync(memory)){globalThis.fixtureAllocation=Buffer.alloc(Number(fs.readFileSync(memory,'utf8')),1);setInterval(()=>{},1000);}\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{},1000);\n`,
+    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-settings'))},JSON.stringify({args,cwd:process.cwd(),TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP}));\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nconst dependency={'@aviaratech/ai-delivery':'file:reviewed-archive.tgz'};fs.writeFileSync(path.join(prefix,'package.json'),JSON.stringify({dependencies:dependency}));\nif(!args.includes('--package-lock=false')){const targetPackage=JSON.parse(fs.readFileSync(path.join(target,'package.json'),'utf8')),integrity='sha512-'+require('node:crypto').createHash('sha512').update(fs.readFileSync(archive)).digest('base64');fs.writeFileSync(path.join(prefix,'package-lock.json'),JSON.stringify({lockfileVersion:3,packages:{'':{dependencies:dependency},'node_modules/@aviaratech/ai-delivery':{version:targetPackage.version,resolved:'file:reviewed-archive.tgz',integrity}}}));}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nconst logs=${JSON.stringify(join(base, 'log-bytes'))};\nif(fs.existsSync(logs))process.stdout.write(Buffer.alloc(Number(fs.readFileSync(logs,'utf8')),65),()=>{if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);});\nelse if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nconst memory=${JSON.stringify(join(base, 'memory-bytes'))};\nif(fs.existsSync(memory)){globalThis.fixtureAllocation=Buffer.alloc(Number(fs.readFileSync(memory,'utf8')),1);setInterval(()=>{},1000);}\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{if(fs.existsSync(${JSON.stringify(join(base, 'wait-noise'))})){fs.appendFileSync(${JSON.stringify(join(base, 'noise-writes'))},'x');process.stdout.write('pending installer heartbeat\\n');}},1000);\n`,
   );
   chmodSync(join(bin, 'npm'), 0o755);
   const previousPath = process.env.PATH;
@@ -339,9 +341,9 @@ async function fixture(native = false, parent = tmpdir()) {
     input,
     counter,
     marker,
-    cleanup: () => {
+    cleanup: (retainFiles = false) => {
       process.env.PATH = previousPath;
-      rmSync(base, { recursive: true, force: true });
+      if (!retainFiles) rmSync(base, { recursive: true, force: true });
     },
   };
 }
@@ -2524,9 +2526,37 @@ async function prepareOwnedCliStage(): Promise<void> {
   }
 }
 
-type CliPhase = { phase: string; event: 'start' | 'end' | 'settled' | 'pending'; atMs: number };
+const cliBindingSchema = z.strictObject({
+  ownerRoot: z.string(),
+  scenario: z.string(),
+  repoRoot: z.string(),
+  sourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
+  configDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  userConfigDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  archivePath: z.string(),
+  archiveSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  runtimeDirectory: z.string(),
+});
+type CliBinding = z.infer<typeof cliBindingSchema>;
+const cliUnitSchema = z.strictObject({
+  command: z.enum(['runtime:stage', 'runtime:admit']),
+  kind: z.enum(['context', 'preflight', 'installer', 'authority']),
+  call: z.number().int().min(1).max(3),
+  binding: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  result: z
+    .string()
+    .regex(/^sha256:[a-f0-9]{64}$/u)
+    .optional(),
+});
+type CliUnit = z.infer<typeof cliUnitSchema>;
+type CliPhase = { phase: string; event: 'start' | 'end' | 'settled' | 'pending'; atMs: number; unit?: CliUnit };
+function cliUnitResult(unit: CliUnit): string {
+  const { result: _result, ...operation } = unit;
+  return digestValue({ ...operation, result: 'validated-success' });
+}
 type CliScenario =
   | 'normal'
+  | 'progress'
   | 'budget'
   | 'unfinished'
   | 'installer-failure'
@@ -2534,7 +2564,15 @@ type CliScenario =
   | 'handoff-mismatch'
   | 'preparation-failure'
   | 'preparation-cancel';
-type CliTraceFault = 'missing' | 'oversized' | 'records' | 'write';
+type CliTraceFault =
+  | 'missing'
+  | 'oversized'
+  | 'records'
+  | 'write'
+  | 'completion-duplicate'
+  | 'completion-unmatched'
+  | 'completion-rejected'
+  | 'completion-malformed';
 type CliCaseFailure = Error & {
   root: string;
   nativeIdle: boolean;
@@ -2559,13 +2597,17 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
   let lastPhase: CliPhase[] = [];
   let deadline = 0;
   const active = new Map<string, number>();
+  const pendingUnits = new Map<string, CliUnit>();
+  const startedUnits = new Set<string>();
+  const completedUnits: string[] = [];
+  let fixtureBinding: CliBinding | undefined;
   let seen = 0;
   let cancelledPhase: string | undefined;
   let failure: string | undefined;
   let failedBytes: Buffer | undefined;
   let owned: unknown;
   const identities = new Map<string, { pid: number; identity: string; pgid: number }>();
-  let residualInstaller: { pid: number; counter: string } | undefined;
+  let residualInstaller: { pid: number; counter: string; noiseWrites: number } | undefined;
   let cleanupState: import('./verification.js').OwnedProcessState | undefined;
   let traceFaultInjected = false;
   let unreadableSince: number | undefined;
@@ -2588,7 +2630,10 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     let previous = -1;
     for (const item of value as unknown[]) {
       assert.ok(
-        item !== null && typeof item === 'object' && Object.keys(item).length === 3,
+        item !== null &&
+          typeof item === 'object' &&
+          Object.keys(item).length === ('unit' in item ? 4 : 3) &&
+          Object.keys(item).every((key) => ['phase', 'event', 'atMs', 'unit'].includes(key)),
         'CLI phase entry is invalid',
       );
       const entry = item as Partial<CliPhase>;
@@ -2603,13 +2648,19 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
         'CLI phase entry is invalid',
       );
       previous = entry.atMs;
+      if (entry.unit !== undefined) cliUnitSchema.parse(entry.unit);
     }
     const phases = value as CliPhase[];
     assert.ok(
       phases.length >= lastPhase.length &&
         lastPhase.every((entry, index) => {
           const current = phases[index]!;
-          return current.phase === entry.phase && current.event === entry.event && current.atMs === entry.atMs;
+          return (
+            current.phase === entry.phase &&
+            current.event === entry.event &&
+            current.atMs === entry.atMs &&
+            JSON.stringify(current.unit) === JSON.stringify(entry.unit)
+          );
         }),
       'CLI phase history changed after observation',
     );
@@ -2626,13 +2677,97 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     }
   };
   let watch: ReturnType<typeof setInterval> | undefined;
-  const watchPhases = (): void => {
+  const readBinding = (): CliBinding => {
+    const binding = cliBindingSchema.parse(
+      JSON.parse(
+        privateFiles.assertPrivateFile(join(root, 'producer-binding.json'), { maxBytes: 8 * 1024 }).toString('utf8'),
+      ),
+    );
+    assert.equal(binding.ownerRoot, root);
+    assert.equal(binding.scenario, scenario);
+    assert.equal(realpathSync(binding.repoRoot), binding.repoRoot);
+    assert.equal(dirname(dirname(binding.repoRoot)), root);
+    assert.equal(binding.runtimeDirectory, join(dirname(binding.repoRoot), 'staged'));
+    assert.equal(binding.archivePath, join(dirname(binding.repoRoot), 'reviewed archive; inert.tgz'));
+    assert.equal(
+      digestBytes(privateFiles.assertPrivateFile(join(dirname(binding.repoRoot), 'user.json'))),
+      binding.userConfigDigest,
+    );
+    if (fixtureBinding === undefined) {
+      assert.equal(git(binding.repoRoot, 'rev-parse', 'HEAD'), binding.sourceCommit);
+      assert.equal(digestBytes(readFileSync(binding.archivePath)), binding.archiveSha256);
+      fixtureBinding = binding;
+    } else assert.deepEqual(binding, fixtureBinding, 'CLI producer binding changed');
+    return binding;
+  };
+  const watchPhases = (injectFault = true): void => {
     try {
       if (existsSync(tracePath)) {
         const phases = readPhases();
         unreadableSince = undefined;
-        lastPhase = phases;
         for (const entry of phases.slice(seen)) {
+          if (entry.unit !== undefined) {
+            const unit = cliUnitSchema.parse(entry.unit);
+            assert.equal(entry.phase, `unit:${unit.command}:${unit.kind}:${unit.call}`);
+            assert.equal(unit.binding, digestValue(readBinding()));
+            assert.ok(active.has(unit.command), 'Completion record is outside its actual CLI invocation');
+            assert.ok(unit.kind !== 'installer' || (unit.command === 'runtime:stage' && unit.call === 1));
+            assert.ok(unit.kind !== 'authority' || unit.command === 'runtime:admit');
+            if (entry.event === 'start') {
+              assert.equal(unit.result, undefined);
+              assert.ok(!startedUnits.has(entry.phase), 'Duplicate CLI unit start');
+              assert.equal(
+                unit.call,
+                1 + [...startedUnits].filter((name) => name.startsWith(`unit:${unit.command}:${unit.kind}:`)).length,
+              );
+              if (unit.kind === 'preflight')
+                assert.ok(
+                  completedUnits.includes(`unit:${unit.command}:context:${unit.call}`),
+                  'Preflight preceded its validated context',
+                );
+              if (unit.kind === 'context' && unit.call > 1)
+                assert.ok(
+                  completedUnits.includes(`unit:${unit.command}:preflight:${unit.call - 1}`),
+                  'Context recheck preceded its prior preflight',
+                );
+              if (unit.kind === 'installer')
+                assert.ok(
+                  completedUnits.includes('unit:runtime:stage:preflight:1'),
+                  'Installer preceded real preflight',
+                );
+              if (unit.kind === 'authority')
+                assert.ok(
+                  pendingUnits.has(`unit:runtime:admit:preflight:${unit.call}`),
+                  'Authority check is outside its real preflight',
+                );
+              startedUnits.add(entry.phase);
+              pendingUnits.set(entry.phase, unit);
+            } else {
+              assert.equal(entry.event, 'end', 'Only successful delegated units may report completion');
+              const started = pendingUnits.get(entry.phase);
+              assert.ok(started, 'Unmatched or duplicate CLI unit completion');
+              assert.deepEqual({ ...unit, result: undefined }, { ...started, result: undefined });
+              assert.equal(unit.result, cliUnitResult(started), 'CLI unit result binding is invalid');
+              if (unit.command === 'runtime:admit' && unit.kind === 'preflight')
+                assert.ok(
+                  completedUnits.includes(`unit:runtime:admit:authority:${unit.call}`),
+                  'Admission preflight lacks successful authority readback',
+                );
+              pendingUnits.delete(entry.phase);
+              completedUnits.push(entry.phase);
+              // This measures inactivity between verified substantive units, never total command duration.
+              active.set(
+                unit.command,
+                performance.now() + (scenario === 'unfinished' && unit.command === 'runtime:stage' ? 30_000 : 15_000),
+              );
+            }
+            continue;
+          }
+          if (entry.phase.startsWith('unit:')) {
+            assert.equal(entry.event, 'settled', 'CLI unit completion lacks a validated result');
+            assert.ok(pendingUnits.delete(entry.phase), 'Unmatched rejected CLI unit');
+            continue; // A rejected operation is settled, but cannot refresh the stall clock.
+          }
           if (entry.event === 'start')
             active.set(
               entry.phase,
@@ -2640,9 +2775,10 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
             );
           else if (entry.event === 'end' || entry.event === 'settled') active.delete(entry.phase);
         }
+        lastPhase = phases;
         if (phases.length > seen) deadline = performance.now() + 15_000;
         seen = phases.length;
-        if (traceFault !== undefined && traceFault !== 'write' && !traceFaultInjected) {
+        if (injectFault && !idle && traceFault !== undefined && traceFault !== 'write' && !traceFaultInjected) {
           const fixtureRoot = readdirSync(root).find((name) => name.startsWith('ai-delivery-setup-'));
           const marker = fixtureRoot === undefined ? undefined : join(root, fixtureRoot, 'installer-running');
           if (marker !== undefined && existsSync(marker)) {
@@ -2652,6 +2788,20 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
             else if (traceFault === 'oversized') {
               writeFileSync(tracePath, Buffer.alloc(64 * 1024 + 1, 32));
               sharedOutputRead.path = tracePath;
+            } else if (traceFault.startsWith('completion-')) {
+              const completed = phases.find((entry) => entry.unit !== undefined && entry.event === 'end');
+              assert.ok(completed?.unit, 'A completion fault needs a real successful delegated unit first');
+              const injected: CliPhase = {
+                ...completed,
+                atMs: phases.at(-1)!.atMs + 0.001,
+                unit: { ...completed.unit },
+              };
+              if (traceFault === 'completion-unmatched') {
+                injected.unit!.call++;
+                injected.phase = `unit:${injected.unit!.command}:${injected.unit!.kind}:${injected.unit!.call}`;
+              } else if (traceFault === 'completion-rejected') injected.event = 'settled';
+              else if (traceFault === 'completion-malformed') injected.unit!.result = 'sha256:' + '0'.repeat(64);
+              writeFileSync(tracePath, JSON.stringify([...phases, injected]));
             } else writeFileSync(tracePath, JSON.stringify(Array.from({ length: 65 }, () => phases[0])));
           }
         }
@@ -2795,7 +2945,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     if (needsPreparation && !preparationCompleted) receiptFailure ??= 'CLI preparation failed before completed handoff';
     else {
       try {
-        lastPhase = readPhases();
+        watchPhases(false);
       } catch (error) {
         receiptFailure ??= error instanceof Error ? error.message : String(error);
       }
@@ -2810,6 +2960,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
             residualInstaller = {
               pid: Number(readFileSync(marker, 'utf8')),
               counter: readFileSync(join(base, 'installs'), 'utf8'),
+              noiseWrites: existsSync(join(base, 'noise-writes')) ? lstatSync(join(base, 'noise-writes')).size : 0,
             };
           }
         }
@@ -2834,6 +2985,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
           residualInstaller,
           preparationElapsedMs,
           preparationCompleted,
+          completedUnits,
         }) +
         '\n',
     );
@@ -2849,6 +3001,42 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
       traceFaultInjected,
       restoredGlobalsWithPending: failedBytes?.includes(Buffer.from('SETUP_CLI_ENV_RESTORED_WITH_PENDING')) ?? false,
     });
+  if (fixtureBinding !== undefined) {
+    const savedConfig = process.env.AI_DELIVERY_CONFIG;
+    try {
+      process.env.AI_DELIVERY_CONFIG = join(dirname(fixtureBinding.repoRoot), 'user.json');
+      assert.equal((await loadDeliveryConfig(fixtureBinding.repoRoot)).configDigest, fixtureBinding.configDigest);
+    } finally {
+      if (savedConfig === undefined) delete process.env.AI_DELIVERY_CONFIG;
+      else process.env.AI_DELIVERY_CONFIG = savedConfig;
+    }
+    if (failure === undefined) {
+      assert.equal(pendingUnits.size, 0, 'A successful CLI retained an unfinished semantic unit');
+      const stage = JSON.parse(
+        privateFiles.assertPrivateFile(join(fixtureBinding.runtimeDirectory, 'runtime-stage.json')).toString('utf8'),
+      ) as {
+        status: string;
+        recordId: string;
+        intent: { sourceCommit: string; configDigest: string; archiveSha256: string };
+        admission: RuntimeAdmission;
+      };
+      const { recordId, ...content } = stage;
+      assert.equal(recordId, digestValue(content));
+      assert.equal(stage.status, 'complete');
+      assert.equal(stage.intent.sourceCommit, fixtureBinding.sourceCommit);
+      assert.equal(stage.intent.configDigest, fixtureBinding.configDigest);
+      assert.equal(stage.intent.archiveSha256, fixtureBinding.archiveSha256);
+      assert.deepEqual(
+        JSON.parse(
+          privateFiles
+            .assertPrivateFile(join(fixtureBinding.repoRoot, '.git/ai-delivery/runtime-admission.json'))
+            .toString('utf8'),
+        ),
+        stage.admission,
+      );
+      assert.ok(completedUnits.includes('unit:runtime:stage:installer:1') || prepared !== undefined);
+    }
+  }
   if (prepared !== undefined) {
     // Parent retains original validated bindings even when the child receives the mismatch fault.
     for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
@@ -2861,6 +3049,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
   assert.equal(existsSync(root), false, 'Owned CLI case root was not removed');
   return {
     phases: lastPhase,
+    completedUnits,
     nativeIdle: idle,
     cancelledPhase,
     failure,
@@ -2886,11 +3075,11 @@ test(
     const phases: CliPhase[] = [];
     let activeCommands = 0;
     let traceFailure: Error | undefined;
-    const phase = (name: string, event: CliPhase['event']): void => {
+    const phase = (name: string, event: CliPhase['event'], unit?: CliUnit): void => {
       if (traceFailure !== undefined) return;
       try {
         assert.ok(phases.length < 64, 'CLI phase count exceeded its bound');
-        phases.push({ phase: name, event, atMs: performance.now() });
+        phases.push({ phase: name, event, atMs: performance.now(), ...(unit === undefined ? {} : { unit }) });
         if (traceFault === 'write' && name === 'import:runtime:stage' && event === 'end') {
           assert.ok(activeCommands > 0, 'Trace write fault requires an actually pending CLI command');
           process.stderr.write('SETUP_CLI_TRACE_WRITE_FAULT_WITH_PENDING\n');
@@ -2929,14 +3118,30 @@ test(
       assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
       preparedCliClosure(f.input);
     }
-    if (scenario === 'unfinished') writeFileSync(join(f.base, 'wait'), '');
+    if (scenario === 'unfinished') {
+      writeFileSync(join(f.base, 'wait'), '');
+      writeFileSync(join(f.base, 'wait-noise'), '');
+    }
     if (scenario === 'installer-failure') writeFileSync(join(f.base, 'fail'), '');
+    chmodSync(join(f.base, 'user.json'), 0o600);
+    const binding: CliBinding = {
+      ownerRoot: dirname(tracePath),
+      scenario,
+      repoRoot: f.root,
+      sourceCommit: f.input.expectedSourceCommit,
+      configDigest: f.input.expectedConfigDigest,
+      userConfigDigest: digestBytes(readFileSync(join(f.base, 'user.json'))),
+      archivePath: f.input.archivePath,
+      archiveSha256: f.input.expectedArchiveSha256,
+      runtimeDirectory: f.input.runtimeDirectory,
+    };
+    atomicJson.writePrivateJsonFileAtomically(join(dirname(tracePath), 'producer-binding.json'), binding);
     phase('preparation', 'end');
     const argv = process.argv;
     const exitCode = process.exitCode;
     const stdout = vi.spyOn(process.stdout, 'write');
     const pending: Promise<unknown>[] = [];
-    const restoreAuthorObservations: (() => void)[] = [];
+    const restoreObservations: (() => void)[] = [];
     const restoreEnvs = vi.unstubAllEnvs.bind(vi);
     const environmentProbe =
       traceFault === 'write'
@@ -2959,6 +3164,114 @@ test(
           ...args,
         ];
         vi.resetModules();
+        const calls = { context: 0, preflight: 0, installer: 0, authority: 0 };
+        const observeUnit = async <T>(
+          kind: CliUnit['kind'],
+          operation: () => Promise<T>,
+          validate: (value: T) => void,
+        ): Promise<T> => {
+          const unit: CliUnit = {
+            command: args[0] as CliUnit['command'],
+            kind,
+            call: ++calls[kind],
+            binding: digestValue(binding),
+          };
+          const name = `unit:${unit.command}:${unit.kind}:${unit.call}`;
+          phase(name, 'start', unit);
+          try {
+            const value = await operation();
+            validate(value);
+            phase(name, 'end', { ...unit, result: cliUnitResult(unit) });
+            return value;
+          } catch (error) {
+            phase(name, 'settled'); // Failure is evidence of settlement, never successful progress.
+            throw error;
+          }
+        };
+        const contextModule = await import('./issue.js');
+        const context = contextModule.loadDeliveryContext;
+        const contextObserver = vi.spyOn(contextModule, 'loadDeliveryContext').mockImplementation((...input) =>
+          observeUnit(
+            'context',
+            () => context(...input),
+            (value) => {
+              assert.equal(input[0].repoRoot, f.root);
+              assert.equal(input[0].identity, 'host-author');
+              assert.equal(input[0].role, 'author');
+              assert.equal(value.config.repository, 'example/widget');
+              assert.equal(value.configuration?.configDigest, f.input.expectedConfigDigest);
+              assert.equal(value.clients.role, 'author');
+              assert.equal(value.clients.authSource, 'personal');
+              assert.equal(value.clients.credentialSource, 'env:AUTHOR_TOKEN');
+            },
+          ),
+        );
+        restoreObservations.push(() => contextObserver.mockRestore());
+        const preflightModule = await import('./pr.js');
+        const preflight = preflightModule.preflightReviewRoute;
+        const preflightObserver = vi.spyOn(preflightModule, 'preflightReviewRoute').mockImplementation((...input) =>
+          observeUnit(
+            'preflight',
+            () => preflight(...input),
+            (value) => {
+              assert.equal(value.author.actorLogin, 'host-user');
+              assert.equal(value.author.identity, 'host-author');
+              assert.equal(value.author.authSource, 'personal');
+              assert.equal(value.reviewer.actorLogin, 'reviewer[bot]');
+              assert.equal(value.reviewer.identity, 'synthetic-reviewer');
+              assert.equal(value.reviewer.repositoryAccess, 'readable');
+              assert.equal(value.rules.visibility, 'unknown');
+              assert.equal(value.rules.observedRequiredApprovals, null);
+              assert.equal(value.approvalEligibility, 'unknown');
+            },
+          ),
+        );
+        restoreObservations.push(() => preflightObserver.mockRestore());
+        const verificationModule = await import('./verification.js');
+        const writer = verificationModule.withRuntimeSetupWriter;
+        const observedWriter: typeof writer = (root, operation, scope) =>
+          writer(
+            root,
+            (runner) =>
+              operation({
+                ...runner,
+                run: (...input) =>
+                  observeUnit(
+                    'installer',
+                    () => runner.run(...input),
+                    () => {
+                      assert.equal(root, f.root);
+                      assert.equal(input[0][0], 'npm');
+                      assert.equal(input[0][1], 'install');
+                      assert.equal(input[0][input[0].indexOf('--prefix') + 1], f.input.runtimeDirectory);
+                      assert.equal(input[0].at(-1), join(f.input.runtimeDirectory, 'reviewed-archive.tgz'));
+                      assert.equal(input[4], f.input.runtimeDirectory);
+                      runner.assertQuiescent();
+                      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+                      const installed = JSON.parse(
+                        readFileSync(
+                          join(f.input.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/package.json'),
+                          'utf8',
+                        ),
+                      ) as { name: string; version: string };
+                      assert.equal(installed.name, '@aviaratech/ai-delivery');
+                      assert.equal(installed.version, f.input.packageVersion);
+                      const lock = JSON.parse(
+                        readFileSync(join(f.input.runtimeDirectory, 'package-lock.json'), 'utf8'),
+                      ) as { packages: Record<string, { version: string }> };
+                      assert.equal(
+                        lock.packages['node_modules/@aviaratech/ai-delivery']?.version,
+                        f.input.packageVersion,
+                      );
+                    },
+                  ),
+              }),
+            scope,
+          );
+        const writerObserver = vi
+          .spyOn(verificationModule, 'withRuntimeSetupWriter')
+          .mockImplementation(observedWriter);
+        restoreObservations.push(() => writerObserver.mockRestore());
         if (args[0] === 'runtime:admit') {
           const clientsModule = await import('./github/client.js');
           const create = clientsModule.createDeliveryGitHubClients;
@@ -2977,10 +3290,19 @@ test(
                       scenario !== 'budget' || authorChecks === 1 || !actors.pauseAuthor,
                       'Budget fixture repeated its deliberate HTTP delay at another required authority check',
                     );
-                    const response = await authenticatedAuthor(...request);
-                    // This fictional HTTP port can withhold its response; the actual CLI parse remains pending.
-                    if (scenario === 'admission-stall') await new Promise<void>(() => {});
-                    return response;
+                    return await observeUnit(
+                      'authority',
+                      async () => {
+                        const response = await authenticatedAuthor(...request);
+                        // This fictional HTTP port can withhold its response; the actual CLI parse remains pending.
+                        if (scenario === 'admission-stall') await new Promise<void>(() => {});
+                        return response;
+                      },
+                      (response) => {
+                        assert.equal(response.actorLogin, 'host-user');
+                        assert.equal(response.credentialIdentity, 'user:37');
+                      },
+                    );
                   } finally {
                     // The budget regression needs one four-second response, not one per required recheck.
                     if (scenario === 'budget') actors.pauseAuthor = false;
@@ -2990,7 +3312,7 @@ test(
               }
               return client;
             });
-          restoreAuthorObservations.push(() => clients.mockRestore());
+          restoreObservations.push(() => clients.mockRestore());
         }
         const { Command } = await import('commander');
         const descriptor = Object.getOwnPropertyDescriptor(Command.prototype, 'parseAsync');
@@ -3058,6 +3380,11 @@ test(
         '--runtime-directory',
         f.input.runtimeDirectory,
       ];
+      if (scenario === 'progress') {
+        // Two actual authority responses alone exceed the old aggregate command limit.
+        actors.pauseAuthor = true;
+        actors.authorDelayMs = 8_000;
+      }
       const staged = await runCli([
         'runtime:stage',
         '--authorize-stage',
@@ -3078,6 +3405,7 @@ test(
         for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
       }
       phase('assertions:stageId', 'end');
+      if (scenario === 'progress') actors.pauseAuthor = false;
       const authorCallsBeforeAdmission = actors.authorCalls;
       if (scenario === 'budget') actors.pauseAuthor = true;
       const admitted = await runCli([
@@ -3101,14 +3429,15 @@ test(
     } finally {
       phase('drain', 'start');
       await Promise.allSettled(pending);
-      for (const restore of restoreAuthorObservations) restore();
+      for (const restore of restoreObservations) restore();
       environmentProbe?.mockRestore();
       phase('drain', 'end');
       phase('cleanup', 'start');
       stdout.mockRestore();
       process.argv = argv;
       process.exitCode = exitCode;
-      if (ownedFixture !== undefined) ownedFixture.cleanup();
+      // The existing parent owns final artifact corroboration and disposal after native quiescence.
+      if (ownedFixture !== undefined) ownedFixture.cleanup(true);
       else process.env.PATH = previousPath;
       phase('cleanup', 'end');
     }
@@ -3119,7 +3448,17 @@ test(
   0,
 );
 
-test('CLI stage/admit preparation and commands retain separate finite budgets', async () => {
+test('CLI stage/admit completes substantive work beyond the former aggregate command limit', async () => {
+  const result = await observeStageAdmitCase('progress');
+  assert.equal(result.failure, undefined, 'The actual CLI must complete while real producer units keep completing');
+  const start = result.phases.find((entry) => entry.phase === 'runtime:stage' && entry.event === 'start');
+  const end = result.phases.find((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled');
+  assert.ok(start && end && end.atMs - start.atMs > 15_000);
+  assert.ok(result.nativeIdle && result.rootRemoved);
+  assert.ok(result.phases.some((entry) => entry.phase === 'runtime:admit' && entry.event === 'settled'));
+});
+
+test('CLI stage/admit separates preparation from substantive command progress', async () => {
   const result = await observeStageAdmitCase('budget');
   const authorChecks = result.phases.filter(
     (entry) => entry.phase.startsWith('admit:author:') && entry.event === 'start',
@@ -3136,10 +3475,7 @@ test('CLI stage/admit preparation and commands retain separate finite budgets', 
     const end = result.phases.find(
       (candidate) => candidate.phase === entry.phase && ['end', 'settled'].includes(candidate.event),
     );
-    assert.ok(
-      end !== undefined && end.atMs - entry.atMs < 15_000,
-      `${entry.phase} did not complete within its own bound`,
-    );
+    assert.ok(end !== undefined, `${entry.phase} did not settle`);
   }
 });
 
@@ -3219,6 +3555,11 @@ test('CLI stage/admit keeps an unfinished real installer owned until native quie
     'CLI caller relinquished an unfinished command',
   );
   assert.equal(result.cancelledPhase, 'runtime:stage');
+  assert.ok(
+    (result.residualInstaller?.noiseWrites ?? 0) >= 2,
+    'The actually stalled installer must emit repeated noise',
+  );
+  assert.equal(result.completedUnits.includes('unit:runtime:stage:installer:1'), false);
   assert.equal(
     result.phases.some((entry) => entry.phase === 'cleanup'),
     false,
@@ -3257,48 +3598,52 @@ test('CLI stage/admit keeps a stalled admission response owned until native quie
   );
 });
 
-test.each(['missing', 'oversized', 'records', 'write'] as const)(
-  'CLI stage/admit preserves owned recovery evidence when its trace fails: %s',
-  async (fault) => {
-    let failure: CliCaseFailure | undefined;
-    sharedOutputRead.unboundedReads = 0;
+test.each([
+  'missing',
+  'oversized',
+  'records',
+  'write',
+  'completion-duplicate',
+  'completion-unmatched',
+  'completion-rejected',
+  'completion-malformed',
+] as const)('CLI stage/admit preserves owned recovery evidence when its trace fails: %s', async (fault) => {
+  let failure: CliCaseFailure | undefined;
+  sharedOutputRead.unboundedReads = 0;
+  try {
     try {
-      try {
-        await observeStageAdmitCase('unfinished', fault);
-      } catch (error) {
-        assert.ok(error instanceof Error);
-        failure = error as CliCaseFailure;
-      }
-      assert.ok(failure?.receiptFailure, 'Unavailable phase evidence was accepted');
-      assert.equal(failure.nativeIdle, true);
-      assert.equal(failure.traceFaultInjected, true, 'The real pending CLI trace fault did not execute');
-      assert.equal(existsSync(failure.root), true, 'Untrusted phase evidence was discarded before recovery');
-      assert.ok(failure.retainedPhaseCount <= 64, 'Invalid final trace replaced validated bounded evidence');
-      assert.equal(sharedOutputRead.unboundedReads, 0, 'Failure handling attempted an unbounded final trace read');
-      assert.equal(failure.restoredGlobalsWithPending, false, 'Trace failure bypassed the actual command join');
-      if (fault !== 'write') assert.equal(failure.residualInstaller?.counter, 'x');
-    } finally {
-      sharedOutputRead.path = '';
-      if (failure?.nativeIdle && failure.cleanupState !== undefined) {
-        const recorded = JSON.parse(
-          privateFiles
-            .assertPrivateFile(join(failure.root, 'ownership.json'), { maxBytes: 256 * 1024 })
-            .toString('utf8'),
-        ) as { idle: boolean; owned: { rootPid: number } };
-        assert.equal(recorded.idle, true);
-        assert.equal(recorded.owned.rootPid, failure.cleanupState.rootPid);
-        const { confirmOwnedCleanup } = await import('./verification.js');
-        await confirmOwnedCleanup(failure.cleanupState);
-        rmSync(failure.root, { recursive: true, force: true });
-        assert.equal(existsSync(failure.root), false);
-        process.stdout.write(
-          `SETUP_CLI_TRACE_RECOVERY ${JSON.stringify({ fault, root: failure.root, quiescenceRechecked: true, removed: true })}\n`,
-        );
-      }
-      sharedOutputRead.unboundedReads = 0;
+      await observeStageAdmitCase('unfinished', fault);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      failure = error as CliCaseFailure;
     }
-  },
-);
+    assert.ok(failure?.receiptFailure, 'Unavailable phase evidence was accepted');
+    assert.equal(failure.nativeIdle, true);
+    assert.equal(failure.traceFaultInjected, true, 'The real pending CLI trace fault did not execute');
+    assert.equal(existsSync(failure.root), true, 'Untrusted phase evidence was discarded before recovery');
+    assert.ok(failure.retainedPhaseCount <= 64, 'Invalid final trace replaced validated bounded evidence');
+    assert.equal(sharedOutputRead.unboundedReads, 0, 'Failure handling attempted an unbounded final trace read');
+    assert.equal(failure.restoredGlobalsWithPending, false, 'Trace failure bypassed the actual command join');
+    if (fault !== 'write') assert.equal(failure.residualInstaller?.counter, 'x');
+  } finally {
+    sharedOutputRead.path = '';
+    if (failure?.nativeIdle && failure.cleanupState !== undefined) {
+      const recorded = JSON.parse(
+        privateFiles.assertPrivateFile(join(failure.root, 'ownership.json'), { maxBytes: 256 * 1024 }).toString('utf8'),
+      ) as { idle: boolean; owned: { rootPid: number } };
+      assert.equal(recorded.idle, true);
+      assert.equal(recorded.owned.rootPid, failure.cleanupState.rootPid);
+      const { confirmOwnedCleanup } = await import('./verification.js');
+      await confirmOwnedCleanup(failure.cleanupState);
+      rmSync(failure.root, { recursive: true, force: true });
+      assert.equal(existsSync(failure.root), false);
+      process.stdout.write(
+        `SETUP_CLI_TRACE_RECOVERY ${JSON.stringify({ fault, root: failure.root, quiescenceRechecked: true, removed: true })}\n`,
+      );
+    }
+    sharedOutputRead.unboundedReads = 0;
+  }
+});
 
 test(
   'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer',
