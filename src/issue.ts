@@ -1823,7 +1823,7 @@ export interface IssueInfo {
   worktree: string | null;
 }
 
-export async function issueInfo(context: DeliveryContext, issueNumber: number): Promise<IssueInfo> {
+async function readIssueInfo(context: DeliveryContext, issueNumber: number) {
   const { clients, config, repo } = context;
   const issue = (await clients.rest.issues.get({ issue_number: issueNumber, owner: repo.owner, repo: repo.repo })).data;
   if ('pull_request' in issue) throw new DeliveryError('Requested issue number is a pull request.');
@@ -1877,7 +1877,11 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
     url: issue.html_url,
     worktree: null,
   };
-  return info;
+  return { info, issueNodeId: issue.node_id, issueNumber: issue.number };
+}
+
+export async function issueInfo(context: DeliveryContext, issueNumber: number): Promise<IssueInfo> {
+  return (await readIssueInfo(context, issueNumber)).info;
 }
 
 /** Invalid canonical content stays inspectable; omitted state is unknown, never an assertion of undeferred. */
@@ -1902,14 +1906,25 @@ export async function listIssueSubissues(context: DeliveryContext, issueNumber: 
   return children.map((child) => child.number).sort((left, right) => left - right);
 }
 
-export async function readyCheck(context: DeliveryContext, issueNumber: number): Promise<AgentReadinessResult> {
-  const info = await issueInfo(context, issueNumber);
+export async function readyCheck(
+  context: DeliveryContext,
+  issueNumber: number,
+  onReadback?: (observation: {
+    info: IssueInfo;
+    issueNodeId: string;
+    issueNumber: number;
+    trackingParent: boolean;
+  }) => void,
+): Promise<AgentReadinessResult> {
+  const observation = await readIssueInfo(context, issueNumber);
+  const { info } = observation;
   const trackingParent = await hasNativeSubIssues({
     issueNumber,
     repo: context.repo,
     rest: context.clients.rest,
     requireComplete: context.readPageLimit !== undefined,
   });
+  onReadback?.({ ...observation, trackingParent });
   return evaluateAgentReadiness({
     blockedBy: info.blockedBy,
     body: info.body,

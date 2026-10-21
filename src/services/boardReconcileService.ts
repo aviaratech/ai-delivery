@@ -1123,7 +1123,23 @@ async function observeIssue(
     !stoppedProjects.has(configuration.projectId)
   ) {
     try {
-      const ready = await readyCheck(context, native.number);
+      const ready = await readyCheck(context, native.number, ({ info, issueNodeId, issueNumber, trackingParent }) => {
+        // Readiness performs a later composite read: it must not authorize activation from an earlier snapshot.
+        if (
+          issueNodeId !== native.node_id ||
+          issueNumber !== native.number ||
+          info.url !== native.html_url ||
+          info.state !== 'open' ||
+          digestValue(info.body) !== record.native.bodyDigest ||
+          info.points !== record.native.points ||
+          trackingParent ||
+          info.blockedBy.length !== 0 ||
+          info.projectStatus !== record.status.current
+        )
+          throw new DeliveryError('Native or Project facts changed during readiness.');
+        native = nativeIssue({ ...native, labels: info.labels }, repository);
+        record.native.priority = info.priority ?? null;
+      });
       if (!ready.ready) throw new DeliveryError('Readiness is not satisfied.');
       if (record.status.current !== 'In Progress') await assertIssueStartCapacity(context, native.number);
       record.status = { ...record.status, target: 'In Progress', rule: 'active' };
@@ -1133,8 +1149,8 @@ async function observeIssue(
   }
   if (record.status.rule === 'unknown' && (intent === undefined || intent.kind === 'set-status'))
     missing('status-evidence');
-  if (configuration && intent === undefined)
-    record.metadata = metadata(
+  if (configuration) {
+    const reports = metadata(
       context,
       native,
       configuration,
@@ -1143,6 +1159,13 @@ async function observeIssue(
       record.status.current,
       member !== null && record.status.kind !== 'unreadable',
     );
+    record.metadata =
+      intent === undefined || intent.target === 'In Progress'
+        ? reports
+        : reports.filter(
+            (value) => value.code === 'duplicate-field-label' && value.fieldId === configuration.statusFieldId,
+          );
+  }
   bounded(record);
   return record;
 }
@@ -1367,6 +1390,8 @@ function updateObservedIssue(result: BoardReconcileResult, current: IssueRecord,
   const old = result.issues[index]!;
   const { target, rule, ...status } = current.status;
   const active = operation.kind === 'set-status' && operation.target === 'In Progress';
+  const statusFieldId = result.observedBindings.find((binding) => binding.repository === current.repository)?.routing
+    .statusFieldId;
   const issues = [...result.issues];
   issues[index] = {
     ...old,
@@ -1378,6 +1403,9 @@ function updateObservedIssue(result: BoardReconcileResult, current: IssueRecord,
     },
     native: active ? current.native : { ...old.native, state: current.native.state },
     activity: active ? current.activity : old.activity,
+    metadata: active
+      ? current.metadata
+      : [...old.metadata.filter((value) => value.fieldId !== statusFieldId), ...current.metadata],
     gaps: [...new Map([...old.gaps, ...current.gaps].map((value) => [digestValue(value), value])).values()],
   };
   // Optional detailed observations cannot consume the space reserved for attempted-write evidence.
@@ -1423,7 +1451,13 @@ async function guardObservation(
   const binding = original.bindings.find((value) => value.repository === operation.repository);
   if (!binding || !live.configuration || !live.clients.authenticatedAuthor)
     throw new OperationRefusal('configured-author', 'refused', true);
-  const actor = ActorSchema.parse(await live.clients.authenticatedAuthor(options.signal));
+  let actor: z.infer<typeof ActorSchema>;
+  try {
+    actor = ActorSchema.parse(await live.clients.authenticatedAuthor(options.signal));
+  } catch (error) {
+    if (globalFailureReason(error) !== null) throw error;
+    throw new OperationRefusal('actor-readback', 'refused', true);
+  }
   if (digestValue(actor) !== digestValue(binding.actor)) throw new OperationRefusal('actor', 'refused', true);
   if (
     live.configuration.configDigest !== binding.configDigest ||

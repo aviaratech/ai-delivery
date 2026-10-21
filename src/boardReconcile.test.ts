@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { afterEach, test, vi } from 'vitest';
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import { syntheticDiscoveryClients, syntheticDiscoveryConfig } from './fixtures/discovery.js';
-import { IssueFields, renderIssueBody } from './issueContract.js';
+import { IssueFields, parseIssueBody, renderIssueBody } from './issueContract.js';
 import type { DeliveryContext } from './issue.js';
 import type { ProjectDeliveryStatus } from './github/projectDelivery.js';
 import { gitEnvironment } from './gitProcess.js';
@@ -1707,3 +1707,115 @@ test('apply development-token override is rejected before clients while configur
     f.cleanup();
   }
 });
+
+test('opaque actor revalidation failure stops every remaining independent Project group', async () => {
+  const f = await boardFixture(1, ['example/widget', 'other/second', 'third/last'], true);
+  try {
+    for (const row of f.rows.values()) row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    const actor = f.contexts[1]!.clients.authenticatedAuthor!;
+    f.contexts[1]!.clients.authenticatedAuthor = async (signal) => {
+      if (f.writes.length > 0)
+        throw new (await import('./errors.js')).DeliveryError('Personal author identity readback failed.');
+      return actor(signal);
+    };
+    const result = await applyPlan(f, plan);
+    assert.equal(result.operations[0]!.outcome, 'applied');
+    assert.equal(result.operations[1]!.outcome, 'refused');
+    assert.equal(result.operations[2]!.attempted, false);
+    assert.equal(f.writes.length, 1);
+    assert.equal(result.scopeComplete, false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['closure', 'points', 'status'] as const)(
+  '%s observed by the final readiness reread refuses activation before mutation',
+  async (change) => {
+    const f = await boardFixture(1);
+    try {
+      const row = f.rows.get('example/widget:17')!;
+      const request = { ...f.request, checkouts: [f.checkout('example/widget', 17)] };
+      const plan = await collect(f.contexts, request, [f.root]);
+      assert.equal(plan.operations[0]!.target, 'In Progress');
+      const original = f.contexts[0]!.clients.rest.issues.get;
+      let reads = 0;
+      f.contexts[0]!.clients.rest.issues.get = (async (input) => {
+        if (++reads === 6) {
+          // global pair, outer guard pair, then final boundary pair
+          if (change === 'closure') row.state = 'closed';
+          if (change === 'points') row.points = 4;
+          if (change === 'status') f.members.get(row.node_id)!.status = 'Blocked';
+        }
+        return original(input);
+      }) as typeof original;
+      const result = await applyPlan(f, plan);
+      assert.equal(reads >= 6, true);
+      assert.equal(f.writes.length, 0);
+      assert.equal(result.operations[0]!.attempted, false);
+      assert.ok(result.summary.refused + result.summary.drifted > 0);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test('verified Status postimage refreshes current duplicate-label migration advice', async () => {
+  const f = await boardFixture(1);
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    row.state = 'closed';
+    row.labels = [{ name: 'status:Todo' }];
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    assert.equal(plan.issues[0]!.metadata.find((value) => value.label === 'status:Todo')!.mapping, 'exact');
+    const result = await applyPlan(f, plan);
+    assert.equal(result.summary.applied, 1);
+    assert.equal(result.issues[0]!.status.current, 'Done');
+    const duplicate = result.issues[0]!.metadata.find((value) => value.label === 'status:Todo')!;
+    assert.equal(duplicate.authoritativeValue, 'Shipped');
+    assert.equal(duplicate.mapping, 'conflicting');
+    assert.deepEqual(row.labels, [{ name: 'status:Todo' }]);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['active', 'parked', 'deferred'] as const)(
+  '%s Status apply and lost-response recovery retain the exact original intent',
+  async (mode) => {
+    const f = await boardFixture(1);
+    try {
+      const row = f.rows.get('example/widget:17')!;
+      const checkouts = mode === 'active' ? [f.checkout('example/widget', 17)] : [];
+      if (mode !== 'active') {
+        f.members.get(row.node_id)!.status = 'In Progress';
+        const fields = parseIssueBody(row.body, { title: row.title }).issue;
+        row.body = renderIssueBody({
+          ...fields,
+          ...(mode === 'parked' ? { draft: true } : { deferral: { trigger: 'Await the synthetic fixture signal.' } }),
+        });
+      }
+      const plan = await collect(f.contexts, { ...f.request, checkouts }, [f.root]);
+      const target = mode === 'active' ? 'In Progress' : 'Todo';
+      assert.equal(plan.operations[0]!.target, target);
+      f.controls.failAfterStatus = true;
+      const interrupted = await applyPlan(f, plan);
+      assert.equal(interrupted.summary.unknown, 1);
+      assert.equal(f.statusFor(row.node_id), target);
+      f.controls.failAfterStatus = false;
+      f.writes.length = 0;
+      const resumed = await applyPlan(f, plan, interrupted);
+      assert.equal(resumed.summary.satisfied, 1);
+      assert.equal(resumed.summary.applied, 0);
+      assert.equal(f.writes.length, 0);
+      assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
+      f.members.get(row.node_id)!.status = mode === 'active' ? 'Todo' : 'In Progress';
+      const applied = await applyPlan(f, plan);
+      assert.equal(applied.summary.applied, 1);
+      assert.equal(applied.operations[0]!.readback!.status.current, target);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
