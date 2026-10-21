@@ -116,6 +116,7 @@ export async function discoverDeliveryRouting(input: {
   overrides: DeliveryOverrides;
   repositorySelected?: boolean;
   maxPages?: number;
+  requireWritableProject?: boolean;
 }): Promise<DeliveryRouting> {
   const [owner, repo] = input.repository.split('/');
   if (!owner || !repo) throw new DeliveryError('Invalid delivery repository.');
@@ -233,7 +234,7 @@ export async function discoverDeliveryRouting(input: {
       if (projectSource === 'explicit' || !(error instanceof DeliveryError)) throw error;
       continue;
     }
-    if (!configuration.writable)
+    if (!configuration.writable && input.requireWritableProject !== false)
       throw new DeliveryError('A compatible delivery Project is not writable; refusing destination fallback.');
     compatible.push(configuration);
   }

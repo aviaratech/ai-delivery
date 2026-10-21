@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { Command } from 'commander';
 import { z } from 'zod';
 
@@ -14,6 +14,8 @@ import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
 import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch } from './issueContract.js';
 import { NativeIssueDateFields } from './github/nativeIssueMetadata.js';
+import { DeliveryError } from './errors.js';
+import { parseBoardReconcileRequest } from './services/boardReconcileService.js';
 
 const program = new Command();
 program
@@ -83,6 +85,15 @@ function run(name: AiDeliveryMcpToolName, input: Record<string, unknown>): Promi
 }
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+function reconciliationFile(path: string): unknown {
+  const limit = 16 * 1024 * 1024;
+  const stat = statSync(path);
+  if (!stat.isFile() || stat.size > limit)
+    throw new DeliveryError('Reconciliation files must be regular UTF-8 JSON files of at most 16 MiB.');
+  const bytes = readFileSync(path);
+  if (bytes.byteLength > limit) throw new DeliveryError('Reconciliation files exceed 16 MiB.');
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown;
 }
 
 const plugin = program.command('plugin').description('Manage the ai-delivery native plugin');
@@ -395,6 +406,37 @@ program
           undefer: o.undefer === true ? true : undefined,
         }),
       ),
+  );
+
+program
+  .command('board:reconcile')
+  .description('Plan or apply bounded Project reconciliation for explicit repositories')
+  .requiredOption('--repositories <owner/repo...>', '1–10 explicit GitHub repositories')
+  .option('--checkouts-file <path>', 'UTF-8 JSON checkout selectors for dry-run')
+  .option('--dry-run', 'Collect a plan without writes (default)')
+  .option('--apply', 'Apply the retained original plan')
+  .option('--plan-file <path>', 'Original complete reconciliation plan JSON')
+  .option('--prior-result-file <path>', 'Optional prior result JSON for the exact original plan')
+  .action(
+    async (options: {
+      repositories: string[];
+      checkoutsFile?: string;
+      dryRun?: boolean;
+      apply?: boolean;
+      planFile?: string;
+      priorResultFile?: string;
+    }) => {
+      if (options.dryRun && options.apply) throw new DeliveryError('Choose either --dry-run or --apply.');
+      const request = parseBoardReconcileRequest({
+        repositories: options.repositories,
+        ...(execution().repo === undefined ? {} : { repo: execution().repo }),
+        mode: options.apply ? 'apply' : 'dry-run',
+        ...(options.checkoutsFile === undefined ? {} : { checkouts: reconciliationFile(options.checkoutsFile) }),
+        ...(options.planFile === undefined ? {} : { plan: reconciliationFile(options.planFile) }),
+        ...(options.priorResultFile === undefined ? {} : { priorResult: reconciliationFile(options.priorResultFile) }),
+      });
+      return run('board_reconcile', request);
+    },
   );
 
 program

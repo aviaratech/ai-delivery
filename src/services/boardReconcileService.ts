@@ -374,7 +374,12 @@ function globalFailureReason(error: unknown): 'rate-limit' | 'authentication' | 
     return 'authentication';
   return null;
 }
-function gap(repository: string, stage: string, error?: unknown, projectId?: string): ReconcileGap {
+export function boardReconcileGap(
+  repository: string,
+  stage: string,
+  error?: unknown,
+  projectId?: string,
+): ReconcileGap {
   return {
     repository,
     stage,
@@ -450,6 +455,10 @@ export function incompleteBoardReconcile(
   request: ApplyBoardReconcileRequest,
   failure: ReconcileGap,
 ): BoardReconcileResult;
+export function incompleteBoardReconcile(
+  request: BoardReconcileRequest,
+  failure: ReconcileGap,
+): BoardReconcilePlan | BoardReconcileResult;
 export function incompleteBoardReconcile(
   request: BoardReconcileRequest,
   failure: ReconcileGap,
@@ -916,7 +925,7 @@ async function observeIssue(
   options.signal?.throwIfAborted();
   const gaps: ReconcileGap[] = [];
   const missing = (stage: string, error?: unknown) => {
-    gaps.push(gap(repository, stage, error, configuration?.projectId));
+    gaps.push(boardReconcileGap(repository, stage, error, configuration?.projectId));
     if (globalFailureReason(error) !== null) {
       state.scopeComplete = false;
       state.globalReadFailure = error;
@@ -1150,7 +1159,7 @@ export async function collectBoardReconcilePlan(
     plan.packageIdentity = readPackageArtifactIdentity();
   } catch (error) {
     plan.scopeComplete = false;
-    plan.gaps.push(gap(plan.scope[0]!, 'package-identity', error));
+    plan.gaps.push(boardReconcileGap(plan.scope[0]!, 'package-identity', error));
   }
   const selected = new Map(contexts.map((context) => [context.config.repository.toLowerCase(), context]));
   if (
@@ -1177,7 +1186,7 @@ export async function collectBoardReconcilePlan(
       const context = selected.get(repository.toLowerCase());
       if (!context) {
         plan.scopeComplete = false;
-        plan.gaps.push(gap(repository, 'context'));
+        plan.gaps.push(boardReconcileGap(repository, 'context'));
         continue;
       }
       if (
@@ -1193,7 +1202,7 @@ export async function collectBoardReconcilePlan(
       } catch (error) {
         plan.scopeComplete = false;
         if (globalFailureReason(error) !== null) state.globalReadFailure = error;
-        plan.gaps.push(gap(repository, 'issue-inventory', error));
+        plan.gaps.push(boardReconcileGap(repository, 'issue-inventory', error));
       }
       let configuration: ProjectDeliveryConfiguration | null = null;
       let items: ProjectItemObservation[] | null = null;
@@ -1243,7 +1252,7 @@ export async function collectBoardReconcilePlan(
         } catch (error) {
           plan.scopeComplete = false;
           if (globalFailureReason(error) !== null) state.globalReadFailure = error;
-          plan.gaps.push(gap(repository, 'actor', error, configuration.projectId));
+          plan.gaps.push(boardReconcileGap(repository, 'actor', error, configuration.projectId));
         }
         plan.bindings.push({
           repository,
@@ -1257,7 +1266,7 @@ export async function collectBoardReconcilePlan(
         if (globalFailureReason(error) !== null) state.globalReadFailure = error;
         const projectId = configuration?.projectId ?? context.configuration?.routing.projectId;
         if (projectId !== undefined) stoppedProjects.add(projectId);
-        plan.gaps.push(gap(repository, 'project-inventory', error, configuration?.projectId));
+        plan.gaps.push(boardReconcileGap(repository, 'project-inventory', error, configuration?.projectId));
       }
       for (const listed of rows.values()) {
         const record = await observeIssue(context, listed, configuration, items, plan.checkouts, options, state);
@@ -1270,7 +1279,7 @@ export async function collectBoardReconcilePlan(
         const overhead = Buffer.byteLength(JSON.stringify({ ...plan, issues: [], operations: [] }), 'utf8');
         if (retainedRecordsBytes + recordBytes + overhead + 4096 > MAX_BYTES) {
           plan.scopeComplete = false;
-          plan.gaps.push(gap(repository, 'retained-output'));
+          plan.gaps.push(boardReconcileGap(repository, 'retained-output'));
           return finishPlan(plan);
         }
         retainedRecordsBytes += recordBytes;
@@ -1280,7 +1289,7 @@ export async function collectBoardReconcilePlan(
     }
   } catch (error) {
     plan.scopeComplete = false;
-    plan.gaps.push(gap(currentRepository, 'collection', error));
+    plan.gaps.push(boardReconcileGap(currentRepository, 'collection', error));
   }
   return finishPlan(plan);
 }
@@ -1539,7 +1548,7 @@ export async function boardReconcile(
   const original = request.plan;
   let current: BoardReconcilePlan | undefined;
   const refuse = (stage: string, error?: unknown): BoardReconcileResult => {
-    const result = incompleteBoardReconcile(request, gap(original.scope[0]!, stage, error));
+    const result = incompleteBoardReconcile(request, boardReconcileGap(original.scope[0]!, stage, error));
     if (current) {
       result.observedBindings = current.bindings;
       result.issues = current.issues;
@@ -1549,7 +1558,7 @@ export async function boardReconcile(
     } catch {
       result.issues = [];
       result.scopeComplete = false;
-      result.gaps = [gap(original.scope[0]!, 'retained-output')];
+      result.gaps = [boardReconcileGap(original.scope[0]!, 'retained-output')];
       return finishResult(result);
     }
   };
@@ -1599,7 +1608,7 @@ export async function boardReconcile(
   } catch (error) {
     return refuse('preflight', error);
   }
-  const result = incompleteBoardReconcile(request, gap(original.scope[0]!, 'not-started'));
+  const result = incompleteBoardReconcile(request, boardReconcileGap(original.scope[0]!, 'not-started'));
   result.scopeComplete = true;
   result.gaps = [];
   result.observedBindings = current.bindings;
@@ -1687,7 +1696,7 @@ export async function boardReconcile(
       operation.outcome =
         error instanceof OperationRefusal ? error.outcome : operation.attempted ? 'unknown' : 'refused';
       result.gaps.push(
-        gap(
+        boardReconcileGap(
           operation.repository,
           error instanceof OperationRefusal ? error.stage : 'operation-read-write',
           error,

@@ -377,6 +377,7 @@ export async function loadDeliveryConfig(
     signal?: AbortSignal;
     repository?: string;
     readPageLimit?: number;
+    requireWritableProject?: boolean;
   } = {},
 ): Promise<LoadedGitHubConfig> {
   options.signal?.throwIfAborted();
@@ -409,6 +410,9 @@ export async function loadDeliveryConfig(
       overrides: settings.overrides,
       repositorySelected: options.repository !== undefined,
       ...(options.readPageLimit === undefined ? {} : { maxPages: options.readPageLimit }),
+      ...(options.requireWritableProject === undefined
+        ? {}
+        : { requireWritableProject: options.requireWritableProject }),
     });
   } catch (error) {
     if (error instanceof DeliveryError) throw error;

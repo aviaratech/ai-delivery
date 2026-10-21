@@ -212,6 +212,7 @@ export interface DeliveryContext {
 
 export async function loadDeliveryContext(input: {
   readPageLimit?: number;
+  requireWritableProject?: boolean;
   identity: string;
   personalAuth?: boolean;
   repoRoot: string;
@@ -221,6 +222,7 @@ export async function loadDeliveryContext(input: {
 }): Promise<DeliveryContext> {
   const loaded = await loadDeliveryConfig(input.repoRoot, {
     ...(input.readPageLimit === undefined ? {} : { readPageLimit: input.readPageLimit }),
+    ...(input.requireWritableProject === undefined ? {} : { requireWritableProject: input.requireWritableProject }),
     ...(input.repository === undefined ? {} : { repository: input.repository }),
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -252,7 +254,7 @@ export async function loadDeliveryContext(input: {
     clients,
     config,
     configuration: loaded,
-    projectConfiguration,
+    ...(input.requireWritableProject === false ? {} : { projectConfiguration }),
     repo,
     root: '',
     ...(input.readPageLimit === undefined ? {} : { readPageLimit: input.readPageLimit }),

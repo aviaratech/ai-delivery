@@ -23,8 +23,20 @@ import { gitEnvironment } from './gitProcess.js';
 import * as board from './services/boardReconcileService.js';
 import * as version from './version.js';
 import { digestValue } from './delivery/common.js';
+import { executeTool } from './dispatch.js';
+import * as githubClients from './github/client.js';
+import * as issueModule from './issue.js';
+import { createAiDeliveryMcpServer } from './mcp/index.js';
+import type { AiDeliveryMcpToolName } from './mcp/tools.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
+const boardName: AiDeliveryMcpToolName = 'board_reconcile';
 
 type Checkout = { repository: string; issueNumber: number; path: string };
 type DryRequest = { repositories: string[]; mode: 'dry-run'; checkouts?: Checkout[] };
@@ -379,7 +391,10 @@ async function boardFixture(count = 101, repositories = ['example/widget'], inde
       rest,
       role: 'author' as const,
       authSource: 'app' as const,
-      authenticatedAuthor: async () => ({ actorLogin: 'operator', credentialIdentity: 'user:1' }),
+      authenticatedAuthor: async () => ({
+        actorLogin: 'synthetic-author[bot]',
+        credentialIdentity: 'app:1:installation:2',
+      }),
     } as DeliveryContext['clients'];
     const loaded = await loadDeliveryConfig('', { clients, repository, readPageLimit: 20 });
     contexts.push({
@@ -1434,6 +1449,260 @@ test('an interruption before add leaves a revalidated incomplete operation retry
       f.writes.map((write) => write.kind),
       ['add'],
     );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('actual MCP registrar and library share bounded explicit-scope reconciliation', async () => {
+  const f = await boardFixture(1);
+  const server = createAiDeliveryMcpServer({ repoRoot: f.root });
+  const client = new Client({ name: 'board-reconcile-fixture', version: '1' });
+  const [transport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const clients = vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockResolvedValue(f.contexts[0]!.clients);
+  const loads = vi.spyOn(issueModule, 'loadDeliveryContext');
+  try {
+    await server.connect(serverTransport);
+    await client.connect(transport);
+    const listed = await client.listTools();
+    const tool = listed.tools.find((value) => value.name === boardName);
+    assert.ok(tool);
+    assert.equal(tool.inputSchema.type, 'object');
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    for (const input of [
+      { repositories: [] },
+      { repositories: Array.from({ length: 11 }, (_, n) => `example/r${String(n)}`) },
+      { repositories: ['example/widget', 'EXAMPLE/Widget'] },
+      { repositories: ['invalid'] },
+      { repositories: ['example/widget'], mode: 'apply' },
+      { repositories: ['example/widget'], mode: 'dry-run', extra: true },
+      { repositories: ['example/widget'], repo: 'example/other' },
+      {
+        repositories: ['example/widget'],
+        checkouts: [
+          { repository: 'example/widget', issueNumber: 17, path: f.root },
+          { repository: 'example/widget', issueNumber: 17, path: f.root },
+        ],
+      },
+    ]) {
+      const response = await client.callTool({ name: boardName, arguments: input });
+      assert.equal(response.isError, true);
+      assert.equal(clients.mock.calls.length, 0);
+    }
+    await assert.rejects(
+      executeTool(boardName, { repositories: ['example/widget'] }, { repoRoot: f.root, repo: 'example/other' }),
+    );
+    assert.equal(clients.mock.calls.length, 0);
+    const fromLibrary = board.BoardReconcilePlanSchema.parse(
+      await executeTool(boardName, f.request, { repoRoot: f.root }),
+    );
+    const beforeInvalid = clients.mock.calls.length;
+    for (const input of [
+      { ...f.request, plan: fromLibrary },
+      { ...f.request, priorResult: {} },
+      { repositories: fromLibrary.scope, mode: 'apply', plan: fromLibrary, checkouts: [] },
+    ])
+      await assert.rejects(executeTool(boardName, input, { repoRoot: f.root }));
+    assert.equal(clients.mock.calls.length, beforeInvalid);
+    const response = await client.callTool({ name: boardName, arguments: f.request });
+    assert.equal(response.isError, undefined, JSON.stringify(response));
+    const fromMcp = board.BoardReconcilePlanSchema.parse(JSON.parse((response.content as { text: string }[])[0]!.text));
+    assert.equal(fromMcp.planId, fromLibrary.planId);
+    assert.equal(fromMcp.scopeComplete, true);
+    assert.ok(loads.mock.calls.length >= 2);
+    assert.equal(
+      loads.mock.calls.every(([input]) => input.readPageLimit === 20),
+      true,
+    );
+    assert.deepEqual(f.writes, []);
+  } finally {
+    await client.close();
+    await server.close();
+    f.cleanup();
+  }
+});
+
+test.each(['dry-run', 'apply'] as const)(
+  'pre-context access failure preserves %s output without writes',
+  async (mode) => {
+    const f = await boardFixture(1);
+    const server = createAiDeliveryMcpServer({ repoRoot: f.root });
+    const client = new Client({ name: 'board-access-fixture', version: '1' });
+    const [transport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      f.rows.get('example/widget:17')!.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      const request = mode === 'apply' ? { repositories: plan.scope, mode, plan } : f.request;
+      f.controls.beforeGraphql = (query) => {
+        if (query.includes('DeliveryRepository'))
+          throw Object.assign(new Error('No repository read access'), { status: 403 });
+      };
+      vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockResolvedValue(f.contexts[0]!.clients);
+      await server.connect(serverTransport);
+      await client.connect(transport);
+      const library: unknown = await executeTool(boardName, request, { repoRoot: f.root });
+      const response = await client.callTool({ name: boardName, arguments: request });
+      assert.equal(response.isError, undefined, JSON.stringify(response));
+      for (const value of [library, JSON.parse((response.content as { text: string }[])[0]!.text) as unknown]) {
+        if (mode === 'apply') {
+          const result = board.BoardReconcileResultSchema.parse(value);
+          assert.equal(result.planId, plan.planId);
+          assert.equal(result.scopeComplete, false);
+          assert.equal(result.summary.applied, 0);
+        } else assert.equal(board.BoardReconcilePlanSchema.parse(value).scopeComplete, false);
+      }
+      assert.deepEqual(f.writes, []);
+    } finally {
+      await client.close();
+      await server.close();
+      f.cleanup();
+    }
+  },
+);
+
+test('public dry-run permits a readable Project without write access', async () => {
+  const f = await boardFixture(1);
+  try {
+    f.controls.writable = false;
+    vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockResolvedValue(f.contexts[0]!.clients);
+    const result = board.BoardReconcilePlanSchema.parse(await executeTool(boardName, f.request, { repoRoot: f.root }));
+    assert.equal(result.scopeComplete, true);
+    assert.deepEqual(f.writes, []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['dry-run', 'apply', 'apply-empty'] as const)(
+  'pre-context 21st routing page preserves %s mode through real library and MCP',
+  async (variant) => {
+    const f = await boardFixture(1);
+    const server = createAiDeliveryMcpServer({ repoRoot: f.root });
+    const client = new Client({ name: 'board-pre-context-fixture', version: '1' });
+    const [transport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      if (variant === 'apply') f.rows.get('example/widget:17')!.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      const prior = board.incompleteBoardReconcile(
+        { repositories: plan.scope, mode: 'apply', plan },
+        { repository: plan.scope[0]!, stage: 'prior', reason: 'evidence-unavailable' },
+      );
+      if (prior.operations[0]) {
+        const operation = prior.operations[0];
+        operation.outcome = 'unknown';
+        operation.attempted = true;
+        operation.before = {
+          itemId: operation.expected.itemId!,
+          archived: false,
+          status: { current: 'Todo', kind: 'verified', name: 'Queued', optionId: 'STATUS-0' },
+        };
+        operation.readback = structuredClone(operation.before);
+      }
+      const request =
+        variant === 'dry-run' ? f.request : { repositories: plan.scope, mode: 'apply', plan, priorResult: prior };
+      const original = f.contexts[0]!.clients.graphql;
+      let requests = 0;
+      const limited = (async (query: string, variables: Record<string, unknown>) => {
+        const response: unknown = await original(query, variables);
+        if (!query.includes('ProjectDeliveryConfiguration')) return response;
+        requests++;
+        const cloned = JSON.parse(JSON.stringify(response)) as {
+          organization: { projectV2: { fields: { nodes: unknown[]; pageInfo: unknown } } };
+        };
+        if (variables.cursor != null) cloned.organization.projectV2.fields.nodes = [];
+        cloned.organization.projectV2.fields.pageInfo = { hasNextPage: true, endCursor: `bounded-${String(requests)}` };
+        return cloned;
+      }) as unknown as typeof original;
+      vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockResolvedValue({
+        ...f.contexts[0]!.clients,
+        graphql: limited,
+      });
+      await server.connect(serverTransport);
+      await client.connect(transport);
+      for (const surface of ['library', 'mcp']) {
+        const before = requests;
+        const value: unknown =
+          surface === 'library'
+            ? await executeTool(boardName, request, { repoRoot: f.root })
+            : await (async () => {
+                const response = await client.callTool({ name: boardName, arguments: request });
+                assert.equal(response.isError, undefined, JSON.stringify(response));
+                return JSON.parse((response.content as { text: string }[])[0]!.text) as unknown;
+              })();
+        assert.equal(requests - before, 20);
+        if (variant === 'dry-run') {
+          const result = board.BoardReconcilePlanSchema.parse(value);
+          assert.equal(result.scopeComplete, false);
+          assert.equal(result.gaps[0]!.pagesRequested, 20);
+        } else {
+          const result = board.BoardReconcileResultSchema.parse(value);
+          assert.equal(result.scopeComplete, false);
+          assert.equal(result.planId, plan.planId);
+          assert.deepEqual(
+            result.operations.map((operation) => operation.operationId),
+            plan.operations.map((operation) => operation.operationId),
+          );
+          assert.equal(result.summary.applied, 0);
+          assert.equal(result.summary.satisfied, 0);
+          if (result.operations[0]) {
+            assert.deepEqual(result.operations[0].priorEvidence.at(-1), {
+              outcome: 'unknown',
+              attempted: true,
+              before: prior.operations[0]!.before,
+              readback: prior.operations[0]!.readback,
+            });
+            assert.ok(result.operations[0].knownItemIds.includes(prior.operations[0]!.expected.itemId!));
+          }
+        }
+        assert.deepEqual(f.writes, []);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+      f.cleanup();
+    }
+  },
+);
+
+test('apply development-token override is rejected before clients while configured personal author remains valid', async () => {
+  const f = await boardFixture(1);
+  try {
+    f.rows.get('example/widget:17')!.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    const clients = vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockResolvedValue(f.contexts[0]!.clients);
+    await assert.rejects(
+      executeTool(
+        boardName,
+        { repositories: plan.scope, mode: 'apply', plan },
+        { repoRoot: f.root, identity: 'personal', personalAuth: true },
+      ),
+      /override/u,
+    );
+    assert.equal(clients.mock.calls.length, 0);
+    const settingsPath = join(f.root, 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { roles: { author: unknown } };
+    settings.roles.author = {
+      authSource: 'personal',
+      identity: 'host-author',
+      credentialEnv: { token: 'SYNTHETIC_TOKEN' },
+    };
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    f.contexts[0]!.clients.authSource = 'personal';
+    f.contexts[0]!.clients.authenticatedAuthor = async () => ({
+      actorLogin: 'host-author',
+      credentialIdentity: 'user:1',
+    });
+    const personal = board.BoardReconcilePlanSchema.parse(
+      await executeTool(boardName, f.request, { repoRoot: f.root }),
+    );
+    const result = board.BoardReconcileResultSchema.parse(
+      await executeTool(
+        boardName,
+        { repositories: personal.scope, mode: 'apply', plan: personal },
+        { repoRoot: f.root },
+      ),
+    );
+    assert.equal(result.summary.applied, 1);
   } finally {
     f.cleanup();
   }

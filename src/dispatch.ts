@@ -1,4 +1,10 @@
 import { deliveryHealth, type DeliveryHealthRequest } from './services/deliveryHealthService.js';
+import {
+  boardReconcile,
+  boardReconcileGap,
+  parseBoardReconcileRequest,
+  incompleteBoardReconcile,
+} from './services/boardReconcileService.js';
 import { loadDeliverySettings } from './config/deliveryConfig.js';
 import { resolveCheckout, resolveRepoFromRemote } from './github/repo.js';
 import { DeliveryError } from './errors.js';
@@ -84,6 +90,7 @@ export async function contextFor(
   commandName: string,
   role: 'author' | 'reviewer' = 'author',
   readPageLimit?: number,
+  requireWritableProject?: boolean,
 ) {
   const settings = await loadDeliverySettings();
   const identity = input.identity ?? settings.roles[role].identity;
@@ -102,6 +109,7 @@ export async function contextFor(
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(readPageLimit === undefined ? {} : { readPageLimit }),
+    ...(requireWritableProject === undefined ? {} : { requireWritableProject }),
   });
 }
 /** GitHub owns branch linkage; hosts own worktree preparation. */
@@ -268,6 +276,38 @@ export async function executeTool(
 ): Promise<unknown> {
   const definition = getAiDeliveryMcpTool(name);
   if (!definition) throw new DeliveryError(`Unknown ai-delivery tool ${name}.`);
+  if (name === 'board_reconcile') {
+    let request = parseBoardReconcileRequest(raw);
+    if (execution.repo !== undefined) {
+      if (request.repo !== undefined && request.repo.toLowerCase() !== execution.repo.trim().toLowerCase())
+        throw new DeliveryError('Tool and execution repository selectors disagree.');
+      request = parseBoardReconcileRequest({ ...request, repo: execution.repo });
+    }
+    if (request.mode === 'apply' && execution.personalAuth === true)
+      throw new DeliveryError(
+        'Board apply forbids the legacy personal-auth development override; use the configured author.',
+      );
+    let repository = request.repositories[0]!;
+    let checkoutRoots: readonly string[] = [];
+    const contexts: Awaited<ReturnType<typeof loadDeliveryContext>>[] = [];
+    try {
+      const settings = await loadDeliverySettings();
+      checkoutRoots = settings.checkoutRoots;
+      for (const selected of request.repositories) {
+        repository = selected;
+        contexts.push(
+          await contextFor({ ...execution, repoRoot: '', repo: selected }, definition.commandName, 'author', 20, false),
+        );
+      }
+    } catch (error) {
+      const failure = boardReconcileGap(repository, 'context', error);
+      return incompleteBoardReconcile(request, failure);
+    }
+    return boardReconcile(contexts, request, {
+      checkoutRoots,
+      ...(execution.signal === undefined ? {} : { signal: execution.signal }),
+    });
+  }
   const { repo: selected, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
   if (name === 'issue_finish' && input.nonClosing === true)
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
