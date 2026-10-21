@@ -22,6 +22,7 @@ import type { ProjectDeliveryStatus } from './github/projectDelivery.js';
 import { gitEnvironment } from './gitProcess.js';
 import * as board from './services/boardReconcileService.js';
 import * as version from './version.js';
+import { digestValue } from './delivery/common.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -31,7 +32,40 @@ const collect = async (contexts: DeliveryContext[], request: DryRequest, roots: 
   return board.collectBoardReconcilePlan(contexts, request, { checkoutRoots: roots });
 };
 
-async function boardFixture(count = 101, repositories = ['example/widget']) {
+async function applyPlan(
+  f: Awaited<ReturnType<typeof boardFixture>>,
+  plan: board.BoardReconcilePlan,
+  priorResult?: board.BoardReconcileResult,
+  signal?: AbortSignal,
+) {
+  const operation = Reflect.get(board, 'boardReconcile') as
+    | ((
+        contexts: readonly DeliveryContext[],
+        request: board.BoardReconcileRequest,
+        options: { checkoutRoots: readonly string[] },
+      ) => Promise<board.BoardReconcilePlan | board.BoardReconcileResult>)
+    | undefined;
+  assert.equal(typeof operation, 'function');
+  const request = board.parseBoardReconcileRequest({
+    repositories: f.request.repositories,
+    mode: 'apply',
+    plan,
+    ...(priorResult === undefined ? {} : { priorResult }),
+  });
+  return board.BoardReconcileResultSchema.parse(
+    await operation!(f.contexts, request, { checkoutRoots: [f.root], ...(signal === undefined ? {} : { signal }) }),
+  );
+}
+function redigest(plan: board.BoardReconcilePlan): void {
+  plan.operations = plan.operations.map((operation) => {
+    const { operationId: _id, ...intent } = operation;
+    return { ...intent, operationId: digestValue(intent) };
+  });
+  const { planId: _id, collectionStartedAt: _start, collectionCompletedAt: _end, ...semantic } = plan;
+  plan.planId = digestValue(semantic);
+}
+
+async function boardFixture(count = 101, repositories = ['example/widget'], independentProjects = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'board-reconcile-')));
   const roles = {
     author: {
@@ -110,6 +144,9 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
     writable: true,
     failAfterAdd: false,
     automaticStatus: null as ProjectDeliveryStatus | null,
+    failAfterStatus: false,
+    beforeGraphql: undefined as undefined | ((query: string, variables: Record<string, unknown>) => void),
+    afterWrite: undefined as undefined | ((kind: string, node: string) => void),
   };
   const git = (cwd: string, args: string[]) =>
     execFileSync('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', ...args], {
@@ -159,7 +196,13 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
     Done: 'STATUS-3',
   };
   for (const repository of repositories) {
-    const configured = { ...syntheticDiscoveryConfig, repository };
+    const organization = repository.split('/')[0]!;
+    const projectId = independentProjects ? `PROJECT-${organization}` : 'PROJECT-1';
+    const configured = {
+      ...syntheticDiscoveryConfig,
+      repository,
+      native: { ...syntheticDiscoveryConfig.native, organization },
+    };
     const discovery = syntheticDiscoveryClients(configured);
     const own = (number: number) => {
       const row = rows.get(`${repository}:${String(number)}`);
@@ -169,13 +212,14 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
     const item = (node: string, member: NonNullable<ReturnType<typeof members.get>>) => ({
       id: member.itemId,
       isArchived: member.archived,
-      project: { id: 'PROJECT-1', number: 1 },
+      project: { id: projectId, number: 1 },
       content: controls.hiddenContent
         ? null
         : { __typename: 'Issue', id: node, number: member.number, repository: { nameWithOwner: member.repository } },
       fieldValueByName: member.status === null ? null : { name: names[member.status], optionId: option[member.status] },
     });
     const graphql = (async (query: string, variables: Record<string, unknown> = {}) => {
+      controls.beforeGraphql?.(query, variables);
       if (query.includes('mutation')) {
         if (query.includes('AddProjectDeliveryItem')) {
           const node = String(variables.contentId);
@@ -190,6 +234,7 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
             archived: false,
           });
           writes.push({ kind: 'add', subject: node });
+          controls.afterWrite?.('add', node);
           if (controls.failAfterAdd) throw new Error('Lost add response');
           return { addProjectV2ItemById: { item: { id: `ADDED-${node}` } } };
         }
@@ -200,6 +245,8 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
             (s) => option[s] === variables.optionId,
           )!;
           writes.push({ kind: 'status', subject: found[0] });
+          controls.afterWrite?.('status', found[0]);
+          if (controls.failAfterStatus) throw new Error('Lost Status response');
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
         }
         throw new Error('Unexpected mutation');
@@ -207,12 +254,14 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
       if (query.includes('ProjectDeliveryItems')) {
         controls.itemPages++;
         const offset = typeof variables.cursor === 'string' ? Number(variables.cursor.slice(1)) : 0;
-        const all = [...members.entries()];
+        const all = [...members.entries()].filter(
+          ([, member]) => !independentProjects || member.repository.split('/')[0] === organization,
+        );
         const slice = all.slice(offset, offset + 100);
         return {
           organization: {
             projectV2: {
-              id: 'PROJECT-1',
+              id: projectId,
               number: 1,
               items: {
                 nodes: slice.map(([node, m]) => item(node, m)),
@@ -265,11 +314,12 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
             id: `REPO-${repository}`,
             nameWithOwner: repository,
             isFork: false,
-            owner: { __typename: 'Organization', login: 'example' },
+            owner: { __typename: 'Organization', login: organization },
           },
         };
       if (query.includes('ProjectDeliveryConfiguration')) {
         const data = response as { organization: { projectV2: Record<string, unknown> } };
+        data.organization.projectV2.id = projectId;
         data.organization.projectV2.viewerCanUpdate = controls.writable;
       }
       return response;
@@ -336,7 +386,7 @@ async function boardFixture(count = 101, repositories = ['example/widget']) {
       clients,
       config: loaded.config,
       configuration: loaded,
-      repo: { owner: 'example', repo: repository.split('/')[1]! },
+      repo: { owner: organization, repo: repository.split('/')[1]! },
       root: '',
       readPageLimit: 20,
     });
@@ -896,3 +946,495 @@ test.each(['verified', 'foreign-marker', 'duplicate'] as const)(
     }
   },
 );
+
+test('membership-only apply and resume preserve automatic Todo and unresolved activity', async () => {
+  const f = await boardFixture(1);
+  try {
+    const node = f.rows.get('example/widget:17')!.node_id;
+    f.members.delete(node);
+    f.controls.automaticStatus = 'Todo';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    const applied = await applyPlan(f, plan);
+    assert.equal(applied.summary.applied, 1);
+    assert.equal(applied.summary.unresolved, 1);
+    assert.equal(f.statusFor(node), 'Todo');
+    assert.deepEqual(
+      f.writes.map((w) => w.kind),
+      ['add'],
+    );
+    f.writes.length = 0;
+    const resumed = await applyPlan(f, plan, applied);
+    assert.equal(resumed.planId, plan.planId);
+    assert.equal(resumed.summary.applied, 0);
+    assert.equal(resumed.summary.satisfied, 1);
+    assert.equal(resumed.summary.unresolved, 1);
+    assert.equal(f.statusFor(node), 'Todo');
+    assert.deepEqual(f.writes, []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['actor', 'access', 'inventory', 'archive', 'configuration'] as const)(
+  'apply preflight %s drift refuses before writes',
+  async (failure) => {
+    const f = await boardFixture(1);
+    try {
+      const row = f.rows.get('example/widget:17')!;
+      row.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      assert.equal(plan.operations.length, 1);
+      if (failure === 'actor')
+        f.contexts[0]!.clients.authenticatedAuthor = async () => ({
+          actorLogin: 'different-actor',
+          credentialIdentity: 'user:1',
+        });
+      if (failure === 'access') f.controls.writable = false;
+      if (failure === 'inventory')
+        f.rows.set('example/widget:99', {
+          ...row,
+          number: 99,
+          id: 99,
+          node_id: 'NEW-ISSUE99',
+          state: 'open',
+          html_url: 'https://github.com/example/widget/issues/99',
+        });
+      if (failure === 'archive') f.members.get(row.node_id)!.archived = true;
+      if (failure === 'configuration') {
+        const path = join(f.root, 'settings.json');
+        const settings = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+        settings.checkoutRoots = [];
+        writeFileSync(path, JSON.stringify(settings));
+      }
+      const result = await applyPlan(f, plan);
+      assert.equal(result.planId, plan.planId);
+      assert.ok(result.summary.refused + result.summary.drifted > 0);
+      assert.equal(result.summary.applied, 0);
+      assert.deepEqual(f.writes, []);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['destination', 'artifact'] as const)(
+  'a recomputed %s digest cannot authorize different intent',
+  async (failure) => {
+    const f = await boardFixture(1);
+    try {
+      f.rows.get('example/widget:17')!.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      if (failure === 'destination') plan.operations[0]!.projectId = 'FOREIGN-PROJECT';
+      else plan.packageIdentity!.packageDistDigest = `sha256:${'a'.repeat(64)}`;
+      redigest(plan);
+      assert.equal(board.BoardReconcileInput.safeParse({ ...f.request, mode: 'apply', plan }).success, true);
+      const result = await applyPlan(f, plan);
+      assert.ok(result.summary.refused + result.summary.drifted > 0);
+      assert.deepEqual(f.writes, []);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test('validated prior item evidence prevents recreating a deleted membership', async () => {
+  const f = await boardFixture(1);
+  try {
+    const node = f.rows.get('example/widget:17')!.node_id;
+    f.members.delete(node);
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    const prior = await applyPlan(f, plan);
+    f.members.delete(node);
+    f.writes.length = 0;
+    const result = await applyPlan(f, plan, prior);
+    assert.ok(result.summary.refused + result.summary.drifted > 0);
+    assert.deepEqual(f.writes, []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('known add response item survives a failed readback and constrains resume', async () => {
+  const f = await boardFixture(1);
+  try {
+    const node = f.rows.get('example/widget:17')!.node_id;
+    f.members.delete(node);
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    f.controls.beforeGraphql = (query) => {
+      if (query.includes('ProjectDeliveryItemReadback')) throw new Error('Unreadable exact item');
+    };
+    const prior = await applyPlan(f, plan);
+    assert.equal(prior.operations[0]!.attempted, true);
+    assert.equal(prior.operations[0]!.outcome, 'unknown');
+    assert.deepEqual(prior.operations[0]!.knownItemIds, [`ADDED-${node}`]);
+    f.controls.beforeGraphql = undefined;
+    f.members.delete(node);
+    f.writes.length = 0;
+    const resumed = await applyPlan(f, plan, prior);
+    assert.equal(resumed.summary.applied, 0);
+    assert.deepEqual(f.writes, []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['add', 'status'] as const)(
+  'lost %s response is unknown until fresh resume proves the postimage',
+  async (kind) => {
+    const f = await boardFixture(1);
+    try {
+      const row = f.rows.get('example/widget:17')!;
+      if (kind === 'add') {
+        f.members.delete(row.node_id);
+        f.controls.automaticStatus = 'Todo';
+      } else row.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      f.controls.failAfterAdd = kind === 'add';
+      f.controls.failAfterStatus = kind === 'status';
+      const prior = await applyPlan(f, plan);
+      assert.equal(prior.summary.unknown, 1);
+      assert.equal(prior.operations[0]!.attempted, true);
+      f.controls.failAfterAdd = false;
+      f.controls.failAfterStatus = false;
+      f.writes.length = 0;
+      const resumed = await applyPlan(f, plan, prior);
+      assert.equal(resumed.summary.satisfied, 1);
+      assert.equal(resumed.summary.applied, 0);
+      assert.deepEqual(f.writesSinceResume, []);
+      assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
+      assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.attempted, true);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['absent', 'unexpected-auto-status'] as const)(
+  'Status follow-up after membership preserves %s preimage',
+  async (variant) => {
+    const f = await boardFixture(1);
+    try {
+      const row = f.rows.get('example/widget:17')!;
+      f.members.delete(row.node_id);
+      f.blockers.set('example/widget:17', [
+        {
+          id: 'OPEN-BLOCKER',
+          number: 90,
+          title: 'Open',
+          state: 'OPEN',
+          repository: { nameWithOwner: 'example/widget' },
+        },
+      ]);
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      assert.equal(plan.operations.length, 2);
+      f.controls.automaticStatus = variant === 'absent' ? null : 'Todo';
+      const first = await applyPlan(f, plan);
+      assert.equal(first.operations[0]!.outcome, 'applied');
+      assert.equal(first.operations[1]!.outcome, variant === 'absent' ? 'applied' : 'refused');
+      assert.equal(f.statusFor(row.node_id), variant === 'absent' ? 'Blocked' : 'Todo');
+      f.writes.length = 0;
+      const resumed = await applyPlan(f, plan, first);
+      assert.deepEqual(f.writes, []);
+      assert.equal(resumed.operations[0]!.outcome, 'satisfied');
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['add', 'status'] as const)('native truth is guarded immediately before %s', async (kind) => {
+  const f = await boardFixture(1);
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    if (kind === 'add') f.members.delete(row.node_id);
+    else row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    let itemReads = 0;
+    f.controls.beforeGraphql = (query) => {
+      if (query.includes('ProjectDeliveryItems') && ++itemReads === 3) row.state = kind === 'add' ? 'closed' : 'open';
+    };
+    const result = await applyPlan(f, plan);
+    assert.deepEqual(f.writes, []);
+    assert.equal(result.operations[0]!.attempted, false);
+    assert.equal(result.summary.drifted, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['native-drift', 'cancel'] as const)(
+  'post-write %s retains attempted evidence and stops the shared Project',
+  async (failure) => {
+    const f = await boardFixture(2);
+    const controller = new AbortController();
+    try {
+      for (const row of f.rows.values()) row.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      f.controls.afterWrite = (_kind, node) => {
+        if (failure === 'cancel') controller.abort();
+        else [...f.rows.values()].find((row) => row.node_id === node)!.state = 'open';
+      };
+      const result = await applyPlan(f, plan, undefined, controller.signal);
+      assert.equal(f.writes.length, 1);
+      assert.equal(result.operations[0]!.attempted, true);
+      if (failure === 'cancel') assert.equal(result.scopeComplete, false);
+      assert.equal(result.operations[0]!.outcome, failure === 'cancel' ? 'unknown' : 'drifted');
+      assert.equal(result.operations[1]!.attempted, false);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test('late prerequisite overflow preserves an earlier applied operation', async () => {
+  const f = await boardFixture(2);
+  try {
+    for (const row of f.rows.values()) row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    let readsAfterWrite = 0,
+      overflowRequests = 0;
+    const original = f.contexts[0]!.clients.graphql;
+    f.contexts[0]!.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
+      if (f.writes.length && query.includes('ProjectDeliveryItems') && ++readsAfterWrite >= 2) {
+        overflowRequests++;
+        return {
+          organization: {
+            projectV2: {
+              id: 'PROJECT-1',
+              number: 1,
+              items: { nodes: [], pageInfo: { hasNextPage: true, endCursor: `late-${String(overflowRequests)}` } },
+            },
+          },
+        };
+      }
+      return original(query, variables);
+    }) as unknown as typeof original;
+    const result = await applyPlan(f, plan);
+    assert.equal(result.scopeComplete, false);
+    assert.equal(result.summary.applied, 1);
+    assert.equal(result.summary.refused, 1);
+    assert.equal(result.operations[0]!.outcome, 'applied');
+    assert.equal(result.operations[1]!.attempted, false);
+    assert.equal(result.gaps.at(-1)!.pagesRequested, 20);
+    assert.equal(result.gaps.at(-1)!.collection, 'project-items');
+    assert.equal(overflowRequests, 20);
+    assert.equal(f.writes.length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('an oversized readback cannot erase an attempted write', async () => {
+  const f = await boardFixture(1);
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    f.controls.afterWrite = () =>
+      (f.controls.beforeGraphql = (query) => {
+        if (query.includes('ProjectDeliveryItemReadback')) throw new Error('x'.repeat(17 * 1024 * 1024));
+      });
+    const result = await applyPlan(f, plan);
+    assert.equal(result.operations[0]!.attempted, true);
+    assert.equal(result.operations[0]!.outcome, 'unknown');
+    assert.equal(result.operations[0]!.issueNodeId, row.node_id);
+    assert.ok(Buffer.byteLength(JSON.stringify(result)) < 16 * 1024 * 1024);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('retained result capacity is reserved before a next mutation', async () => {
+  const f = await boardFixture(1);
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    const prior = board.incompleteBoardReconcile(
+      { repositories: plan.scope, mode: 'apply', plan },
+      { repository: plan.scope[0]!, stage: 'prior', reason: 'evidence-unavailable' },
+    );
+    const entry = { outcome: 'unknown' as const, attempted: true, before: null, readback: null };
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry)) + 1;
+    const baseline = Buffer.byteLength(
+      JSON.stringify({ repositories: plan.scope, mode: 'apply', plan, priorResult: prior }),
+    );
+    prior.operations[0]!.priorEvidence = Array.from(
+      { length: Math.floor((16 * 1024 * 1024 - baseline - 512) / entryBytes) },
+      () => entry,
+    );
+    const result = await applyPlan(f, plan, prior);
+    assert.deepEqual(f.writes, []);
+    assert.equal(result.summary.applied, 0);
+    assert.ok(result.summary.refused > 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 16 * 1024 * 1024);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('an exact Status target appearing at the final boundary skips the mutation', async () => {
+  const f = await boardFixture(1);
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    let reads = 0;
+    f.controls.beforeGraphql = (query) => {
+      if (query.includes('ProjectDeliveryItems') && ++reads === 4) f.members.get(row.node_id)!.status = 'Done';
+    };
+    const result = await applyPlan(f, plan);
+    assert.deepEqual(f.writes, []);
+    assert.equal(result.summary.satisfied, 1);
+    assert.equal(result.operations[0]!.attempted, false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('cancellation between add and update resumes the same frozen intent', async () => {
+  const f = await boardFixture(1);
+  const controller = new AbortController();
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    f.members.delete(row.node_id);
+    f.blockers.set('example/widget:17', [
+      { id: 'BLOCKER', number: 91, title: 'Open', state: 'OPEN', repository: { nameWithOwner: 'example/widget' } },
+    ]);
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    f.controls.afterWrite = () => controller.abort();
+    const first = await applyPlan(f, plan, undefined, controller.signal);
+    assert.equal(first.operations[0]!.outcome, 'unknown');
+    assert.equal(first.operations[1]!.attempted, false);
+    f.controls.afterWrite = undefined;
+    f.writes.length = 0;
+    const resumed = await applyPlan(f, plan, first);
+    assert.deepEqual(
+      f.writes.map((write) => write.kind),
+      ['status'],
+    );
+    assert.equal(resumed.operations[0]!.outcome, 'satisfied');
+    assert.equal(resumed.operations[1]!.outcome, 'applied');
+    assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
+    assert.equal(f.statusFor(row.node_id), 'Blocked');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each([false, true])(
+  'Project ambiguity stops dependents while independent groups finish (%s)',
+  async (independent) => {
+    const f = await boardFixture(
+      1,
+      independent ? ['example/widget', 'other/second'] : ['example/widget', 'example/second'],
+      independent,
+    );
+    try {
+      for (const row of f.rows.values()) row.state = 'closed';
+      const plan = await collect(f.contexts, f.request, [f.root]);
+      assert.equal(plan.scopeComplete, true);
+      let first = true;
+      const orderedFirst = plan.operations[0]!;
+      f.controls.beforeGraphql = (query, variables) => {
+        if (first && query.includes('ProjectDeliveryItems') && f.controls.itemPages >= 1) {
+          // Wait until global preflight has collected every selected inventory.
+          if (f.controls.issuePages >= plan.scope.length * 2) {
+            first = false;
+            const member = f.members.get(orderedFirst.issueNodeId)!;
+            member.archived = true;
+          }
+        }
+        void variables;
+      };
+      const result = await applyPlan(f, plan);
+      assert.equal(result.operations[0]!.outcome, 'drifted');
+      assert.equal(f.writes.length, independent ? 1 : 0);
+      if (independent) assert.equal(result.operations[1]!.outcome, 'applied');
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each([401, 429])('global failure %s after an applied operation stops independent groups', async (status) => {
+  const f = await boardFixture(1, ['example/widget', 'other/second'], true);
+  try {
+    for (const row of f.rows.values()) row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    let configurationReadsAfterWrite = 0;
+    f.controls.beforeGraphql = (query) => {
+      if (f.writes.length && query.includes('ProjectDeliveryConfiguration') && ++configurationReadsAfterWrite === 3)
+        throw Object.assign(new Error('Provider unavailable'), { status });
+    };
+    const result = await applyPlan(f, plan);
+    assert.equal(result.operations[0]!.outcome, 'applied');
+    assert.equal(f.writes.length, 1);
+    assert.equal(result.operations[1]!.attempted, false);
+    assert.ok(result.gaps.some((value) => value.reason === (status === 401 ? 'authentication' : 'rate-limit')));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('resumed and uninterrupted operations reach identical exact postimages', async () => {
+  const f = await boardFixture(2);
+  try {
+    for (const row of f.rows.values()) row.state = 'closed';
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    const uninterrupted = await applyPlan(f, plan);
+    assert.equal(uninterrupted.summary.applied, 2);
+    for (const member of f.members.values()) member.status = 'Todo';
+    f.writes.length = 0;
+    f.controls.failAfterStatus = true;
+    const interrupted = await applyPlan(f, plan);
+    assert.equal(interrupted.operations[0]!.outcome, 'unknown');
+    assert.equal(interrupted.operations[1]!.attempted, false);
+    f.controls.failAfterStatus = false;
+    f.writes.length = 0;
+    const resumed = await applyPlan(f, plan, interrupted);
+    const postimages = (result: board.BoardReconcileResult) =>
+      result.operations.map((operation) => ({
+        operationId: operation.operationId,
+        repository: operation.repository,
+        issueNodeId: operation.issueNodeId,
+        projectId: operation.projectId,
+        target: operation.target,
+        readback: operation.readback,
+      }));
+    assert.deepEqual(postimages(resumed), postimages(uninterrupted));
+    assert.deepEqual(
+      resumed.operations.map((operation) => operation.attempted),
+      [false, true],
+    );
+    assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('an interruption before add leaves a revalidated incomplete operation retryable', async () => {
+  const f = await boardFixture(1);
+  const controller = new AbortController();
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    f.members.delete(row.node_id);
+    const plan = await collect(f.contexts, f.request, [f.root]);
+    let reads = 0;
+    f.controls.beforeGraphql = (query) => {
+      if (query.includes('ProjectDeliveryItems') && ++reads === 3) controller.abort();
+    };
+    const interrupted = await applyPlan(f, plan, undefined, controller.signal);
+    assert.equal(f.writes.length, 0);
+    assert.equal(interrupted.operations[0]!.attempted, false);
+    f.controls.beforeGraphql = undefined;
+    const resumed = await applyPlan(f, plan, interrupted);
+    assert.equal(resumed.summary.applied, 1);
+    assert.deepEqual(
+      f.writes.map((write) => write.kind),
+      ['add'],
+    );
+  } finally {
+    f.cleanup();
+  }
+});

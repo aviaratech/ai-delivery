@@ -403,7 +403,7 @@ export async function restoreIssueProjectItem(
 
 /** Add only membership and verify the exact unarchived item; Status is never written here. */
 export async function ensureIssueProjectMembership(
-  input: ProjectDeliveryInput & { beforeAdd?: () => Promise<void> },
+  input: ProjectDeliveryInput & { beforeAdd?: () => Promise<void>; onItemKnown?: (itemId: string) => void },
 ): Promise<{ itemId: string; archived: false }> {
   const configuration =
     input.configuration ??
@@ -433,6 +433,8 @@ export async function ensureIssueProjectMembership(
     const created = requireRecord(payload.item, 'GitHub omitted the created Project item.');
     itemId = requireString(created.id, 'GitHub omitted the created Project item id.');
   }
+  // Retain mutation identity even if the exact readback is subsequently unavailable.
+  input.onItemKnown?.(itemId);
   const item = await readProjectItem({ configuration, graphql: input.graphql, issueNodeId: input.issueNodeId, itemId });
   if (item.archived) throw new DeliveryError('Project membership readback is archived.');
   return { itemId, archived: false };

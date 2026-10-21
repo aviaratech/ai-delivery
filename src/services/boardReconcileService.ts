@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
 import { z } from 'zod';
-import { NativeDeliveryConfigSchema } from '../config/deliveryConfig.js';
+import { loadDeliveryConfig, NativeDeliveryConfigSchema } from '../config/deliveryConfig.js';
 import { digestValue } from '../delivery/common.js';
 import {
   CollectionLimitError,
@@ -17,6 +17,8 @@ import {
   getProjectDeliveryConfiguration,
   projectSettingsFromDeliveryConfig,
   readProjectDeliveryItems,
+  ensureIssueProjectMembership,
+  syncIssueProjectStatus,
   type ProjectDeliveryConfiguration,
   type ProjectDeliveryStatus,
   type ProjectItemObservation,
@@ -37,6 +39,7 @@ import { parseIssueBody } from '../issueContract.js';
 import { readPackageArtifactIdentity } from '../version.js';
 
 const MAX_BYTES = 16 * 1024 * 1024;
+class RetainedOutputLimitError extends DeliveryError {}
 const ALGORITHM = 'board-reconcile@1';
 const Id = z.string().min(1).max(512);
 const Sha256 = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
@@ -197,7 +200,7 @@ type IssueRecord = z.infer<typeof IssueSchema>;
 type Binding = z.infer<typeof BindingSchema>;
 type Operation = z.infer<typeof OperationSchema>;
 const Outcome = z.enum(['applied', 'satisfied', 'failed', 'drifted', 'refused', 'unknown']);
-const ItemEvidenceSchema = z.strictObject({ itemId: Id, status: StatusObservationSchema, archived: z.literal(false) });
+const ItemEvidenceSchema = z.strictObject({ itemId: Id, status: StatusObservationSchema, archived: z.boolean() });
 const AttemptEvidenceSchema = z.strictObject({
   outcome: Outcome,
   attempted: z.boolean(),
@@ -210,6 +213,7 @@ const ResultOperationSchema = OperationSchema.extend({
   before: ItemEvidenceSchema.nullable(),
   readback: ItemEvidenceSchema.nullable(),
   priorEvidence: z.array(AttemptEvidenceSchema),
+  knownItemIds: z.array(Id),
 });
 export const BoardReconcileResultSchema = z.strictObject({
   schemaVersion: z.literal('ai-delivery.board-reconcile-result@1'),
@@ -240,7 +244,7 @@ function bounded(value: unknown): void {
     throw new DeliveryError('Reconciliation evidence must be serializable JSON.');
   }
   if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > MAX_BYTES)
-    throw new DeliveryError('Reconciliation retained input/output exceeds 16 MiB UTF-8 or is not JSON.');
+    throw new RetainedOutputLimitError('Reconciliation retained input/output exceeds 16 MiB UTF-8 or is not JSON.');
 }
 function normalizedScope(scope: readonly string[]): string[] {
   return scope.map((r) => r.trim().toLowerCase()).sort();
@@ -285,6 +289,7 @@ function validatePrior(plan: BoardReconcilePlan, prior: BoardReconcileResult): v
       before: _before,
       readback: _readback,
       priorEvidence: _prior,
+      knownItemIds: _known,
       ...intent
     } = found;
     if (digestValue(intent) !== digestValue(operation))
@@ -465,6 +470,14 @@ export function incompleteBoardReconcile(
       attempted: false,
       before: null,
       readback: null,
+      knownItemIds: [
+        ...new Set([
+          ...(old?.knownItemIds ?? []),
+          ...(operation.expected.itemId === null ? [] : [operation.expected.itemId]),
+          ...(old?.before ? [old.before.itemId] : []),
+          ...(old?.readback ? [old.readback.itemId] : []),
+        ]),
+      ].sort(),
       priorEvidence: old
         ? [
             ...old.priorEvidence,
@@ -819,7 +832,7 @@ function metadata(
   return reports;
 }
 function prerequisites(issue: IssueRecord, kind: Operation['kind']): unknown {
-  if (kind === 'add-membership') return { state: 'open' };
+  if (kind === 'add-membership') return { state: issue.native.state };
   switch (issue.status.rule) {
     case 'closed':
       return { state: issue.native.state };
@@ -873,6 +886,258 @@ function propose(issue: IssueRecord, configuration: ProjectDeliveryConfiguration
   return operations;
 }
 
+interface ReconcileReadState {
+  scopeComplete: boolean;
+  globalReadFailure: unknown;
+  failedFieldCatalogs: Map<string, CollectionLimitError>;
+  stoppedProjects: Set<string>;
+}
+function readState(): ReconcileReadState {
+  return {
+    scopeComplete: true,
+    globalReadFailure: undefined,
+    failedFieldCatalogs: new Map(),
+    stoppedProjects: new Set(),
+  };
+}
+/** One fact/rule derivation owner for collection and mutation-boundary rechecks. */
+async function observeIssue(
+  context: DeliveryContext,
+  listed: NativeIssue,
+  configuration: ProjectDeliveryConfiguration | null,
+  items: readonly ProjectItemObservation[] | null,
+  checkouts: readonly z.infer<typeof CheckoutSchema>[],
+  options: ReconcileOptions,
+  state: ReconcileReadState,
+  intent?: Operation,
+): Promise<IssueRecord> {
+  const repository = context.config.repository;
+  const { failedFieldCatalogs, stoppedProjects } = state;
+  options.signal?.throwIfAborted();
+  const gaps: ReconcileGap[] = [];
+  const missing = (stage: string, error?: unknown) => {
+    gaps.push(gap(repository, stage, error, configuration?.projectId));
+    if (globalFailureReason(error) !== null) {
+      state.scopeComplete = false;
+      state.globalReadFailure = error;
+    }
+    if (error instanceof CollectionLimitError) {
+      state.scopeComplete = false;
+      if (configuration) stoppedProjects.add(configuration.projectId);
+      if (error.collection === 'native-field-catalog')
+        failedFieldCatalogs.set(context.config.native.organization.toLowerCase(), error);
+    }
+  };
+  let native = listed;
+  try {
+    if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
+    native = nativeIssue(
+      (await context.clients.rest.issues.get({ ...context.repo, issue_number: listed.number })).data,
+      repository,
+    );
+    if (native.number !== listed.number || native.node_id !== listed.node_id)
+      throw new DeliveryError('Native issue identity changed.');
+  } catch (error) {
+    missing('native-identity', error);
+    state.scopeComplete = false;
+  }
+  options.signal?.throwIfAborted();
+  let canonical = false,
+    draft: boolean | null = null,
+    deferred: boolean | null = null;
+  if (
+    intent === undefined ||
+    (intent.kind === 'set-status' && intent.target !== 'Done' && intent.target !== 'Blocked')
+  ) {
+    try {
+      const body = parseIssueBody(native.body ?? '', { title: native.title });
+      if (!body.legacy) {
+        canonical = true;
+        draft = body.issue.draft ?? false;
+        deferred = body.issue.deferral != null;
+      } else missing('canonical-body');
+    } catch (error) {
+      missing('canonical-body', error);
+    }
+  }
+  let blockers: z.infer<typeof BlockerSchema>[] | null = null;
+  if (intent === undefined || (intent.kind === 'set-status' && intent.target !== 'Done' && native.state === 'open')) {
+    try {
+      if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
+      const relationships = await getNativeBlockerRelationships({
+        graphql: context.clients.graphql,
+        repo: context.repo,
+        issueNumber: native.number,
+        issueNodeId: native.node_id,
+        requireRepositoryIdentity: true,
+        maxPages: 20,
+      });
+      blockers = relationships.blockers
+        .map((b) => BlockerSchema.parse({ id: b.id, repository: b.repository, number: b.number, state: b.state }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+    } catch (error) {
+      missing('native-blockers', error);
+    }
+    options.signal?.throwIfAborted();
+  }
+  let tracking: ReturnType<typeof parseConfiguredNativeIssueMetadata> | null = null;
+  if (
+    intent === undefined ||
+    (intent.kind === 'set-status' && intent.target === 'In Progress' && native.state === 'open')
+  ) {
+    try {
+      if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
+      const failed = failedFieldCatalogs.get(context.config.native.organization.toLowerCase());
+      if (failed) throw failed;
+      const fields = await readIssueNativeFields(context, native.number);
+      tracking = parseConfiguredNativeIssueMetadata(
+        fields.values,
+        nativeIssueSettingsFromDeliveryConfig(context.config),
+      );
+    } catch (error) {
+      missing('native-metadata', error);
+    }
+    options.signal?.throwIfAborted();
+  }
+  let hasChildren: boolean | null = null;
+  if (
+    intent === undefined ||
+    (intent.kind === 'set-status' && intent.target === 'In Progress' && native.state === 'open')
+  ) {
+    try {
+      if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
+      hasChildren = await hasNativeSubIssues({
+        issueNumber: native.number,
+        repo: context.repo,
+        rest: context.clients.rest,
+        requireComplete: true,
+      });
+    } catch (error) {
+      missing('native-children', error);
+    }
+  }
+  let observed: IssueRecord['activity'] = { state: 'unknown', observation: null };
+  if (
+    intent === undefined ||
+    (intent.kind === 'set-status' && intent.target === 'In Progress' && native.state === 'open')
+  ) {
+    try {
+      if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
+      observed = await activity(
+        context,
+        native,
+        checkouts.find((checkout) => checkout.repository === repository && checkout.issueNumber === native.number),
+        options,
+      );
+    } catch (error) {
+      missing('checkout', error);
+    }
+  }
+  const matches = items?.filter((item) => item.contentKind === 'issue' && item.contentId === native.node_id) ?? [];
+  if (
+    matches.some(
+      (item) => item.repository?.toLowerCase() !== repository.toLowerCase() || item.issueNumber !== native.number,
+    )
+  ) {
+    missing('membership-identity');
+    state.scopeComplete = false;
+  }
+  const member = matches.length === 1 ? matches[0]! : null;
+  const membership: IssueRecord['membership'] = {
+    kind:
+      items === null
+        ? 'unknown'
+        : matches.length > 1
+          ? 'duplicate'
+          : member?.archived
+            ? 'archived-preserved'
+            : member
+              ? 'present'
+              : native.state === 'closed'
+                ? 'not-required'
+                : 'absent',
+    itemId: member?.id ?? null,
+    itemIds: matches.map((item) => item.id).sort(),
+  };
+  if (membership.kind === 'unknown' || membership.kind === 'duplicate') {
+    missing('membership');
+    state.scopeComplete = false;
+  }
+  const record: IssueRecord = {
+    repository,
+    issueNodeId: native.node_id,
+    issueNumber: native.number,
+    projectId: configuration?.projectId ?? context.configuration?.routing.projectId ?? 'unresolved-project',
+    native: {
+      state: native.state,
+      bodyDigest: digestValue(native.body ?? ''),
+      canonical,
+      draft,
+      deferred,
+      blockers,
+      hasChildren,
+      points: tracking?.points ?? null,
+      priority: tracking?.priority ?? null,
+    },
+    membership,
+    status: {
+      current: member?.status ?? null,
+      kind:
+        member?.statusRead ??
+        (membership.kind === 'absent' || membership.kind === 'not-required' ? 'unset' : 'unreadable'),
+      name: member?.statusName ?? null,
+      optionId: member?.statusOptionId ?? null,
+      target: null,
+      rule: 'unknown',
+    },
+    activity: observed,
+    metadata: [],
+    gaps,
+  };
+  if (member && !member.archived && record.status.kind === 'unreadable') missing('project-status');
+  if (!['present', 'absent'].includes(membership.kind)) record.status.rule = 'preserved';
+  else if (native.state === 'closed') record.status = { ...record.status, target: 'Done', rule: 'closed' };
+  else if (blockers?.some((blocker) => blocker.state === 'OPEN'))
+    record.status = { ...record.status, target: 'Blocked', rule: 'blocker' };
+  else if (blockers !== null && canonical && (draft === true || deferred === true))
+    record.status = { ...record.status, target: 'Todo', rule: 'parked' };
+  else if (
+    blockers !== null &&
+    canonical &&
+    draft === false &&
+    deferred === false &&
+    observed.state === 'observed-checkout' &&
+    tracking !== null &&
+    tracking.points !== undefined &&
+    hasChildren === false &&
+    configuration !== null &&
+    !stoppedProjects.has(configuration.projectId)
+  ) {
+    try {
+      const ready = await readyCheck(context, native.number);
+      if (!ready.ready) throw new DeliveryError('Readiness is not satisfied.');
+      if (record.status.current !== 'In Progress') await assertIssueStartCapacity(context, native.number);
+      record.status = { ...record.status, target: 'In Progress', rule: 'active' };
+    } catch (error) {
+      missing('readiness-capacity', error);
+    }
+  }
+  if (record.status.rule === 'unknown' && (intent === undefined || intent.kind === 'set-status'))
+    missing('status-evidence');
+  if (configuration && intent === undefined)
+    record.metadata = metadata(
+      context,
+      native,
+      configuration,
+      record.native,
+      tracking !== null,
+      record.status.current,
+      member !== null && record.status.kind !== 'unreadable',
+    );
+  bounded(record);
+  return record;
+}
+
 export async function collectBoardReconcilePlan(
   contexts: readonly DeliveryContext[],
   raw: DryRunBoardReconcileRequest,
@@ -902,9 +1167,8 @@ export async function collectBoardReconcilePlan(
     repository: selected.get(checkout.repository.toLowerCase())?.config.repository ?? checkout.repository,
   }));
   const projects = new Map<string, { identity: string; items: ProjectItemObservation[] | null }>();
-  const stoppedProjects = new Set<string>();
-  const failedFieldCatalogs = new Map<string, CollectionLimitError>();
-  let globalReadFailure: unknown;
+  const state = readState();
+  const { stoppedProjects } = state;
   let retainedRecordsBytes = 0;
   let currentRepository = plan.scope[0]!;
   try {
@@ -924,18 +1188,18 @@ export async function collectBoardReconcilePlan(
         throw new DeliveryError('Reconciliation requires a bounded configured author context.');
       const rows = new Map<string, NativeIssue>();
       try {
-        if (globalReadFailure !== undefined) throw globalReadFailure;
+        if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
         await inventory(context, rows, options.signal);
       } catch (error) {
         plan.scopeComplete = false;
-        if (globalFailureReason(error) !== null) globalReadFailure = error;
+        if (globalFailureReason(error) !== null) state.globalReadFailure = error;
         plan.gaps.push(gap(repository, 'issue-inventory', error));
       }
       let configuration: ProjectDeliveryConfiguration | null = null;
       let items: ProjectItemObservation[] | null = null;
       try {
         options.signal?.throwIfAborted();
-        if (globalReadFailure !== undefined) throw globalReadFailure;
+        if (state.globalReadFailure !== undefined) throw state.globalReadFailure;
         if (context.configuration && stoppedProjects.has(context.configuration.routing.projectId))
           throw new DeliveryError('Shared Project collection previously stopped.');
         configuration = await getProjectDeliveryConfiguration({
@@ -978,7 +1242,7 @@ export async function collectBoardReconcilePlan(
           actor = ActorSchema.parse(await context.clients.authenticatedAuthor(options.signal));
         } catch (error) {
           plan.scopeComplete = false;
-          if (globalFailureReason(error) !== null) globalReadFailure = error;
+          if (globalFailureReason(error) !== null) state.globalReadFailure = error;
           plan.gaps.push(gap(repository, 'actor', error, configuration.projectId));
         }
         plan.bindings.push({
@@ -990,214 +1254,15 @@ export async function collectBoardReconcilePlan(
         });
       } catch (error) {
         plan.scopeComplete = false;
-        if (globalFailureReason(error) !== null) globalReadFailure = error;
+        if (globalFailureReason(error) !== null) state.globalReadFailure = error;
         const projectId = configuration?.projectId ?? context.configuration?.routing.projectId;
         if (projectId !== undefined) stoppedProjects.add(projectId);
         plan.gaps.push(gap(repository, 'project-inventory', error, configuration?.projectId));
       }
       for (const listed of rows.values()) {
-        options.signal?.throwIfAborted();
-        const gaps: ReconcileGap[] = [];
-        const missing = (stage: string, error?: unknown) => {
-          gaps.push(gap(repository, stage, error, configuration?.projectId));
-          if (globalFailureReason(error) !== null) {
-            plan.scopeComplete = false;
-            globalReadFailure = error;
-          }
-          if (error instanceof CollectionLimitError) {
-            plan.scopeComplete = false;
-            if (configuration) stoppedProjects.add(configuration.projectId);
-            if (error.collection === 'native-field-catalog')
-              failedFieldCatalogs.set(context.config.native.organization.toLowerCase(), error);
-          }
-        };
-        let native = listed;
-        try {
-          if (globalReadFailure !== undefined) throw globalReadFailure;
-          native = nativeIssue(
-            (await context.clients.rest.issues.get({ ...context.repo, issue_number: listed.number })).data,
-            repository,
-          );
-          if (native.number !== listed.number || native.node_id !== listed.node_id)
-            throw new DeliveryError('Native issue identity changed.');
-        } catch (error) {
-          missing('native-identity', error);
-          plan.scopeComplete = false;
-        }
-        options.signal?.throwIfAborted();
-        let canonical = false,
-          draft: boolean | null = null,
-          deferred: boolean | null = null;
-        try {
-          const body = parseIssueBody(native.body ?? '', { title: native.title });
-          if (!body.legacy) {
-            canonical = true;
-            draft = body.issue.draft ?? false;
-            deferred = body.issue.deferral != null;
-          } else missing('canonical-body');
-        } catch (error) {
-          missing('canonical-body', error);
-        }
-        let blockers: z.infer<typeof BlockerSchema>[] | null = null;
-        try {
-          if (globalReadFailure !== undefined) throw globalReadFailure;
-          const relationships = await getNativeBlockerRelationships({
-            graphql: context.clients.graphql,
-            repo: context.repo,
-            issueNumber: native.number,
-            issueNodeId: native.node_id,
-            requireRepositoryIdentity: true,
-            maxPages: 20,
-          });
-          blockers = relationships.blockers
-            .map((b) => BlockerSchema.parse({ id: b.id, repository: b.repository, number: b.number, state: b.state }))
-            .sort((a, b) => a.id.localeCompare(b.id));
-        } catch (error) {
-          missing('native-blockers', error);
-        }
-        options.signal?.throwIfAborted();
-        let tracking: ReturnType<typeof parseConfiguredNativeIssueMetadata> | null = null;
-        try {
-          if (globalReadFailure !== undefined) throw globalReadFailure;
-          const failed = failedFieldCatalogs.get(context.config.native.organization.toLowerCase());
-          if (failed) throw failed;
-          const fields = await readIssueNativeFields(context, native.number);
-          tracking = parseConfiguredNativeIssueMetadata(
-            fields.values,
-            nativeIssueSettingsFromDeliveryConfig(context.config),
-          );
-        } catch (error) {
-          missing('native-metadata', error);
-        }
-        options.signal?.throwIfAborted();
-        let hasChildren: boolean | null = null;
-        try {
-          if (globalReadFailure !== undefined) throw globalReadFailure;
-          hasChildren = await hasNativeSubIssues({
-            issueNumber: native.number,
-            repo: context.repo,
-            rest: context.clients.rest,
-            requireComplete: true,
-          });
-        } catch (error) {
-          missing('native-children', error);
-        }
-        let observed: IssueRecord['activity'] = { state: 'unknown', observation: null };
-        try {
-          if (globalReadFailure !== undefined) throw globalReadFailure;
-          observed = await activity(
-            context,
-            native,
-            plan.checkouts.find(
-              (checkout) => checkout.repository === repository && checkout.issueNumber === native.number,
-            ),
-            options,
-          );
-        } catch (error) {
-          missing('checkout', error);
-        }
-        const matches =
-          items?.filter((item) => item.contentKind === 'issue' && item.contentId === native.node_id) ?? [];
-        if (
-          matches.some(
-            (item) => item.repository?.toLowerCase() !== repository.toLowerCase() || item.issueNumber !== native.number,
-          )
-        ) {
-          missing('membership-identity');
-          plan.scopeComplete = false;
-        }
-        const member = matches.length === 1 ? matches[0]! : null;
-        const membership: IssueRecord['membership'] = {
-          kind:
-            items === null
-              ? 'unknown'
-              : matches.length > 1
-                ? 'duplicate'
-                : member?.archived
-                  ? 'archived-preserved'
-                  : member
-                    ? 'present'
-                    : native.state === 'closed'
-                      ? 'not-required'
-                      : 'absent',
-          itemId: member?.id ?? null,
-          itemIds: matches.map((item) => item.id).sort(),
-        };
-        if (membership.kind === 'unknown' || membership.kind === 'duplicate') {
-          missing('membership');
-          plan.scopeComplete = false;
-        }
-        const record: IssueRecord = {
-          repository,
-          issueNodeId: native.node_id,
-          issueNumber: native.number,
-          projectId: configuration?.projectId ?? context.configuration?.routing.projectId ?? 'unresolved-project',
-          native: {
-            state: native.state,
-            bodyDigest: digestValue(native.body ?? ''),
-            canonical,
-            draft,
-            deferred,
-            blockers,
-            hasChildren,
-            points: tracking?.points ?? null,
-            priority: tracking?.priority ?? null,
-          },
-          membership,
-          status: {
-            current: member?.status ?? null,
-            kind:
-              member?.statusRead ??
-              (membership.kind === 'absent' || membership.kind === 'not-required' ? 'unset' : 'unreadable'),
-            name: member?.statusName ?? null,
-            optionId: member?.statusOptionId ?? null,
-            target: null,
-            rule: 'unknown',
-          },
-          activity: observed,
-          metadata: [],
-          gaps,
-        };
-        if (member && !member.archived && record.status.kind === 'unreadable') missing('project-status');
-        if (!['present', 'absent'].includes(membership.kind)) record.status.rule = 'preserved';
-        else if (native.state === 'closed') record.status = { ...record.status, target: 'Done', rule: 'closed' };
-        else if (blockers?.some((blocker) => blocker.state === 'OPEN'))
-          record.status = { ...record.status, target: 'Blocked', rule: 'blocker' };
-        else if (blockers !== null && canonical && (draft === true || deferred === true))
-          record.status = { ...record.status, target: 'Todo', rule: 'parked' };
-        else if (
-          blockers !== null &&
-          canonical &&
-          draft === false &&
-          deferred === false &&
-          observed.state === 'observed-checkout' &&
-          tracking !== null &&
-          tracking.points !== undefined &&
-          hasChildren === false &&
-          configuration !== null &&
-          !stoppedProjects.has(configuration.projectId)
-        ) {
-          try {
-            const ready = await readyCheck(context, native.number);
-            if (!ready.ready) throw new DeliveryError('Readiness is not satisfied.');
-            await assertIssueStartCapacity(context, native.number);
-            record.status = { ...record.status, target: 'In Progress', rule: 'active' };
-          } catch (error) {
-            missing('readiness-capacity', error);
-          }
-        }
-        if (record.status.rule === 'unknown') missing('status-evidence');
+        const record = await observeIssue(context, listed, configuration, items, plan.checkouts, options, state);
+        plan.scopeComplete = plan.scopeComplete && state.scopeComplete;
         const operations = configuration ? propose(record, configuration) : [];
-        if (configuration)
-          record.metadata = metadata(
-            context,
-            native,
-            configuration,
-            record.native,
-            tracking !== null,
-            record.status.current,
-            member !== null && record.status.kind !== 'unreadable',
-          );
         const recordBytes =
           Buffer.byteLength(JSON.stringify(record), 'utf8') +
           operations.reduce((n, operation) => n + Buffer.byteLength(JSON.stringify(operation), 'utf8') + 1, 0) +
@@ -1218,4 +1283,429 @@ export async function collectBoardReconcilePlan(
     plan.gaps.push(gap(currentRepository, 'collection', error));
   }
   return finishPlan(plan);
+}
+
+type ResultOperation = z.infer<typeof ResultOperationSchema>;
+type ItemEvidence = z.infer<typeof ItemEvidenceSchema>;
+class OperationRefusal extends DeliveryError {
+  constructor(
+    readonly stage: string,
+    readonly outcome: 'refused' | 'drifted' = 'drifted',
+    readonly global = false,
+  ) {
+    super('Reconciliation prerequisites changed or cannot be proved.');
+  }
+}
+class SatisfiedAtBoundary extends Error {}
+function itemEvidence(issue: IssueRecord): ItemEvidence | null {
+  if (issue.membership.itemId === null) return null;
+  const { target: _target, rule: _rule, ...status } = issue.status;
+  return { itemId: issue.membership.itemId, status, archived: issue.membership.kind === 'archived-preserved' };
+}
+function rememberItems(result: BoardReconcileResult, operation: Operation, ids: readonly string[]): void {
+  const peers = result.operations.filter(
+    (value) =>
+      value.repository === operation.repository &&
+      value.issueNodeId === operation.issueNodeId &&
+      value.projectId === operation.projectId,
+  );
+  const known = [...new Set([...peers.flatMap((value) => value.knownItemIds), ...ids])].sort();
+  for (const peer of peers) peer.knownItemIds = known;
+}
+function captureEvidence(
+  result: BoardReconcileResult,
+  operation: ResultOperation,
+  issue: IssueRecord,
+  phase: 'before' | 'readback',
+): void {
+  if (
+    issue.repository !== operation.repository ||
+    issue.issueNodeId !== operation.issueNodeId ||
+    issue.issueNumber !== operation.issueNumber ||
+    issue.projectId !== operation.projectId
+  )
+    return;
+  operation[phase] = itemEvidence(issue);
+  if (issue.membership.itemId !== null) rememberItems(result, operation, [issue.membership.itemId]);
+}
+function finishResult(result: BoardReconcileResult): BoardReconcileResult {
+  const count = (outcome: ResultOperation['outcome']) =>
+    result.operations.filter((operation) => operation.outcome === outcome).length;
+  const unresolved = result.issues.filter(
+    (issue) =>
+      ['present', 'absent'].includes(issue.membership.kind) &&
+      (issue.status.rule === 'unknown' ||
+        issue.status.kind === 'unreadable' ||
+        (issue.status.target !== null && issue.status.current !== issue.status.target)),
+  ).length;
+  result.summary = {
+    applied: count('applied'),
+    satisfied: count('satisfied'),
+    failed: count('failed'),
+    drifted: count('drifted'),
+    refused: count('refused'),
+    unknown: count('unknown'),
+    unresolved: unresolved + result.gaps.length,
+  };
+  bounded(result);
+  return BoardReconcileResultSchema.parse(result);
+}
+function updateObservedIssue(result: BoardReconcileResult, current: IssueRecord, operation: Operation): void {
+  const index = result.issues.findIndex(
+    (issue) => issue.repository === current.repository && issue.issueNodeId === current.issueNodeId,
+  );
+  if (index < 0) return;
+  const old = result.issues[index]!;
+  const { target, rule, ...status } = current.status;
+  const active = operation.kind === 'set-status' && operation.target === 'In Progress';
+  const issues = [...result.issues];
+  issues[index] = {
+    ...old,
+    membership: current.membership,
+    status: {
+      ...old.status,
+      ...status,
+      ...(rule !== 'unknown' || operation.kind === 'set-status' ? { target, rule } : {}),
+    },
+    native: active ? current.native : { ...old.native, state: current.native.state },
+    activity: active ? current.activity : old.activity,
+    gaps: [...new Map([...old.gaps, ...current.gaps].map((value) => [digestValue(value), value])).values()],
+  };
+  // Optional detailed observations cannot consume the space reserved for attempted-write evidence.
+  bounded({ ...result, issues, pendingEvidenceReserve: ' '.repeat(12288) });
+  result.issues = issues;
+}
+function assertMapping(configuration: ProjectDeliveryConfiguration, binding: Binding): void {
+  const routing = binding.routing;
+  if (
+    configuration.projectId !== routing.projectId ||
+    configuration.projectNumber !== routing.native.project.number ||
+    configuration.statusFieldId !== routing.statusFieldId ||
+    configuration.pointsFieldId !== routing.pointsFieldId ||
+    configuration.priorityFieldId !== routing.priorityFieldId ||
+    digestValue(configuration.statusOptionIds) !== digestValue(routing.statusOptionIds)
+  )
+    throw new OperationRefusal('project-routing');
+}
+async function refreshContext(context: DeliveryContext, options: ReconcileOptions): Promise<DeliveryContext> {
+  options.signal?.throwIfAborted();
+  const loaded = await loadDeliveryConfig('', {
+    clients: context.clients,
+    repository: context.config.repository,
+    readPageLimit: 20,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const { projectConfiguration: _old, ...rest } = context;
+  return { ...rest, config: loaded.config, configuration: loaded, readPageLimit: 20 };
+}
+interface GuardObservation {
+  context: DeliveryContext;
+  configuration: ProjectDeliveryConfiguration;
+  issue: IssueRecord;
+  state: ReconcileReadState;
+}
+async function guardObservation(
+  context: DeliveryContext,
+  original: BoardReconcilePlan,
+  operation: Operation,
+  options: ReconcileOptions,
+): Promise<GuardObservation> {
+  const live = await refreshContext(context, options);
+  const binding = original.bindings.find((value) => value.repository === operation.repository);
+  if (!binding || !live.configuration || !live.clients.authenticatedAuthor)
+    throw new OperationRefusal('configured-author', 'refused', true);
+  const actor = ActorSchema.parse(await live.clients.authenticatedAuthor(options.signal));
+  if (digestValue(actor) !== digestValue(binding.actor)) throw new OperationRefusal('actor', 'refused', true);
+  if (
+    live.configuration.configDigest !== binding.configDigest ||
+    digestValue(live.configuration.routing) !== digestValue(binding.routing) ||
+    digestValue([...options.checkoutRoots].sort()) !== binding.checkoutRootsDigest
+  )
+    throw new OperationRefusal('configuration-routing');
+  if (digestValue(readPackageArtifactIdentity()) !== digestValue(original.packageIdentity))
+    throw new OperationRefusal('executing-artifact', 'refused', true);
+  const configuration = await getProjectDeliveryConfiguration({
+    graphql: live.clients.graphql,
+    org: live.config.native.organization,
+    settings: projectSettingsFromDeliveryConfig(live.config),
+    requireWritable: true,
+    maxPages: 20,
+  });
+  assertMapping(configuration, binding);
+  if (configuration.projectId !== operation.projectId) throw new OperationRefusal('operation-destination');
+  const items = await readProjectDeliveryItems({
+    graphql: live.clients.graphql,
+    org: live.config.native.organization,
+    configuration,
+    maxPages: 20,
+  });
+  const selected = original.issues.find(
+    (issue) =>
+      issue.repository === operation.repository &&
+      issue.issueNodeId === operation.issueNodeId &&
+      issue.issueNumber === operation.issueNumber,
+  );
+  if (!selected) throw new OperationRefusal('operation-subject');
+  // The observer re-reads the exact native subject; this seed contains only frozen inventory identity.
+  const listed: NativeIssue = {
+    number: selected.issueNumber,
+    node_id: selected.issueNodeId,
+    state: selected.native.state,
+    title: '',
+    body: null,
+    html_url: `https://github.com/${selected.repository}/issues/${String(selected.issueNumber)}`,
+    labels: [],
+  };
+  const state = readState();
+  const issue = await observeIssue(live, listed, configuration, items, original.checkouts, options, state, operation);
+  return { context: live, configuration, issue, state };
+}
+function assertGuardComplete(observation: GuardObservation): void {
+  if (observation.state.globalReadFailure !== undefined) throw observation.state.globalReadFailure;
+  if (!observation.state.scopeComplete) {
+    const failure = observation.issue.gaps.find((value) => value.reason === 'collection-limit');
+    if (
+      failure?.collection !== undefined &&
+      failure.limit !== undefined &&
+      failure.pagesRequested !== undefined &&
+      failure.rowsObserved !== undefined
+    )
+      throw new CollectionLimitError({
+        collection: failure.collection,
+        limit: failure.limit,
+        pagesRequested: failure.pagesRequested,
+        rowsObserved: failure.rowsObserved,
+      });
+    throw new OperationRefusal('incomplete-native-membership', 'refused');
+  }
+}
+function operationState(
+  operation: Operation,
+  current: IssueRecord,
+  knownItemIds: readonly string[],
+): 'pending' | 'satisfied' {
+  if (
+    current.repository !== operation.repository ||
+    current.issueNodeId !== operation.issueNodeId ||
+    current.issueNumber !== operation.issueNumber ||
+    current.projectId !== operation.projectId
+  )
+    throw new OperationRefusal('subject-destination');
+  if (['archived-preserved', 'duplicate', 'unknown', 'not-required'].includes(current.membership.kind))
+    throw new OperationRefusal('membership-state');
+  if (knownItemIds.some((id) => id !== current.membership.itemId)) throw new OperationRefusal('known-item-disappeared');
+  if (operation.kind === 'add-membership') {
+    if (
+      current.native.state !== 'open' ||
+      digestValue(prerequisites(current, operation.kind)) !== operation.prerequisiteDigest
+    )
+      throw new OperationRefusal('native-membership-truth');
+    if (current.membership.kind === 'present') return 'satisfied';
+    return 'pending';
+  }
+  if (current.membership.kind !== 'present' || current.status.kind === 'unreadable')
+    throw new OperationRefusal('status-membership-preimage', 'refused');
+  if (
+    current.status.target !== operation.target ||
+    current.status.rule === 'unknown' ||
+    digestValue(prerequisites(current, operation.kind)) !== operation.prerequisiteDigest
+  )
+    throw new OperationRefusal('native-status-truth');
+  if (current.status.current === operation.target) return 'satisfied';
+  if (
+    operation.expected.membership === 'absent'
+      ? current.status.current !== null
+      : current.status.current !== operation.expected.status
+  )
+    throw new OperationRefusal('status-preimage', 'refused');
+  return 'pending';
+}
+function inventoryIdentity(plan: BoardReconcilePlan): string {
+  return digestValue(
+    plan.issues
+      .map((issue) => [issue.repository, issue.issueNodeId, issue.issueNumber])
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+  );
+}
+
+/** The one mode coordinator. All actual writes stay with projectDelivery.ts. */
+export async function boardReconcile(
+  contexts: readonly DeliveryContext[],
+  raw: BoardReconcileRequest,
+  options: ReconcileOptions,
+): Promise<BoardReconcilePlan | BoardReconcileResult> {
+  const request = parseBoardReconcileRequest(raw);
+  if (request.mode === 'dry-run') return collectBoardReconcilePlan(contexts, request, options);
+  const original = request.plan;
+  let current: BoardReconcilePlan | undefined;
+  const refuse = (stage: string, error?: unknown): BoardReconcileResult => {
+    const result = incompleteBoardReconcile(request, gap(original.scope[0]!, stage, error));
+    if (current) {
+      result.observedBindings = current.bindings;
+      result.issues = current.issues;
+    }
+    try {
+      return finishResult(result);
+    } catch {
+      result.issues = [];
+      result.scopeComplete = false;
+      result.gaps = [gap(original.scope[0]!, 'retained-output')];
+      return finishResult(result);
+    }
+  };
+  const liveContexts: DeliveryContext[] = [];
+  const configurations = new Map<string, ProjectDeliveryConfiguration>();
+  try {
+    for (const context of contexts) liveContexts.push(await refreshContext(context, options));
+    current = await collectBoardReconcilePlan(
+      liveContexts,
+      { repositories: original.scope, mode: 'dry-run', checkouts: original.checkouts },
+      options,
+    );
+    if (!current.scopeComplete) return refuse('incomplete-preflight');
+    if (digestValue(current.packageIdentity) !== digestValue(original.packageIdentity))
+      return refuse('executing-artifact');
+    if (digestValue(current.bindings) !== digestValue(original.bindings)) return refuse('actor-configuration-routing');
+    if (inventoryIdentity(current) !== inventoryIdentity(original)) return refuse('issue-inventory-drift');
+    for (const context of liveContexts) {
+      const configuration = await getProjectDeliveryConfiguration({
+        graphql: context.clients.graphql,
+        org: context.config.native.organization,
+        settings: projectSettingsFromDeliveryConfig(context.config),
+        requireWritable: true,
+        maxPages: 20,
+      });
+      const binding = original.bindings.find((value) => value.repository === context.config.repository);
+      if (!binding) return refuse('binding-subject');
+      assertMapping(configuration, binding);
+      configurations.set(context.config.repository, configuration);
+    }
+    for (const operation of original.operations) {
+      const issue = original.issues.find(
+        (value) =>
+          value.repository === operation.repository &&
+          value.issueNodeId === operation.issueNodeId &&
+          value.issueNumber === operation.issueNumber,
+      );
+      const configuration = configurations.get(operation.repository);
+      if (
+        !issue ||
+        !configuration ||
+        operation.projectId !== configuration.projectId ||
+        !propose(issue, configuration).some((value) => digestValue(value) === digestValue(operation))
+      )
+        return refuse('original-operation-intent');
+    }
+  } catch (error) {
+    return refuse('preflight', error);
+  }
+  const result = incompleteBoardReconcile(request, gap(original.scope[0]!, 'not-started'));
+  result.scopeComplete = true;
+  result.gaps = [];
+  result.observedBindings = current.bindings;
+  result.issues = current.issues;
+  for (const operation of result.operations) rememberItems(result, operation, []);
+  try {
+    bounded({ ...result, pendingEvidenceReserve: ' '.repeat(12288) });
+  } catch (error) {
+    return refuse('retained-output', error);
+  }
+  const stopped = new Set<string>();
+  let globalStop = false;
+  const ordered = [...result.operations].sort(
+    (a, b) =>
+      a.repository.localeCompare(b.repository) ||
+      a.issueNodeId.localeCompare(b.issueNodeId) ||
+      (a.kind === b.kind ? 0 : a.kind === 'add-membership' ? -1 : 1),
+  );
+  for (const operation of ordered) {
+    const context = liveContexts.find((value) => value.config.repository === operation.repository);
+    if (!context || globalStop || stopped.has(operation.projectId)) continue;
+    let observation: GuardObservation | undefined;
+    try {
+      options.signal?.throwIfAborted();
+      bounded({ ...result, pendingEvidenceReserve: ' '.repeat(12288) });
+      observation = await guardObservation(context, original, operation, options);
+      captureEvidence(result, operation, observation.issue, 'before');
+      updateObservedIssue(result, observation.issue, operation);
+      assertGuardComplete(observation);
+      const state = operationState(operation, observation.issue, operation.knownItemIds);
+      if (state === 'satisfied') {
+        operation.outcome = 'satisfied';
+        operation.readback = itemEvidence(observation.issue);
+        continue;
+      }
+      // Reserve the maximum bounded item/status/attempt evidence before crossing a writer boundary.
+      bounded({ ...result, pendingEvidenceReserve: ' '.repeat(12288) });
+      const guard = async () => {
+        const checked = await guardObservation(context, original, operation, options);
+        captureEvidence(result, operation, checked.issue, 'before');
+        updateObservedIssue(result, checked.issue, operation);
+        assertGuardComplete(checked);
+        if (operationState(operation, checked.issue, operation.knownItemIds) === 'satisfied')
+          throw new SatisfiedAtBoundary();
+        options.signal?.throwIfAborted();
+        operation.attempted = true;
+      };
+      try {
+        if (operation.kind === 'add-membership') {
+          await ensureIssueProjectMembership({
+            graphql: context.clients.graphql,
+            org: context.config.native.organization,
+            configuration: observation.configuration,
+            issueNodeId: operation.issueNodeId,
+            maxPages: 20,
+            beforeAdd: guard,
+            onItemKnown: (id) => rememberItems(result, operation, [id]),
+          });
+        } else {
+          if (operation.target === null) throw new OperationRefusal('missing-status-target', 'refused');
+          await syncIssueProjectStatus({
+            graphql: context.clients.graphql,
+            org: context.config.native.organization,
+            configuration: observation.configuration,
+            issueNodeId: operation.issueNodeId,
+            status: operation.target,
+            maxPages: 20,
+            beforeAdd: async () => {
+              throw new OperationRefusal('status-cannot-create-membership');
+            },
+            beforeAdvance: guard,
+          });
+        }
+      } catch (error) {
+        if (!(error instanceof SatisfiedAtBoundary)) throw error;
+      }
+      observation = await guardObservation(context, original, operation, options);
+      captureEvidence(result, operation, observation.issue, 'readback');
+      updateObservedIssue(result, observation.issue, operation);
+      assertGuardComplete(observation);
+      if (operationState(operation, observation.issue, operation.knownItemIds) !== 'satisfied')
+        throw new OperationRefusal('write-postimage');
+      operation.outcome = operation.attempted ? 'applied' : 'satisfied';
+    } catch (error) {
+      operation.outcome =
+        error instanceof OperationRefusal ? error.outcome : operation.attempted ? 'unknown' : 'refused';
+      result.gaps.push(
+        gap(
+          operation.repository,
+          error instanceof OperationRefusal ? error.stage : 'operation-read-write',
+          error,
+          operation.projectId,
+        ),
+      );
+      stopped.add(operation.projectId);
+      if (error instanceof CollectionLimitError || error instanceof RetainedOutputLimitError)
+        result.scopeComplete = false;
+      if (
+        globalFailureReason(error) !== null ||
+        options.signal?.aborted ||
+        (error instanceof OperationRefusal && error.global)
+      ) {
+        globalStop = true;
+        result.scopeComplete = false;
+      }
+    }
+  }
+  return finishResult(result);
 }
