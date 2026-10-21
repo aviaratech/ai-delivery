@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { executeTool, type ExecutionContext } from '../dispatch.js';
 import { setLogsSuppressed } from '../logger.js';
 import { PACKAGE_VERSION } from '../version.js';
+import { getIncompleteIssueUpdate } from '../issue.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
@@ -68,6 +69,9 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
           }
           return { content: [{ type: 'text' as const, text: JSON.stringify(value) }] };
         } catch (error) {
+          const incomplete = getIncompleteIssueUpdate(error);
+          if (incomplete !== undefined)
+            return { content: [{ type: 'text' as const, text: JSON.stringify(incomplete) }], isError: true };
           const message = error instanceof Error ? error.message : String(error);
           return { content: [{ type: 'text' as const, text: message }], isError: true };
         }

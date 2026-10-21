@@ -7,6 +7,38 @@ import { test } from 'vitest';
 import { pathToFileURL } from 'node:url';
 import { DeliveryError, getMachineRequestDiagnostics, setMachineRequestDiagnostics } from './errors.js';
 
+test('actual CLI serializes incomplete native update evidence and exits nonzero', () => {
+  const cli = pathToFileURL(join(process.cwd(), 'dist', 'cli.js')).href;
+  const dispatch = pathToFileURL(join(process.cwd(), 'dist', 'dispatch.js')).href;
+  const owner = pathToFileURL(join(process.cwd(), 'dist', 'issue.js')).href;
+  const partial = {
+    status: 'update-incomplete',
+    native: { status: 'unknown', repository: 'example/widget', issueNumber: 17, readback: null },
+    project: { status: 'pending', desiredStatus: 'Done' },
+    recovery: { tool: 'issue_batch_update' },
+  };
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--experimental-test-module-mocks',
+      '--no-warnings',
+      '--input-type=module',
+      '-e',
+      `import assert from 'node:assert/strict'; import { mock } from 'node:test'; import { IssueUpdateIncompleteError } from ${JSON.stringify(owner)};
+      mock.module(${JSON.stringify(dispatch)}, { exports: {
+        contextFor: () => { throw new Error('Unexpected configuration access'); },
+        executeTool: async (name, input) => { assert.equal(name, 'issue_update'); assert.equal(input.issueNumber, 17); throw new IssueUpdateIncompleteError(${JSON.stringify(partial)}); }
+      }});
+      process.argv = [process.execPath, ${JSON.stringify(cli)}, '--repo', 'example/widget', 'update', '--issue', '17', '--state', 'closed', '--close-reason', 'completed'];
+      await import(${JSON.stringify(cli)});`,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 1);
+  assert.deepEqual(JSON.parse(result.stdout), partial);
+  assert.equal(result.stderr, '');
+});
+
 test.each<[unknown, number]>([
   [{ schemaVersion: 'ai-delivery.board-reconcile-plan@1', scopeComplete: true, summary: { unresolved: 4 } }, 0],
   [{ schemaVersion: 'ai-delivery.board-reconcile-plan@1', scopeComplete: false }, 1],
