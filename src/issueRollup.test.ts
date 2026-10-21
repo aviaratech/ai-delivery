@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import { issueInfo, listIssueSubissues } from './issue.js';
 import { issue63Fixture } from './fixtures/issue63.js';
+import { CollectionLimitError } from './errors.js';
 
 function rollupFixture() {
   const f = issue63Fixture();
@@ -114,6 +115,12 @@ function rollupFixture() {
       throw new Error('Synthetic child Project read unavailable');
     f.controls.missingProjectIssue = controls.missingProjectIssue;
     const result = await graphql(query, variables);
+    if (query.includes('blockedBy(first:'))
+      Object.assign((result as { repository: { issue: Record<string, unknown> } }).repository.issue, {
+        id: `ISSUE${String(variables.number)}`,
+        number: variables.number,
+        repository: { nameWithOwner: 'example/widget' },
+      });
     if (query.includes('ProjectDeliveryItems')) {
       const project = (result as { organization: { projectV2: Record<string, unknown> } }).organization.projectV2;
       project.id = controls.projectIdentity;
@@ -171,6 +178,101 @@ test('short child pages with next links contribute to one complete direct rollup
   assert.equal(progress.childCount, 3);
   assert.equal(progress.pointsTotal, 7);
   assert.deepEqual(f.childPages, [1, 2]);
+});
+
+test('a bounded caller refuses child pagination before requesting a page outside its scope', async () => {
+  const f = rollupFixture();
+  f.context.readPageLimit = 1;
+  f.controls.pages = [[f.children[0]], [f.children[1], f.children[2]]];
+  f.controls.links.set(
+    1,
+    '<https://api.github.com/repos/example/widget/issues/17/sub_issues?per_page=100&page=2>; rel="next"',
+  );
+  await assert.rejects(
+    () => listIssueSubissues(f.context, 17),
+    (error: unknown) => {
+      assert.ok(error instanceof CollectionLimitError);
+      assert.equal(error.collection, 'native-sub-issues');
+      assert.equal(error.pagesRequested, 1);
+      assert.equal(error.rowsObserved, 1);
+      assert.equal(error.limit, 1);
+      return true;
+    },
+  );
+  assert.deepEqual(f.childPages, [1]);
+  assert.deepEqual(f.metadataReads, []);
+  assert.deepEqual(f.writes, []);
+});
+
+test('bounded parent progress preserves the Project definition page budget', async () => {
+  const f = rollupFixture();
+  f.context.readPageLimit = 1;
+  const graphql = f.context.clients.graphql;
+  let definitionRequests = 0;
+  f.context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
+    if (query.includes('ProjectDeliveryConfiguration')) {
+      definitionRequests++;
+      return {
+        organization: {
+          projectV2: {
+            id: 'PROJECT',
+            number: 1,
+            title: 'Delivery',
+            closed: false,
+            viewerCanUpdate: true,
+            fields: {
+              nodes: [],
+              pageInfo: { hasNextPage: definitionRequests === 1, endCursor: `page-${String(definitionRequests)}` },
+            },
+          },
+        },
+      };
+    }
+    const result = await graphql(query, variables);
+    // The parent already captured its configuration; force fresh discovery for the child rollup.
+    if (query.includes('ProjectDeliveryItems')) delete f.context.projectConfiguration;
+    return result;
+  }) as typeof f.context.clients.graphql;
+  await assert.rejects(f.read, (error: unknown) => {
+    assert.ok(error instanceof CollectionLimitError);
+    assert.equal(error.collection, 'project-fields');
+    assert.equal(error.pagesRequested, 1);
+    assert.equal(error.rowsObserved, 0);
+    assert.equal(error.limit, 1);
+    return true;
+  });
+  assert.equal(definitionRequests, 1);
+  assert.deepEqual(f.metadataReads, [17]);
+  assert.deepEqual(f.writes, []);
+});
+
+test('bounded parent progress preserves each child Project status page budget', async () => {
+  const f = rollupFixture();
+  f.context.readPageLimit = 1;
+  const graphql = f.context.clients.graphql;
+  let childProjectRequests = 0;
+  f.context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
+    const result = await graphql(query, variables);
+    if (query.includes('ProjectDeliveryItems') && f.metadataReads.some((number) => number !== 17)) {
+      childProjectRequests++;
+      const project = (result as { organization: { projectV2: { items: { nodes: unknown[]; pageInfo: unknown } } } })
+        .organization.projectV2;
+      if (variables.cursor !== null) project.items.nodes = [];
+      project.items.pageInfo = { hasNextPage: variables.cursor === null, endCursor: 'child-page-1' };
+    }
+    return result;
+  }) as typeof f.context.clients.graphql;
+  await assert.rejects(f.read, (error: unknown) => {
+    assert.ok(error instanceof CollectionLimitError);
+    assert.equal(error.collection, 'project-items');
+    assert.equal(error.pagesRequested, 1);
+    assert.equal(error.rowsObserved, f.rows.size);
+    assert.equal(error.limit, 1);
+    return true;
+  });
+  assert.equal(childProjectRequests, 1);
+  assert.deepEqual(f.metadataReads, [17, 18]);
+  assert.deepEqual(f.writes, []);
 });
 
 for (const page of [1, 2])

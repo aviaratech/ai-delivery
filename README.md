@@ -303,6 +303,7 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 | Rewrite with prior history | `issue_update` | `update --issue N --fields-file <typed.json> --preserve-history` |
 | Reparent one issue | `issue_update` | `update --issue N --parent P` |
 | Plan / apply a batch | `issue_batch_update` | `batch:update --items-file <items.json> [--dry-run]` |
+| Reconcile Project membership / Status | `board_reconcile` | `board:reconcile --repositories <owner/repo...> [--dry-run]`; retained plan and result JSON for apply/recovery |
 | Record a typed journal | `issue_comment` | See the [typed journal contract](#typed-issue-journals); the MCP call returns the authored comment identity and readback |
 | Close with a reason | `issue_update` | `update --issue N --state closed --close-reason not_planned --superseded-by S` |
 
@@ -502,6 +503,53 @@ status read and ten oldest issues; bounds are 500 issues, 20 pages per read
 and 20 oldest issues. `--max-project-pages` bounds Project status collection. Limits and read failures
 produce explicit partial **observed** counts, not complete zeroes. Issues whose
 current Project status cannot be resolved have a separate unknown count.
+
+## Scoped Project reconciliation
+
+`board_reconcile` uses the same dispatcher as the library's existing `executeTool`
+and CLI `board:reconcile`. Supply 1–10 explicit `repositories`; the command never
+infers this scope from launch-directory Git. An optional singular `repo` must agree
+with the sole selected repository. Dry-run is the default and requires read access
+through the configured author. Apply requires fresh write access through that same
+author and refuses the legacy development-token override.
+
+The dry-run `ai-delivery.board-reconcile-plan@1` includes every selected native
+issue, current membership/Status, native facts, gaps, metadata suggestions and
+deterministic operations. These operation artifacts remain under `ai-delivery.mcp@2`.
+Bounds are 500 native issues per repository, 20 requests per logical prerequisite
+collection (including its completion page), and 16 MiB UTF-8 for retained JSON
+inputs and structured output. An overflow or unreadable inventory produces an
+incomplete report; it never authorizes a truncated-scope apply. These bounds do not
+claim an HTTP response-byte or process-memory ceiling.
+
+Open issues may receive missing membership independently of Status. Status follows
+proven native closure, open blockers, canonical draft/deferral, then positive local
+checkout evidence with readiness and WIP admission. `checkouts` (CLI
+`--checkouts-file`) selects absolute physical checkouts for native-linked current
+branches inside configured roots. A checkout does not prove a running task, and
+missing activity evidence does not prove inactivity. Unknown Status remains
+unresolved, archived items stay preserved, and metadata/duplicate-label suggestions
+never repair native fields or labels.
+
+Retain the exact original plan. Apply supplies `mode: "apply"` and `plan` (CLI
+`--apply --plan-file`); optional `priorResult` (`--prior-result-file`) preserves known
+item IDs and historical attempts on that same plan. Files contain regular UTF-8
+JSON data. Scope, artifact bytes, configuration, destinations, inventory and author
+are revalidated before writes; operation-specific native and item facts are checked
+at both write boundaries and afterward. A compatible exact postimage is satisfied
+without repeating the write. A deleted known item or unexpected automatic/human
+Status requires a fresh plan. Recovery adds no journal store or automatic rollback.
+Plans identify the executing package manifest/dist bytes independently of cwd;
+the root library and bundled plugin layouts need fresh plans even at equal versions.
+
+The apply `ai-delivery.board-reconcile-result@1` preserves applied, satisfied,
+failed, drifted/refused and unknown-after-attempt evidence. A failed shared Project
+group stops its dependents; independent groups may finish. Global cancellation,
+authentication or rate-limit failure stops remaining writes. The CLI prints complete
+compact JSON before exiting nonzero for incomplete scope or unresolved apply work.
+A complete dry-run can exit zero with explicit issue gaps and metadata suggestions.
+GitHub provides no expected-current-value predicate for these mutations: observable
+drift is detected, while races with outside writers can remain ambiguous.
 
 ## Typed issue journals
 

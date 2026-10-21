@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, unlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, unlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it, vi } from 'vitest';
@@ -189,7 +189,7 @@ afterEach(() => {
 
 describe('per-call repository selection', () => {
   it('selects matching origins A → B → A, prefers a matching current checkout and refuses ambiguous clones', () => {
-    const root = mkdtempSync(join(tmpdir(), 'delivery-checkouts-'));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-checkouts-')));
     const clone = (name: string, repo: string) => {
       const path = join(root, name);
       execFileSync('git', ['init', '-q', path]);

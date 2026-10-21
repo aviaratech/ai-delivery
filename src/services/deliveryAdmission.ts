@@ -40,11 +40,11 @@ export const RuntimeAdmissionSchema = z
 
 export type RuntimeAdmission = z.infer<typeof RuntimeAdmissionSchema>;
 
-function fileDigest(path: string): string {
+export function fileDigest(path: string): string {
   return `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
 }
 
-function directoryDigest(path: string): string {
+export function directoryDigest(path: string): string {
   const entries: { path: string; sha256: string }[] = [];
   const visit = (directory: string, relative: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) =>

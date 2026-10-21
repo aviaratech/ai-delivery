@@ -269,10 +269,13 @@ function trackingRepository() {
     id: `ITEM${String(issue.number)}`,
     isArchived: false,
     content: { id: issue.node_id },
-    fieldValueByName: {
-      name: issue.status,
-      optionId: `STATUS-${String(['Queued', 'Active', 'Waiting', 'Shipped'].indexOf(issue.status!))}`,
-    },
+    fieldValueByName:
+      issue.status === null
+        ? null
+        : {
+            name: issue.status,
+            optionId: `STATUS-${String(['Queued', 'Active', 'Waiting', 'Shipped'].indexOf(issue.status))}`,
+          },
   });
   const graphql = async (query: string, input: Input) => {
     target(input);
