@@ -1134,7 +1134,7 @@ async function observeIssue(
           info.points !== record.native.points ||
           trackingParent ||
           info.blockedBy.length !== 0 ||
-          info.projectStatus !== record.status.current
+          (info.projectStatus !== record.status.current && info.projectStatus !== 'In Progress')
         )
           throw new DeliveryError('Native or Project facts changed during readiness.');
         native = nativeIssue({ ...native, labels: info.labels }, repository);
@@ -1142,6 +1142,59 @@ async function observeIssue(
       });
       if (!ready.ready) throw new DeliveryError('Readiness is not satisfied.');
       if (record.status.current !== 'In Progress') await assertIssueStartCapacity(context, native.number);
+      // The ordinary readiness reader collapses archived, absent and unset membership to null.
+      // Recheck strict identity and access after every readiness/capacity read before authorizing a write.
+      const latestConfiguration = await getProjectDeliveryConfiguration({
+        graphql: context.clients.graphql,
+        org: context.config.native.organization,
+        settings: projectSettingsFromDeliveryConfig(context.config),
+        requireWritable: intent !== undefined,
+        maxPages: 20,
+      });
+      if (projectIdentity(latestConfiguration) !== projectIdentity(configuration))
+        throw new DeliveryError('Project mapping changed during readiness.');
+      const latestItems = await readProjectDeliveryItems({
+        graphql: context.clients.graphql,
+        org: context.config.native.organization,
+        configuration: latestConfiguration,
+        maxPages: 20,
+      });
+      const latestMatches = latestItems.filter(
+        (item) => item.contentKind === 'issue' && item.contentId === native.node_id,
+      );
+      const latestMember = latestMatches[0];
+      if (
+        latestMatches.length !== matches.length ||
+        (member &&
+          (!latestMember ||
+            latestMember.id !== member.id ||
+            latestMember.archived !== member.archived ||
+            latestMember.projectId !== member.projectId ||
+            latestMember.projectNumber !== member.projectNumber ||
+            latestMember.repository?.toLowerCase() !== member.repository?.toLowerCase() ||
+            latestMember.issueNumber !== member.issueNumber))
+      )
+        throw new DeliveryError('Project membership changed during readiness.');
+      if (member && latestMember) {
+        const sameStatus =
+          latestMember.status === member.status &&
+          latestMember.statusRead === member.statusRead &&
+          latestMember.statusName === member.statusName &&
+          latestMember.statusOptionId === member.statusOptionId;
+        const completedStatus =
+          latestMember.statusRead === 'verified' &&
+          latestMember.status === 'In Progress' &&
+          latestMember.statusOptionId === latestConfiguration.statusOptionIds['In Progress'];
+        if (!sameStatus && !completedStatus) throw new DeliveryError('Project Status changed during readiness.');
+        record.status = {
+          ...record.status,
+          current: latestMember.status,
+          kind: latestMember.statusRead,
+          name: latestMember.statusName,
+          optionId: latestMember.statusOptionId,
+        };
+      }
+      options.signal?.throwIfAborted();
       record.status = { ...record.status, target: 'In Progress', rule: 'active' };
     } catch (error) {
       missing('readiness-capacity', error);

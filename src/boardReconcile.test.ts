@@ -1819,3 +1819,53 @@ test.each(['active', 'parked', 'deferred'] as const)(
     }
   },
 );
+
+test.each(['archived', 'missing', 'unwritable'] as const)(
+  'later readiness cannot hide %s membership behind initially unset Status',
+  async (change) => {
+    const f = await boardFixture(1);
+    try {
+      const row = f.rows.get('example/widget:17')!;
+      f.members.get(row.node_id)!.status = null;
+      const plan = await collect(f.contexts, { ...f.request, checkouts: [f.checkout('example/widget', 17)] }, [f.root]);
+      assert.equal(plan.operations[0]!.target, 'In Progress');
+      const original = f.contexts[0]!.clients.rest.issues.get;
+      let reads = 0;
+      f.contexts[0]!.clients.rest.issues.get = (async (input) => {
+        if (++reads === 6) {
+          if (change === 'archived') f.members.get(row.node_id)!.archived = true;
+          if (change === 'missing') f.members.delete(row.node_id);
+          if (change === 'unwritable') f.controls.writable = false;
+        }
+        return original(input);
+      }) as typeof original;
+      const result = await applyPlan(f, plan);
+      assert.equal(reads >= 6, true);
+      assert.equal(result.operations[0]!.attempted, false);
+      assert.equal(f.writes.length, 0);
+      assert.ok(result.summary.refused + result.summary.drifted > 0);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test('a compatible active postimage observed during readiness is satisfied without a repeated update', async () => {
+  const f = await boardFixture(1);
+  try {
+    const row = f.rows.get('example/widget:17')!;
+    const plan = await collect(f.contexts, { ...f.request, checkouts: [f.checkout('example/widget', 17)] }, [f.root]);
+    const original = f.contexts[0]!.clients.rest.issues.get;
+    let reads = 0;
+    f.contexts[0]!.clients.rest.issues.get = (async (input) => {
+      if (++reads === 6) f.members.get(row.node_id)!.status = 'In Progress';
+      return original(input);
+    }) as typeof original;
+    const result = await applyPlan(f, plan);
+    assert.equal(result.summary.satisfied, 1);
+    assert.equal(result.operations[0]!.attempted, false);
+    assert.equal(f.writes.length, 0);
+  } finally {
+    f.cleanup();
+  }
+});
