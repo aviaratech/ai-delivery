@@ -18,6 +18,13 @@ import { BoardReconcilePlanSchema, BoardReconcileResultSchema } from './services
 
 const packageRoot = fileURLToPath(new URL('../', import.meta.url));
 const pluginRoot = join(packageRoot, 'plugins', 'ai-delivery');
+const qualificationOwner = (await import(new URL('../scripts/current-qualification.mjs', import.meta.url).href)) as {
+  copyReleaseArchive(
+    contractPath: string,
+    cwd: string,
+    destination: string,
+  ): { archivePath: string; archiveSha256: string };
+};
 
 test('README and delivery skill CLI examples name supported commands and required options', () => {
   const cli = readFileSync(join(packageRoot, 'src', 'cli.ts'), 'utf8');
@@ -60,71 +67,65 @@ test('README and delivery skill CLI examples name supported commands and require
 });
 
 for (const launchCheckout of [false, true]) {
-  test(`the ${launchCheckout ? 'bundled' : 'packed'} launcher creates, updates and journals repository B from ${launchCheckout ? 'checkout A' : 'a non-Git directory'} without an identity environment`, async () => {
-    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-launch-routing-')));
-    let selectedPluginRoot = pluginRoot;
-    let discoveryFixture = new URL('./fixtures/discovery.js', import.meta.url).href;
-    if (!launchCheckout) {
-      try {
-        const packed = JSON.parse(
-          execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', directory], {
-            cwd: packageRoot,
-            encoding: 'utf8',
-            maxBuffer: 1024 * 1024,
-            env: {
-              PATH: process.env.PATH ?? '',
-              TMPDIR: tmpdir(),
-              HOME: directory,
-              npm_config_cache: join(directory, 'npm-cache'),
-            },
-          }),
-        ) as { filename: string }[];
-        assert.equal(packed.length, 1);
-        const unpacked = join(directory, 'unpacked');
-        mkdirSync(unpacked);
-        execFileSync('tar', ['-xzf', join(directory, packed[0]!.filename), '-C', unpacked]);
-        selectedPluginRoot = join(directory, 'plugin-cache');
-        // Detach the packed native plugin so the launcher uses its bundled runtime,
-        // rather than the package-local CLI whose npm dependencies are not installed here.
-        cpSync(join(unpacked, 'package', 'plugins', 'ai-delivery'), selectedPluginRoot, { recursive: true });
-        discoveryFixture = pathToFileURL(join(unpacked, 'package', 'dist', 'fixtures', 'discovery.js')).href;
-        assert.equal(existsSync(join(selectedPluginRoot, 'runtime', 'dist', 'cli.js')), true);
-      } catch (error) {
-        rmSync(directory, { recursive: true, force: true });
-        throw error;
+  test(
+    `the ${launchCheckout ? 'bundled' : 'packed'} launcher creates, updates and journals repository B from ${launchCheckout ? 'checkout A' : 'a non-Git directory'} without an identity environment`,
+    { tags: launchCheckout ? [] : ['release'] },
+    async () => {
+      const directory = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-launch-routing-')));
+      let selectedPluginRoot = pluginRoot;
+      let discoveryFixture = new URL('./fixtures/discovery.js', import.meta.url).href;
+      if (!launchCheckout) {
+        try {
+          const archive = qualificationOwner.copyReleaseArchive(
+            process.env.AI_DELIVERY_RELEASE_CONTRACT ?? '',
+            packageRoot,
+            join(directory, 'qualified.tgz'),
+          );
+          const unpacked = join(directory, 'unpacked');
+          mkdirSync(unpacked);
+          execFileSync('tar', ['-xzf', archive.archivePath, '-C', unpacked]);
+          selectedPluginRoot = join(directory, 'plugin-cache');
+          // Detach the packed native plugin so the launcher uses its bundled runtime,
+          // rather than the package-local CLI whose npm dependencies are not installed here.
+          cpSync(join(unpacked, 'package', 'plugins', 'ai-delivery'), selectedPluginRoot, { recursive: true });
+          discoveryFixture = pathToFileURL(join(unpacked, 'package', 'dist', 'fixtures', 'discovery.js')).href;
+          assert.equal(existsSync(join(selectedPluginRoot, 'runtime', 'dist', 'cli.js')), true);
+        } catch (error) {
+          rmSync(directory, { recursive: true, force: true });
+          throw error;
+        }
       }
-    }
-    if (launchCheckout) {
-      execFileSync('git', ['init', '-q', directory]);
-      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/a.git'], { cwd: directory });
-    }
-    const preload = join(directory, 'mock-github.mjs');
-    const calls = join(directory, 'requests.json');
-    const settings = join(directory, 'user.json');
-    const boardStatePath = join(directory, 'board-state.json');
-    writeFileSync(boardStatePath, JSON.stringify({ member: 'ITEM17', status: 'Todo', writes: [] }));
-    writeFileSync(
-      settings,
-      JSON.stringify({
-        schemaVersion: 'ai-delivery.user@1',
-        roles: {
-          author: { authSource: 'personal', identity: 'operator', credentialEnv: { token: 'SYNTHETIC_TOKEN' } },
-          reviewer: {
-            identity: 'reviewer',
-            credentialEnv: { appId: 'REVIEW_APP', installationId: 'REVIEW_INSTALL', privateKeyPath: 'REVIEW_KEY' },
+      if (launchCheckout) {
+        execFileSync('git', ['init', '-q', directory]);
+        execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/a.git'], { cwd: directory });
+      }
+      const preload = join(directory, 'mock-github.mjs');
+      const calls = join(directory, 'requests.json');
+      const settings = join(directory, 'user.json');
+      const boardStatePath = join(directory, 'board-state.json');
+      writeFileSync(boardStatePath, JSON.stringify({ member: 'ITEM17', status: 'Todo', writes: [] }));
+      writeFileSync(
+        settings,
+        JSON.stringify({
+          schemaVersion: 'ai-delivery.user@1',
+          roles: {
+            author: { authSource: 'personal', identity: 'operator', credentialEnv: { token: 'SYNTHETIC_TOKEN' } },
+            reviewer: {
+              identity: 'reviewer',
+              credentialEnv: { appId: 'REVIEW_APP', installationId: 'REVIEW_INSTALL', privateKeyPath: 'REVIEW_KEY' },
+            },
           },
-        },
-        project: 1,
-        checkoutRoots: [],
-        pointsField: 'Estimate',
-        priorityField: 'Urgency',
-        statusField: 'Flow',
-        statuses: syntheticDiscoveryConfig.native.project.statuses,
-      }),
-    );
-    writeFileSync(
-      preload,
-      `
+          project: 1,
+          checkoutRoots: [],
+          pointsField: 'Estimate',
+          priorityField: 'Urgency',
+          statusField: 'Flow',
+          statuses: syntheticDiscoveryConfig.native.project.statuses,
+        }),
+      );
+      writeFileSync(
+        preload,
+        `
 import {existsSync,readFileSync,writeFileSync} from 'node:fs';
 import {syntheticDiscoveryClients} from ${JSON.stringify(discoveryFixture)};
 const configuration=${JSON.stringify(syntheticDiscoveryConfig)};
@@ -187,253 +188,257 @@ globalThis.fetch=async(url,init)=>{
   return new Response(JSON.stringify(data),{status:200,headers:{'content-type':'application/json'}});
 };
 `,
-    );
-    const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [join(selectedPluginRoot, 'dist', 'mcp-launcher.js')],
-      cwd: directory,
-      env: {
-        PATH: process.env.PATH ?? '',
-        TMPDIR: tmpdir(),
-        HOME: directory,
-        AI_DELIVERY_CONFIG: settings,
-        SYNTHETIC_TOKEN: 'inert-personal-token',
-        NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
-      },
-      stderr: 'pipe',
-    });
-    const client = new Client({ name: 'actual-launch-routing', version: '1' });
-    try {
-      await client.connect(transport, { timeout: 30000 });
-      const readyInput = {
-        repo: 'example/b',
-        title: 'Validate widget launch routing across repositories',
-        points: 2,
-        problem: 'A launcher can bind a widget issue to the checkout repository instead of the explicit caller.',
-        outcome: 'Create and update the issue only in explicitly selected repository B.',
-        acceptanceCriteria: [
-          {
-            behavior: 'Create, update and journal requests address repository B with zero repository A requests.',
-            verifiedBy: 'Packaged stdio client results and captured REST path assertions.',
-          },
-        ],
-        outOfScope: ['Live authentication and host configuration.'],
-      };
-      const created = await client.callTool({
-        name: 'issue_create',
-        arguments: { ...readyInput, labels: ['enhancement'] },
-      });
-      assert.equal(created.isError, undefined, JSON.stringify(created));
-      const updated = await client.callTool({
-        name: 'issue_update',
-        arguments: { repo: 'example/b', issueNumber: 17, labels: ['bug'] },
-      });
-      assert.equal(updated.isError, undefined, JSON.stringify(updated));
-      const common = {
-        repo: 'example/b',
-        issueNumber: 17,
-        summary: 'Packed journal validation works.',
-        status: 'In progress',
-        nextStep: 'Independent review',
-        nextDate: '2026-10-09',
-        keyNumbers: ['5 journal kinds'],
-        evidence: ['https://github.com/example/b/issues/17'],
-      };
-      const journals = [
-        { ...common, kind: 'start', outcome: 'Deliver strict validation' },
-        { ...common, kind: 'progress', done: ['Added regression'], decisionNeeded: 'None' },
-        { ...common, kind: 'decision', decision: 'Keep variants strict', rationale: 'Preserve the contract' },
-        { ...common, kind: 'blocker', blocker: 'Review pending', resolution: 'Independent acceptance' },
-        {
-          ...common,
-          kind: 'closeout',
-          acceptance: [{ criterion: 'Explicit repo works', evidence: common.evidence[0] }],
-          followUps: [],
+      );
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [join(selectedPluginRoot, 'dist', 'mcp-launcher.js')],
+        cwd: directory,
+        env: {
+          PATH: process.env.PATH ?? '',
+          TMPDIR: tmpdir(),
+          HOME: directory,
+          AI_DELIVERY_CONFIG: settings,
+          SYNTHETIC_TOKEN: 'inert-personal-token',
+          NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
         },
-      ];
-      const decoded = (response: unknown) =>
-        JSON.parse((response as { content: { text: string }[] }).content[0]!.text) as {
-          commentId: number;
-          url: string;
-          body: string;
-          reused: boolean;
-        };
-      for (const [index, journal] of journals.entries()) {
-        const response = await client.callTool({ name: 'issue_comment', arguments: journal });
-        assert.equal(response.isError, undefined, JSON.stringify(response));
-        const readback = decoded(response);
-        assert.equal(readback.commentId, 91 + index);
-        assert.equal(readback.url, `https://github.com/example/b/issues/17#issuecomment-${String(91 + index)}`);
-        assert.equal(readback.body.split('\n')[0], common.summary);
-        assert.ok(readback.body.includes(`**Kind:** ${journal.kind}.`));
-        assert.match(readback.body, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
-        assert.equal(readback.reused, false);
-      }
-      const retried = await client.callTool({ name: 'issue_comment', arguments: journals[1]! });
-      assert.equal(retried.isError, undefined, JSON.stringify(retried));
-      assert.equal(decoded(retried).commentId, 92);
-      assert.equal(decoded(retried).reused, true);
-      const beforeInvalidRequests = (JSON.parse(readFileSync(calls, 'utf8')) as unknown[]).length;
-      for (const invalid of [
-        { ...journals[1], unknown: true },
-        { ...journals[1], outcome: 'Wrong variant' },
-        { ...journals[1], kind: 'unsupported' },
-        { ...journals[1], nextDate: '2026-02-30' },
-        { ...journals[1], repo: 'invalid' },
-      ]) {
-        const refused = await client.callTool({ name: 'issue_comment', arguments: invalid }).then(
-          (result) => result.isError === true,
-          () => true,
-        );
-        assert.equal(refused, true);
-      }
-      assert.equal(
-        (JSON.parse(readFileSync(calls, 'utf8')) as unknown[]).length,
-        beforeInvalidRequests,
-        'invalid packed journals never reach configuration discovery, author authentication or writes',
-      );
-      const unknown = await client.callTool({
-        name: 'issue_create',
-        arguments: { ...readyInput, labels: ['missing-label'] },
+        stderr: 'pipe',
       });
-      assert.equal(unknown.isError, true);
-      assert.match(JSON.stringify(unknown), /Unknown repository label.*missing-label/u);
-      // Exercise the actual bundled coordinator and CLI against the same synthetic provider state.
-      const boardValue = async (arguments_: Record<string, unknown>) => {
-        const response = await client.callTool({ name: 'board_reconcile', arguments: arguments_ });
-        assert.equal(response.isError, undefined, JSON.stringify(response));
-        return JSON.parse((response.content as { text: string }[])[0]!.text) as unknown;
-      };
-      const boardEnv = {
-        PATH: process.env.PATH ?? '',
-        TMPDIR: tmpdir(),
-        HOME: directory,
-        AI_DELIVERY_CONFIG: settings,
-        SYNTHETIC_TOKEN: 'inert-personal-token',
-        NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
-      };
-      const activeCli = launchCheckout
-        ? join(packageRoot, 'dist', 'cli.js')
-        : join(selectedPluginRoot, 'runtime', 'dist', 'cli.js');
-      const boardCli = (...args: string[]) =>
-        spawnSync(process.execPath, [activeCli, 'board:reconcile', '--repositories', 'example/b', ...args], {
-          cwd: directory,
-          env: boardEnv,
-          encoding: 'utf8',
-          maxBuffer: 32 * 1024 * 1024,
+      const client = new Client({ name: 'actual-launch-routing', version: '1' });
+      try {
+        await client.connect(transport, { timeout: 30000 });
+        const readyInput = {
+          repo: 'example/b',
+          title: 'Validate widget launch routing across repositories',
+          points: 2,
+          problem: 'A launcher can bind a widget issue to the checkout repository instead of the explicit caller.',
+          outcome: 'Create and update the issue only in explicitly selected repository B.',
+          acceptanceCriteria: [
+            {
+              behavior: 'Create, update and journal requests address repository B with zero repository A requests.',
+              verifiedBy: 'Packaged stdio client results and captured REST path assertions.',
+            },
+          ],
+          outOfScope: ['Live authentication and host configuration.'],
+        };
+        const created = await client.callTool({
+          name: 'issue_create',
+          arguments: { ...readyInput, labels: ['enhancement'] },
         });
-      writeFileSync(boardStatePath, JSON.stringify({ member: null, status: null, writes: [], failAddResponse: true }));
-      const plan = BoardReconcilePlanSchema.parse(await boardValue({ repositories: ['example/b'] }));
-      assert.equal(plan.scopeComplete, true);
-      assert.equal(plan.operations.length, 1);
-      assert.equal(plan.operations[0]!.kind, 'add-membership');
-      const rootLibrary = spawnSync(
-        process.execPath,
-        [
-          '--input-type=module',
-          '-e',
-          `import {executeTool} from ${JSON.stringify(pathToFileURL(join(packageRoot, 'dist', 'agent.js')).href)};console.log(JSON.stringify(await executeTool('board_reconcile',{repositories:['example/b']},{repoRoot:process.cwd()})));`,
-        ],
-        { cwd: directory, env: boardEnv, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-      );
-      assert.equal(rootLibrary.status, 0, rootLibrary.stderr);
-      const rootPlan = BoardReconcilePlanSchema.parse(JSON.parse(rootLibrary.stdout));
-      assert.equal(rootPlan.packageIdentity!.packageVersion, plan.packageIdentity!.packageVersion);
-      assert.deepEqual(rootPlan.scope, plan.scope);
-      assert.deepEqual(rootPlan.operations, plan.operations);
-      if (!launchCheckout) {
-        assert.notDeepEqual(rootPlan.packageIdentity, plan.packageIdentity);
-        const crossArtifact = BoardReconcileResultSchema.parse(
-          await boardValue({ repositories: rootPlan.scope, mode: 'apply', plan: rootPlan }),
+        assert.equal(created.isError, undefined, JSON.stringify(created));
+        const updated = await client.callTool({
+          name: 'issue_update',
+          arguments: { repo: 'example/b', issueNumber: 17, labels: ['bug'] },
+        });
+        assert.equal(updated.isError, undefined, JSON.stringify(updated));
+        const common = {
+          repo: 'example/b',
+          issueNumber: 17,
+          summary: 'Packed journal validation works.',
+          status: 'In progress',
+          nextStep: 'Independent review',
+          nextDate: '2026-10-09',
+          keyNumbers: ['5 journal kinds'],
+          evidence: ['https://github.com/example/b/issues/17'],
+        };
+        const journals = [
+          { ...common, kind: 'start', outcome: 'Deliver strict validation' },
+          { ...common, kind: 'progress', done: ['Added regression'], decisionNeeded: 'None' },
+          { ...common, kind: 'decision', decision: 'Keep variants strict', rationale: 'Preserve the contract' },
+          { ...common, kind: 'blocker', blocker: 'Review pending', resolution: 'Independent acceptance' },
+          {
+            ...common,
+            kind: 'closeout',
+            acceptance: [{ criterion: 'Explicit repo works', evidence: common.evidence[0] }],
+            followUps: [],
+          },
+        ];
+        const decoded = (response: unknown) =>
+          JSON.parse((response as { content: { text: string }[] }).content[0]!.text) as {
+            commentId: number;
+            url: string;
+            body: string;
+            reused: boolean;
+          };
+        for (const [index, journal] of journals.entries()) {
+          const response = await client.callTool({ name: 'issue_comment', arguments: journal });
+          assert.equal(response.isError, undefined, JSON.stringify(response));
+          const readback = decoded(response);
+          assert.equal(readback.commentId, 91 + index);
+          assert.equal(readback.url, `https://github.com/example/b/issues/17#issuecomment-${String(91 + index)}`);
+          assert.equal(readback.body.split('\n')[0], common.summary);
+          assert.ok(readback.body.includes(`**Kind:** ${journal.kind}.`));
+          assert.match(readback.body, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
+          assert.equal(readback.reused, false);
+        }
+        const retried = await client.callTool({ name: 'issue_comment', arguments: journals[1]! });
+        assert.equal(retried.isError, undefined, JSON.stringify(retried));
+        assert.equal(decoded(retried).commentId, 92);
+        assert.equal(decoded(retried).reused, true);
+        const beforeInvalidRequests = (JSON.parse(readFileSync(calls, 'utf8')) as unknown[]).length;
+        for (const invalid of [
+          { ...journals[1], unknown: true },
+          { ...journals[1], outcome: 'Wrong variant' },
+          { ...journals[1], kind: 'unsupported' },
+          { ...journals[1], nextDate: '2026-02-30' },
+          { ...journals[1], repo: 'invalid' },
+        ]) {
+          const refused = await client.callTool({ name: 'issue_comment', arguments: invalid }).then(
+            (result) => result.isError === true,
+            () => true,
+          );
+          assert.equal(refused, true);
+        }
+        assert.equal(
+          (JSON.parse(readFileSync(calls, 'utf8')) as unknown[]).length,
+          beforeInvalidRequests,
+          'invalid packed journals never reach configuration discovery, author authentication or writes',
         );
-        assert.equal(crossArtifact.summary.applied, 0);
-        assert.equal(crossArtifact.summary.refused, 1);
-      } else assert.deepEqual(rootPlan.packageIdentity, plan.packageIdentity);
-      const interrupted = BoardReconcileResultSchema.parse(
-        await boardValue({ repositories: plan.scope, mode: 'apply', plan }),
-      );
-      assert.equal(interrupted.summary.unknown, 1);
-      assert.equal(interrupted.operations[0]!.attempted, true);
-      const planFile = join(directory, 'plan.json'),
-        priorFile = join(directory, 'prior-result.json');
-      writeFileSync(planFile, JSON.stringify(plan));
-      writeFileSync(priorFile, JSON.stringify(interrupted));
-      const resumedCli = boardCli('--apply', '--plan-file', planFile, '--prior-result-file', priorFile);
-      assert.equal(resumedCli.status, 1, resumedCli.stderr);
-      const resumed = BoardReconcileResultSchema.parse(JSON.parse(resumedCli.stdout));
-      assert.equal(resumed.summary.applied, 0);
-      assert.equal(resumed.summary.satisfied, 1);
-      assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
-      assert.equal(resumed.summary.unresolved, 1);
-      assert.deepEqual((JSON.parse(readFileSync(boardStatePath, 'utf8')) as { writes: string[] }).writes, ['add']);
-      writeFileSync(boardStatePath, JSON.stringify({ member: null, status: null, writes: [] }));
-      const partialCli = boardCli('--apply', '--plan-file', planFile);
-      assert.equal(partialCli.status, 1, partialCli.stderr);
-      const applied = BoardReconcileResultSchema.parse(JSON.parse(partialCli.stdout));
-      assert.equal(applied.summary.applied, 1);
-      assert.equal(applied.operations[0]!.readback!.itemId, 'ADDED17');
-      const historical = structuredClone(applied);
-      historical.operations[0]!.outcome = 'unknown';
-      historical.summary.applied = 0;
-      historical.summary.unknown = 1;
-      writeFileSync(priorFile, JSON.stringify(historical));
-      const emptyPlan = BoardReconcilePlanSchema.parse(await boardValue({ repositories: ['example/b'] }));
-      assert.equal(emptyPlan.operations.length, 0);
-      for (const failure of ['pages', 'access']) {
+        const unknown = await client.callTool({
+          name: 'issue_create',
+          arguments: { ...readyInput, labels: ['missing-label'] },
+        });
+        assert.equal(unknown.isError, true);
+        assert.match(JSON.stringify(unknown), /Unknown repository label.*missing-label/u);
+        // Exercise the actual bundled coordinator and CLI against the same synthetic provider state.
+        const boardValue = async (arguments_: Record<string, unknown>) => {
+          const response = await client.callTool({ name: 'board_reconcile', arguments: arguments_ });
+          assert.equal(response.isError, undefined, JSON.stringify(response));
+          return JSON.parse((response.content as { text: string }[])[0]!.text) as unknown;
+        };
+        const boardEnv = {
+          PATH: process.env.PATH ?? '',
+          TMPDIR: tmpdir(),
+          HOME: directory,
+          AI_DELIVERY_CONFIG: settings,
+          SYNTHETIC_TOKEN: 'inert-personal-token',
+          NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
+        };
+        const activeCli = launchCheckout
+          ? join(packageRoot, 'dist', 'cli.js')
+          : join(selectedPluginRoot, 'runtime', 'dist', 'cli.js');
+        const boardCli = (...args: string[]) =>
+          spawnSync(process.execPath, [activeCli, 'board:reconcile', '--repositories', 'example/b', ...args], {
+            cwd: directory,
+            env: boardEnv,
+            encoding: 'utf8',
+            maxBuffer: 32 * 1024 * 1024,
+          });
         writeFileSync(
           boardStatePath,
-          JSON.stringify({ member: 'ADDED17', status: 'Todo', writes: ['add'], failDiscovery: failure }),
+          JSON.stringify({ member: null, status: null, writes: [], failAddResponse: true }),
         );
-        for (const value of [
-          await boardValue({ repositories: plan.scope, mode: 'apply', plan, priorResult: historical }),
-          ...(() => {
-            const result = boardCli('--apply', '--plan-file', planFile, '--prior-result-file', priorFile);
-            assert.equal(result.status, 1, result.stderr);
-            return [JSON.parse(result.stdout) as unknown];
-          })(),
-        ]) {
-          const result = BoardReconcileResultSchema.parse(value);
-          assert.equal(result.scopeComplete, false);
-          assert.equal(result.planId, plan.planId);
-          assert.equal(result.summary.applied, 0);
-          assert.equal(result.summary.satisfied, 0);
-          assert.equal(result.operations[0]!.attempted, false);
-          assert.equal(result.operations[0]!.operationId, plan.operations[0]!.operationId);
-          assert.ok(result.operations[0]!.knownItemIds.includes('ADDED17'));
-          assert.deepEqual(result.operations[0]!.priorEvidence.at(-1)!.readback, historical.operations[0]!.readback);
-          if (failure === 'pages') assert.equal(result.gaps[0]!.pagesRequested, 20);
+        const plan = BoardReconcilePlanSchema.parse(await boardValue({ repositories: ['example/b'] }));
+        assert.equal(plan.scopeComplete, true);
+        assert.equal(plan.operations.length, 1);
+        assert.equal(plan.operations[0]!.kind, 'add-membership');
+        const rootLibrary = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `import {executeTool} from ${JSON.stringify(pathToFileURL(join(packageRoot, 'dist', 'agent.js')).href)};console.log(JSON.stringify(await executeTool('board_reconcile',{repositories:['example/b']},{repoRoot:process.cwd()})));`,
+          ],
+          { cwd: directory, env: boardEnv, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
+        );
+        assert.equal(rootLibrary.status, 0, rootLibrary.stderr);
+        const rootPlan = BoardReconcilePlanSchema.parse(JSON.parse(rootLibrary.stdout));
+        assert.equal(rootPlan.packageIdentity!.packageVersion, plan.packageIdentity!.packageVersion);
+        assert.deepEqual(rootPlan.scope, plan.scope);
+        assert.deepEqual(rootPlan.operations, plan.operations);
+        if (!launchCheckout) {
+          assert.notDeepEqual(rootPlan.packageIdentity, plan.packageIdentity);
+          const crossArtifact = BoardReconcileResultSchema.parse(
+            await boardValue({ repositories: rootPlan.scope, mode: 'apply', plan: rootPlan }),
+          );
+          assert.equal(crossArtifact.summary.applied, 0);
+          assert.equal(crossArtifact.summary.refused, 1);
+        } else assert.deepEqual(rootPlan.packageIdentity, plan.packageIdentity);
+        const interrupted = BoardReconcileResultSchema.parse(
+          await boardValue({ repositories: plan.scope, mode: 'apply', plan }),
+        );
+        assert.equal(interrupted.summary.unknown, 1);
+        assert.equal(interrupted.operations[0]!.attempted, true);
+        const planFile = join(directory, 'plan.json'),
+          priorFile = join(directory, 'prior-result.json');
+        writeFileSync(planFile, JSON.stringify(plan));
+        writeFileSync(priorFile, JSON.stringify(interrupted));
+        const resumedCli = boardCli('--apply', '--plan-file', planFile, '--prior-result-file', priorFile);
+        assert.equal(resumedCli.status, 1, resumedCli.stderr);
+        const resumed = BoardReconcileResultSchema.parse(JSON.parse(resumedCli.stdout));
+        assert.equal(resumed.summary.applied, 0);
+        assert.equal(resumed.summary.satisfied, 1);
+        assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
+        assert.equal(resumed.summary.unresolved, 1);
+        assert.deepEqual((JSON.parse(readFileSync(boardStatePath, 'utf8')) as { writes: string[] }).writes, ['add']);
+        writeFileSync(boardStatePath, JSON.stringify({ member: null, status: null, writes: [] }));
+        const partialCli = boardCli('--apply', '--plan-file', planFile);
+        assert.equal(partialCli.status, 1, partialCli.stderr);
+        const applied = BoardReconcileResultSchema.parse(JSON.parse(partialCli.stdout));
+        assert.equal(applied.summary.applied, 1);
+        assert.equal(applied.operations[0]!.readback!.itemId, 'ADDED17');
+        const historical = structuredClone(applied);
+        historical.operations[0]!.outcome = 'unknown';
+        historical.summary.applied = 0;
+        historical.summary.unknown = 1;
+        writeFileSync(priorFile, JSON.stringify(historical));
+        const emptyPlan = BoardReconcilePlanSchema.parse(await boardValue({ repositories: ['example/b'] }));
+        assert.equal(emptyPlan.operations.length, 0);
+        for (const failure of ['pages', 'access']) {
+          writeFileSync(
+            boardStatePath,
+            JSON.stringify({ member: 'ADDED17', status: 'Todo', writes: ['add'], failDiscovery: failure }),
+          );
+          for (const value of [
+            await boardValue({ repositories: plan.scope, mode: 'apply', plan, priorResult: historical }),
+            ...(() => {
+              const result = boardCli('--apply', '--plan-file', planFile, '--prior-result-file', priorFile);
+              assert.equal(result.status, 1, result.stderr);
+              return [JSON.parse(result.stdout) as unknown];
+            })(),
+          ]) {
+            const result = BoardReconcileResultSchema.parse(value);
+            assert.equal(result.scopeComplete, false);
+            assert.equal(result.planId, plan.planId);
+            assert.equal(result.summary.applied, 0);
+            assert.equal(result.summary.satisfied, 0);
+            assert.equal(result.operations[0]!.attempted, false);
+            assert.equal(result.operations[0]!.operationId, plan.operations[0]!.operationId);
+            assert.ok(result.operations[0]!.knownItemIds.includes('ADDED17'));
+            assert.deepEqual(result.operations[0]!.priorEvidence.at(-1)!.readback, historical.operations[0]!.readback);
+            if (failure === 'pages') assert.equal(result.gaps[0]!.pagesRequested, 20);
+          }
+          const dry = boardCli('--dry-run');
+          assert.equal(dry.status, 1, dry.stderr);
+          assert.equal(BoardReconcilePlanSchema.parse(JSON.parse(dry.stdout)).scopeComplete, false);
+          const empty = BoardReconcileResultSchema.parse(
+            await boardValue({ repositories: emptyPlan.scope, mode: 'apply', plan: emptyPlan }),
+          );
+          assert.equal(empty.scopeComplete, false);
+          assert.deepEqual(empty.operations, []);
         }
-        const dry = boardCli('--dry-run');
-        assert.equal(dry.status, 1, dry.stderr);
-        assert.equal(BoardReconcilePlanSchema.parse(JSON.parse(dry.stdout)).scopeComplete, false);
-        const empty = BoardReconcileResultSchema.parse(
-          await boardValue({ repositories: emptyPlan.scope, mode: 'apply', plan: emptyPlan }),
+        writeFileSync(boardStatePath, JSON.stringify({ member: 'ADDED17', status: 'Todo', writes: ['add'] }));
+        const completeDry = boardCli('--dry-run');
+        assert.equal(completeDry.status, 0, completeDry.stderr);
+        assert.equal(BoardReconcilePlanSchema.parse(JSON.parse(completeDry.stdout)).scopeComplete, true);
+        const requests = JSON.parse(readFileSync(calls, 'utf8')) as Array<{ path: string; method: string }>;
+        assert.equal(
+          requests.some((call) => call.path.startsWith('/repos/example/a/')),
+          false,
         );
-        assert.equal(empty.scopeComplete, false);
-        assert.deepEqual(empty.operations, []);
+        assert.equal(requests.filter((call) => call.path.endsWith('/issues') && call.method === 'POST').length, 1);
+        assert.equal(
+          requests.filter((call) => call.path.endsWith('/issues/17/comments') && call.method === 'POST').length,
+          5,
+          'five authored journals read back; retry adds no sixth write',
+        );
+        assert.equal(existsSync(join(directory, '.issue-cli')), false);
+      } finally {
+        await client.close();
+        await transport.close();
+        rmSync(directory, { recursive: true, force: true });
       }
-      writeFileSync(boardStatePath, JSON.stringify({ member: 'ADDED17', status: 'Todo', writes: ['add'] }));
-      const completeDry = boardCli('--dry-run');
-      assert.equal(completeDry.status, 0, completeDry.stderr);
-      assert.equal(BoardReconcilePlanSchema.parse(JSON.parse(completeDry.stdout)).scopeComplete, true);
-      const requests = JSON.parse(readFileSync(calls, 'utf8')) as Array<{ path: string; method: string }>;
-      assert.equal(
-        requests.some((call) => call.path.startsWith('/repos/example/a/')),
-        false,
-      );
-      assert.equal(requests.filter((call) => call.path.endsWith('/issues') && call.method === 'POST').length, 1);
-      assert.equal(
-        requests.filter((call) => call.path.endsWith('/issues/17/comments') && call.method === 'POST').length,
-        5,
-        'five authored journals read back; retry adds no sixth write',
-      );
-      assert.equal(existsSync(join(directory, '.issue-cli')), false);
-    } finally {
-      await client.close();
-      await transport.close();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 }
 
 test('CLI reports the selected package version', () => {

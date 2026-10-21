@@ -5,12 +5,17 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url';
 import { readArchive, sha256 } from './current-consumer.mjs';
 import { FULL_GATES, SKIP_ALLOWLIST } from './checks.mjs';
-import { sourceIdentity, validateCheckpoint, validateConsumer } from './current-qualification.mjs';
+import {
+  sourceIdentity,
+  validateCheckpoint,
+  validateConsumer,
+  validateReleaseTests,
+} from './current-qualification.mjs';
 
 /** @typedef {{source:string,version:string}} SelectionInputs */
 /** @typedef {SelectionInputs & {digest:string}} Inputs */
 /** @typedef {{sha256:string,contents:string}} Retained */
-/** @typedef {{overall:Retained,checkpoint:Retained,contract:Retained,producer:Retained,artifact:Retained,consumer:Retained,attempt:Retained}} Records */
+/** @typedef {{overall:Retained,checkpoint:Retained,contract:Retained,producer:Retained,artifact:Retained,releaseTests:Retained,consumer:Retained,attempt:Retained}} Records */
 /** @typedef {{schemaVersion:string,sourceCommit:string,sourceTree:string,packageVersion:string,archive:{filename:string,sha256:string,size:number},records:Records,limits:string}} Bundle */
 
 /** @param {string} root @param {string} path */
@@ -159,6 +164,7 @@ export function validateBundle(bundle, inputs) {
   /** @param {keyof Records} name */
   const parse = (name) => {
     const record = bundle.records[name];
+    assert.ok(record, `Retained ${name} evidence is missing.`);
     assert.match(record.sha256, /^[a-f0-9]{64}$/u);
     assert.equal(sha256(record.contents), record.sha256, `Retained ${name} digest differs.`);
     return /** @type {unknown} */ (JSON.parse(record.contents));
@@ -172,6 +178,7 @@ export function validateBundle(bundle, inputs) {
       parse('artifact')
     );
   const consumer = /** @type {import('./current-consumer.mjs').Receipt} */ (parse('consumer'));
+  const releaseTests = parse('releaseTests');
   const attempt = /** @type {import('./current-qualification.mjs').ConsumerAttempt} */ (parse('attempt'));
   assert.equal(overall.schemaVersion, 'ai-delivery.current-qualification@1');
   assert.equal(overall.status, 'passed');
@@ -197,12 +204,14 @@ export function validateBundle(bundle, inputs) {
     assert.equal(artifact[field], expected);
     assert.equal(consumer[field], expected);
   }
-  for (const name of /** @type {const} */ (['checkpoint', 'producer', 'artifact', 'consumer']))
+  for (const name of /** @type {const} */ (['checkpoint', 'producer', 'artifact', 'releaseTests', 'consumer']))
     assert.equal(overall[name]?.sha256, bundle.records[name].sha256);
   assert.equal(overall.consumerAttempt?.sha256, bundle.records.attempt.sha256);
   assert.equal(contract.producer?.checksResultSha256, bundle.records.producer.sha256);
   assert.equal(contract.producer.artifactReceiptSha256, bundle.records.artifact.sha256);
   assert.equal(artifact.checksResultSha256, bundle.records.producer.sha256);
+  assert.ok(overall.checkpoint);
+  validateReleaseTests(releaseTests, checkpoint, overall.checkpoint, bundle.records.contract.sha256);
   assert.equal(producer.schemaVersion, 'contributor-checks@1');
   assert.equal(producer.status, 'passed');
   assert.equal(producer.fullSuccess, true);
@@ -291,7 +300,16 @@ export function validateBundle(bundle, inputs) {
   assert.equal(attempt.command.exitCode, 0);
   assert.equal(attempt.command.signal, null);
   assert.equal(attempt.command.cleanupConfirmed, true);
-  return { overall, checkpoint, contract, producer, artifact, consumer, attempt };
+  return {
+    overall,
+    checkpoint,
+    contract,
+    producer,
+    artifact,
+    releaseTests: /** @type {import('./checks.mjs').CheckReport} */ (releaseTests),
+    consumer,
+    attempt,
+  };
 }
 
 /** Select the original archive from a complete fresh or compatibly resumed result.
@@ -360,6 +378,7 @@ export function selectReleaseArtifact(qualification, destination, inputs, cwd = 
       contract: { sha256: sha256(contractBytes), contents: contractBytes.toString('utf8') },
       producer: retain(overall.producer),
       artifact: retain(overall.artifact),
+      releaseTests: retain(overall.releaseTests),
       consumer: retain(overall.consumer),
       attempt: retain(overall.consumerAttempt),
     },
@@ -370,6 +389,17 @@ export function selectReleaseArtifact(qualification, destination, inputs, cwd = 
   assert.ok(overall.checkpoint && overall.consumer);
   assert.deepEqual(sourceIdentity(source), checkpoint.source);
   const validated = validateCheckpoint(overall.checkpoint.path, source);
+  assert.ok(overall.releaseTests);
+  assert.equal(proof.releaseTests.resultsDir, dirname(overall.releaseTests.path), 'Release receipt ownership differs.');
+  assert.equal(basename(overall.releaseTests.path), 'result.json');
+  assert.equal(dirname(proof.releaseTests.resultsDir), root);
+  assert.match(basename(proof.releaseTests.resultsDir), /^release-tests-[a-f0-9-]{36}$/u);
+  assert.ok(proof.releaseTests.release?.temporary);
+  assert.equal(
+    lstatSync(proof.releaseTests.release.temporary.path, { throwIfNoEntry: false }),
+    undefined,
+    'Release temporary root remains.',
+  );
   validateConsumer(proof.consumer, contract, validated.candidate);
   assert.equal(proof.attempt.directory, dirname(overall.consumer.path));
   assert.equal(proof.attempt.consumerPath, overall.consumer.path);

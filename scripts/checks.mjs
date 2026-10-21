@@ -21,18 +21,21 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { fileURLToPath } from 'node:url';
 
 /** @typedef {NodeJS.ProcessEnv} Environment */
+/** @typedef {{file:string,title:string}} CaseIdentity */
+/** @typedef {{contractPath:string,checkpoint:{path:string,sha256:string},sourceCommit:string,sourceTree:string,sourceManifestSha256:string,sourceLockSha256:string,producerSha256:string,archiveSha256:string}} ReleaseContext */
 /** @typedef {{ppid:number, pgid:number, rss:number, zombie:boolean, birth:string}} ProcessRow */
 /** @typedef {{cwd:string, env:Environment, directory:string, signal?:AbortSignal, timeoutMs?:number, maxOutputBytes?:number, maxRssBytes?:number, progress?:(record:CommandRecord)=>void}} CommandOptions */
 /** @typedef {{command:string[], startedAt:string, stdoutPath:string, stderrPath:string, outputBytes:number, peakRssBytes:number, timeoutMs:number, exitCode:number|null, signal:NodeJS.Signals|null, status:string, ownedProcesses:{pid:number,birth:string}[], observedProcesses:{pid:number,birth:string}[], pid?:number, spawnError?:string, error?:string, cleanupConfirmed?:boolean, completedAt?:string}} CommandRecord */
 /** @typedef {{controller:{version:string, executable:string}, npm:{version:string, executable:string}, libraryConsumer:{version:string, executable:string}} Toolchain */
 /** @typedef {{kind:string, sha256:string, fileCount:number, stagedGitTree?:string}} TreeIdentity */
-/** @typedef {{success:boolean, numTotalTests:number, numPassedTests:number, testResults:{name:string, status:string, assertionResults:{fullName:string, status:string}[]}[]}} TestReport */
+/** @typedef {{success:boolean, numTotalTests:number, numPassedTests:number, testResults:{name:string, status:string, assertionResults:{fullName:string, status:string,tags?:string[]}[]}[]}} TestReport */
 /** @typedef {{name:string, version:string, bin:Record<string,string>, exports:Record<string,Record<string,string>>}} Manifest */
 /** @typedef {{name:string, version:string, files:{path:string,mode:number,size:number}[]}} PackInventory */
 /** @typedef {{result?:{url:string, functions:{ranges:{startOffset:number,endOffset:number,count:number}[]}[]}[]}} V8Report */
 /** @typedef {Partial<CommandRecord> & {stage:string, command:string[], status:string, directory:string}} StageRecord */
-/** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
-/** @typedef {{cwd?:string, resultsDir?:string, fast?:boolean, testFiles?:string[], buildPlugin?:boolean, install?:boolean, stagedTree?:string, signal?:AbortSignal, timeoutMs?:number, execute?:typeof executeCommand, toolchain?:typeof validateToolchain, environment?:Environment}} CheckOptions */
+/** @typedef {{path:string,dev:number,ino:number,quiescent:boolean,removed:boolean,error?:string}} ReleaseTemporary */
+/** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, release?:ReleaseContext & {contractSha256:string,historicalInputSupplied:boolean,temporary?:ReleaseTemporary}, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
+/** @typedef {{cwd?:string, resultsDir?:string, fast?:boolean, testFiles?:string[], buildPlugin?:boolean, release?:ReleaseContext, install?:boolean, stagedTree?:string, signal?:AbortSignal, timeoutMs?:number, execute?:typeof executeCommand, toolchain?:typeof validateToolchain, environment?:Environment}} CheckOptions */
 
 /** @param {unknown} error */
 export function errorMessage(error) {
@@ -41,6 +44,140 @@ export function errorMessage(error) {
 
 export const FULL_GATES = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
 export const FAST_GATES = ['format', 'lint', 'types'];
+/** @type {(CaseIdentity & {kind:"mandatory"|"external-historical-qualification"})[]} */
+export const RELEASE_CASES = [
+  {
+    file: 'dist/setup.test.js',
+    title: 'real npm success disables file logs and preserves unrelated host destinations',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'real npm failure disables file logs and preserves unrelated host destinations',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'real npm cancel disables file logs and preserves unrelated host destinations',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'real npm keeps the reviewed tarball closure after hidden-lock invalidation and completed reuse',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'CLI stage/admit separates preparation from substantive command progress',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'CLI prepared handoff rejects a mismatched stage identity without reinstall or admission',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'CLI preparation failure retains owned evidence through native drain',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'CLI preparation cancel retains owned evidence through native drain',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title: 'CLI stage/admit keeps a stalled admission response owned until native quiescence',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/setup.test.js',
+    title:
+      'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer',
+    kind: 'external-historical-qualification',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title:
+      'filesystem fixture gate deterministically queues a scan through reader rejection and pass teardown on node26',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title:
+      'filesystem fixture gate deterministically queues a scan through reader rejection and assertion teardown on node26',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title: 'filesystem fixture gate preserves leaked FIFO and unrelated files after abrupt on node26',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title: 'filesystem fixture gate preserves leaked FIFO and unrelated files after block on node26',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title: 'filesystem fixture gate preserves leaked FIFO and unrelated files after cancel on node26',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title: 'filesystem fixture gate still enforces positive byte limits after deterministic contention on node26',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/lifecycle.test.js',
+    title: 'Node 26 packed public exports preserve standalone and malformed-capability behavior',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetPolicyLocal.test.js',
+    title:
+      'per-operation runtime preparation (15s asserted work, 15s drain) public MCP runtime_stage asserts bounded first install and exact reuse/lifecycle control with tracked policy inert',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetPolicyLocal.test.js',
+    title:
+      'per-operation runtime preparation (15s asserted work, 15s drain) public MCP runtime_admit binds and reuses exact stage bytes after bounded real stage setup and leaves tracked policy inert',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetPolicyLocal.test.js',
+    title:
+      'per-operation runtime preparation (15s asserted work, 15s drain) public MCP runtime_admit refuses primary source edits and leaves edited policy inert',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetPolicyLocal.test.js',
+    title:
+      'per-operation runtime preparation (15s asserted work, 15s drain) edited runtime_admit refusal keeps bounded preparation outside its asserted-work budget',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetPolicyLocal.test.js',
+    title:
+      'per-operation runtime preparation (15s asserted work, 15s drain) public MCP transition apply reaches unsupported historical binding after bounded stage/admit/reconnect without loading tracked policy',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetPolicyLocal.test.js',
+    title:
+      'per-operation runtime preparation (15s asserted work, 15s drain) public MCP transition apply reaches unsupported historical binding after bounded stage/admit/reconnect without loading edited policy',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/pluginPackaging.test.js',
+    title:
+      'the packed launcher creates, updates and journals repository B from a non-Git directory without an identity environment',
+    kind: 'mandatory',
+  },
+];
+
 export const SKIP_ALLOWLIST = [
   {
     file: 'dist/setup.test.js',
@@ -78,6 +215,8 @@ export function safeEnvironment(input = process.env) {
     'npm_config_globalconfig',
     'AI_DELIVERY_NODE26_EXECUTABLE',
     'AI_DELIVERY_REAL_PACKAGE_ARCHIVE',
+    'AI_DELIVERY_TEST_LANE',
+    'AI_DELIVERY_RELEASE_CONTRACT',
   ]) {
     if (input[key] !== undefined) env[key] = input[key];
   }
@@ -400,8 +539,9 @@ export async function executeCommand(
   return record;
 }
 
-/** @param {TestReport} report @param {string[]} expected @param {string} cwd @param {string} output @param {Environment} [env] */
-export function analyzeTests(report, expected, cwd, output, env = {}) {
+/** @param {TestReport} report @param {string[]} expected @param {string} cwd @param {string} output @param {Environment} [env] @param {'pr'|'release'} [lane] */
+export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr') {
+  assert.ok(lane === 'pr' || lane === 'release', 'Unknown test lane.');
   assert.equal(report.success, true, 'Vitest did not report success.');
   assert.ok(
     report.testResults.every((file) => file.status === 'passed'),
@@ -413,21 +553,58 @@ export function analyzeTests(report, expected, cwd, output, env = {}) {
     file.assertionResults.map((test) => ({ ...test, file: relative(cwd, file.name).replaceAll('\\', '/') })),
   );
   assert.ok(cases.length, 'Zero tests cannot establish full success.');
-  const passed = cases.filter((test) => test.status === 'passed');
-  const skipped = cases.filter((test) => ['pending', 'skipped'].includes(test.status));
   assert.ok(
-    cases.every((test) => ['passed', 'pending', 'skipped'].includes(test.status)),
+    cases.every((test) => typeof test.fullName === 'string' && ['passed', 'pending', 'skipped'].includes(test.status)),
     'Failed, todo or unknown test results are not full success.',
   );
-  const skips = skipped.map((test) => {
-    const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
-    assert.ok(allowed, `Unexpected skip: ${test.file}: ${test.fullName}`);
-    assert.ok(
-      allowed.kind !== 'external-historical-qualification' || !env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE,
-      'Historical archive qualification skipped despite explicit AI_DELIVERY_REAL_PACKAGE_ARCHIVE input.',
-    );
-    return allowed;
-  });
+  assert.equal(report.numTotalTests, cases.length, 'Reported test count mismatch.');
+  assert.equal(
+    report.numPassedTests,
+    cases.filter((test) => test.status === 'passed').length,
+    'Reported passing count mismatch.',
+  );
+  /** @param {string} file @param {string} title */
+  const key = (file, title) => JSON.stringify([file, title]);
+  const inventory = new Map(RELEASE_CASES.map((test) => [key(test.file, test.title), test]));
+  /** @param {{file:string,fullName:string}} test */
+  const releaseCase = (test) => inventory.has(key(test.file, test.fullName));
+  for (const test of cases) {
+    if (test.tags !== undefined)
+      assert.equal(test.tags.includes('release'), releaseCase(test), 'Tags differ from reviewed release inventory.');
+    if ((lane === 'pr' && releaseCase(test)) || (lane === 'release' && !releaseCase(test)))
+      assert.notEqual(test.status, 'passed', 'A case executed outside its owned lane.');
+  }
+  for (const expected of RELEASE_CASES.filter((test) => selected.includes(test.file))) {
+    const observed = cases.filter((test) => key(test.file, test.fullName) === key(expected.file, expected.title));
+    assert.ok(observed.length <= 1, 'A release identity executed more than once.');
+    if (lane === 'release' && (expected.kind === 'mandatory' || env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE)) {
+      assert.equal(observed.length, 1, 'Required release case is missing.');
+      assert.equal(observed[0].status, 'passed', 'Required release case did not pass.');
+    }
+    if (
+      lane === 'release' &&
+      expected.kind === 'external-historical-qualification' &&
+      !env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE
+    )
+      assert.ok(
+        observed.every((test) => test.status !== 'passed'),
+        'Historical qualification ran without its genuine input.',
+      );
+  }
+  const owned = cases.filter((test) => (lane === 'release' ? releaseCase(test) : !releaseCase(test)));
+  const passed = owned.filter((test) => test.status === 'passed');
+  assert.ok(passed.length, 'Zero passing owned cases cannot establish success.');
+  const skips = owned
+    .filter((test) => ['pending', 'skipped'].includes(test.status))
+    .map((test) => {
+      const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
+      assert.ok(allowed, `Unexpected skip: ${test.file}: ${test.fullName}`);
+      assert.ok(
+        allowed.kind !== 'external-historical-qualification' || !env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE,
+        'Historical archive qualification skipped despite explicit AI_DELIVERY_REAL_PACKAGE_ARCHIVE input.',
+      );
+      return allowed;
+    });
   if (skips.some((entry) => entry.kind === 'parent-launched-helper')) {
     assert.ok(
       passed.some(
@@ -445,14 +622,18 @@ export function analyzeTests(report, expected, cwd, output, env = {}) {
     );
     assert.ok(output.includes('SETUP_INTERRUPTION_RECEIPT'), 'Parent-launched helper proof is missing.');
   }
-  assert.equal(report.numTotalTests, cases.length, 'Reported test count mismatch.');
-  assert.equal(report.numPassedTests, passed.length, 'Reported passing count mismatch.');
   return {
     files: selected.length,
-    total: cases.length,
+    total: owned.length,
     passed: passed.length,
     skips,
     parentLaunchedHelperProved: skips.some((entry) => entry.kind === 'parent-launched-helper'),
+    lane,
+    selectedCases: owned.map((test) => ({ file: test.file, title: test.fullName })),
+    laneExcluded:
+      lane === 'pr'
+        ? RELEASE_CASES.filter((test) => selected.includes(test.file)).map(({ file, title }) => ({ file, title }))
+        : cases.filter((test) => !releaseCase(test)).map((test) => ({ file: test.file, title: test.fullName })),
   };
 }
 
@@ -600,6 +781,7 @@ export async function runChecks({
   fast = false,
   testFiles,
   buildPlugin = false,
+  release,
   install = false,
   stagedTree,
   signal,
@@ -618,19 +800,31 @@ export async function runChecks({
     schemaVersion: 'contributor-checks@1',
     runId: randomUUID(),
     startedAt: new Date().toISOString(),
-    scope: testFiles !== undefined ? 'focused' : fast ? 'fast' : 'full',
+    scope: release ? 'release' : testFiles !== undefined ? 'focused' : fast ? 'fast' : 'full',
     status: 'running',
     fullSuccess: false,
     artifactQualified: false,
-    artifactOmitted: ['actual scripts-disabled archive', 'current-consumer application and owned cleanup'],
-    gates:
-      testFiles !== undefined
+    artifactOmitted: release
+      ? ['full PR producer', 'current-consumer application and owned cleanup']
+      : [
+          'release install/archive cases',
+          'actual scripts-disabled archive',
+          'current-consumer application and owned cleanup',
+        ],
+    gates: release
+      ? ['tests']
+      : testFiles !== undefined
         ? [...FAST_GATES, 'build', ...(buildPlugin ? ['plugin-build'] : []), 'tests']
         : fast
           ? FAST_GATES
           : FULL_GATES,
-    omitted:
-      testFiles !== undefined
+    omitted: release
+      ? [
+          ...FULL_GATES.filter((gate) => gate !== 'tests'),
+          'PR test cases',
+          'full producer and production consumer proof',
+        ]
+      : testFiles !== undefined
         ? ['unselected tests', 'inventory', ...(buildPlugin ? [] : ['plugin bundle'])]
         : fast
           ? FULL_GATES.filter((gate) => !FAST_GATES.includes(gate))
@@ -644,6 +838,36 @@ export async function runChecks({
   /** @param {string} message */
   const notify = (message) => process.stdout.write(`[${report.scope}] ${message}\n`);
   try {
+    assert.ok(
+      environment.AI_DELIVERY_TEST_LANE === undefined || ['pr', 'release'].includes(environment.AI_DELIVERY_TEST_LANE),
+      'Unknown test lane.',
+    );
+    if (release) {
+      assert.ok(
+        !fast && testFiles === undefined && !buildPlugin && !install && stagedTree === undefined,
+        'Release scope cannot combine with ordinary/staged gates.',
+      );
+      const { validateReleaseEntry } = await import('./current-qualification.mjs');
+      const validated = validateReleaseEntry(release.contractPath, cwd);
+      assert.deepEqual(
+        validated,
+        release,
+        'Release context differs from its immutable source/producer/archive contract.',
+      );
+      report.release = {
+        ...validated,
+        contractSha256: createHash('sha256').update(readFileSync(validated.contractPath)).digest('hex'),
+        historicalInputSupplied: Boolean(environment.AI_DELIVERY_REAL_PACKAGE_ARCHIVE),
+      };
+      environment = {
+        ...environment,
+        AI_DELIVERY_TEST_LANE: 'release',
+        AI_DELIVERY_RELEASE_CONTRACT: validated.contractPath,
+      };
+    } else {
+      environment = { ...environment, AI_DELIVERY_TEST_LANE: 'pr' };
+      delete environment.AI_DELIVERY_RELEASE_CONTRACT;
+    }
     assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs >= 0, 'Command timeout must be a nonnegative integer.');
     assert.ok(
       !fast || !install,
@@ -670,7 +894,7 @@ export async function runChecks({
       notify(`START ${stage}`);
       const result = await execute(command, {
         cwd,
-        env: fast ? environment : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
+        env: fast || release ? environment : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
         directory: entry.directory,
         signal,
         timeoutMs,
@@ -716,32 +940,20 @@ export async function runChecks({
       notify(`EXIT ${stage}: 0`);
       return result;
     };
-    if (install) await run('dependency-provisioning', [...npm, 'ci', '--no-audit', '--no-fund']);
-    await run('format', [...npm, 'run', 'format:check']);
-    await run('lint', [...npm, 'run', 'lint']);
-    await run('types', [...npm, 'run', 'typecheck']);
-    if (!fast || report.selectedTestFiles) {
-      // Clean output once, immediately before the only compiled build in this graph.
-      rmSync(join(cwd, 'dist'), { recursive: true, force: true });
-      await run(
-        'build',
-        fast
-          ? [process.execPath, join(cwd, 'node_modules/typescript/lib/tsc.js'), '-p', 'tsconfig.build.json']
-          : [...npm, 'run', 'build'],
-      );
-      if (fast && buildPlugin) await run('plugin-build', [process.execPath, join(cwd, 'scripts/build-plugin.mjs')]);
-      const allTests = assertCleanSelection(cwd);
-      report.selectedTestFiles ??= allTests;
+    /** @param {string[]} allTests */
+    const testSelected = async (allTests) => {
+      assert.ok(report.selectedTestFiles?.length, 'Selected test files are missing.');
       const testReport = join(directory, 'vitest.json');
       const testRun = await run('tests', [
         process.execPath,
         join(cwd, 'node_modules/vitest/vitest.mjs'),
         'run',
         '--maxWorkers=1',
+        `--tags-filter=${release ? 'release' : '!release'}`,
         '--reporter=default',
         '--reporter=json',
         `--outputFile.json=${testReport}`,
-        ...(fast
+        ...(fast || release
           ? [
               '--no-cache',
               ...allTests
@@ -757,14 +969,62 @@ export async function runChecks({
         cwd,
         readFileSync(testRun.stdoutPath, 'utf8'),
         environment,
+        release ? 'release' : 'pr',
       );
-      if (!fast) {
-        const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);
-        report.inventory = analyzeInventory(
-          /** @type {PackInventory[]} */ (JSON.parse(readFileSync(inventory.stdoutPath, 'utf8'))),
-          cwd,
+    };
+    if (release) {
+      const temporary = join(directory, 'temporary');
+      mkdirSync(temporary, { mode: 0o700 });
+      const identity = lstatSync(temporary);
+      assert.equal(realpathSync(temporary), temporary, 'Release temporary directory is aliased.');
+      assert.ok(report.release);
+      report.release.temporary = {
+        path: temporary,
+        dev: identity.dev,
+        ino: identity.ino,
+        quiescent: false,
+        removed: false,
+      };
+      environment = { ...environment, TMPDIR: temporary, TEMP: temporary, TMP: temporary };
+      report.selectedTestFiles = [...new Set(RELEASE_CASES.map((test) => test.file))];
+      await testSelected(report.selectedTestFiles);
+      const { validateReleaseEntry } = await import('./current-qualification.mjs');
+      assert.deepEqual(
+        validateReleaseEntry(release.contractPath, cwd),
+        release,
+        'Release inputs changed during tests.',
+      );
+      assert.equal(
+        createHash('sha256').update(readFileSync(release.contractPath)).digest('hex'),
+        report.release?.contractSha256,
+        'Release contract bytes changed during tests.',
+      );
+    } else {
+      if (install) await run('dependency-provisioning', [...npm, 'ci', '--no-audit', '--no-fund']);
+      await run('format', [...npm, 'run', 'format:check']);
+      await run('lint', [...npm, 'run', 'lint']);
+      await run('types', [...npm, 'run', 'typecheck']);
+      if (!fast || report.selectedTestFiles) {
+        // Clean output once, immediately before the only compiled build in this graph.
+        rmSync(join(cwd, 'dist'), { recursive: true, force: true });
+        await run(
+          'build',
+          fast
+            ? [process.execPath, join(cwd, 'node_modules/typescript/lib/tsc.js'), '-p', 'tsconfig.build.json']
+            : [...npm, 'run', 'build'],
         );
-        report.coverage = coverageBaseline(join(directory, 'v8'), cwd);
+        if (fast && buildPlugin) await run('plugin-build', [process.execPath, join(cwd, 'scripts/build-plugin.mjs')]);
+        const allTests = assertCleanSelection(cwd);
+        report.selectedTestFiles ??= allTests;
+        await testSelected(allTests);
+        if (!fast) {
+          const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);
+          report.inventory = analyzeInventory(
+            /** @type {PackInventory[]} */ (JSON.parse(readFileSync(inventory.stdoutPath, 'utf8'))),
+            cwd,
+          );
+          report.coverage = coverageBaseline(join(directory, 'v8'), cwd);
+        }
       }
     }
     assert.deepEqual(
@@ -775,11 +1035,41 @@ export async function runChecks({
       'Source tree changed during checks.',
     );
     report.status = fast ? 'partial-passed' : 'passed';
-    report.fullSuccess = !fast;
+    report.fullSuccess = !fast && !release;
   } catch (error) {
     report.status =
       signal?.aborted || report.commands.some((entry) => entry.status === 'cancelled') ? 'cancelled' : 'failed';
     report.error = errorMessage(error);
+  }
+  if (report.release?.temporary) {
+    const temporary = report.release.temporary;
+    try {
+      assert.ok(
+        report.commands.every((command) => command.cleanupConfirmed === true),
+        'Release command quiescence is unconfirmed.',
+      );
+      temporary.quiescent = true;
+      const identity = lstatSync(temporary.path);
+      assert.ok(
+        identity.isDirectory() &&
+          !identity.isSymbolicLink() &&
+          identity.dev === temporary.dev &&
+          identity.ino === temporary.ino,
+        'Release temporary identity changed; preserve it for reconciliation.',
+      );
+      assert.equal(realpathSync(temporary.path), temporary.path, 'Release temporary path changed.');
+      rmSync(temporary.path, { recursive: true });
+      assert.equal(
+        lstatSync(temporary.path, { throwIfNoEntry: false }),
+        undefined,
+        'Release temporary directory remains.',
+      );
+      temporary.removed = true;
+    } catch (error) {
+      temporary.error = errorMessage(error);
+      report.error = [report.error, `Release cleanup failed: ${temporary.error}`].filter(Boolean).join('; ');
+      if (report.status !== 'cancelled') report.status = 'failed';
+    }
   }
   report.completedAt = new Date().toISOString();
   report.exitCode =

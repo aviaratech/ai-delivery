@@ -20,6 +20,16 @@ import { test } from 'vitest';
 type Json = { [key: string]: unknown };
 type Inputs = { source: string; version: string; digest: string };
 type DispatchInputs = Inputs & { qualificationOnly: string; artifactId: string };
+type ReleaseContext = {
+  contractPath: string;
+  checkpoint: { path: string; sha256: string };
+  sourceCommit: string;
+  sourceTree: string;
+  sourceManifestSha256: string;
+  sourceLockSha256: string;
+  producerSha256: string;
+  archiveSha256: string;
+};
 type Bundle = {
   archive: { filename: string; sha256: string };
   records: Record<string, { sha256: string; contents: string }>;
@@ -78,7 +88,40 @@ const api = (await import(new URL('../scripts/release-artifact.mjs', import.meta
 const canonical = (await import(new URL('../scripts/current-consumer.mjs', import.meta.url).href)) as Canonical;
 const qualification = (await import(new URL('../scripts/current-qualification.mjs', import.meta.url).href)) as {
   sourceIdentity(cwd: string): Source;
+  copyReleaseArchive(
+    contractPath: string,
+    cwd: string,
+    destination: string,
+  ): { archivePath: string; archiveSha256: string };
+  validateReleaseEntry(contractPath: string, cwd: string): ReleaseContext;
+  runQualification(options: {
+    cwd: string;
+    resultsDir: string;
+    resume: string;
+    checks: () => Promise<never>;
+    execute: () => Promise<never>;
+  }): Promise<{ qualified: boolean; error?: string }>;
 };
+type LaneChecks = {
+  RELEASE_CASES: { file: string; title: string; kind: 'mandatory' | 'external-historical-qualification' }[];
+  runChecks(options: {
+    cwd: string;
+    resultsDir: string;
+    release: ReleaseContext;
+    toolchain: () => object;
+    execute: (command: string[], options: { directory: string; env: NodeJS.ProcessEnv }) => Promise<object>;
+  }): Promise<{
+    scope: string;
+    status: string;
+    fullSuccess: boolean;
+    artifactQualified: boolean;
+    commands: { stage: string }[];
+    tests?: { passed: number };
+    release?: { temporary?: { path: string; removed: boolean; quiescent: boolean; error?: string } };
+    error?: string;
+  }>;
+};
+const laneChecks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as LaneChecks;
 const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
 
 test('qualification without a digest cannot enter publication', () => {
@@ -442,6 +485,8 @@ function fixture() {
     },
   };
   const files = new Map<string, string>([['package.json', JSON.stringify(manifest)]]);
+  for (const file of ['setup', 'lifecycle', 'targetPolicyLocal', 'pluginPackaging'])
+    files.set(`dist/${file}.test.js`, '// fictional compiled release test bytes\n');
   for (const path of [
     'LICENSE',
     'README.md',
@@ -507,6 +552,11 @@ function fixture() {
   const archivePath = join(results, 'pack', `aviaratech-ai-delivery-${version}.tgz`);
   writeFileSync(archivePath, archive);
   writeFileSync(join(source, 'package-lock.json'), '{"synthetic":true}\n');
+  writeFileSync(
+    join(source, '.gitignore'),
+    ['setup', 'lifecycle', 'targetPolicyLocal', 'pluginPackaging'].map((name) => `/dist/${name}.test.js`).join('\n') +
+      '\n',
+  );
   execFileSync('git', ['init', '-q', source]);
   execFileSync('git', ['add', '.'], { cwd: source });
   execFileSync(
@@ -619,6 +669,51 @@ function fixture() {
     contract,
     contractSha256,
   });
+  const releaseDirectory = join(results, 'release-tests-00000000-0000-4000-8000-000000000000');
+  const releaseTests = save(join(releaseDirectory, 'result.json'), {
+    schemaVersion: 'contributor-checks@1',
+    scope: 'release',
+    status: 'passed',
+    exitCode: 0,
+    fullSuccess: false,
+    artifactQualified: false,
+    resultsDir: releaseDirectory,
+    gates: ['tests'],
+    omitted: ['PR producer and consumer'],
+    tree: identity.fingerprint,
+    toolchain: {
+      controller: { version: 'v24.21.0', executable: contract.node24 },
+      libraryConsumer: { version: 'v26.2.0', executable: contract.node26 },
+      npm: { version: '11.19.0', executable: contract.npmCli },
+    },
+    release: {
+      ...qualification.validateReleaseEntry(join(results, 'contract.json'), source),
+      contractSha256: canonical.sha256(readFileSync(join(results, 'contract.json'))),
+      historicalInputSupplied: false,
+      temporary: { path: join(releaseDirectory, 'temporary'), dev: 1, ino: 1, removed: true, quiescent: true },
+    },
+    commands: [{ stage: 'tests', ...command }],
+    selectedTestFiles: [...new Set(laneChecks.RELEASE_CASES.map((test) => test.file))],
+    tests: {
+      lane: 'release',
+      files: 4,
+      total: 24,
+      passed: 23,
+      skips: laneChecks.RELEASE_CASES.filter((test) => test.kind === 'external-historical-qualification'),
+      selectedCases: laneChecks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
+      laneExcluded: [],
+    },
+  });
+  save(join(results, 'release-tests-attempt.json'), {
+    stage: 'release-tests',
+    status: 'completed',
+    checkpointSha256: checkpoint.sha256,
+    contractSha256,
+    directory: releaseDirectory,
+    resultPath: releaseTests.path,
+    receipt: releaseTests,
+    command: { stage: 'tests', ...command },
+  });
   const consumerDirectory = join(results, 'consumer-00000000-0000-4000-8000-000000000000');
   const consumer = save(join(consumerDirectory, 'result.json'), {
     schemaVersion: 'ai-delivery.current-consumer@1',
@@ -672,6 +767,7 @@ function fixture() {
     producer,
     artifact,
     checkpoint,
+    releaseTests,
     consumer,
     consumerAttempt: attempt,
     consumerProcess: command,
@@ -686,6 +782,7 @@ function fixture() {
     save(path, data);
   };
   return {
+    contract,
     directory,
     source,
     results,
@@ -693,6 +790,7 @@ function fixture() {
     inputs,
     archivePath,
     consumerDirectory,
+    releaseTests,
     overall,
     save,
     edit,
@@ -732,6 +830,207 @@ test('first qualification selects observed bytes without a pre-known digest', ()
   }
 });
 
+test('packed helpers copy only the retained qualified archive without repacking', () => {
+  assert.equal(typeof qualification.copyReleaseArchive, 'function');
+  const f = fixture();
+  try {
+    const original = readFileSync(f.archivePath);
+    const contract = readFileSync(join(f.results, 'contract.json'));
+    const destination = join(f.directory, 'helper.tgz');
+    assert.deepEqual(qualification.copyReleaseArchive(join(f.results, 'contract.json'), f.source, destination), {
+      archivePath: destination,
+      archiveSha256: f.inputs.digest,
+    });
+    assert.deepEqual(readFileSync(destination), original);
+    assert.deepEqual(readFileSync(f.archivePath), original);
+    assert.deepEqual(readFileSync(join(f.results, 'contract.json')), contract);
+    assert.throws(() => qualification.copyReleaseArchive(join(f.results, 'contract.json'), f.source, destination));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('release scope runs only the exact mandatory inventory without another build', async () => {
+  const f = fixture();
+  try {
+    const context = qualification.validateReleaseEntry(join(f.results, 'contract.json'), f.source);
+    const files = [
+      'dist/setup.test.js',
+      'dist/lifecycle.test.js',
+      'dist/targetPolicyLocal.test.js',
+      'dist/pluginPackaging.test.js',
+    ];
+    let launched = 0;
+    let driftDuringTest = false;
+    let commandStatus = 'passed';
+    let confirmed = true;
+    const unrelated = join(f.directory, 'unrelated');
+    writeFileSync(unrelated, 'preserve');
+    const toolchain = () => ({
+      controller: { version: 'v24.21.0', executable: f.contract.node24 },
+      npm: { version: '11.19.0', executable: f.contract.npmCli },
+      libraryConsumer: { version: 'v26.2.0', executable: f.contract.node26 },
+    });
+    const execute = async (command: string[], options: { directory: string; env: NodeJS.ProcessEnv }) => {
+      launched++;
+      assert.ok(command.includes('--tags-filter=release'));
+      assert.deepEqual(
+        command.filter((arg) => arg.startsWith('dist/')),
+        files,
+      );
+      assert.equal(options.env.AI_DELIVERY_TEST_LANE, 'release');
+      assert.equal(options.env.AI_DELIVERY_RELEASE_CONTRACT, context.contractPath);
+      assert.equal(options.env.TMPDIR, options.env.TEMP);
+      assert.equal(options.env.TEMP, options.env.TMP);
+      assert.ok(options.env.TMPDIR);
+      writeFileSync(join(options.env.TMPDIR, 'owned-leftover'), 'remove after quiescence');
+      mkdirSync(options.directory, { recursive: true });
+      const output = command.find((arg) => arg.startsWith('--outputFile.json='))!.slice('--outputFile.json='.length);
+      writeFileSync(
+        output,
+        JSON.stringify({
+          success: true,
+          numTotalTests: 24,
+          numPassedTests: 23,
+          testResults: files.map((file) => ({
+            name: join(f.source, file),
+            status: 'passed',
+            assertionResults: laneChecks.RELEASE_CASES.filter((test) => test.file === file).map((test) => ({
+              fullName: test.title,
+              status: test.kind === 'mandatory' ? 'passed' : 'pending',
+              tags: ['release'],
+            })),
+          })),
+        }),
+      );
+      const stdoutPath = join(options.directory, 'stdout.txt');
+      const stderrPath = join(options.directory, 'stderr.txt');
+      writeFileSync(stdoutPath, '');
+      writeFileSync(stderrPath, '');
+      if (driftDuringTest) writeFileSync(join(f.source, files[0]!), '// changed ignored compiled bytes\n');
+      return {
+        status: commandStatus,
+        exitCode: commandStatus === 'passed' ? 0 : 1,
+        signal: commandStatus === 'cancelled' ? 'SIGTERM' : null,
+        cleanupConfirmed: confirmed,
+        stdoutPath,
+        stderrPath,
+      };
+    };
+    const report = await laneChecks.runChecks({
+      cwd: f.source,
+      resultsDir: join(f.directory, 'release-checks'),
+      release: context,
+      toolchain,
+      execute,
+    });
+    assert.equal(report.status, 'passed', report.error);
+    assert.equal(report.scope, 'release');
+    assert.equal(report.fullSuccess, false);
+    assert.equal(report.artifactQualified, false);
+    assert.equal(report.tests?.passed, 23);
+    assert.deepEqual(
+      report.commands.map((command) => command.stage),
+      ['tests'],
+    );
+    assert.equal(launched, 1);
+    assert.equal(report.release?.temporary?.removed, true);
+    assert.equal(existsSync(report.release!.temporary!.path), false);
+    for (const status of ['failed', 'cancelled']) {
+      commandStatus = status;
+      const terminal = await laneChecks.runChecks({
+        cwd: f.source,
+        resultsDir: join(f.directory, `release-${status}`),
+        release: context,
+        toolchain,
+        execute,
+      });
+      assert.equal(terminal.status, status);
+      assert.equal(terminal.release?.temporary?.removed, true);
+      assert.equal(existsSync(terminal.release!.temporary!.path), false);
+      assert.equal(readFileSync(unrelated, 'utf8'), 'preserve');
+    }
+    commandStatus = 'passed';
+    confirmed = false;
+    const unconfirmed = await laneChecks.runChecks({
+      cwd: f.source,
+      resultsDir: join(f.directory, 'unconfirmed-cleanup'),
+      release: context,
+      toolchain,
+      execute,
+    });
+    assert.equal(unconfirmed.status, 'failed');
+    assert.equal(unconfirmed.release?.temporary?.removed, false);
+    assert.ok(existsSync(join(unconfirmed.release!.temporary!.path, 'owned-leftover')));
+    assert.match(unconfirmed.release!.temporary!.error!, /quiescence/u);
+    confirmed = true;
+    const beforeRefusal = launched;
+    const rejected = await laneChecks.runChecks({
+      cwd: f.source,
+      resultsDir: join(f.directory, 'wrong-context'),
+      release: { ...context, archiveSha256: '0'.repeat(64) },
+      toolchain,
+      execute,
+    });
+    assert.equal(rejected.status, 'failed');
+    assert.equal(launched, beforeRefusal, 'A mismatched context must not launch another child.');
+    driftDuringTest = true;
+    const changed = await laneChecks.runChecks({
+      cwd: f.source,
+      resultsDir: join(f.directory, 'changed-during-tests'),
+      release: context,
+      toolchain,
+      execute,
+    });
+    assert.equal(changed.status, 'failed', 'Ignored compiled changes during a release run must invalidate its proof.');
+    assert.equal(launched, beforeRefusal + 1);
+    assert.equal(
+      execFileSync('git', ['status', '--porcelain'], { cwd: f.source, encoding: 'utf8' }),
+      '',
+      'Git cleanliness cannot prove ignored test bytes.',
+    );
+    const stale = await laneChecks.runChecks({
+      cwd: f.source,
+      resultsDir: join(f.directory, 'stale-compiled'),
+      release: context,
+      toolchain,
+      execute,
+    });
+    assert.equal(stale.status, 'failed');
+    assert.equal(launched, beforeRefusal + 1, 'Stale compiled release bytes must fail before launch.');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['archive-drift', 'source-drift', 'compiled-drift', 'destination-link', 'parent-alias'])(
+  'packed archive copy refuses %s without replacing originals',
+  (failure) => {
+    assert.equal(typeof qualification.copyReleaseArchive, 'function');
+    const f = fixture();
+    try {
+      let destination = join(f.directory, 'helper.tgz');
+      const original = readFileSync(f.archivePath);
+      if (failure === 'archive-drift') writeFileSync(f.archivePath, 'changed archive');
+      if (failure === 'source-drift') writeFileSync(join(f.source, 'untracked'), 'changed source');
+      if (failure === 'compiled-drift') {
+        writeFileSync(join(f.source, 'dist/setup.test.js'), '// changed ignored compiled bytes\n');
+        assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: f.source, encoding: 'utf8' }), '');
+      }
+      if (failure === 'destination-link') symlinkSync(f.archivePath, destination);
+      if (failure === 'parent-alias') {
+        symlinkSync(f.directory, join(f.directory, 'alias'));
+        destination = join(f.directory, 'alias/helper.tgz');
+      }
+      assert.throws(() => qualification.copyReleaseArchive(join(f.results, 'contract.json'), f.source, destination));
+      if (failure !== 'archive-drift') assert.deepEqual(readFileSync(f.archivePath), original);
+      if (failure !== 'destination-link') assert.equal(existsSync(destination), false);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
 test('publication verification never learns a missing expected digest', () => {
   const f = fixture();
   try {
@@ -743,14 +1042,26 @@ test('publication verification never learns a missing expected digest', () => {
   }
 });
 
-test('fresh outer resume selects and portably verifies original qualified bytes without replay', () => {
+test('fresh outer resume selects and portably verifies original qualified bytes without replay', async () => {
   const f = fixture();
   try {
     const originalResult = readFileSync(join(f.results, 'result.json'));
     const originalArchive = readFileSync(f.archivePath);
     const outer = join(f.directory, 'resumed-outer');
-    mkdirSync(outer);
-    f.save(join(outer, 'result.json'), { ...f.overall, resultsDir: outer });
+    let commands = 0;
+    const forbidden = async () => {
+      commands++;
+      throw new Error('Completed units must not replay.');
+    };
+    const resumed = await qualification.runQualification({
+      cwd: f.source,
+      resultsDir: outer,
+      resume: join(f.results, 'checkpoint.json'),
+      checks: forbidden,
+      execute: forbidden,
+    });
+    assert.equal(resumed.qualified, true, resumed.error);
+    assert.equal(commands, 0);
     const bundle = api.selectReleaseArtifact(outer, f.output, f.inputs, f.source);
     assert.deepEqual(readFileSync(join(f.results, 'result.json')), originalResult);
     assert.equal(bundle.records['checkpoint']?.contents, readFileSync(join(f.results, 'checkpoint.json'), 'utf8'));
@@ -758,6 +1069,86 @@ test('fresh outer resume selects and portably verifies original qualified bytes 
     rmSync(f.results, { recursive: true });
     rmSync(outer, { recursive: true });
     assert.deepEqual(readFileSync(api.verifyReleaseArtifact(f.output, f.inputs)), originalArchive);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each([
+  'missing',
+  'corrupt',
+  'PR-only',
+  'source',
+  'contract',
+  'producer',
+  'archive',
+  'missing-case',
+  'duplicate-case',
+  'failed-case',
+  'cleanup',
+  'command-cleanup',
+  'leftover-temp',
+])('release selection refuses %s release proof before retaining output', (failure) => {
+  const f = fixture();
+  try {
+    if (failure === 'missing')
+      f.edit(join(f.results, 'result.json'), (data) => {
+        delete data['releaseTests'];
+      });
+    else if (failure === 'corrupt') writeFileSync(f.releaseTests.path, '{}');
+    else {
+      f.edit(f.releaseTests.path, (data) => {
+        const context = data['release'] as Json;
+        const tests = data['tests'] as Json;
+        if (failure === 'PR-only') data['scope'] = 'full';
+        if (failure === 'source') context['sourceCommit'] = 'a'.repeat(40);
+        if (failure === 'contract') context['contractSha256'] = 'b'.repeat(64);
+        if (failure === 'producer') context['producerSha256'] = 'c'.repeat(64);
+        if (failure === 'archive') context['archiveSha256'] = 'd'.repeat(64);
+        if (failure === 'missing-case') (tests['selectedCases'] as unknown[]).pop();
+        if (failure === 'duplicate-case')
+          (tests['selectedCases'] as unknown[]).push((tests['selectedCases'] as unknown[])[0]);
+        if (failure === 'failed-case') tests['passed'] = 22;
+        if (failure === 'cleanup') (context['temporary'] as Json)['removed'] = false;
+        if (failure === 'command-cleanup') (data['commands'] as Json[])[0]!['cleanupConfirmed'] = false;
+      });
+      f.edit(join(f.results, 'result.json'), (data) => {
+        data['releaseTests'] = {
+          path: f.releaseTests.path,
+          sha256: canonical.sha256(readFileSync(f.releaseTests.path)),
+        };
+      });
+    }
+    if (failure === 'leftover-temp') mkdirSync(join(dirname(f.releaseTests.path), 'temporary'));
+    assert.throws(() => api.selectReleaseArtifact(f.results, f.output, f.inputs, f.source));
+    assert.equal(existsSync(f.output), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('portable verification refuses missing or incomplete release proof even with consistent hashes', () => {
+  const f = fixture();
+  try {
+    const bundle = api.selectReleaseArtifact(f.results, f.output, f.inputs, f.source);
+    const original = bundle.records['releaseTests'];
+    assert.ok(original);
+    const path = join(f.output, 'qualification.json');
+    f.edit(path, (data) => {
+      delete (data['records'] as Json)['releaseTests'];
+    });
+    assert.throws(() => api.verifyReleaseArtifact(f.output, f.inputs));
+    bundle.records['releaseTests'] = original;
+    const report = JSON.parse(original.contents) as Json;
+    report['scope'] = 'full';
+    const contents = JSON.stringify(report);
+    bundle.records['releaseTests'] = { contents, sha256: canonical.sha256(contents) };
+    const overall = JSON.parse(bundle.records['overall']!.contents) as Json;
+    (overall['releaseTests'] as Json)['sha256'] = canonical.sha256(contents);
+    const overallContents = JSON.stringify(overall);
+    bundle.records['overall'] = { contents: overallContents, sha256: canonical.sha256(overallContents) };
+    f.save(path, bundle);
+    assert.throws(() => api.verifyReleaseArtifact(f.output, f.inputs));
   } finally {
     f.cleanup();
   }
