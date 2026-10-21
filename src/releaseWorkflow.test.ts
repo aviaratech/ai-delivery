@@ -28,10 +28,12 @@ type Api = {
   selectReleaseArtifact(root: string, output: string, inputs: Pick<Inputs, 'source' | 'version'>, cwd: string): Bundle;
   verifyReleaseArtifact(root: string, inputs: Inputs): string;
   validateQualificationOrigin(
+    this: void,
     metadata: { artifact: Json; attempt: Json; workflow: Json; jobs: Json },
     inputs: { repository: string; repositoryId: number; source: string; artifactId: number },
   ): { artifactId: number; runId: number; runAttempt: number; artifactName: string };
   releaseDispatch(
+    this: void,
     inputs: DispatchInputs,
   ):
     | { qualificationOnly: true; source: string; version: string }
@@ -304,14 +306,14 @@ test('accepted artifact promotion executes no qualification graph', async () => 
     assert.deepEqual(result.commands, [{ command: 'git', args: ['rev-parse', 'HEAD'] }]);
     const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
     const step = workflow
-      .split(/(?=^      - )/mu)
+      .split(/(?=^ {6}- )/mu)
       .find((step) => step.includes('name: Verify accepted original archive\n'));
     assert.ok(step);
     assert.match(step, /if: \$\{\{ !inputs\.qualification_only \}\}/u);
     const script = step
       .split('        run: |\n')[1]
       ?.split('\n')
-      .map((line) => line.replace(/^          /u, ''))
+      .map((line) => line.replace(/^ {10}/u, ''))
       .join('\n');
     assert.ok(script);
     const trace = execFileSync('/bin/bash', ['-ex', '-c', 'exec 2>&1\n' + script], {
@@ -907,7 +909,7 @@ test('actual release workflow passes the qualified archive through upload and di
   );
   assert.match(packageJob, /path: \$\{\{ runner\.temp \}\}\/release-artifact\//u);
   assert.doesNotMatch(packageJob, /npm run build|npm pack/u);
-  const steps = packageJob.split(/(?=^      - )/mu);
+  const steps = packageJob.split(/(?=^ {6}- )/mu);
   for (const name of [
     'Pin npm',
     'Qualify and retain the exact archive',
