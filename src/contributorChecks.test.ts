@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -34,11 +35,12 @@ type CommandOptions = {
   progress?: (record: object) => void;
 };
 type Report = {
+  scope: string;
   status: string;
   fullSuccess: boolean;
   exitCode: number;
   omitted: string[];
-  commands: { stage: string; status: string }[];
+  commands: { stage: string; status: string; command: string[] }[];
   selectedTestFiles?: string[];
   error?: string;
   observedTests?: { total: number; passed: number; failed: number };
@@ -81,6 +83,9 @@ type Checks = {
     cwd: string;
     resultsDir: string;
     fast?: boolean;
+    testFiles?: string[];
+    buildPlugin?: boolean;
+    install?: boolean;
     toolchain?: () => Toolchain;
     execute?: Checks['executeCommand'];
   }): Promise<Report>;
@@ -145,8 +150,8 @@ function executor(f: ReturnType<typeof fixture>, failStage = ''): Checks['execut
         'clean before build, rather than after selection',
       );
       mkdirSync(join(f.cwd, 'dist'), { recursive: true });
-      const source = existsSync(join(f.cwd, 'src/renamed.test.ts')) ? 'renamed' : 'original';
-      writeFileSync(join(f.cwd, `dist/${source}.test.js`), '// compiled synthetic test\n');
+      for (const source of readdirSync(join(f.cwd, 'src')).filter((name) => name.endsWith('.test.ts')))
+        writeFileSync(join(f.cwd, 'dist', source.replace(/\.ts$/u, '.js')), '// compiled synthetic test\n');
       for (const path of [
         'dist/cli.js',
         'dist/index.js',
@@ -288,6 +293,97 @@ test('fast success and command failure remain partial and preserve omitted/remai
     assert.equal(testFailure.observedTests?.total, 1);
     assert.match(readFileSync(join(f.base, 'failed-tests/result.txt'), 'utf8'), /Observed test results/u);
     assert.equal(testFailure.commands.at(-1)!.status, 'failed');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('explicit focused files run only their compilation and tests without install, inventory or plugin bundling', async () => {
+  for (const selected of ['original', 'tooling']) {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.cwd, 'src/tooling.test.ts'), '// another changed contract\n');
+      const report = await checks.runChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'focused'),
+        fast: true,
+        testFiles: [`dist/${selected}.test.js`],
+        toolchain: () => f.toolchain,
+        execute: executor(f),
+      });
+      assert.equal(report.exitCode, 0, report.error);
+      assert.equal(report.scope, 'focused');
+      assert.equal(report.status, 'partial-passed');
+      assert.equal(report.fullSuccess, false);
+      assert.deepEqual(report.selectedTestFiles, [`dist/${selected}.test.js`]);
+      assert.deepEqual(
+        report.commands.map((entry) => entry.stage),
+        ['format', 'lint', 'types', 'build', 'tests'],
+      );
+      assert.deepEqual(report.commands[3]!.command.slice(1), [
+        join(f.cwd, 'node_modules/typescript/lib/tsc.js'),
+        '-p',
+        'tsconfig.build.json',
+      ]);
+      assert.ok(report.omitted.includes('unselected tests'));
+      assert.ok(report.omitted.includes('inventory'));
+      assert.equal(
+        report.commands.some((entry) => entry.command.includes('ci') || entry.command.includes('pack')),
+        false,
+      );
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('invalid focused selection or local dependency install refuses before launching any gate', async () => {
+  for (const options of [
+    { fast: true, testFiles: [] },
+    { fast: true, testFiles: ['dist/missing.test.js'] },
+    { fast: true, testFiles: ['../dist/original.test.js'] },
+    { fast: true, testFiles: ['dist/*.test.js'] },
+    { fast: true, testFiles: ['dist/original.test.js', 'dist/original.test.js'] },
+    { testFiles: ['dist/original.test.js'] },
+    { fast: true, install: true },
+  ]) {
+    const f = fixture();
+    try {
+      const report = await checks.runChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'invalid'),
+        ...options,
+        toolchain: () => f.toolchain,
+        execute: executor(f),
+      });
+      assert.equal(report.exitCode, 1);
+      assert.equal(report.fullSuccess, false);
+      assert.deepEqual(report.commands, []);
+      assert.match(report.error!, /focused|install|selection|explicit/iu);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('focused plugin bundling requires an explicit artifact-dependent selection', async () => {
+  const f = fixture();
+  try {
+    const report = await checks.runChecks({
+      cwd: f.cwd,
+      resultsDir: join(f.base, 'plugin-focused'),
+      fast: true,
+      testFiles: ['dist/original.test.js'],
+      buildPlugin: true,
+      toolchain: () => f.toolchain,
+      execute: executor(f),
+    });
+    assert.equal(report.exitCode, 0, report.error);
+    assert.deepEqual(
+      report.commands.map((entry) => entry.stage),
+      ['format', 'lint', 'types', 'build', 'plugin-build', 'tests'],
+    );
+    assert.equal(report.fullSuccess, false);
   } finally {
     f.cleanup();
   }

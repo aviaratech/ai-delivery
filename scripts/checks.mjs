@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 /** @typedef {{result?:{url:string, functions:{ranges:{startOffset:number,endOffset:number,count:number}[]}[]}[]}} V8Report */
 /** @typedef {Partial<CommandRecord> & {stage:string, command:string[], status:string, directory:string}} StageRecord */
 /** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
-/** @typedef {{cwd?:string, resultsDir?:string, fast?:boolean, install?:boolean, stagedTree?:string, signal?:AbortSignal, timeoutMs?:number, execute?:typeof executeCommand, toolchain?:typeof validateToolchain, environment?:Environment}} CheckOptions */
+/** @typedef {{cwd?:string, resultsDir?:string, fast?:boolean, testFiles?:string[], buildPlugin?:boolean, install?:boolean, stagedTree?:string, signal?:AbortSignal, timeoutMs?:number, execute?:typeof executeCommand, toolchain?:typeof validateToolchain, environment?:Environment}} CheckOptions */
 
 /** @param {unknown} error */
 export function errorMessage(error) {
@@ -149,6 +149,22 @@ export function expectedTests(cwd) {
   const sources = walk(join(cwd, 'src')).filter((path) => path.endsWith('.test.ts'));
   assert.ok(sources.length, 'No intended source tests selected.');
   return sources.map((path) => `dist/${path.slice(0, -3)}.js`);
+}
+
+/** @param {string} cwd @param {string[]} requested */
+export function selectFocusedTests(cwd, requested) {
+  assert.ok(
+    Array.isArray(requested) && requested.length > 0,
+    'An explicit nonempty focused test selection is required.',
+  );
+  const intended = new Set(expectedTests(cwd));
+  assert.equal(new Set(requested).size, requested.length, 'Duplicate focused test selection.');
+  for (const file of requested)
+    assert.ok(
+      typeof file === 'string' && intended.has(file) && !/[\\*?[\]{}]/u.test(file),
+      `Invalid focused test selection: ${file}`,
+    );
+  return [...requested].sort();
 }
 
 /** @param {string} cwd */
@@ -582,6 +598,8 @@ export async function runChecks({
   cwd = process.cwd(),
   resultsDir,
   fast = false,
+  testFiles,
+  buildPlugin = false,
   install = false,
   stagedTree,
   signal,
@@ -600,13 +618,23 @@ export async function runChecks({
     schemaVersion: 'contributor-checks@1',
     runId: randomUUID(),
     startedAt: new Date().toISOString(),
-    scope: fast ? 'fast' : 'full',
+    scope: testFiles !== undefined ? 'focused' : fast ? 'fast' : 'full',
     status: 'running',
     fullSuccess: false,
     artifactQualified: false,
     artifactOmitted: ['actual scripts-disabled archive', 'current-consumer application and owned cleanup'],
-    gates: fast ? FAST_GATES : FULL_GATES,
-    omitted: fast ? FULL_GATES.filter((gate) => !FAST_GATES.includes(gate)) : [],
+    gates:
+      testFiles !== undefined
+        ? [...FAST_GATES, 'build', ...(buildPlugin ? ['plugin-build'] : []), 'tests']
+        : fast
+          ? FAST_GATES
+          : FULL_GATES,
+    omitted:
+      testFiles !== undefined
+        ? ['unselected tests', 'inventory', ...(buildPlugin ? [] : ['plugin bundle'])]
+        : fast
+          ? FULL_GATES.filter((gate) => !FAST_GATES.includes(gate))
+          : [],
     commands: [],
     resultsDir: directory,
     timeoutMs,
@@ -617,6 +645,13 @@ export async function runChecks({
   const notify = (message) => process.stdout.write(`[${report.scope}] ${message}\n`);
   try {
     assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs >= 0, 'Command timeout must be a nonnegative integer.');
+    assert.ok(
+      !fast || !install,
+      'Local fast/focused checks never install dependencies; complete explicit setup separately.',
+    );
+    assert.ok(testFiles === undefined || fast, 'Explicit focused selection requires --fast.');
+    assert.ok(!buildPlugin || testFiles !== undefined, 'Plugin bundling requires an explicit focused selection.');
+    if (testFiles !== undefined) report.selectedTestFiles = selectFocusedTests(cwd, testFiles);
     report.tree = treeIdentity(cwd);
     if (stagedTree !== undefined) {
       assert.match(stagedTree, /^[0-9a-f]{40}$/u);
@@ -635,7 +670,7 @@ export async function runChecks({
       notify(`START ${stage}`);
       const result = await execute(command, {
         cwd,
-        env: { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
+        env: fast ? environment : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
         directory: entry.directory,
         signal,
         timeoutMs,
@@ -685,11 +720,18 @@ export async function runChecks({
     await run('format', [...npm, 'run', 'format:check']);
     await run('lint', [...npm, 'run', 'lint']);
     await run('types', [...npm, 'run', 'typecheck']);
-    if (!fast) {
+    if (!fast || report.selectedTestFiles) {
       // Clean output once, immediately before the only compiled build in this graph.
       rmSync(join(cwd, 'dist'), { recursive: true, force: true });
-      await run('build', [...npm, 'run', 'build']);
-      report.selectedTestFiles = assertCleanSelection(cwd);
+      await run(
+        'build',
+        fast
+          ? [process.execPath, join(cwd, 'node_modules/typescript/lib/tsc.js'), '-p', 'tsconfig.build.json']
+          : [...npm, 'run', 'build'],
+      );
+      if (fast && buildPlugin) await run('plugin-build', [process.execPath, join(cwd, 'scripts/build-plugin.mjs')]);
+      const allTests = assertCleanSelection(cwd);
+      report.selectedTestFiles ??= allTests;
       const testReport = join(directory, 'vitest.json');
       const testRun = await run('tests', [
         process.execPath,
@@ -699,6 +741,14 @@ export async function runChecks({
         '--reporter=default',
         '--reporter=json',
         `--outputFile.json=${testReport}`,
+        ...(fast
+          ? [
+              '--no-cache',
+              ...allTests
+                .filter((file) => !report.selectedTestFiles?.includes(file))
+                .map((file) => `--exclude=${file}`),
+            ]
+          : []),
         ...report.selectedTestFiles,
       ]);
       report.tests = analyzeTests(
@@ -708,12 +758,14 @@ export async function runChecks({
         readFileSync(testRun.stdoutPath, 'utf8'),
         environment,
       );
-      const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);
-      report.inventory = analyzeInventory(
-        /** @type {PackInventory[]} */ (JSON.parse(readFileSync(inventory.stdoutPath, 'utf8'))),
-        cwd,
-      );
-      report.coverage = coverageBaseline(join(directory, 'v8'), cwd);
+      if (!fast) {
+        const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);
+        report.inventory = analyzeInventory(
+          /** @type {PackInventory[]} */ (JSON.parse(readFileSync(inventory.stdoutPath, 'utf8'))),
+          cwd,
+        );
+        report.coverage = coverageBaseline(join(directory, 'v8'), cwd);
+      }
     }
     assert.deepEqual(
       treeIdentity(cwd),
@@ -743,6 +795,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const options = {};
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--fast') options.fast = true;
+    else if (args[i] === '--test-file') (options.testFiles ??= []).push(args[++i]);
+    else if (args[i] === '--build-plugin') options.buildPlugin = true;
     else if (args[i] === '--install') options.install = true;
     else if (args[i] === '--results-dir') options.resultsDir = args[++i];
     else if (args[i] === '--staged-tree') options.stagedTree = args[++i];

@@ -42,6 +42,7 @@ type Staged = {
     cwd: string;
     resultsDir: string;
     signal?: AbortSignal;
+    testFiles?: string[];
     execute?: () => Promise<{ status: string; cleanupConfirmed: boolean }>;
   }): Promise<StagedResult>;
 };
@@ -58,7 +59,40 @@ function fixture(runner?: string) {
   git('config', 'user.email', 'contributor@example.test');
   writeFileSync(join(cwd, 'partial.txt'), 'original\n');
   writeFileSync(join(cwd, 'delete.txt'), 'tracked deletion\n');
-  writeFileSync(join(cwd, 'package-lock.json'), '{"synthetic":"original"}\n');
+  writeFileSync(join(cwd, '.gitignore'), '/node_modules/\n/dist/\n');
+  const manifest = { name: 'staged-fixture', version: '1.0.0', dependencies: { 'fixture-dependency': '1.0.0' } };
+  const packages = {
+    '': manifest,
+    'node_modules/fixture-dependency': { version: '1.0.0', dependencies: { 'fixture-transitive': '1.0.0' } },
+    'node_modules/fixture-transitive': { version: '1.0.0' },
+  };
+  writeFileSync(join(cwd, 'package.json'), JSON.stringify(manifest));
+  writeFileSync(
+    join(cwd, 'package-lock.json'),
+    JSON.stringify({ lockfileVersion: 3, synthetic: 'original', packages }),
+  );
+  mkdirSync(join(cwd, 'src'));
+  writeFileSync(join(cwd, 'src/selected.test.ts'), '// selected synthetic contract\n');
+  mkdirSync(join(cwd, 'node_modules/fixture-dependency'), { recursive: true });
+  writeFileSync(
+    join(cwd, 'node_modules/fixture-dependency/package.json'),
+    JSON.stringify({ name: 'fixture-dependency', version: '1.0.0', dependencies: { 'fixture-transitive': '1.0.0' } }),
+  );
+  writeFileSync(
+    join(cwd, 'node_modules/.package-lock.json'),
+    JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        'node_modules/fixture-dependency': { version: '1.0.0', dependencies: { 'fixture-transitive': '1.0.0' } },
+        'node_modules/fixture-transitive': { version: '1.0.0' },
+      },
+    }),
+  );
+  mkdirSync(join(cwd, 'node_modules/fixture-transitive'));
+  writeFileSync(
+    join(cwd, 'node_modules/fixture-transitive/package.json'),
+    JSON.stringify({ name: 'fixture-transitive', version: '1.0.0' }),
+  );
   if (runner !== undefined) writeFileSync(join(cwd, 'scripts/checks.mjs'), runner);
   git('add', '.');
   git('commit', '-qm', 'Synthetic baseline');
@@ -97,44 +131,152 @@ test('exact staged tree isolates partial edits, additions, deletions and lockfil
   }
 });
 
-function syntheticRunner(fullSuccess = true) {
+function syntheticRunner(focused = true) {
   return `import fs from 'node:fs';import path from 'node:path';
 const args=process.argv.slice(2);const tree=args[args.indexOf('--staged-tree')+1],dir=args[args.indexOf('--results-dir')+1];
-if(!args.includes('--install'))process.exit(8);
-if(fs.readFileSync('package-lock.json','utf8')!=='{"synthetic":"original"}\\n')process.exit(9);
+if(args.includes('--install')||!args.includes('--fast')||!args.includes('--test-file'))process.exit(8);
+if(JSON.parse(fs.readFileSync('package-lock.json','utf8')).synthetic!=='original')process.exit(9);
 if(process.env.GH_TOKEN||process.env.NODE_OPTIONS||process.env.NODE_PATH)process.exit(10);
-fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'result.json'),JSON.stringify({fullSuccess:${fullSuccess},tree:{stagedGitTree:tree}}));`;
+fs.mkdirSync('node_modules/.vite',{recursive:true});fs.writeFileSync('node_modules/.vite/owned-cache','synthetic cache');
+fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'result.json'),JSON.stringify({scope:'${focused ? 'focused' : 'fast'}',status:'partial-passed',fullSuccess:false,artifactQualified:false,selectedTestFiles:['dist/selected.test.js'],tests:{files:1,total:1,passed:1},tree:{stagedGitTree:tree}}));`;
 }
 
-test('tracked entry executes staged runner rather than unstaged code and cleans only owned snapshot', async () => {
+test('missing explicit hook selection refuses before validation without provisioning dependencies', async () => {
+  const f = fixture(syntheticRunner());
+  try {
+    const result = await staged.runStagedChecks({ cwd: f.cwd, resultsDir: join(f.base, 'missing-selection') });
+    assert.equal(result.status, 'failed');
+    assert.match(result.error!, /explicit.*selection/iu);
+    assert.equal(result.cleanupConfirmed, true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('staged dependency incompatibility refuses instead of installing or accepting different package versions', async () => {
+  for (const scenario of [
+    'version',
+    'package-version',
+    'missing',
+    'missing-transitive',
+    'missing-metadata-entry',
+    'staged-manifest',
+  ]) {
+    const f = fixture(syntheticRunner());
+    try {
+      const metadata = join(f.cwd, 'node_modules/.package-lock.json');
+      if (scenario === 'missing') rmSync(join(f.cwd, 'node_modules'), { recursive: true });
+      else if (scenario === 'missing-transitive')
+        rmSync(join(f.cwd, 'node_modules/fixture-transitive'), { recursive: true });
+      else if (scenario === 'package-version')
+        writeFileSync(
+          join(f.cwd, 'node_modules/fixture-transitive/package.json'),
+          JSON.stringify({ name: 'fixture-transitive', version: '2.0.0' }),
+        );
+      else if (scenario === 'staged-manifest') {
+        writeFileSync(
+          join(f.cwd, 'package.json'),
+          JSON.stringify({ name: 'staged-fixture', version: '1.0.0', dependencies: { 'fixture-dependency': '2.0.0' } }),
+        );
+        f.git('add', 'package.json');
+      } else
+        writeFileSync(
+          metadata,
+          JSON.stringify({
+            lockfileVersion: 3,
+            packages: { 'node_modules/fixture-dependency': { version: scenario === 'version' ? '2.0.0' : '1.0.0' } },
+          }),
+        );
+      const result = await staged.runStagedChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'incompatible'),
+        testFiles: ['dist/selected.test.js'],
+      });
+      assert.equal(result.status, 'failed');
+      assert.match(result.error!, /dependenc|compatible|setup/iu);
+      assert.equal(result.cleanupConfirmed, true);
+      assert.equal(result.sourceIndexUnchanged, true);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('observable installed dependency metadata drift cannot become successful hook evidence', async () => {
+  for (const changedMetadata of ['.package-lock.json', 'fixture-transitive/package.json']) {
+    const f = fixture(syntheticRunner());
+    try {
+      const result = await staged.runStagedChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'drift'),
+        testFiles: ['dist/selected.test.js'],
+        execute: async () => {
+          const metadata = join(f.cwd, 'node_modules', changedMetadata);
+          writeFileSync(metadata, readFileSync(metadata, 'utf8') + '\n');
+          return { status: 'passed', cleanupConfirmed: true };
+        },
+      });
+      assert.equal(result.status, 'failed');
+      assert.match(result.error!, /dependenc.*(changed|drift)/iu);
+      assert.equal(result.cleanupConfirmed, true);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('tracked entry reuses transitive dependencies with staged code and cleans only owned snapshot', async () => {
   const f = fixture(syntheticRunner());
   try {
     writeFileSync(join(f.cwd, 'scripts/checks.mjs'), "throw Error('Unstaged runner must not execute');\n");
     writeFileSync(join(f.cwd, 'package-lock.json'), '{"synthetic":"unstaged must not install"}\n');
+    writeFileSync(
+      join(f.cwd, 'package.json'),
+      JSON.stringify({
+        name: 'staged-fixture',
+        version: '1.0.0',
+        dependencies: { 'fixture-dependency': '1.0.0' },
+        description: 'unstaged manifest must survive',
+      }),
+    );
     const index = hash(readFileSync(join(f.cwd, '.git/index')));
     const resultsDir = join(f.base, 'results');
-    const result = await staged.runStagedChecks({ cwd: f.cwd, resultsDir });
-    assert.equal(result.status, 'passed');
-    assert.equal(result.fullSuccess, true);
+    const result = await staged.runStagedChecks({ cwd: f.cwd, resultsDir, testFiles: ['dist/selected.test.js'] });
+    assert.equal(result.status, 'partial-passed');
+    assert.equal(result.fullSuccess, false);
     assert.equal(result.sourceIndexUnchanged, true);
     assert.equal(result.cleanupConfirmed, true);
     assert.equal(existsSync(result.ownedDirectory), false);
-    assert.equal(existsSync(join(resultsDir, 'full/result.json')), true);
+    assert.equal(existsSync(join(resultsDir, 'focused/result.json')), true);
+    assert.equal(existsSync(join(f.cwd, 'node_modules/.vite')), false);
+    assert.equal(
+      (
+        JSON.parse(readFileSync(join(f.cwd, 'node_modules/fixture-dependency/package.json'), 'utf8')) as {
+          version: string;
+        }
+      ).version,
+      '1.0.0',
+    );
     assert.equal(hash(readFileSync(join(f.cwd, '.git/index'))), index);
     assert.match(readFileSync(join(f.cwd, 'scripts/checks.mjs'), 'utf8'), /Unstaged runner/u);
     assert.match(readFileSync(join(f.cwd, 'package-lock.json'), 'utf8'), /unstaged must not install/u);
+    assert.match(readFileSync(join(f.cwd, 'package.json'), 'utf8'), /unstaged manifest must survive/u);
     await assert.rejects(staged.runStagedChecks({ cwd: f.cwd, resultsDir }), /Existing staged result/u);
   } finally {
     f.cleanup();
   }
 });
 
-test('fast or missing staged runner cannot become hook full success; unrelated source survives failure', async () => {
+test('fast-only or missing staged runner cannot become focused hook success; unrelated source survives failure', async () => {
   for (const runner of [undefined, syntheticRunner(false)]) {
     const f = fixture(runner);
     try {
       const before = hash(readFileSync(join(f.cwd, '.git/index')));
-      const result = await staged.runStagedChecks({ cwd: f.cwd, resultsDir: join(f.base, 'result') });
+      const result = await staged.runStagedChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'result'),
+        testFiles: ['dist/selected.test.js'],
+      });
       assert.equal(result.fullSuccess, false);
       assert.equal(result.status, 'failed');
       assert.equal(result.cleanupConfirmed, true);
@@ -152,7 +294,11 @@ test('unsafe staged symlink is refused before commands and cleanup preserves the
     symlinkSync('../outside', join(f.cwd, 'link'));
     f.git('add', 'link');
     const before = hash(readFileSync(join(f.cwd, '.git/index')));
-    const result = await staged.runStagedChecks({ cwd: f.cwd, resultsDir: join(f.base, 'result') });
+    const result = await staged.runStagedChecks({
+      cwd: f.cwd,
+      resultsDir: join(f.base, 'result'),
+      testFiles: ['dist/selected.test.js'],
+    });
     assert.equal(result.status, 'failed');
     assert.match(result.error!, /symlink index entry/u);
     assert.equal(result.cleanupConfirmed, true);
@@ -169,7 +315,12 @@ test('staged graph cancellation preserves source and partial evidence after owne
   try {
     const before = hash(readFileSync(join(f.cwd, '.git/index')));
     const resultsDir = join(f.base, 'result');
-    const result = await staged.runStagedChecks({ cwd: f.cwd, resultsDir, signal: controller.signal });
+    const result = await staged.runStagedChecks({
+      cwd: f.cwd,
+      resultsDir,
+      signal: controller.signal,
+      testFiles: ['dist/selected.test.js'],
+    });
     assert.equal(result.status, 'cancelled');
     assert.equal(result.exitCode, 130);
     assert.equal(result.sourceIndexUnchanged, true);
@@ -190,6 +341,7 @@ test('unconfirmed child completion preserves the owned snapshot and marks cleanu
     const result = await staged.runStagedChecks({
       cwd: f.cwd,
       resultsDir: join(f.base, 'uncertain'),
+      testFiles: ['dist/selected.test.js'],
       execute: async () => ({ status: 'failed', cleanupConfirmed: false }),
     });
     ownedDirectory = result.ownedDirectory;
@@ -245,14 +397,22 @@ test('synthetic commit -a and path-limited hooks validate the Git-supplied tempo
       const hook = join(f.cwd, '.git/hooks/pre-commit');
       writeFileSync(
         hook,
-        `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(entry)} --results-dir ${quote(resultsDir)}\n`,
+        `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(entry)} --results-dir ${quote(resultsDir)}${mode === 'path' ? ' --test-file dist/selected.test.js' : ''}\n`,
       );
       chmodSync(hook, 0o755); // Only this disposable synthetic repository owns the hook.
       writeFileSync(join(f.cwd, 'partial.txt'), `${mode} committed content\n`);
       if (mode === 'path') writeFileSync(join(f.cwd, 'delete.txt'), 'unrelated unstaged content\n');
-      f.git('commit', '-qm', `Synthetic ${mode} commit`, ...(mode === 'all' ? ['-a'] : ['--', 'partial.txt']));
+      execFileSync(
+        'git',
+        ['commit', '-qm', `Synthetic ${mode} commit`, ...(mode === 'all' ? ['-a'] : ['--', 'partial.txt'])],
+        {
+          cwd: f.cwd,
+          env: { ...process.env, AI_DELIVERY_FOCUSED_TESTS: '["dist/selected.test.js"]' },
+        },
+      );
       const result = JSON.parse(readFileSync(join(resultsDir, 'staged.json'), 'utf8')) as StagedResult;
-      assert.equal(result.fullSuccess, true);
+      assert.equal(result.fullSuccess, false);
+      assert.equal(result.status, 'partial-passed');
       assert.equal(result.sourceIndexUnchanged, true);
       assert.equal(result.cleanupConfirmed, true);
       assert.notEqual(resolve(result.sourceIndexPath!), join(f.cwd, '.git/index'));
