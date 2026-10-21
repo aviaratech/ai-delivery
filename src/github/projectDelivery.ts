@@ -1,7 +1,7 @@
 import type { graphql as GraphQLType } from '@octokit/graphql';
 import type { DeliveryConfig } from '../config/deliveryConfig.js';
 
-import { DeliveryError } from '../errors.js';
+import { CollectionLimitError, DeliveryError } from '../errors.js';
 
 export const PROJECT_DELIVERY_STATUSES = ['Todo', 'In Progress', 'Blocked', 'Done'] as const;
 
@@ -134,12 +134,14 @@ export async function getProjectDeliveryConfiguration(input: {
   org: string;
   requireWritable?: boolean;
   settings: ProjectDeliverySettings;
+  maxPages?: number;
 }): Promise<ProjectDeliveryConfiguration> {
   const settings = requireProjectSettings(input.settings);
   const project = await readProjectDeliveryDefinition({
     graphql: input.graphql,
     org: input.org,
     number: settings.number,
+    ...(input.maxPages === undefined ? {} : { maxPages: input.maxPages }),
   });
   return resolveProjectDeliveryConfiguration(project, { requireWritable: input.requireWritable === true, settings });
 }
@@ -148,6 +150,7 @@ export async function readProjectDeliveryDefinition(input: {
   graphql: typeof GraphQLType;
   org: string;
   number: number;
+  maxPages?: number;
 }): Promise<Record<string, unknown>> {
   const nodes: unknown[] = [];
   let cursor: null | string = null;
@@ -155,8 +158,17 @@ export async function readProjectDeliveryDefinition(input: {
   const seenCursors = new Set<string>();
   const fieldIds = new Set<string>();
   let project: null | Record<string, unknown> = null;
+  let pages = 0;
 
   while (hasNextPage) {
+    if (input.maxPages !== undefined && pages >= input.maxPages)
+      throw new CollectionLimitError({
+        collection: 'project-fields',
+        pagesRequested: pages,
+        rowsObserved: nodes.length,
+        limit: input.maxPages,
+      });
+    pages++;
     const response: unknown = await input.graphql(
       `
         query ProjectDeliveryConfiguration($org: String!, $number: Int!, $cursor: String) {
@@ -404,8 +416,51 @@ export async function assertIssueProjectWritable(input: ProjectDeliveryInput): P
     throw new DeliveryError('The issue delivery Project item is archived and cannot be updated.');
 }
 
+/** Add only membership and verify the exact unarchived item; Status is never written here. */
+export async function ensureIssueProjectMembership(
+  input: ProjectDeliveryInput & { beforeAdd?: () => Promise<void>; onItemKnown?: (itemId: string) => void },
+): Promise<{ itemId: string; archived: false }> {
+  const configuration =
+    input.configuration ??
+    (await getProjectDeliveryConfiguration({
+      ...input,
+      settings: requireProjectSettings(input.settings),
+      requireWritable: true,
+    }));
+  assertWritableConfiguration(configuration);
+  const existing = await findIssueProjectItem({ ...input, configuration, refuseUnreadable: true });
+  if (existing?.archived) throw new DeliveryError('The issue delivery Project item is archived and cannot be updated.');
+  let itemId = existing?.id;
+  if (itemId === undefined) {
+    await input.beforeAdd?.();
+    const response: unknown = await input.graphql(
+      `
+        mutation AddProjectDeliveryItem($projectId: ID!, $contentId: ID!) {
+          addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+            item { id }
+          }
+        }
+      `,
+      { contentId: input.issueNodeId, projectId: configuration.projectId },
+    );
+    const added = requireRecord(response, 'GitHub returned invalid Project item creation evidence.');
+    const payload = requireRecord(added.addProjectV2ItemById, 'GitHub omitted Project item creation payload.');
+    const created = requireRecord(payload.item, 'GitHub omitted the created Project item.');
+    itemId = requireString(created.id, 'GitHub omitted the created Project item id.');
+  }
+  // Retain mutation identity even if the exact readback is subsequently unavailable.
+  input.onItemKnown?.(itemId);
+  const item = await readProjectItem({ configuration, graphql: input.graphql, issueNodeId: input.issueNodeId, itemId });
+  if (item.archived) throw new DeliveryError('Project membership readback is archived.');
+  return { itemId, archived: false };
+}
+
 export async function syncIssueProjectStatus(
-  input: ProjectDeliveryInput & { status: ProjectDeliveryStatus; beforeAdvance?: () => Promise<void> },
+  input: ProjectDeliveryInput & {
+    status: ProjectDeliveryStatus;
+    beforeAdd?: () => Promise<void>;
+    beforeAdvance?: () => Promise<void>;
+  },
 ): Promise<ProjectDeliveryStatusReadback> {
   const configuration =
     input.configuration ??
@@ -429,26 +484,8 @@ export async function syncIssueProjectStatus(
   }
 
   if (item === null) {
-    const response: unknown = await input.graphql(
-      `
-        mutation AddProjectDeliveryItem($projectId: ID!, $contentId: ID!) {
-          addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-            item { id }
-          }
-        }
-      `,
-      { contentId: input.issueNodeId, projectId: configuration.projectId },
-    );
-    const added = requireRecord(response, 'GitHub returned invalid Project item creation evidence.');
-    const payload = requireRecord(added.addProjectV2ItemById, 'GitHub omitted Project item creation payload.');
-    const created = requireRecord(payload.item, 'GitHub omitted the created Project item.');
-    item = {
-      archived: false,
-      contentId: input.issueNodeId,
-      id: requireString(created.id, 'GitHub omitted the created Project item id.'),
-      status: null,
-      statusOptionId: null,
-    };
+    const membership = await ensureIssueProjectMembership({ ...input, configuration });
+    item = { archived: false, contentId: input.issueNodeId, id: membership.itemId, status: null, statusOptionId: null };
   }
 
   const optionId = configuration.statusOptionIds[input.status];
@@ -539,10 +576,13 @@ function assertWritableConfiguration(configuration: ProjectDeliveryConfiguration
   }
 }
 
-async function findIssueProjectItem(
-  input: ProjectDeliveryInput & { configuration: ProjectDeliveryConfiguration },
-): Promise<null | ProjectDeliveryItem> {
-  const matches: ProjectDeliveryItem[] = [];
+async function fetchProjectDeliveryItemNodes(
+  input: Omit<ProjectDeliveryInput, 'issueNodeId'> & {
+    configuration: ProjectDeliveryConfiguration;
+    strictProjection?: boolean;
+  },
+): Promise<unknown[]> {
+  const nodes: unknown[] = [];
   let cursor: null | string = null;
   let hasNextPage = true;
   const seenCursors = new Set<string>();
@@ -552,7 +592,12 @@ async function findIssueProjectItem(
 
   while (hasNextPage) {
     if (input.maxPages !== undefined && pages >= input.maxPages)
-      throw new DeliveryError('Project item page limit reached; status evidence is incomplete.');
+      throw new CollectionLimitError({
+        collection: 'project-items',
+        pagesRequested: pages,
+        rowsObserved: nodes.length,
+        limit: input.maxPages,
+      });
     pages++;
     const response: unknown = await input.graphql(
       `
@@ -565,7 +610,7 @@ async function findIssueProjectItem(
                 nodes {
                   id
                   isArchived
-                  content { ... on Issue { id } }
+                  content { __typename ... on Issue { id number repository { nameWithOwner } } ... on PullRequest { id } ... on DraftIssue { id } }
                   fieldValueByName(name: $statusField) {
                     ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
                   }
@@ -584,10 +629,12 @@ async function findIssueProjectItem(
       },
     );
     const record = requireRecord(response, 'GitHub returned invalid delivery Project item evidence.');
+    if (input.strictProjection && 'errors' in record)
+      throw new DeliveryError('GitHub returned partial Project item evidence.');
     const organization = requireRecord(record.organization, 'GitHub omitted the delivery Project organization.');
     const project = requireRecord(organization.projectV2, 'GitHub omitted the delivery Project.');
     if (
-      input.capacityRead &&
+      (input.capacityRead || input.strictProjection) &&
       (project.id !== input.configuration.projectId || project.number !== input.configuration.projectNumber)
     )
       throw new DeliveryError('WIP capacity Project identity disagrees with the configured Project.');
@@ -595,12 +642,9 @@ async function findIssueProjectItem(
     if (!Array.isArray(items.nodes)) {
       throw new DeliveryError('GitHub returned invalid delivery Project items.');
     }
-    for (const rawItem of items.nodes) {
-      const item = parseProjectItem(rawItem, input.configuration, input.capacityRead);
-      if (item !== null && item.contentId === input.issueNodeId) matches.push(item);
-    }
+    nodes.push(...(items.nodes as unknown[]));
     const pageInfo = requireRecord(items.pageInfo, 'GitHub omitted delivery Project item pagination.');
-    if (input.capacityRead && typeof pageInfo.hasNextPage !== 'boolean')
+    if ((input.capacityRead || input.strictProjection) && typeof pageInfo.hasNextPage !== 'boolean')
       throw new DeliveryError('WIP capacity Project pagination is incomplete.');
     hasNextPage = pageInfo.hasNextPage === true;
     const nextCursor = typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null;
@@ -609,12 +653,91 @@ async function findIssueProjectItem(
     cursor = nextCursor;
   }
 
-  if (matches.length > 1) {
+  return nodes;
+}
+
+async function findIssueProjectItem(
+  input: ProjectDeliveryInput & { configuration: ProjectDeliveryConfiguration; refuseUnreadable?: boolean },
+): Promise<null | ProjectDeliveryItem> {
+  const matches: ProjectDeliveryItem[] = [];
+  for (const raw of await fetchProjectDeliveryItemNodes(input)) {
+    if (input.refuseUnreadable && (!isRecord(raw) || raw.content === null || raw.content === undefined))
+      throw new DeliveryError('Project membership is unreadable; absence cannot be proved.');
+    const item = parseProjectItem(raw, input.configuration, input.capacityRead);
+    if (item?.contentId === input.issueNodeId) matches.push(item);
+  }
+  if (matches.length > 1)
     throw new DeliveryError(
       `Issue has ${String(matches.length)} duplicate Project items in ${input.configuration.title}.`,
     );
-  }
   return matches[0] ?? null;
+}
+
+export interface ProjectItemObservation extends ProjectDeliveryItem {
+  projectId: string;
+  projectNumber: number;
+  contentKind: 'issue' | 'draft' | 'pull-request';
+  statusRead: 'verified' | 'unset' | 'unreadable';
+  statusName: string | null;
+  repository?: string;
+  issueNumber?: number;
+}
+
+/** Complete, strict reconciliation projection over the same Project pagination owner. */
+export async function readProjectDeliveryItems(input: {
+  graphql: typeof GraphQLType;
+  org: string;
+  configuration: ProjectDeliveryConfiguration;
+  maxPages: number;
+}): Promise<ProjectItemObservation[]> {
+  const observations: ProjectItemObservation[] = [];
+  const ids = new Set<string>();
+  for (const raw of await fetchProjectDeliveryItemNodes({ ...input, strictProjection: true })) {
+    const record = requireRecord(raw, 'GitHub returned invalid Project membership.');
+    if (typeof record.isArchived !== 'boolean') throw new DeliveryError('Project archive projection is incomplete.');
+    const content = requireRecord(record.content, 'Project content is unreadable; absence cannot be proved.');
+    const kind = content.__typename;
+    if (kind !== 'Issue' && kind !== 'DraftIssue' && kind !== 'PullRequest')
+      throw new DeliveryError('Project content type is unreadable.');
+    // Membership identity is independent of whether this item's Status is usable.
+    let item = parseProjectItem({ ...record, fieldValueByName: null }, input.configuration);
+    if (!item || ids.has(item.id)) throw new DeliveryError('Project item identity is missing or repeated.');
+    let statusRead: ProjectItemObservation['statusRead'] = record.fieldValueByName === null ? 'unset' : 'unreadable';
+    const rawStatus = isRecord(record.fieldValueByName) ? record.fieldValueByName : null;
+    const safeText = (value: unknown): string | null =>
+      typeof value === 'string' && value.length > 0 && value.length <= 512 ? value : null;
+    const statusName = safeText(rawStatus?.name);
+    if (record.fieldValueByName !== undefined && record.fieldValueByName !== null) {
+      try {
+        item = parseProjectItem(record, input.configuration)!;
+        statusRead = 'verified';
+      } catch {
+        item.statusOptionId = safeText(rawStatus?.optionId);
+      }
+    }
+    ids.add(item.id);
+    const identity = {
+      ...item,
+      projectId: input.configuration.projectId,
+      projectNumber: input.configuration.projectNumber,
+      statusRead,
+      statusName,
+    };
+    if (kind === 'Issue') {
+      const repository = requireString(
+        requireRecord(content.repository, 'Project issue repository is unreadable.').nameWithOwner,
+        'Project issue repository is missing.',
+      );
+      if (
+        !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository) ||
+        !Number.isSafeInteger(content.number) ||
+        Number(content.number) <= 0
+      )
+        throw new DeliveryError('Project issue identity is invalid.');
+      observations.push({ ...identity, contentKind: 'issue', repository, issueNumber: Number(content.number) });
+    } else observations.push({ ...identity, contentKind: kind === 'DraftIssue' ? 'draft' : 'pull-request' });
+  }
+  return observations;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

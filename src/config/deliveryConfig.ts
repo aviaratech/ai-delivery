@@ -208,6 +208,7 @@ const DeliveryConfigSchema = z
   });
 
 export type DeliveryConfig = z.infer<typeof DeliveryConfigSchema>;
+export const NativeDeliveryConfigSchema = DeliveryConfigSchema.shape.native;
 export type DeliveryRole = keyof DeliveryConfig['roles'];
 
 const ModulePath = z.string().regex(/^\.\/(?!.*(?:^|\/)\.\.(?:\/|$))[^\s]+\.(?:mjs|js)$/u);
@@ -370,7 +371,14 @@ export async function loadDeliverySettings(_repositoryRoot?: string): Promise<Lo
 
 export async function loadDeliveryConfig(
   repositoryRoot: string,
-  options: { clients?: DiscoveryClients; personalAuth?: boolean; signal?: AbortSignal; repository?: string } = {},
+  options: {
+    clients?: DiscoveryClients;
+    personalAuth?: boolean;
+    signal?: AbortSignal;
+    repository?: string;
+    readPageLimit?: number;
+    requireWritableProject?: boolean;
+  } = {},
 ): Promise<LoadedGitHubConfig> {
   options.signal?.throwIfAborted();
   const settings = await loadDeliverySettings();
@@ -401,6 +409,10 @@ export async function loadDeliveryConfig(
       repository,
       overrides: settings.overrides,
       repositorySelected: options.repository !== undefined,
+      ...(options.readPageLimit === undefined ? {} : { maxPages: options.readPageLimit }),
+      ...(options.requireWritableProject === undefined
+        ? {}
+        : { requireWritableProject: options.requireWritableProject }),
     });
   } catch (error) {
     if (error instanceof DeliveryError) throw error;

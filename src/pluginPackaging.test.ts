@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,7 @@ import type { LoadedDeliveryConfig } from './config/deliveryConfig.js';
 import { buildRuntimeAdmission, validateRuntimeAdmission } from './services/deliveryAdmission.js';
 import { retainedWorktreeTransitionProducerDigest } from './verification.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
+import { BoardReconcilePlanSchema, BoardReconcileResultSchema } from './services/boardReconcileService.js';
 
 const packageRoot = fileURLToPath(new URL('../', import.meta.url));
 const pluginRoot = join(packageRoot, 'plugins', 'ai-delivery');
@@ -100,6 +101,8 @@ for (const launchCheckout of [false, true]) {
     const preload = join(directory, 'mock-github.mjs');
     const calls = join(directory, 'requests.json');
     const settings = join(directory, 'user.json');
+    const boardStatePath = join(directory, 'board-state.json');
+    writeFileSync(boardStatePath, JSON.stringify({ member: 'ITEM17', status: 'Todo', writes: [] }));
     writeFileSync(
       settings,
       JSON.stringify({
@@ -122,25 +125,43 @@ for (const launchCheckout of [false, true]) {
     writeFileSync(
       preload,
       `
-import {writeFileSync} from 'node:fs';
+import {existsSync,readFileSync,writeFileSync} from 'node:fs';
 import {syntheticDiscoveryClients} from ${JSON.stringify(discoveryFixture)};
 const configuration=${JSON.stringify(syntheticDiscoveryConfig)};
-const requests=[];
 const comments=[];
 const fields=[configuration.native.points,configuration.native.priority].map(field=>({id:Number(field.databaseId),name:field.name,data_type:'single_select',options:field.values.map(name=>({name:String(name)}))}));
 let fieldValues=[];
 let issue={id:117,number:17,node_id:'ISSUE17',title:'Widget',body:'',state:'open',labels:[],html_url:'https://github.com/example/b/issues/17'};
 const page=nodes=>({nodes,pageInfo:{hasNextPage:false,endCursor:null}});
 globalThis.fetch=async(url,init)=>{
+  const requests=existsSync(${JSON.stringify(calls)})?JSON.parse(readFileSync(${JSON.stringify(calls)},'utf8')):[];
+  const boardState=JSON.parse(readFileSync(${JSON.stringify(boardStatePath)},'utf8'));
+  const saveBoard=()=>writeFileSync(${JSON.stringify(boardStatePath)},JSON.stringify(boardState));
   const path=new URL(String(url)).pathname;const method=init?.method??'GET';
   requests.push({path,method});writeFileSync(${JSON.stringify(calls)},JSON.stringify(requests));
   const json=init?.body?JSON.parse(init.body):{};
   let data;
   if(path==='/graphql'){
     const query=json.query;
-    if(query.includes('ProjectDeliveryItems'))data={organization:{projectV2:{items:page([{id:'ITEM17',isArchived:false,content:{id:'ISSUE17'},fieldValueByName:{name:'Queued',optionId:'STATUS-0'}}])}}};
-    else if(query.includes('blockedBy('))data={repository:{issue:{parent:null,blockedBy:page([])}}};
-    else data=await syntheticDiscoveryClients({...configuration,repository:'example/'+(json.variables?.repo??'b')}).graphql(query,json.variables);
+    const item=()=>({id:boardState.member,isArchived:false,project:{id:'PROJECT-1',number:1},content:{__typename:'Issue',id:'ISSUE17',number:17,repository:{nameWithOwner:'example/b'}},fieldValueByName:boardState.status===null?null:{name:'Queued',optionId:'STATUS-0'}});
+    if(boardState.failDiscovery==='access'&&query.includes('DeliveryRepository'))return new Response(JSON.stringify({message:'Synthetic access denied'}),{status:403,headers:{'content-type':'application/json'}});
+    if(query.includes('AddProjectDeliveryItem')){
+      boardState.member='ADDED17';boardState.status='Todo';boardState.writes.push('add');
+      const lost=boardState.failAddResponse;boardState.failAddResponse=false;saveBoard();
+      if(lost)throw new Error('Synthetic lost add response');
+      data={addProjectV2ItemById:{item:{id:boardState.member}}};
+    }
+    else if(query.includes('ProjectDeliveryItems'))data={organization:{projectV2:{id:'PROJECT-1',number:1,items:page(boardState.member?[item()]:[])}}};
+    else if(query.includes('ProjectDeliveryItemReadback'))data={node:boardState.member===json.variables.itemId?item():null};
+    else if(query.includes('blockedBy('))data={repository:{issue:{id:'ISSUE17',number:17,repository:{nameWithOwner:'example/b'},parent:null,blockedBy:page([])}}};
+    else if(query.includes('DeliveryIssueBranches'))data={repository:{issue:{linkedBranches:page([])}}};
+    else {
+      data=await syntheticDiscoveryClients({...configuration,repository:'example/'+(json.variables?.repo??'b')}).graphql(query,json.variables);
+      if(boardState.failDiscovery==='pages'&&query.includes('ProjectDeliveryConfiguration')){
+        if(json.variables.cursor!=null)data.organization.projectV2.fields.nodes=[];
+        data.organization.projectV2.fields.pageInfo={hasNextPage:true,endCursor:'next-'+String(json.variables.cursor??'first')};
+      }
+    }
     return new Response(JSON.stringify({data}),{status:200,headers:{'content-type':'application/json'}});
   }
   if(path==='/user')data={id:1,login:'operator'};
@@ -159,6 +180,8 @@ globalThis.fetch=async(url,init)=>{
     data=fieldValues;
   }
   else if(path.endsWith('/issues')&&method==='POST'){issue={...issue,...json};data=issue;}
+  else if(path.endsWith('/issues')&&method==='GET')data=[issue];
+  else if(path.endsWith('/sub_issues'))data=[];
   else if(path.endsWith('/issues/17')){if(method==='PATCH')issue={...issue,...json};data=issue;}
   else throw new Error('Unexpected synthetic request '+method+' '+path);
   return new Response(JSON.stringify(data),{status:200,headers:{'content-type':'application/json'}});
@@ -275,6 +298,124 @@ globalThis.fetch=async(url,init)=>{
       });
       assert.equal(unknown.isError, true);
       assert.match(JSON.stringify(unknown), /Unknown repository label.*missing-label/u);
+      // Exercise the actual bundled coordinator and CLI against the same synthetic provider state.
+      const boardValue = async (arguments_: Record<string, unknown>) => {
+        const response = await client.callTool({ name: 'board_reconcile', arguments: arguments_ });
+        assert.equal(response.isError, undefined, JSON.stringify(response));
+        return JSON.parse((response.content as { text: string }[])[0]!.text) as unknown;
+      };
+      const boardEnv = {
+        PATH: process.env.PATH ?? '',
+        TMPDIR: tmpdir(),
+        HOME: directory,
+        AI_DELIVERY_CONFIG: settings,
+        SYNTHETIC_TOKEN: 'inert-personal-token',
+        NODE_OPTIONS: `--v8-pool-size=1 --import=${preload}`,
+      };
+      const activeCli = launchCheckout
+        ? join(packageRoot, 'dist', 'cli.js')
+        : join(selectedPluginRoot, 'runtime', 'dist', 'cli.js');
+      const boardCli = (...args: string[]) =>
+        spawnSync(process.execPath, [activeCli, 'board:reconcile', '--repositories', 'example/b', ...args], {
+          cwd: directory,
+          env: boardEnv,
+          encoding: 'utf8',
+          maxBuffer: 32 * 1024 * 1024,
+        });
+      writeFileSync(boardStatePath, JSON.stringify({ member: null, status: null, writes: [], failAddResponse: true }));
+      const plan = BoardReconcilePlanSchema.parse(await boardValue({ repositories: ['example/b'] }));
+      assert.equal(plan.scopeComplete, true);
+      assert.equal(plan.operations.length, 1);
+      assert.equal(plan.operations[0]!.kind, 'add-membership');
+      const rootLibrary = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `import {executeTool} from ${JSON.stringify(pathToFileURL(join(packageRoot, 'dist', 'agent.js')).href)};console.log(JSON.stringify(await executeTool('board_reconcile',{repositories:['example/b']},{repoRoot:process.cwd()})));`,
+        ],
+        { cwd: directory, env: boardEnv, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
+      );
+      assert.equal(rootLibrary.status, 0, rootLibrary.stderr);
+      const rootPlan = BoardReconcilePlanSchema.parse(JSON.parse(rootLibrary.stdout));
+      assert.equal(rootPlan.packageIdentity!.packageVersion, plan.packageIdentity!.packageVersion);
+      assert.deepEqual(rootPlan.scope, plan.scope);
+      assert.deepEqual(rootPlan.operations, plan.operations);
+      if (!launchCheckout) {
+        assert.notDeepEqual(rootPlan.packageIdentity, plan.packageIdentity);
+        const crossArtifact = BoardReconcileResultSchema.parse(
+          await boardValue({ repositories: rootPlan.scope, mode: 'apply', plan: rootPlan }),
+        );
+        assert.equal(crossArtifact.summary.applied, 0);
+        assert.equal(crossArtifact.summary.refused, 1);
+      } else assert.deepEqual(rootPlan.packageIdentity, plan.packageIdentity);
+      const interrupted = BoardReconcileResultSchema.parse(
+        await boardValue({ repositories: plan.scope, mode: 'apply', plan }),
+      );
+      assert.equal(interrupted.summary.unknown, 1);
+      assert.equal(interrupted.operations[0]!.attempted, true);
+      const planFile = join(directory, 'plan.json'),
+        priorFile = join(directory, 'prior-result.json');
+      writeFileSync(planFile, JSON.stringify(plan));
+      writeFileSync(priorFile, JSON.stringify(interrupted));
+      const resumedCli = boardCli('--apply', '--plan-file', planFile, '--prior-result-file', priorFile);
+      assert.equal(resumedCli.status, 1, resumedCli.stderr);
+      const resumed = BoardReconcileResultSchema.parse(JSON.parse(resumedCli.stdout));
+      assert.equal(resumed.summary.applied, 0);
+      assert.equal(resumed.summary.satisfied, 1);
+      assert.equal(resumed.operations[0]!.priorEvidence.at(-1)!.outcome, 'unknown');
+      assert.equal(resumed.summary.unresolved, 1);
+      assert.deepEqual((JSON.parse(readFileSync(boardStatePath, 'utf8')) as { writes: string[] }).writes, ['add']);
+      writeFileSync(boardStatePath, JSON.stringify({ member: null, status: null, writes: [] }));
+      const partialCli = boardCli('--apply', '--plan-file', planFile);
+      assert.equal(partialCli.status, 1, partialCli.stderr);
+      const applied = BoardReconcileResultSchema.parse(JSON.parse(partialCli.stdout));
+      assert.equal(applied.summary.applied, 1);
+      assert.equal(applied.operations[0]!.readback!.itemId, 'ADDED17');
+      const historical = structuredClone(applied);
+      historical.operations[0]!.outcome = 'unknown';
+      historical.summary.applied = 0;
+      historical.summary.unknown = 1;
+      writeFileSync(priorFile, JSON.stringify(historical));
+      const emptyPlan = BoardReconcilePlanSchema.parse(await boardValue({ repositories: ['example/b'] }));
+      assert.equal(emptyPlan.operations.length, 0);
+      for (const failure of ['pages', 'access']) {
+        writeFileSync(
+          boardStatePath,
+          JSON.stringify({ member: 'ADDED17', status: 'Todo', writes: ['add'], failDiscovery: failure }),
+        );
+        for (const value of [
+          await boardValue({ repositories: plan.scope, mode: 'apply', plan, priorResult: historical }),
+          ...(() => {
+            const result = boardCli('--apply', '--plan-file', planFile, '--prior-result-file', priorFile);
+            assert.equal(result.status, 1, result.stderr);
+            return [JSON.parse(result.stdout) as unknown];
+          })(),
+        ]) {
+          const result = BoardReconcileResultSchema.parse(value);
+          assert.equal(result.scopeComplete, false);
+          assert.equal(result.planId, plan.planId);
+          assert.equal(result.summary.applied, 0);
+          assert.equal(result.summary.satisfied, 0);
+          assert.equal(result.operations[0]!.attempted, false);
+          assert.equal(result.operations[0]!.operationId, plan.operations[0]!.operationId);
+          assert.ok(result.operations[0]!.knownItemIds.includes('ADDED17'));
+          assert.deepEqual(result.operations[0]!.priorEvidence.at(-1)!.readback, historical.operations[0]!.readback);
+          if (failure === 'pages') assert.equal(result.gaps[0]!.pagesRequested, 20);
+        }
+        const dry = boardCli('--dry-run');
+        assert.equal(dry.status, 1, dry.stderr);
+        assert.equal(BoardReconcilePlanSchema.parse(JSON.parse(dry.stdout)).scopeComplete, false);
+        const empty = BoardReconcileResultSchema.parse(
+          await boardValue({ repositories: emptyPlan.scope, mode: 'apply', plan: emptyPlan }),
+        );
+        assert.equal(empty.scopeComplete, false);
+        assert.deepEqual(empty.operations, []);
+      }
+      writeFileSync(boardStatePath, JSON.stringify({ member: 'ADDED17', status: 'Todo', writes: ['add'] }));
+      const completeDry = boardCli('--dry-run');
+      assert.equal(completeDry.status, 0, completeDry.stderr);
+      assert.equal(BoardReconcilePlanSchema.parse(JSON.parse(completeDry.stdout)).scopeComplete, true);
       const requests = JSON.parse(readFileSync(calls, 'utf8')) as Array<{ path: string; method: string }>;
       assert.equal(
         requests.some((call) => call.path.startsWith('/repos/example/a/')),
