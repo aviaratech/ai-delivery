@@ -12,15 +12,34 @@ nvm use 24.21.0
 node -p 'JSON.stringify({version:process.version,execPath:process.execPath})'
 npm --version
 "$AI_DELIVERY_NODE26_EXECUTABLE" -p 'JSON.stringify({version:process.version,execPath:process.execPath})'
+# Explicit initial dependency setup, when missing or incompatible:
 npm ci --ignore-scripts --no-audit --no-fund
-npm run checks
 ```
+
+For each ordinary change, run fast checks plus an explicit focused selection
+for the changed contracts, using fresh owned results outside the checkout:
+
+```sh
+npm run checks:fast -- --test-file dist/contributorChecks.test.js --test-file dist/stagedChecks.test.js --results-dir /owned/new/local-results
+```
+
+This runs format/lint/types, one clean TypeScript compilation and only the
+selected test files. Add `--build-plugin` only when those selected contracts
+need the bundled plugin artifact. Select tests deliberately: an existing mixed
+file can contain real npm installation/archive cases, which are not ordinary
+local validation. The local runner never implicitly provisions dependencies,
+packs an archive or selects every test. Do not run the full local suite per
+change. Required green CI for the current independently reviewed candidate and
+current base is the merge gate; missing, failed or stale required CI cannot be
+replaced by local results. Preserve old full-local failures as diagnostic history;
+they do not create a blanket additional merge prerequisite.
 
 The runner fails before gates for missing, wrong or inaccessible prerequisites.
 It resolves existing temporary-directory aliases to their physical paths so
 macOS synthetic fixtures do not mistake `/var` or `/tmp` aliases for managed
 plugin symlinks; this creates no new destination or host setting.
-Local and CI full entry `npm run checks` runs `scripts/current-qualification.mjs`:
+The maintained full entry `npm run checks`, used by current CI and explicit
+package/release qualification, runs `scripts/current-qualification.mjs`:
 the canonical six-gate producer, one actual scripts-disabled pack, then an owned,
 credential-free production-only consumer installation of that exact archive.
 The producer in `scripts/checks.mjs` runs formatting, native type-aware lint,
@@ -30,7 +49,8 @@ with one worker, and complete dry inventory validation. The immutable
 producer success. Overall `ai-delivery.current-qualification@1` requires the
 exact archive, resolved production closure, installed byte/mode checks, CLI,
 exports, packaged stdio MCP schemas, skills, actual Node26 library use, and owned
-quiescent removal. Its `qualified: true` and exit 0 are full contributor proof.
+quiescent removal. Its `qualified: true` and exit 0 are full package qualification
+proof, distinct from ordinary local fast/focused evidence.
 A producer pass alone reports `artifactQualified: false`.
 Source names, compiled names and actual Vitest selection must agree;
 deleted/renamed tests cannot survive in stale `dist`. Actual artifact qualification
@@ -72,14 +92,18 @@ overall result, never inserted back into the producer hash. Do not rerun a
 successful producer or pack merely to report or join evidence. Each invocation
 needs fresh owned output storage; preserve uncertain/interrupted receipts.
 
-`npm run checks:fast` runs only format/lint/types. It reports `partial-passed`,
-`fullSuccess: false` and omitted build/tests/inventory. `npm test` is a separate
+Plain `npm run checks:fast` runs only format/lint/types. It reports `partial-passed`,
+`fullSuccess: false` and omitted build/tests/inventory. With repeatable exact
+`--test-file dist/path.test.js` arguments, it reports `scope: focused`, retains
+the actual selection/commands and omits unselected tests, inventory and package
+proof. Empty, duplicate, missing or glob selections refuse; they never fall back
+to all tests. Both local modes retain `artifactQualified: false`. `npm test` is a separate
 development command, not full-check proof. Every check run prints its results
 directory and keeps `result.json`, `result.txt`, per-command logs, toolchain/tree,
 selected file/test counts, skips, start/final exit, signals and partial state.
 Raw test observations survive a failing command and remain distinct from the
 validated proof required for full success.
-Select owned storage outside the checkout with `npm run checks -- --results-dir
+Select owned storage outside the checkout with `npm run checks:fast -- --results-dir
 /an/owned/new/result-directory`. Existing results are never overwritten by a
 retry. A lost response or missing CI artifact means completion is **unknown**:
 inspect the original result and PID/birth records, prove owned quiescence, then
@@ -123,11 +147,27 @@ or failed artifact transport requires reconciliation, not a blind retry.
 The optional tracked hook is `scripts/pre-commit.mjs`. It copies the index into
 an owned temporary directory, honoring `GIT_INDEX_FILE` (including temporary
 indexes supplied by `git commit -a` and path-limited commits), computes the exact staged tree with private
-objects, materializes that tree, provisions from its staged lock and invokes
-its **staged** six-gate canonical producer. The snapshot hook reports actual
-archive/clean-HEAD consumer omissions and `artifactQualified: false`; it does not
-install or force an uncommitted index through clean-source qualification. It does not stash, write the original index or
-unstaged files, or borrow checkout node_modules. It checks the source index for
+objects, materializes that tree and invokes its **staged** fast/focused runner.
+Supply a nonempty explicit selection using repeatable `--test-file` arguments
+for direct invocation, or Git's no-argument hook with a JSON array:
+
+```sh
+AI_DELIVERY_FOCUSED_TESTS='["dist/stagedChecks.test.js","dist/contributorChecks.test.js"]' git commit
+```
+
+The hook reuses compatible installed dependencies through links under an owned
+`node_modules` parent, keeping tool caches and outputs in owned storage. It checks
+installed metadata and actual package versions against the **staged** lock,
+requires its dependency declarations to match the staged manifest, and uses
+read-only `npm ls --package-lock-only` to validate that lock's graph. This avoids
+npm treating linked dependencies as development projects. Unrelated unstaged
+manifest/lock changes are preserved.
+Missing/incompatible setup or observable dependency metadata drift refuses;
+the hook never installs or repairs dependencies and does not copy their payload.
+This is local compatibility evidence, not installed-byte/package provenance.
+The snapshot hook reports `partial-passed`, `fullSuccess: false`, actual
+archive/clean-HEAD consumer omissions and `artifactQualified: false`. It does
+not stash, write the original index or unstaged files. It checks the source index for
 drift and removes only its owned snapshot after quiescence; results survive.
 Unmerged/submodule/symlink index entries fail explicitly. Opt-in installation
 in your own checkout only, after inspecting and preserving any existing hook:
@@ -141,6 +181,9 @@ chmod +x "$hook_path"
 ```
 
 The hook needs the pinned controller/npm PATH and exported actual Node26 path.
+Its selection input is consumed once and forwarded as exact arguments to the
+sanitized staged child. A selected contract requiring plugin bundling also needs
+an explicit `--build-plugin` argument in the hook invocation.
 Synthetic fixtures prove partial staging, additions, deletions and lockfile
 isolation without operator hook installation. Command environments are
 allowlisted: credential references, NODE_PATH and ambient NODE_OPTIONS are not
