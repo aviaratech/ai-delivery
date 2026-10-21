@@ -9,6 +9,7 @@ import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import type { DeliveryContext } from './issue.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
+import * as projectDelivery from './github/projectDelivery.js';
 
 function updateFixture() {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-history-'));
@@ -785,6 +786,205 @@ test('reconciliation WIP guards bound their label catalog', async () => {
   });
   assert.equal(requests, 20);
 });
+
+function membershipFixture() {
+  const configuration = { ...listingFixture().context.projectConfiguration!, writable: true };
+  const events: string[] = [];
+  const controls = { corrupt: '', archived: false, duplicate: false, unreadable: false };
+  let member = false;
+  let status: 'In Progress' | null = null;
+  const item = (readback = false) => ({
+    id: readback && controls.corrupt === 'item' ? 'WRONG' : 'ITEM17',
+    isArchived: controls.archived,
+    project: { id: readback && controls.corrupt === 'project' ? 'WRONG' : 'PROJECT', number: 1 },
+    content: controls.unreadable
+      ? null
+      : {
+          __typename: 'Issue',
+          id: readback && controls.corrupt === 'issue' ? 'WRONG' : 'ISSUE17',
+          number: 17,
+          repository: { nameWithOwner: 'example/widget' },
+        },
+    fieldValueByName:
+      status === null ? null : { name: 'Active', optionId: controls.corrupt === 'option' ? 'WRONG' : 'ACTIVE' },
+  });
+  const graphql = (async (query: string) => {
+    if (query.includes('mutation AddProjectDeliveryItem')) {
+      events.push('add');
+      member = true;
+      return { addProjectV2ItemById: { item: { id: 'ITEM17' } } };
+    }
+    if (query.includes('mutation UpdateProjectDeliveryStatus')) {
+      events.push('status');
+      status = 'In Progress';
+      return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
+    }
+    if (query.includes('query ProjectDeliveryItemReadback')) {
+      events.push('readback');
+      return { node: item(true) };
+    }
+    if (query.includes('query ProjectDeliveryItems'))
+      return {
+        organization: {
+          projectV2: {
+            id: 'PROJECT',
+            number: 1,
+            items: {
+              nodes: member ? (controls.duplicate ? [item(), { ...item(), id: 'SECOND' }] : [item()]) : [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
+    throw new Error('Unexpected membership fixture query.');
+  }) as unknown as DeliveryContext['clients']['graphql'];
+  return {
+    input: { graphql, configuration, org: 'example', issueNodeId: 'ISSUE17' },
+    events,
+    controls,
+    setMember: () => {
+      member = true;
+    },
+  };
+}
+
+test('membership-only add verifies the exact unarchived item and reuse writes nothing', async () => {
+  const f = membershipFixture();
+  const ensure = Reflect.get(projectDelivery, 'ensureIssueProjectMembership') as
+    | ((input: typeof f.input & { beforeAdd?: () => Promise<void> }) => Promise<{ itemId: string; archived: false }>)
+    | undefined;
+  assert.equal(typeof ensure, 'function');
+  const result = await ensure!({
+    ...f.input,
+    beforeAdd: async () => {
+      f.events.push('before-add');
+    },
+  });
+  assert.deepEqual(result, { itemId: 'ITEM17', archived: false });
+  assert.deepEqual(f.events, ['before-add', 'add', 'readback']);
+  f.events.length = 0;
+  await ensure!(f.input);
+  assert.deepEqual(f.events, ['readback']);
+});
+
+test.each(['project', 'issue', 'item', 'archive', 'duplicate', 'unreadable'] as const)(
+  'membership refuses %s evidence without a repair write',
+  async (failure) => {
+    const f = membershipFixture();
+    f.setMember();
+    if (failure === 'archive') f.controls.archived = true;
+    else if (failure === 'duplicate') f.controls.duplicate = true;
+    else if (failure === 'unreadable') f.controls.unreadable = true;
+    else f.controls.corrupt = failure;
+    const ensure = Reflect.get(projectDelivery, 'ensureIssueProjectMembership') as
+      | ((input: typeof f.input) => Promise<unknown>)
+      | undefined;
+    assert.equal(typeof ensure, 'function');
+    await assert.rejects(ensure!(f.input));
+    assert.deepEqual(
+      f.events.filter((e) => e === 'add' || e === 'status'),
+      [],
+    );
+  },
+);
+
+test('guards run immediately before both Project mutation boundaries', async () => {
+  const f = membershipFixture();
+  const input = {
+    ...f.input,
+    status: 'In Progress' as const,
+    beforeAdd: async () => {
+      f.events.push('before-add');
+    },
+    beforeAdvance: async () => {
+      f.events.push('before-advance');
+    },
+  };
+  await projectDelivery.syncIssueProjectStatus(input);
+  assert.deepEqual(
+    f.events.filter((e) => e !== 'readback'),
+    ['before-add', 'add', 'before-advance', 'status'],
+  );
+  const refused = membershipFixture();
+  const fail = {
+    ...refused.input,
+    status: 'In Progress' as const,
+    beforeAdd: async () => {
+      throw new Error('native drift');
+    },
+  };
+  await assert.rejects(projectDelivery.syncIssueProjectStatus(fail), /native drift/u);
+  assert.deepEqual(refused.events, []);
+});
+
+test('strict Project observation refuses hidden content instead of proving absence', async () => {
+  const f = membershipFixture();
+  f.setMember();
+  f.controls.unreadable = true;
+  const read = Reflect.get(projectDelivery, 'readProjectDeliveryItems') as
+    | ((input: typeof f.input & { maxPages: number }) => Promise<unknown>)
+    | undefined;
+  assert.equal(typeof read, 'function');
+  await assert.rejects(read!({ ...f.input, maxPages: 20 }));
+  assert.deepEqual(f.events, []);
+});
+
+test('strict Project observation retains exact identities and verified non-issue kinds', async () => {
+  const f = membershipFixture();
+  f.setMember();
+  const base = f.input.graphql;
+  const graphql = (async (query: string) => {
+    const response = await base(query);
+    const data = response as { organization: { projectV2: { items: { nodes: unknown[] } } } };
+    data.organization.projectV2.items.nodes.push(
+      {
+        id: 'DRAFT',
+        isArchived: false,
+        content: { __typename: 'DraftIssue', id: 'DRAFT-CONTENT' },
+        fieldValueByName: null,
+      },
+      { id: 'PR', isArchived: true, content: { __typename: 'PullRequest', id: 'PR-CONTENT' }, fieldValueByName: null },
+    );
+    return data;
+  }) as unknown as typeof base;
+  const result = await projectDelivery.readProjectDeliveryItems({ ...f.input, graphql, maxPages: 20 });
+  assert.deepEqual(result[0], {
+    id: 'ITEM17',
+    archived: false,
+    contentId: 'ISSUE17',
+    status: null,
+    statusOptionId: null,
+    projectId: 'PROJECT',
+    projectNumber: 1,
+    contentKind: 'issue',
+    repository: 'example/widget',
+    issueNumber: 17,
+  });
+  assert.deepEqual(
+    result.map((item) => item.contentKind),
+    ['issue', 'draft', 'pull-request'],
+  );
+  assert.deepEqual(f.events, []);
+});
+
+test.each(['project', 'option'] as const)(
+  'Project %s readback failure preserves an attempted write without retry',
+  async (failure) => {
+    const f = membershipFixture();
+    f.controls.corrupt = failure;
+    if (failure === 'project') {
+      await assert.rejects(projectDelivery.ensureIssueProjectMembership(f.input), /exact issue item/u);
+      assert.deepEqual(f.events, ['add', 'readback']);
+    } else {
+      f.setMember();
+      await assert.rejects(
+        projectDelivery.syncIssueProjectStatus({ ...f.input, status: 'In Progress' }),
+        /unsupported Project Status/u,
+      );
+      assert.deepEqual(f.events, ['status', 'readback']);
+    }
+  },
+);
 
 test('search applies the same case-insensitive label filter to authoritative result rows', async () => {
   const { context } = listingFixture();
