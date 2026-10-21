@@ -10,6 +10,23 @@ export class DeliveryError extends Error {
   }
 }
 
+/** A complete logical collection could not be proved within its supplied page budget. */
+export class CollectionLimitError extends DeliveryError {
+  readonly collection: string;
+  readonly pagesRequested: number;
+  readonly rowsObserved: number;
+  readonly limit: number;
+
+  constructor(input: { collection: string; pagesRequested: number; rowsObserved: number; limit: number }) {
+    super('Collection page limit reached; evidence is incomplete.');
+    this.name = 'CollectionLimitError';
+    this.collection = input.collection;
+    this.pagesRequested = input.pagesRequested;
+    this.rowsObserved = input.rowsObserved;
+    this.limit = input.limit;
+  }
+}
+
 const phases = ['rest.request', 'graphql.request'] as const;
 const endpoints = [
   'pulls.merge',

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
 import { DeliveryHealthInput } from '../services/deliveryHealthService.js';
+import { BoardReconcileInput } from '../services/boardReconcileService.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema } from '../issueJournal.js';
 import {
@@ -156,6 +157,13 @@ const RuntimeController = {
 };
 
 export const AI_DELIVERY_MCP_TOOLS = [
+  {
+    name: 'board_reconcile',
+    commandName: 'board:reconcile',
+    description:
+      'Plan or apply bounded Project membership and proven Status reconciliation for 1–10 explicit repositories. Retain the original plan and optional prior result for recovery; unknown activity and metadata suggestions never authorize writes.',
+    inputSchema: BoardReconcileInput,
+  },
   {
     name: 'delivery_health',
     commandName: 'health',
