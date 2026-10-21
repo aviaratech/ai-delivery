@@ -41,6 +41,24 @@ function validInputs(inputs) {
   assert.match(inputs.digest, /^[a-f0-9]{64}$/u, 'Reviewed archive digest is missing.');
 }
 
+/** Validate the two existing-workflow dispatch modes before any qualification commands.
+ * These inputs carry an independently accepted tuple; validation itself does not establish approval.
+ * @param {Inputs & {qualificationOnly:string,artifactId:string}} inputs */
+export function releaseDispatch({ source, version, digest, qualificationOnly, artifactId }) {
+  validSelection({ source, version });
+  assert.ok(['true', 'false'].includes(qualificationOnly), 'Qualification mode must be an explicit boolean.');
+  if (qualificationOnly === 'true') {
+    assert.equal(digest, '', 'First qualification cannot receive a promotion digest.');
+    assert.equal(artifactId, '', 'First qualification cannot receive a promotion artifact.');
+    return { qualificationOnly: true, source, version };
+  }
+  validInputs({ source, version, digest });
+  assert.match(artifactId, /^[1-9]\d*$/u, 'One accepted artifact ID is required.');
+  const id = Number(artifactId);
+  assert.ok(Number.isSafeInteger(id), 'Accepted artifact ID is unsafe.');
+  return { qualificationOnly: false, source, version, digest, artifactId: id };
+}
+
 /** Bind an independently accepted artifact ID to its original successful qualification attempt.
  * Native metadata retrieval belongs to the workflow; this validator performs no requests.
  * @param {{artifact:unknown,attempt:unknown,workflow:unknown,jobs:unknown}} metadata

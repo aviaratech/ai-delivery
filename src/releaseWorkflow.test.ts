@@ -14,10 +14,12 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { Script } from 'node:vm';
 import { test } from 'vitest';
 
 type Json = { [key: string]: unknown };
 type Inputs = { source: string; version: string; digest: string };
+type DispatchInputs = Inputs & { qualificationOnly: string; artifactId: string };
 type Bundle = {
   archive: { filename: string; sha256: string };
   records: Record<string, { sha256: string; contents: string }>;
@@ -29,6 +31,11 @@ type Api = {
     metadata: { artifact: Json; attempt: Json; workflow: Json; jobs: Json },
     inputs: { repository: string; repositoryId: number; source: string; artifactId: number },
   ): { artifactId: number; runId: number; runAttempt: number; artifactName: string };
+  releaseDispatch(
+    inputs: DispatchInputs,
+  ):
+    | { qualificationOnly: true; source: string; version: string }
+    | { qualificationOnly: false; source: string; version: string; digest: string; artifactId: number };
 };
 type Contract = {
   sourceRoot: string;
@@ -71,6 +78,78 @@ const qualification = (await import(new URL('../scripts/current-qualification.mj
   sourceIdentity(cwd: string): Source;
 };
 const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
+
+test('qualification without a digest cannot enter publication', () => {
+  assert.equal(typeof api.releaseDispatch, 'function');
+  const inputs = { source: 'a'.repeat(40), version: '0.3.35', digest: '', qualificationOnly: 'true', artifactId: '' };
+  assert.deepEqual(api.releaseDispatch(inputs), {
+    source: inputs.source,
+    version: inputs.version,
+    qualificationOnly: true,
+  });
+  assert.throws(() => api.releaseDispatch({ ...inputs, qualificationOnly: 'false' }));
+});
+
+test('accepted artifact dispatch requires the complete external tuple', () => {
+  assert.equal(typeof api.releaseDispatch, 'function');
+  const inputs = {
+    source: 'a'.repeat(40),
+    version: '0.3.35',
+    digest: 'b'.repeat(64),
+    qualificationOnly: 'false',
+    artifactId: '42',
+  };
+  assert.deepEqual(api.releaseDispatch(inputs), {
+    source: inputs.source,
+    version: inputs.version,
+    digest: inputs.digest,
+    qualificationOnly: false,
+    artifactId: 42,
+  });
+});
+
+test.each([
+  'unknown-mode',
+  'empty-mode',
+  'missing-source',
+  'missing-digest',
+  'dummy-digest',
+  'missing-id',
+  'multiple-ids',
+  'zero-id',
+  'leading-zero-id',
+  'unsafe-id',
+  'qualification-digest',
+  'qualification-id',
+])('release dispatch refuses %s before costly commands', (failure) => {
+  assert.equal(typeof api.releaseDispatch, 'function');
+  const inputs = {
+    source: 'a'.repeat(40),
+    version: '0.3.35',
+    digest: 'b'.repeat(64),
+    qualificationOnly: 'false',
+    artifactId: '42',
+  };
+  if (failure === 'unknown-mode') inputs.qualificationOnly = 'automatic';
+  if (failure === 'empty-mode') inputs.qualificationOnly = '';
+  if (failure === 'missing-source') inputs.source = '';
+  if (failure === 'missing-digest') inputs.digest = '';
+  if (failure === 'dummy-digest') inputs.digest = 'dummy';
+  if (failure === 'missing-id') inputs.artifactId = '';
+  if (failure === 'multiple-ids') inputs.artifactId = '42,43';
+  if (failure === 'zero-id') inputs.artifactId = '0';
+  if (failure === 'leading-zero-id') inputs.artifactId = '042';
+  if (failure === 'unsafe-id') inputs.artifactId = '9007199254740992';
+  if (failure === 'qualification-digest') {
+    inputs.qualificationOnly = 'true';
+    inputs.artifactId = '';
+  }
+  if (failure === 'qualification-id') {
+    inputs.qualificationOnly = 'true';
+    inputs.digest = '';
+  }
+  assert.throws(() => api.releaseDispatch(inputs));
+});
 
 function originFixture() {
   const source = 'a'.repeat(40);
@@ -117,6 +196,157 @@ function originFixture() {
     inputs: { repository, repositoryId: 123, source, artifactId: 42 },
   };
 }
+
+async function runOriginWorkflow(
+  qualificationOnly: boolean,
+  inputs: Inputs,
+  failure?: 'main' | 'network' | 'oversized',
+) {
+  const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  const script = /node --input-type=module <<'JS'\n([\s\S]*?)\n\s+JS/u.exec(workflow)?.[1];
+  assert.ok(script);
+  const program = script.replace(/^\s*import .+;\n/gmu, '');
+  const f = originFixture();
+  (f.metadata.artifact['workflow_run'] as Json)['head_sha'] = inputs.source;
+  f.metadata.attempt['head_sha'] = inputs.source;
+  (f.metadata.jobs['jobs'] as Json[])[0]!['head_sha'] = inputs.source;
+  const prefix = 'https://api.github.com/repos/aviaratech/ai-delivery/';
+  const responses: Record<string, unknown> = {
+    'branches/main': {
+      name: 'main',
+      protected: true,
+      commit: { sha: failure === 'main' ? 'b'.repeat(40) : inputs.source },
+      protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['checks', 'secrets'] } },
+    },
+    'actions/artifacts/42': f.metadata.artifact,
+    'actions/runs/101/attempts/2': f.metadata.attempt,
+    'actions/workflows/release.yml': f.metadata.workflow,
+    'actions/runs/101/attempts/2/jobs?per_page=100': f.metadata.jobs,
+  };
+  const commands: { command: string; args: string[] }[] = [];
+  const requests: string[] = [];
+  let output = '';
+  const context = {
+    pkg: {
+      name: '@aviaratech/ai-delivery',
+      version: inputs.version,
+      private: false,
+      license: 'MIT',
+      repository: { url: 'git+https://github.com/aviaratech/ai-delivery.git' },
+    },
+    process: {
+      env: {
+        GITHUB_SHA: inputs.source,
+        GITHUB_REPOSITORY: 'aviaratech/ai-delivery',
+        GITHUB_REPOSITORY_ID: '123',
+        REVIEWED_SOURCE_SHA: inputs.source,
+        RELEASE_VERSION: inputs.version,
+        REVIEWED_ARCHIVE_SHA256: qualificationOnly ? '' : inputs.digest,
+        QUALIFICATION_ONLY: String(qualificationOnly),
+        QUALIFICATION_ARTIFACT_ID: qualificationOnly ? '' : '42',
+        GITHUB_OUTPUT: '/synthetic/output',
+        GH_TOKEN: 'synthetic',
+      },
+    },
+    execFileSync: (command: string, args: string[]) => {
+      commands.push({ command, args: Array.from(args) });
+      assert.equal(command, 'git');
+      assert.deepEqual(Array.from(args), ['rev-parse', 'HEAD']);
+      return inputs.source + '\n';
+    },
+    appendFileSync: (path: string, contents: string) => {
+      assert.equal(path, '/synthetic/output');
+      output += contents;
+    },
+    fetch: (url: string, options: RequestInit) => {
+      requests.push(url);
+      assert.equal(options.method ?? 'GET', 'GET');
+      assert.equal(options.redirect, 'error');
+      assert.equal((options.headers as Record<string, string>)['Authorization'], 'Bearer synthetic');
+      if (failure === 'network') return Promise.reject(new Error('Synthetic request failure'));
+      if (failure === 'oversized') return Promise.resolve(new Response('x'.repeat(4 * 1024 * 1024 + 1)));
+      assert.ok(url.startsWith(prefix));
+      const response = responses[url.slice(prefix.length)];
+      assert.ok(response, 'No latest/by-name/fallback endpoint is permitted.');
+      return Promise.resolve(Response.json(response));
+    },
+    releaseDispatch: api.releaseDispatch,
+    validateQualificationOrigin: api.validateQualificationOrigin,
+    Buffer,
+    AbortSignal,
+  };
+  let error: string | null = null;
+  try {
+    await (new Script(`(async () => {${program}\n})()`).runInNewContext(context) as Promise<void>);
+  } catch (failure) {
+    error = String(failure);
+  }
+  return { error, commands, requests, output };
+}
+
+test('actual qualification entry observes only protected source before any archive exists', async () => {
+  const result = await runOriginWorkflow(true, { source: 'a'.repeat(40), version: '0.3.35', digest: '' });
+  assert.equal(result.error, null);
+  assert.deepEqual(result.commands, [{ command: 'git', args: ['rev-parse', 'HEAD'] }]);
+  assert.deepEqual(result.requests, ['https://api.github.com/repos/aviaratech/ai-delivery/branches/main']);
+  assert.equal(result.output, '');
+});
+
+test('accepted artifact promotion executes no qualification graph', async () => {
+  const f = fixture();
+  try {
+    api.selectReleaseArtifact(f.results, f.output, f.inputs, f.source);
+    writeFileSync(join(f.output, 'SHA256SUMS'), `${f.inputs.digest}  ${basename(f.archivePath)}\n`);
+    const result = await runOriginWorkflow(false, f.inputs);
+    assert.equal(result.error, null);
+    assert.equal(result.output, 'run_id=101\nrun_attempt=2\nartifact_id=42\n');
+    assert.equal(result.requests.length, 5);
+    assert.deepEqual(result.commands, [{ command: 'git', args: ['rev-parse', 'HEAD'] }]);
+    const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+    const step = workflow
+      .split(/(?=^      - )/mu)
+      .find((step) => step.includes('name: Verify accepted original archive\n'));
+    assert.ok(step);
+    assert.match(step, /if: \$\{\{ !inputs\.qualification_only \}\}/u);
+    const script = step
+      .split('        run: |\n')[1]
+      ?.split('\n')
+      .map((line) => line.replace(/^          /u, ''))
+      .join('\n');
+    assert.ok(script);
+    const trace = execFileSync('/bin/bash', ['-ex', '-c', 'exec 2>&1\n' + script], {
+      cwd: realpathSync(new URL('..', import.meta.url)),
+      env: {
+        ...process.env,
+        RUNNER_TEMP: f.directory,
+        REVIEWED_SOURCE_SHA: f.inputs.source,
+        RELEASE_VERSION: f.inputs.version,
+        REVIEWED_ARCHIVE_SHA256: f.inputs.digest,
+      },
+      encoding: 'utf8',
+    });
+    assert.match(trace, /node scripts\/release-artifact\.mjs verify/u);
+    assert.match(trace, /shasum -a 256 -c SHA256SUMS/u);
+    assert.doesNotMatch(trace, /npm ci|npm run|npm pack|current-qualification|current-consumer/u);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['main', 'network', 'oversized'] as const)(
+  'actual origin entry refuses %s readback without fallback commands',
+  async (failure) => {
+    const result = await runOriginWorkflow(
+      false,
+      { source: 'a'.repeat(40), version: '0.3.35', digest: 'b'.repeat(64) },
+      failure,
+    );
+    assert.ok(result.error);
+    assert.equal(result.requests.length, 1);
+    assert.equal(result.output, '');
+    assert.deepEqual(result.commands, [{ command: 'git', args: ['rev-parse', 'HEAD'] }]);
+  },
+);
 
 test('origin binds the exact successful original release attempt', () => {
   const f = originFixture();
@@ -670,13 +900,33 @@ test('actual release workflow passes the qualified archive through upload and di
   const packageJob = workflow.slice(workflow.indexOf('  package:'), workflow.indexOf('  publish:'));
   const publishJob = workflow.slice(workflow.indexOf('  publish:'));
   assert.equal((packageJob.match(/npm run checks/gu) ?? []).length, 1);
-  assert.match(packageJob, /npm run checks -- --results-dir "\$RUNNER_TEMP\/release-qualification"/u);
+  assert.match(packageJob, /npm run checks:release -- --results-dir "\$RUNNER_TEMP\/release-qualification"/u);
   assert.match(
     packageJob,
     /release-artifact\.mjs select "\$RUNNER_TEMP\/release-qualification" "\$RUNNER_TEMP\/release-artifact"/u,
   );
   assert.match(packageJob, /path: \$\{\{ runner\.temp \}\}\/release-artifact\//u);
   assert.doesNotMatch(packageJob, /npm run build|npm pack/u);
+  const steps = packageJob.split(/(?=^      - )/mu);
+  for (const name of [
+    'Pin npm',
+    'Qualify and retain the exact archive',
+    'Scan source history',
+    'Upload qualified package',
+  ]) {
+    const step = steps.find((step) => step.includes(`name: ${name}\n`));
+    assert.ok(step, name);
+    assert.match(step, /if: \$\{\{ inputs\.qualification_only \}\}/u, name);
+  }
+  const promotion = steps.find((step) => step.includes('name: Verify accepted original archive\n'));
+  assert.ok(promotion);
+  assert.match(promotion, /if: \$\{\{ !inputs\.qualification_only \}\}/u);
+  assert.doesNotMatch(promotion, /npm ci|npm run|npm pack|current-qualification|current-consumer/u);
+  assert.match(packageJob, /artifact-ids: \$\{\{ inputs\.qualification_artifact_id \}\}/u);
+  assert.match(packageJob, /run-id: \$\{\{ steps\.origin\.outputs\.run_id \}\}/u);
+  assert.match(packageJob, /actions: read/u);
+  assert.doesNotMatch(packageJob, /id-token: write/u);
+  assert.match(publishJob, /!inputs\.qualification_only && needs\.package\.result == 'success'/u);
   assert.match(publishJob, /release-artifact\.mjs verify package-artifact/u);
   assert.match(publishJob, /ref: \$\{\{ inputs\.reviewed_source_sha \}\}/u);
   assert.match(publishJob, /npm pack --ignore-scripts --pack-destination .*repacked/u);

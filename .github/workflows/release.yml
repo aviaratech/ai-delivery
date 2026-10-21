@@ -11,9 +11,18 @@ on:
         description: Independently accepted stable package version
         required: true
         type: string
+      qualification_only:
+        description: Qualify reviewed source without publication or promotion inputs
+        required: false
+        default: false
+        type: boolean
       archive_sha256:
-        description: Independently accepted npm archive SHA256 (64 lowercase hex characters)
-        required: true
+        description: Independently accepted npm archive SHA256 (required for publication)
+        required: false
+        type: string
+      qualification_artifact_id:
+        description: Independently accepted immutable qualification artifact ID (required for publication)
+        required: false
         type: string
 
 concurrency:
@@ -24,6 +33,8 @@ env:
   REVIEWED_SOURCE_SHA: ${{ inputs.reviewed_source_sha }}
   RELEASE_VERSION: ${{ inputs.package_version }}
   REVIEWED_ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+  QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+  QUALIFICATION_ARTIFACT_ID: ${{ inputs.qualification_artifact_id }}
 
 permissions:
   contents: read
@@ -33,6 +44,12 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.ref_protected && github.repository == 'aviaratech/ai-delivery'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      qualification_artifact_id: ${{ steps.qualified.outputs.artifact-id }}
+      archive_sha256: ${{ steps.qualification.outputs.archive_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,51 +57,135 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
+          node-version: 24.21.0
+          package-manager-cache: false
+      - name: Check reviewed source and release metadata
+        id: origin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          import pkg from './package.json' with { type: 'json' };
+          import { releaseDispatch, validateQualificationOrigin } from './scripts/release-artifact.mjs';
+          const dispatch = releaseDispatch({ source: process.env.REVIEWED_SOURCE_SHA, version: process.env.RELEASE_VERSION, digest: process.env.REVIEWED_ARCHIVE_SHA256, qualificationOnly: process.env.QUALIFICATION_ONLY, artifactId: process.env.QUALIFICATION_ARTIFACT_ID });
+          const { source, version } = dispatch;
+          if (process.env.GITHUB_SHA !== source || execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== source) throw new Error('Dispatch or checkout differs from the reviewed source.');
+          if (pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Reviewed release metadata differs from the source package.');
+          const read = async path => {
+            const response = await fetch(`https://api.github.com/repos/aviaratech/ai-delivery/${path}`, { headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }, redirect: 'error', signal: AbortSignal.timeout(30_000) });
+            if (!response.ok) throw new Error(`Native release readback failed: ${response.status}`);
+            const parts = []; let size = 0;
+            for await (const part of response.body) {
+              size += part.length;
+              if (size > 4 * 1024 * 1024) throw new Error('Native release metadata exceeds its bound.');
+              parts.push(part);
+            }
+            return JSON.parse(Buffer.concat(parts).toString('utf8'));
+          };
+          const branch = await read('branches/main');
+          const checks = branch.protection?.required_status_checks;
+          if (branch.name !== 'main' || branch.protected !== true || branch.commit?.sha !== source || checks?.enforcement_level !== 'everyone' || !['checks', 'secrets'].every(name => checks.contexts?.includes(name))) throw new Error('Protected main or its required checks drifted from the reviewed release.');
+          if (!dispatch.qualificationOnly) {
+            const artifact = await read(`actions/artifacts/${dispatch.artifactId}`);
+            const runId = artifact.workflow_run?.id;
+            const match = /^npm-qualified-([1-9]\d*)$/.exec(artifact.name ?? '');
+            const attemptNumber = Number(match?.[1]);
+            if (!Number.isSafeInteger(runId) || runId < 1 || !Number.isSafeInteger(attemptNumber) || attemptNumber < 1) throw new Error('Original qualification identity is missing or unsafe.');
+            const [attempt, workflow, jobs] = await Promise.all([read(`actions/runs/${runId}/attempts/${attemptNumber}`), read('actions/workflows/release.yml'), read(`actions/runs/${runId}/attempts/${attemptNumber}/jobs?per_page=100`)]);
+            const origin = validateQualificationOrigin({ artifact, attempt, workflow, jobs }, { repository: process.env.GITHUB_REPOSITORY, repositoryId: Number(process.env.GITHUB_REPOSITORY_ID), source, artifactId: dispatch.artifactId });
+            appendFileSync(process.env.GITHUB_OUTPUT, `run_id=${origin.runId}\nrun_attempt=${origin.runAttempt}\nartifact_id=${origin.artifactId}\n`);
+          }
+          JS
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: ${{ inputs.qualification_only }}
+        with:
           node-version: 26.2.0
           package-manager-cache: false
       - name: Retain public-library consumer executable
+        if: ${{ inputs.qualification_only }}
         run: echo "AI_DELIVERY_NODE26_EXECUTABLE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: ${{ inputs.qualification_only }}
         with:
           node-version: 24.21.0
           package-manager-cache: false
       - name: Pin npm
+        if: ${{ inputs.qualification_only }}
         run: npm install --global npm@11.19.0
-      - name: Check reviewed source and release metadata
-        run: |
-          node --input-type=module <<'JS'
-          import { execFileSync } from 'node:child_process';
-          import pkg from './package.json' with { type: 'json' };
-          const { REVIEWED_SOURCE_SHA: source, RELEASE_VERSION: version, REVIEWED_ARCHIVE_SHA256: digest } = process.env;
-          if (!/^[a-f0-9]{40}$/.test(source ?? '') || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version ?? '') || !/^[a-f0-9]{64}$/.test(digest ?? '')) throw new Error('Missing or invalid reviewed release inputs.');
-          if (process.env.GITHUB_SHA !== source || execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== source) throw new Error('Dispatch or checkout differs from the reviewed source.');
-          if (pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Reviewed release metadata differs from the source package.');
-          JS
       - name: Qualify and retain the exact archive
+        id: qualification
+        if: ${{ inputs.qualification_only }}
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
-          npm run checks -- --results-dir "$RUNNER_TEMP/release-qualification"
+          npm run checks:release -- --results-dir "$RUNNER_TEMP/release-qualification"
           node scripts/release-artifact.mjs select "$RUNNER_TEMP/release-qualification" "$RUNNER_TEMP/release-artifact"
+          node --input-type=module <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const proof = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/release-artifact/qualification.json`, 'utf8'));
+          appendFileSync(process.env.GITHUB_OUTPUT, `archive_sha256=${proof.archive.sha256}\n`);
+          JS
           cd "$RUNNER_TEMP/release-artifact"
           test "$(find . -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
-          printf '%s  %s\n' "$REVIEWED_ARCHIVE_SHA256" "aviaratech-ai-delivery-$RELEASE_VERSION.tgz" | shasum -a 256 -c -
           shasum -a 256 ./*.tgz > SHA256SUMS
       - name: Scan source history
+        if: ${{ inputs.qualification_only }}
         uses: trufflesecurity/trufflehog@f714bf454f350590f4a24c3ddb1aef02c35bf5b6 # v3.97.5
         with:
           version: '3.97.5'
           extra_args: --no-verification
+      - name: Upload qualified package
+        id: qualified
+        if: ${{ inputs.qualification_only }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-qualified-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-artifact/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Download independently accepted qualification
+        if: ${{ !inputs.qualification_only }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ inputs.qualification_artifact_id }}
+          run-id: ${{ steps.origin.outputs.run_id }}
+          repository: aviaratech/ai-delivery
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-artifact/
+      - name: Verify accepted original archive
+        if: ${{ !inputs.qualification_only }}
+        run: |
+          node scripts/release-artifact.mjs verify "$RUNNER_TEMP/release-artifact"
+          cd "$RUNNER_TEMP/release-artifact"
+          shasum -a 256 -c SHA256SUMS
       - name: Upload package
+        if: ${{ !inputs.qualification_only }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
           path: ${{ runner.temp }}/release-artifact/
           if-no-files-found: error
           retention-days: 1
+      - name: Retain qualification identity
+        env:
+          OBSERVED_ARCHIVE_SHA256: ${{ steps.qualification.outputs.archive_sha256 }}
+          QUALIFIED_ARTIFACT_ID: ${{ steps.qualified.outputs.artifact-id }}
+          QUALIFIED_ARTIFACT_URL: ${{ steps.qualified.outputs.artifact-url }}
+          TRANSPORT_DIGEST: ${{ steps.qualified.outputs.artifact-digest }}
+          ORIGINAL_RUN_ID: ${{ steps.origin.outputs.run_id }}
+          ORIGINAL_RUN_ATTEMPT: ${{ steps.origin.outputs.run_attempt }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const env = process.env;
+          if (env.QUALIFICATION_ONLY === 'true' && !/^[1-9]\d*$/.test(env.QUALIFIED_ARTIFACT_ID ?? '')) throw new Error('Immutable qualification upload identity is missing.');
+          appendFileSync(env.GITHUB_STEP_SUMMARY, JSON.stringify({ qualificationOnly: env.QUALIFICATION_ONLY === 'true', repository: env.GITHUB_REPOSITORY, source: env.REVIEWED_SOURCE_SHA, version: env.RELEASE_VERSION, archiveSha256: env.OBSERVED_ARCHIVE_SHA256 || env.REVIEWED_ARCHIVE_SHA256, artifactId: env.QUALIFIED_ARTIFACT_ID || env.QUALIFICATION_ARTIFACT_ID, artifactUrl: env.QUALIFIED_ARTIFACT_URL || undefined, originalRunId: env.ORIGINAL_RUN_ID || env.GITHUB_RUN_ID, originalRunAttempt: env.ORIGINAL_RUN_ATTEMPT || env.GITHUB_RUN_ATTEMPT, transportDigest: env.TRANSPORT_DIGEST || undefined }) + '\n');
+          JS
 
   publish:
     needs: package
-    if: github.ref == 'refs/heads/main' && github.ref_protected && github.repository == 'aviaratech/ai-delivery'
+    if: ${{ !inputs.qualification_only && needs.package.result == 'success' && github.ref == 'refs/heads/main' && github.ref_protected && github.repository == 'aviaratech/ai-delivery' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: npm-publish
