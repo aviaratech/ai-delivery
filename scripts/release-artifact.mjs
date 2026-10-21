@@ -7,7 +7,8 @@ import { readArchive, sha256 } from './current-consumer.mjs';
 import { FULL_GATES, SKIP_ALLOWLIST } from './checks.mjs';
 import { sourceIdentity, validateCheckpoint, validateConsumer } from './current-qualification.mjs';
 
-/** @typedef {{source:string,version:string,digest:string}} Inputs */
+/** @typedef {{source:string,version:string}} SelectionInputs */
+/** @typedef {SelectionInputs & {digest:string}} Inputs */
 /** @typedef {{sha256:string,contents:string}} Retained */
 /** @typedef {{overall:Retained,checkpoint:Retained,contract:Retained,producer:Retained,artifact:Retained,consumer:Retained,attempt:Retained}} Records */
 /** @typedef {{schemaVersion:string,sourceCommit:string,sourceTree:string,packageVersion:string,archive:{filename:string,sha256:string,size:number},records:Records,limits:string}} Bundle */
@@ -28,11 +29,96 @@ function bytes(root, path, limit = 32 * 1024 ** 2) {
   return readFileSync(path);
 }
 
-/** @param {Inputs} inputs */
-function validInputs({ source, version, digest }) {
+/** @param {SelectionInputs} inputs */
+function validSelection({ source, version }) {
   assert.match(source, /^[a-f0-9]{40}$/u, 'Reviewed source is missing.');
   assert.match(version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u, 'Reviewed stable version is missing.');
-  assert.match(digest, /^[a-f0-9]{64}$/u, 'Reviewed archive digest is missing.');
+}
+
+/** @param {Inputs} inputs */
+function validInputs(inputs) {
+  validSelection(inputs);
+  assert.match(inputs.digest, /^[a-f0-9]{64}$/u, 'Reviewed archive digest is missing.');
+}
+
+/** Bind an independently accepted artifact ID to its original successful qualification attempt.
+ * Native metadata retrieval belongs to the workflow; this validator performs no requests.
+ * @param {{artifact:unknown,attempt:unknown,workflow:unknown,jobs:unknown}} metadata
+ * @param {{repository:string,repositoryId:number,source:string,artifactId:number}} inputs */
+export function validateQualificationOrigin(metadata, { repository, repositoryId, source, artifactId }) {
+  /** @param {unknown} value @returns {Record<string,unknown>} */
+  const object = (value) => {
+    assert.ok(value && typeof value === 'object' && !Array.isArray(value), 'Native metadata is missing.');
+    return /** @type {Record<string,unknown>} */ (value);
+  };
+  /** @param {unknown} value @returns {number} */
+  const positive = (value) => {
+    assert.ok(typeof value === 'number' && Number.isSafeInteger(value) && value > 0, 'Native ID is unsafe.');
+    return value;
+  };
+  assert.equal(repository, 'aviaratech/ai-delivery', 'Qualification repository differs.');
+  positive(repositoryId);
+  positive(artifactId);
+  assert.match(source, /^[a-f0-9]{40}$/u, 'Reviewed source is missing.');
+  const artifact = object(metadata.artifact);
+  const attempt = object(metadata.attempt);
+  const workflow = object(metadata.workflow);
+  const listing = object(metadata.jobs);
+  assert.equal(artifact.id, artifactId, 'Native artifact ID differs.');
+  assert.equal(artifact.expired, false, 'Qualification artifact expired.');
+  assert.equal(typeof artifact.expires_at, 'string', 'Artifact expiry is missing.');
+  assert.ok(Date.parse(/** @type {string} */ (artifact.expires_at)) > Date.now(), 'Artifact expiry is invalid.');
+  assert.equal(typeof artifact.name, 'string', 'Artifact namespace is missing.');
+  const artifactName = /** @type {string} */ (artifact.name);
+  const name = /^npm-qualified-([1-9]\d*)$/u.exec(artifactName);
+  assert.ok(name, 'Artifact is not original qualification evidence.');
+  const runAttempt = positive(Number(name[1]));
+  const run = object(artifact.workflow_run);
+  const runId = positive(run.id);
+  assert.equal(run.repository_id, repositoryId, 'Artifact repository differs.');
+  assert.equal(run.head_repository_id, repositoryId, 'Fork qualification is forbidden.');
+  assert.equal(run.head_branch, 'main');
+  assert.equal(run.head_sha, source);
+  assert.equal(attempt.id, runId);
+  assert.equal(attempt.run_attempt, runAttempt, 'Original attempt differs; latest is not a substitute.');
+  assert.equal(attempt.event, 'workflow_dispatch');
+  assert.equal(attempt.head_branch, 'main');
+  assert.equal(attempt.head_sha, source);
+  assert.equal(attempt.status, 'completed');
+  assert.equal(attempt.conclusion, 'success', 'Original qualification attempt did not succeed.');
+  for (const field of ['repository', 'head_repository']) {
+    const repo = object(attempt[field]);
+    assert.equal(repo.id, repositoryId);
+    assert.equal(repo.full_name, repository);
+  }
+  positive(workflow.id);
+  assert.equal(attempt.workflow_id, workflow.id);
+  assert.equal(workflow.path, '.github/workflows/release.yml');
+  assert.equal(workflow.state, 'active');
+  assert.ok(Array.isArray(listing.jobs), 'Original attempt jobs are missing.');
+  const jobs = listing.jobs.map(object);
+  assert.ok(jobs.length > 0 && jobs.length <= 100 && listing.total_count === jobs.length, 'Job listing is incomplete.');
+  for (const job of jobs) {
+    assert.equal(job.run_id, runId);
+    assert.equal(job.run_attempt, runAttempt);
+    assert.equal(job.head_sha, source);
+  }
+  const packages = jobs.filter((job) => job.name === 'package');
+  assert.equal(packages.length, 1, 'Qualified package job is missing or ambiguous.');
+  const job = packages[0];
+  assert.equal(job.status, 'completed');
+  assert.equal(job.conclusion, 'success');
+  assert.ok(Array.isArray(job.steps), 'Qualification steps are missing.');
+  const steps = job.steps.map(object);
+  for (const name of ['Qualify and retain the exact archive', 'Scan source history', 'Upload qualified package']) {
+    const matches = steps.filter((step) => step.name === name);
+    assert.equal(matches.length, 1, `Original qualification step is missing or ambiguous: ${name}`);
+    assert.equal(matches[0].status, 'completed');
+    assert.equal(matches[0].conclusion, 'success');
+  }
+  for (const publish of jobs.filter((entry) => entry.name === 'publish'))
+    assert.equal(publish.conclusion, 'skipped', 'Qualification unexpectedly entered publication.');
+  return { artifactId, runId, runAttempt, artifactName };
 }
 
 /** Portable copies retain the original receipt bytes, including their digests.
@@ -190,21 +276,29 @@ export function validateBundle(bundle, inputs) {
   return { overall, checkpoint, contract, producer, artifact, consumer, attempt };
 }
 
-/** Select only the archive already produced and consumed by this fresh full run.
- * @param {string} qualification @param {string} destination @param {Inputs} inputs @param {string} [cwd] */
+/** Select the original archive from a complete fresh or compatibly resumed result.
+ * Selection observes a digest; only publication verification receives an accepted digest.
+ * @param {string} qualification @param {string} destination @param {SelectionInputs} inputs @param {string} [cwd] */
 export function selectReleaseArtifact(qualification, destination, inputs, cwd = process.cwd()) {
-  validInputs(inputs);
-  const root = realpathSync(qualification);
+  validSelection(inputs);
+  const outer = realpathSync(qualification);
+  assert.equal(resolve(qualification), outer, 'Qualification directory is aliased.');
   const source = realpathSync(cwd);
   const output = resolve(destination);
   assert.ok(!inside(source, output) && output !== source, 'Release evidence must be outside source.');
-  assert.ok(!inside(root, output) && output !== root, 'Release output must preserve qualification evidence.');
+  assert.ok(!inside(outer, output) && output !== outer, 'Release output must preserve overall evidence.');
   assert.equal(realpathSync(dirname(output)), dirname(output), 'Release destination parent is aliased.');
-  const overallBytes = bytes(root, join(root, 'result.json'));
+  const overallBytes = bytes(outer, join(outer, 'result.json'));
   const overall = /** @type {import('./current-qualification.mjs').Qualification} */ (
     JSON.parse(overallBytes.toString('utf8'))
   );
-  assert.equal(overall.resultsDir, root, 'Qualification directory differs.');
+  assert.equal(overall.resultsDir, outer, 'Qualification directory differs.');
+  assert.ok(overall.checkpoint && isAbsolute(overall.checkpoint.path), 'Original checkpoint is missing.');
+  assert.equal(basename(overall.checkpoint.path), 'checkpoint.json');
+  const root = dirname(overall.checkpoint.path);
+  assert.equal(realpathSync(root), root, 'Original evidence directory is aliased.');
+  assert.ok(!inside(source, root) && root !== source, 'Original evidence must be outside source.');
+  assert.ok(!inside(root, output) && output !== root, 'Release output must preserve original evidence.');
   /** @param {{path:string,sha256:string}|undefined} ref */
   const retain = (ref) => {
     assert.ok(ref, 'Qualification reference is missing.');
@@ -232,7 +326,8 @@ export function selectReleaseArtifact(qualification, destination, inputs, cwd = 
     sha256: contract.producer?.artifactReceiptSha256,
   });
   const archive = bytes(root, contract.archivePath, 128 * 1024 ** 2);
-  assert.equal(sha256(archive), inputs.digest, 'Archive bytes differ from the reviewed digest.');
+  const digest = sha256(archive);
+  assert.equal(digest, contract.archiveSha256, 'Archive bytes differ from the qualified contract.');
   const contractBytes = bytes(root, join(root, 'contract.json'));
   /** @type {Bundle} */
   const bundle = {
@@ -240,7 +335,7 @@ export function selectReleaseArtifact(qualification, destination, inputs, cwd = 
     sourceCommit: inputs.source,
     sourceTree: checkpoint.source.tree,
     packageVersion: inputs.version,
-    archive: { filename: basename(contract.archivePath), sha256: inputs.digest, size: archive.length },
+    archive: { filename: basename(contract.archivePath), sha256: digest, size: archive.length },
     records: {
       overall: { sha256: sha256(overallBytes), contents: overallBytes.toString('utf8') },
       checkpoint: checkpointRecord,
@@ -253,7 +348,7 @@ export function selectReleaseArtifact(qualification, destination, inputs, cwd = 
     limits:
       'Retained source-bound execution receipts from the reviewed workflow; hashes alone are not execution or cryptographic provenance proof. Confidentiality scan and registry provenance readback remain separate.',
   };
-  const proof = validateBundle(bundle, inputs);
+  const proof = validateBundle(bundle, { ...inputs, digest });
   assert.ok(overall.checkpoint && overall.consumer);
   assert.deepEqual(sourceIdentity(source), checkpoint.source);
   const validated = validateCheckpoint(overall.checkpoint.path, source);
@@ -272,7 +367,7 @@ export function selectReleaseArtifact(qualification, destination, inputs, cwd = 
   mkdirSync(output, { mode: 0o700 }); // Exclusive fresh destination, after validation.
   const archivePath = join(output, bundle.archive.filename);
   copyFileSync(contract.archivePath, archivePath);
-  assert.equal(sha256(readFileSync(archivePath)), inputs.digest, 'Archive changed during copy.');
+  assert.equal(sha256(readFileSync(archivePath)), digest, 'Archive changed during copy.');
   writeFileSync(join(output, 'qualification.json'), JSON.stringify(bundle, null, 2) + '\n', {
     flag: 'wx',
     mode: 0o600,

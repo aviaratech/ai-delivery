@@ -23,8 +23,12 @@ type Bundle = {
   records: Record<string, { sha256: string; contents: string }>;
 };
 type Api = {
-  selectReleaseArtifact(root: string, output: string, inputs: Inputs, cwd: string): Bundle;
+  selectReleaseArtifact(root: string, output: string, inputs: Pick<Inputs, 'source' | 'version'>, cwd: string): Bundle;
   verifyReleaseArtifact(root: string, inputs: Inputs): string;
+  validateQualificationOrigin(
+    metadata: { artifact: Json; attempt: Json; workflow: Json; jobs: Json },
+    inputs: { repository: string; repositoryId: number; source: string; artifactId: number },
+  ): { artifactId: number; runId: number; runAttempt: number; artifactName: string };
 };
 type Contract = {
   sourceRoot: string;
@@ -67,6 +71,122 @@ const qualification = (await import(new URL('../scripts/current-qualification.mj
   sourceIdentity(cwd: string): Source;
 };
 const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
+
+function originFixture() {
+  const source = 'a'.repeat(40);
+  const repository = 'aviaratech/ai-delivery';
+  const repo = { id: 123, full_name: repository };
+  const artifact: Json = {
+    id: 42,
+    name: 'npm-qualified-2',
+    expired: false,
+    expires_at: '2099-01-01T00:00:00Z',
+    workflow_run: { id: 101, repository_id: 123, head_repository_id: 123, head_branch: 'main', head_sha: source },
+  };
+  const attempt: Json = {
+    id: 101,
+    run_attempt: 2,
+    event: 'workflow_dispatch',
+    head_branch: 'main',
+    head_sha: source,
+    status: 'completed',
+    conclusion: 'success',
+    workflow_id: 201,
+    repository: repo,
+    head_repository: repo,
+  };
+  const workflow: Json = { id: 201, path: '.github/workflows/release.yml', state: 'active' };
+  const jobs: Json = {
+    total_count: 1,
+    jobs: [
+      {
+        run_id: 101,
+        run_attempt: 2,
+        head_sha: source,
+        name: 'package',
+        status: 'completed',
+        conclusion: 'success',
+        steps: ['Qualify and retain the exact archive', 'Scan source history', 'Upload qualified package'].map(
+          (name) => ({ name, status: 'completed', conclusion: 'success' }),
+        ),
+      },
+    ],
+  };
+  return {
+    metadata: { artifact, attempt, workflow, jobs },
+    inputs: { repository, repositoryId: 123, source, artifactId: 42 },
+  };
+}
+
+test('origin binds the exact successful original release attempt', () => {
+  const f = originFixture();
+  assert.equal(typeof api.validateQualificationOrigin, 'function');
+  assert.deepEqual(api.validateQualificationOrigin(f.metadata, f.inputs), {
+    artifactId: 42,
+    runId: 101,
+    runAttempt: 2,
+    artifactName: 'npm-qualified-2',
+  });
+});
+
+test.each([
+  'missing-artifact',
+  'different-id',
+  'unsafe-id',
+  'expired',
+  'expiry',
+  'promotion-namespace',
+  'unsafe-attempt',
+  'foreign-repository',
+  'fork',
+  'wrong-source',
+  'wrong-branch',
+  'wrong-event',
+  'wrong-workflow',
+  'wrong-workflow-path',
+  'failed-original-attempt',
+  'later-attempt',
+  'incomplete-attempt',
+  'missing-job',
+  'incomplete-job-list',
+  'wrong-job-attempt',
+  'failed-package',
+  'missing-qualification-step',
+  'failed-scan',
+  'skipped-upload',
+])('origin refuses %s without substituting latest qualification', (failure) => {
+  const f = originFixture();
+  assert.equal(typeof api.validateQualificationOrigin, 'function');
+  const { artifact, attempt, workflow, jobs } = f.metadata;
+  const run = artifact['workflow_run'] as Json;
+  const job = (jobs['jobs'] as Json[])[0]!;
+  const steps = job['steps'] as Json[];
+  if (failure === 'missing-artifact') f.metadata.artifact = {};
+  if (failure === 'different-id') artifact['id'] = 43;
+  if (failure === 'unsafe-id') f.inputs.artifactId = Number.MAX_SAFE_INTEGER + 1;
+  if (failure === 'expired') artifact['expired'] = true;
+  if (failure === 'expiry') artifact['expires_at'] = '2000-01-01T00:00:00Z';
+  if (failure === 'promotion-namespace') artifact['name'] = 'npm-package';
+  if (failure === 'unsafe-attempt') artifact['name'] = 'npm-qualified-9007199254740992';
+  if (failure === 'foreign-repository') run['repository_id'] = 124;
+  if (failure === 'fork') run['head_repository_id'] = 124;
+  if (failure === 'wrong-source') run['head_sha'] = 'b'.repeat(40);
+  if (failure === 'wrong-branch') attempt['head_branch'] = 'issue/166';
+  if (failure === 'wrong-event') attempt['event'] = 'pull_request';
+  if (failure === 'wrong-workflow') attempt['workflow_id'] = 202;
+  if (failure === 'wrong-workflow-path') workflow['path'] = '.github/workflows/ci.yml';
+  if (failure === 'failed-original-attempt') attempt['conclusion'] = 'failure';
+  if (failure === 'later-attempt') attempt['run_attempt'] = 3;
+  if (failure === 'incomplete-attempt') attempt['status'] = 'in_progress';
+  if (failure === 'missing-job') jobs['jobs'] = [];
+  if (failure === 'incomplete-job-list') jobs['total_count'] = 2;
+  if (failure === 'wrong-job-attempt') job['run_attempt'] = 3;
+  if (failure === 'failed-package') job['conclusion'] = 'failure';
+  if (failure === 'missing-qualification-step') steps.shift();
+  if (failure === 'failed-scan') steps[1]!['conclusion'] = 'failure';
+  if (failure === 'skipped-upload') steps[2]!['conclusion'] = 'skipped';
+  assert.throws(() => api.validateQualificationOrigin(f.metadata, f.inputs));
+});
 
 function fixture() {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'synthetic-release-workflow-')));
@@ -364,6 +484,89 @@ test('release selects and re-verifies exact synthetic qualified bytes and retain
   }
 });
 
+test('first qualification selects observed bytes without a pre-known digest', () => {
+  const f = fixture();
+  try {
+    const bundle = api.selectReleaseArtifact(
+      f.results,
+      f.output,
+      { source: f.inputs.source, version: f.inputs.version },
+      f.source,
+    );
+    assert.equal(bundle.archive.sha256, f.inputs.digest);
+    assert.equal(api.verifyReleaseArtifact(f.output, f.inputs), join(f.output, basename(f.archivePath)));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('publication verification never learns a missing expected digest', () => {
+  const f = fixture();
+  try {
+    api.selectReleaseArtifact(f.results, f.output, f.inputs, f.source);
+    for (const digest of ['', 'dummy', '0'.repeat(64)])
+      assert.throws(() => api.verifyReleaseArtifact(f.output, { ...f.inputs, digest }));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('fresh outer resume selects and portably verifies original qualified bytes without replay', () => {
+  const f = fixture();
+  try {
+    const originalResult = readFileSync(join(f.results, 'result.json'));
+    const originalArchive = readFileSync(f.archivePath);
+    const outer = join(f.directory, 'resumed-outer');
+    mkdirSync(outer);
+    f.save(join(outer, 'result.json'), { ...f.overall, resultsDir: outer });
+    const bundle = api.selectReleaseArtifact(outer, f.output, f.inputs, f.source);
+    assert.deepEqual(readFileSync(join(f.results, 'result.json')), originalResult);
+    assert.equal(bundle.records['checkpoint']?.contents, readFileSync(join(f.results, 'checkpoint.json'), 'utf8'));
+    assert.deepEqual(readFileSync(f.archivePath), originalArchive);
+    rmSync(f.results, { recursive: true });
+    rmSync(outer, { recursive: true });
+    assert.deepEqual(readFileSync(api.verifyReleaseArtifact(f.output, f.inputs)), originalArchive);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['checkpoint-alias', 'checkpoint-redirection', 'output-inside-original', 'output-inside-outer'])(
+  'resumed selection refuses %s without changing original evidence',
+  (failure) => {
+    const f = fixture();
+    try {
+      const outer = join(f.directory, 'resumed-outer');
+      mkdirSync(outer);
+      const overall: Json = { ...f.overall, resultsDir: outer };
+      const checkpoint = f.overall['checkpoint'] as { path: string; sha256: string };
+      if (failure === 'checkpoint-alias') {
+        const alias = join(f.directory, 'checkpoint-alias');
+        symlinkSync(f.results, alias);
+        overall['checkpoint'] = { ...checkpoint, path: join(alias, 'checkpoint.json') };
+      }
+      if (failure === 'checkpoint-redirection') {
+        const other = join(f.directory, 'unrelated');
+        mkdirSync(other);
+        const path = join(other, 'checkpoint.json');
+        writeFileSync(path, readFileSync(checkpoint.path));
+        overall['checkpoint'] = { ...checkpoint, path };
+      }
+      f.save(join(outer, 'result.json'), overall);
+      const output =
+        failure === 'output-inside-original'
+          ? join(f.results, 'selected')
+          : failure === 'output-inside-outer'
+            ? join(outer, 'selected')
+            : f.output;
+      assert.throws(() => api.selectReleaseArtifact(outer, output, f.inputs, f.source));
+      assert.equal(existsSync(output), false);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
 test.each([
   'missing',
   'incomplete',
@@ -372,7 +575,6 @@ test.each([
   'omission',
   'wrong-source',
   'wrong-version',
-  'wrong-digest',
   'modified-archive',
   'unsafe-archive-path',
   'linked-archive',
@@ -404,7 +606,6 @@ test.each([
       });
     if (failure === 'wrong-source') f.inputs.source = '0'.repeat(40);
     if (failure === 'wrong-version') f.inputs.version = '0.0.1';
-    if (failure === 'wrong-digest') f.inputs.digest = '0'.repeat(64);
     if (failure === 'modified-archive') writeFileSync(f.archivePath, 'changed archive');
     if (failure === 'unsafe-archive-path') {
       const path = join(f.results, 'checkpoint.json');
