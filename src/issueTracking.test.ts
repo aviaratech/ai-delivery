@@ -8,6 +8,8 @@ import * as issue from './issue.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import type { DeliveryContext } from './issue.js';
+import { getNativeBlockerRelationships } from './github/relationships.js';
+import * as projectDelivery from './github/projectDelivery.js';
 
 function updateFixture() {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-history-'));
@@ -30,6 +32,15 @@ function updateFixture() {
     targetPr: false,
     reason: null as string | null,
     duplicate: null as number | null,
+    archived: false,
+    archiveAfterUpdate: false,
+    projectUnavailableAfterUpdate: false,
+    nativeUnavailableAfterUpdate: false,
+    foreignAfterUpdate: false,
+    wrongNodeAfterUpdate: false,
+    driftAfterUpdate: false,
+    projectFailure: '' as '' | 'rate-limit' | 'cancel',
+    nativeReadsAfterUpdate: 0,
   };
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
   const updates: Record<string, unknown>[] = [];
@@ -47,17 +58,28 @@ function updateFixture() {
       },
       rest: {
         issues: {
-          get: async (input: { issue_number: number }) => ({
-            data:
-              input.issue_number === 17
-                ? { ...live }
-                : {
-                    number: input.issue_number,
-                    id: 118,
-                    html_url: `https://github.com/example/widget/issues/${String(input.issue_number)}`,
-                    ...(controls.targetPr ? { pull_request: {} } : {}),
-                  },
-          }),
+          get: async (input: { issue_number: number }) => {
+            if (updates.length) controls.nativeReadsAfterUpdate++;
+            if (updates.length && controls.nativeUnavailableAfterUpdate) throw new Error('Native unavailable');
+            return {
+              data:
+                input.issue_number === 17
+                  ? {
+                      ...live,
+                      ...(updates.length && controls.wrongNodeAfterUpdate ? { node_id: 'FOREIGN_ISSUE' } : {}),
+                      ...(updates.length && controls.foreignAfterUpdate
+                        ? { html_url: 'https://github.com/other/widget/issues/17' }
+                        : {}),
+                      ...(updates.length && controls.driftAfterUpdate ? { body: 'Concurrent later edit' } : {}),
+                    }
+                  : {
+                      number: input.issue_number,
+                      id: 118,
+                      html_url: `https://github.com/example/widget/issues/${String(input.issue_number)}`,
+                      ...(controls.targetPr ? { pull_request: {} } : {}),
+                    },
+            };
+          },
           listComments: async () => ({ data: comments }),
           createComment: async (input: { body: string }) => {
             events.push('comment');
@@ -86,6 +108,7 @@ function updateFixture() {
             events.push('update');
             updates.push(input);
             if (controls.failUpdate) throw new Error('Update unavailable');
+            if (controls.archiveAfterUpdate) controls.archived = true;
             if (typeof input.title === 'string') live.title = input.title;
             if (typeof input.body === 'string') live.body = input.body;
             if (!controls.ignoreClosure && typeof input.state === 'string') {
@@ -102,6 +125,15 @@ function updateFixture() {
         request: async () => ({ data: [] }),
       },
       graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (query.includes('ProjectDelivery') && updates.length && controls.projectFailure) {
+          if (controls.projectFailure === 'cancel') throw new DOMException('Cancelled', 'AbortError');
+          throw Object.assign(new Error('PRIVATE_RATE_CONTENT'), {
+            status: 429,
+            response: { headers: { 'retry-after': '60' } },
+          });
+        }
+        if (query.includes('ProjectDelivery') && updates.length && controls.projectUnavailableAfterUpdate)
+          throw new Error('PRIVATE_REMOTE_CONTENT');
         if (query.includes('IssueClosureReadback'))
           return {
             repository: {
@@ -131,7 +163,7 @@ function updateFixture() {
                   nodes: [
                     {
                       id: 'ITEM17',
-                      isArchived: false,
+                      isArchived: controls.archived,
                       content: { id: 'ISSUE17' },
                       fieldValueByName: {
                         name: projectStatus,
@@ -145,6 +177,7 @@ function updateFixture() {
             },
           };
         if (query.includes('UpdateProjectDeliveryStatus')) {
+          events.push('project-update');
           projectStatus =
             variables.optionId === 'DONE' ? 'Shipped' : variables.optionId === 'TODO' ? 'Queued' : 'Active';
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
@@ -202,6 +235,135 @@ test('history preserves exact prior content before a rewrite and retries a faile
     fixture.cleanup();
   }
 });
+
+test('initially archived issue update refuses before history, closure or native writes', async () => {
+  const f = updateFixture();
+  try {
+    f.controls.archived = true;
+    await assert.rejects(
+      issue.updateIssue(f.context, {
+        issueNumber: 17,
+        body: 'Replacement',
+        draft: true,
+        preserveHistory: true,
+        state: 'closed',
+        closeReason: 'not_planned',
+      }),
+      /archived/u,
+    );
+    assert.deepEqual(f.updates, []);
+    assert.deepEqual(f.comments, []);
+    assert.equal(f.events.includes('project-update'), false);
+    assert.equal(f.live.state, 'open');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['archive', 'unavailable'] as const)(
+  'post-commit %s reports confirmed native content and closure separately from pending Project work',
+  async (failure) => {
+    const f = updateFixture();
+    try {
+      f.controls.archiveAfterUpdate = failure === 'archive';
+      f.controls.projectUnavailableAfterUpdate = failure === 'unavailable';
+      await assert.rejects(
+        issue.updateIssue(f.context, {
+          issueNumber: 17,
+          body: 'Replacement',
+          draft: true,
+          preserveHistory: true,
+          state: 'closed',
+          closeReason: 'not_planned',
+        }),
+        (error: unknown) => {
+          const result = (
+            error as {
+              result: {
+                status: string;
+                native: {
+                  status: string;
+                  repository: string;
+                  readback: issue.IssueInfo;
+                  closure: issue.IssueClosureReadback;
+                  historyComment: issue.IssueCommentReadback;
+                };
+                project: { status: string; desiredStatus: string };
+                recovery: { tool: string };
+              };
+            }
+          ).result;
+          assert.equal(result.status, 'update-incomplete');
+          assert.equal(result.native.status, 'confirmed');
+          assert.equal(result.native.repository, 'example/widget');
+          assert.equal(result.native.readback.state, 'closed');
+          assert.match(result.native.readback.body, /Replacement/u);
+          assert.equal(result.native.closure.closeReason, 'not_planned');
+          assert.equal(result.native.historyComment.commentId, 91);
+          assert.equal(result.project.status, failure === 'archive' ? 'pending' : 'unknown');
+          assert.equal(result.project.desiredStatus, 'Done');
+          assert.equal(result.recovery.tool, 'issue_batch_update');
+          assert.equal(JSON.stringify(result).includes('PRIVATE_'), false);
+          return true;
+        },
+      );
+      assert.equal(f.updates.length, 1);
+      assert.equal(f.comments.length, 2);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['unavailable', 'foreign', 'drift', 'node'] as const)(
+  'post-commit native %s evidence remains unknown',
+  async (failure) => {
+    const f = updateFixture();
+    try {
+      f.controls.archiveAfterUpdate = true;
+      f.controls.nativeUnavailableAfterUpdate = failure === 'unavailable';
+      f.controls.foreignAfterUpdate = failure === 'foreign';
+      f.controls.wrongNodeAfterUpdate = failure === 'node';
+      f.controls.driftAfterUpdate = failure === 'drift';
+      await assert.rejects(
+        issue.updateIssue(f.context, { issueNumber: 17, body: 'Replacement', draft: true }),
+        (error: unknown) => {
+          const result = (error as { result: { native: { status: string; readback: unknown } } }).result;
+          assert.equal(result.native.status, 'unknown');
+          assert.equal(result.native.readback, null);
+          return true;
+        },
+      );
+      assert.equal(f.updates.length, 1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each(['rate-limit', 'cancel'] as const)(
+  'post-commit %s defers native readback without another request',
+  async (failure) => {
+    const f = updateFixture();
+    try {
+      f.controls.projectFailure = failure;
+      await assert.rejects(
+        issue.updateIssue(f.context, { issueNumber: 17, body: 'Replacement', draft: true }),
+        (error: unknown) => {
+          const partial = issue.getIncompleteIssueUpdate(error);
+          assert.equal(partial?.native.status, 'unknown');
+          assert.equal(partial?.native.readback, null);
+          if (failure === 'rate-limit') assert.equal(partial?.rateLimit?.retryAfterSeconds, 60);
+          assert.equal(JSON.stringify(partial).includes('PRIVATE_'), false);
+          return true;
+        },
+      );
+      assert.equal(f.controls.nativeReadsAfterUpdate, 1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test('history overflow, invalid metadata, failed comment readback and concurrent edits prevent rewrites', async () => {
   for (const failure of ['overflow', 'labels', 'readback', 'drift'] as const) {
@@ -657,6 +819,334 @@ test('native field pagination fails closed on a repeated nonadvancing page', asy
   })) as unknown as typeof context.clients.rest.request;
   await assert.rejects(issue.listIssues(context, {}), /repeated a pagination page/u);
 });
+
+test.each([
+  ['catalog', 'list'],
+  ['values', 'list'],
+  ['catalog', 'ready'],
+  ['values', 'ready'],
+  ['catalog', 'capacity'],
+  ['values', 'capacity'],
+] as const)('reconciliation bounds native %s through %s reads', async (collection, entry) => {
+  const { context } = listingFixture();
+  Object.assign(context, { readPageLimit: 20 });
+  context.clients.rest.issues.get = (async () => ({
+    data: {
+      number: 17,
+      node_id: 'ISSUE17',
+      state: 'open',
+      body: '',
+      title: 'Repair widget',
+      html_url: 'https://github.com/example/widget/issues/17',
+    },
+  })) as typeof context.clients.rest.issues.get;
+  if (entry === 'capacity')
+    context.config = {
+      ...context.config,
+      wipLimits: [{ repository: 'example/widget', name: 'Native', match: { field: 'Estimate', value: '4' }, limit: 2 }],
+    };
+  const originalGraphql = context.clients.graphql;
+  context.clients.graphql = (async (query: string) => {
+    const response = await originalGraphql(query);
+    if (query.includes('ProjectDeliveryItems')) {
+      const parsed = response as { organization: { projectV2: Record<string, unknown> } };
+      Object.assign(parsed.organization.projectV2, { id: 'PROJECT', number: 1 });
+    }
+    if (!query.includes('blockedBy(first:')) return response;
+    const parsed = response as { repository: { issue: Record<string, unknown> } };
+    Object.assign(parsed.repository.issue, {
+      id: 'ISSUE17',
+      number: 17,
+      repository: { nameWithOwner: 'example/widget' },
+    });
+    return parsed;
+  }) as unknown as typeof context.clients.graphql;
+  const original = context.clients.rest.request;
+  let requests = 0;
+  context.clients.rest.request = (async (route: string, params: { page: number }) => {
+    if (route.includes('/orgs/') !== (collection === 'catalog')) return original(route);
+    requests++;
+    return {
+      data:
+        params.page > 20
+          ? []
+          : Array.from({ length: 100 }, (_, index) => {
+              const id = 1000 + params.page * 100 + index;
+              return collection === 'catalog'
+                ? { id, name: `Extra ${String(id)}`, data_type: 'text' }
+                : { issue_field_id: id, issue_field_name: `Extra ${String(id)}`, data_type: 'text', value: 'value' };
+            }),
+    };
+  }) as typeof context.clients.rest.request;
+  const operation =
+    entry === 'list'
+      ? issue.listIssues(context, {})
+      : entry === 'ready'
+        ? issue.readyCheck(context, 17)
+        : issue.assertIssueStartCapacity(context, 17);
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'CollectionLimitError');
+    assert.equal(Reflect.get(error, 'pagesRequested'), 20);
+    return true;
+  });
+  assert.equal(requests, 20);
+});
+
+test('reconciliation bounds blocker pages and binds their source issue', async () => {
+  const { context } = listingFixture();
+  let requests = 0;
+  context.clients.graphql = (async () => {
+    requests++;
+    return {
+      repository: {
+        issue: {
+          id: 'ISSUE17',
+          number: 17,
+          repository: { nameWithOwner: 'example/widget' },
+          parent: null,
+          blockedBy: { nodes: [], pageInfo: { hasNextPage: requests < 21, endCursor: `page-${String(requests)}` } },
+        },
+      },
+    };
+  }) as unknown as typeof context.clients.graphql;
+  const input = { graphql: context.clients.graphql, repo: context.repo, issueNumber: 17, maxPages: 20 };
+  await assert.rejects(getNativeBlockerRelationships(input), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'CollectionLimitError');
+    assert.equal(Reflect.get(error, 'pagesRequested'), 20);
+    return true;
+  });
+  assert.equal(requests, 20);
+});
+
+test('reconciliation WIP guards bound their label catalog', async () => {
+  const { context } = listingFixture();
+  Object.assign(context, { readPageLimit: 20 });
+  context.config = {
+    ...context.config,
+    wipLimits: [{ repository: 'example/widget', name: 'Urgent', match: { label: 'urgent' }, limit: 2 }],
+  };
+  let requests = 0;
+  context.clients.rest.issues.listLabelsForRepo = (async () => {
+    requests++;
+    return {
+      data:
+        requests > 20
+          ? []
+          : Array.from({ length: 100 }, (_, index) => ({
+              name: index === 0 && requests === 1 ? 'urgent' : `label-${String(requests)}-${String(index)}`,
+            })),
+    };
+  }) as typeof context.clients.rest.issues.listLabelsForRepo;
+  await assert.rejects(issue.assertIssueStartCapacity(context, 17), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'CollectionLimitError');
+    return true;
+  });
+  assert.equal(requests, 20);
+});
+
+function membershipFixture() {
+  const configuration = { ...listingFixture().context.projectConfiguration!, writable: true };
+  const events: string[] = [];
+  const controls = { corrupt: '', archived: false, duplicate: false, unreadable: false };
+  let member = false;
+  let status: 'In Progress' | null = null;
+  const item = (readback = false) => ({
+    id: readback && controls.corrupt === 'item' ? 'WRONG' : 'ITEM17',
+    isArchived: controls.archived,
+    project: { id: readback && controls.corrupt === 'project' ? 'WRONG' : 'PROJECT', number: 1 },
+    content: controls.unreadable
+      ? null
+      : {
+          __typename: 'Issue',
+          id: readback && controls.corrupt === 'issue' ? 'WRONG' : 'ISSUE17',
+          number: 17,
+          repository: { nameWithOwner: 'example/widget' },
+        },
+    fieldValueByName:
+      status === null ? null : { name: 'Active', optionId: controls.corrupt === 'option' ? 'WRONG' : 'ACTIVE' },
+  });
+  const graphql = (async (query: string) => {
+    if (query.includes('mutation AddProjectDeliveryItem')) {
+      events.push('add');
+      member = true;
+      return { addProjectV2ItemById: { item: { id: 'ITEM17' } } };
+    }
+    if (query.includes('mutation UpdateProjectDeliveryStatus')) {
+      events.push('status');
+      status = 'In Progress';
+      return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
+    }
+    if (query.includes('query ProjectDeliveryItemReadback')) {
+      events.push('readback');
+      return { node: item(true) };
+    }
+    if (query.includes('query ProjectDeliveryItems'))
+      return {
+        organization: {
+          projectV2: {
+            id: 'PROJECT',
+            number: 1,
+            items: {
+              nodes: member ? (controls.duplicate ? [item(), { ...item(), id: 'SECOND' }] : [item()]) : [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
+    throw new Error('Unexpected membership fixture query.');
+  }) as unknown as DeliveryContext['clients']['graphql'];
+  return {
+    input: { graphql, configuration, org: 'example', issueNodeId: 'ISSUE17' },
+    events,
+    controls,
+    setMember: () => {
+      member = true;
+    },
+  };
+}
+
+test('membership-only add verifies the exact unarchived item and reuse writes nothing', async () => {
+  const f = membershipFixture();
+  const ensure = Reflect.get(projectDelivery, 'ensureIssueProjectMembership') as
+    | ((input: typeof f.input & { beforeAdd?: () => Promise<void> }) => Promise<{ itemId: string; archived: false }>)
+    | undefined;
+  assert.equal(typeof ensure, 'function');
+  const result = await ensure!({
+    ...f.input,
+    beforeAdd: async () => {
+      f.events.push('before-add');
+    },
+  });
+  assert.deepEqual(result, { itemId: 'ITEM17', archived: false });
+  assert.deepEqual(f.events, ['before-add', 'add', 'readback']);
+  f.events.length = 0;
+  await ensure!(f.input);
+  assert.deepEqual(f.events, ['readback']);
+});
+
+test.each(['project', 'issue', 'item', 'archive', 'duplicate', 'unreadable'] as const)(
+  'membership refuses %s evidence without a repair write',
+  async (failure) => {
+    const f = membershipFixture();
+    f.setMember();
+    if (failure === 'archive') f.controls.archived = true;
+    else if (failure === 'duplicate') f.controls.duplicate = true;
+    else if (failure === 'unreadable') f.controls.unreadable = true;
+    else f.controls.corrupt = failure;
+    const ensure = Reflect.get(projectDelivery, 'ensureIssueProjectMembership') as
+      | ((input: typeof f.input) => Promise<unknown>)
+      | undefined;
+    assert.equal(typeof ensure, 'function');
+    await assert.rejects(ensure!(f.input));
+    assert.deepEqual(
+      f.events.filter((e) => e === 'add' || e === 'status'),
+      [],
+    );
+  },
+);
+
+test('guards run immediately before both Project mutation boundaries', async () => {
+  const f = membershipFixture();
+  const input = {
+    ...f.input,
+    status: 'In Progress' as const,
+    beforeAdd: async () => {
+      f.events.push('before-add');
+    },
+    beforeAdvance: async () => {
+      f.events.push('before-advance');
+    },
+  };
+  await projectDelivery.syncIssueProjectStatus(input);
+  assert.deepEqual(
+    f.events.filter((e) => e !== 'readback'),
+    ['before-add', 'add', 'before-advance', 'status'],
+  );
+  const refused = membershipFixture();
+  const fail = {
+    ...refused.input,
+    status: 'In Progress' as const,
+    beforeAdd: async () => {
+      throw new Error('native drift');
+    },
+  };
+  await assert.rejects(projectDelivery.syncIssueProjectStatus(fail), /native drift/u);
+  assert.deepEqual(refused.events, []);
+});
+
+test('strict Project observation refuses hidden content instead of proving absence', async () => {
+  const f = membershipFixture();
+  f.setMember();
+  f.controls.unreadable = true;
+  const read = Reflect.get(projectDelivery, 'readProjectDeliveryItems') as
+    | ((input: typeof f.input & { maxPages: number }) => Promise<unknown>)
+    | undefined;
+  assert.equal(typeof read, 'function');
+  await assert.rejects(read!({ ...f.input, maxPages: 20 }));
+  assert.deepEqual(f.events, []);
+});
+
+test('strict Project observation retains exact identities and verified non-issue kinds', async () => {
+  const f = membershipFixture();
+  f.setMember();
+  const base = f.input.graphql;
+  const graphql = (async (query: string) => {
+    const response = await base(query);
+    const data = response as { organization: { projectV2: { items: { nodes: unknown[] } } } };
+    data.organization.projectV2.items.nodes.push(
+      {
+        id: 'DRAFT',
+        isArchived: false,
+        content: { __typename: 'DraftIssue', id: 'DRAFT-CONTENT' },
+        fieldValueByName: null,
+      },
+      { id: 'PR', isArchived: true, content: { __typename: 'PullRequest', id: 'PR-CONTENT' }, fieldValueByName: null },
+    );
+    return data;
+  }) as unknown as typeof base;
+  const result = await projectDelivery.readProjectDeliveryItems({ ...f.input, graphql, maxPages: 20 });
+  assert.deepEqual(result[0], {
+    id: 'ITEM17',
+    archived: false,
+    contentId: 'ISSUE17',
+    status: null,
+    statusOptionId: null,
+    projectId: 'PROJECT',
+    projectNumber: 1,
+    contentKind: 'issue',
+    statusRead: 'unset',
+    statusName: null,
+    repository: 'example/widget',
+    issueNumber: 17,
+  });
+  assert.deepEqual(
+    result.map((item) => item.contentKind),
+    ['issue', 'draft', 'pull-request'],
+  );
+  assert.deepEqual(f.events, []);
+});
+
+test.each(['project', 'option'] as const)(
+  'Project %s readback failure preserves an attempted write without retry',
+  async (failure) => {
+    const f = membershipFixture();
+    f.controls.corrupt = failure;
+    if (failure === 'project') {
+      await assert.rejects(projectDelivery.ensureIssueProjectMembership(f.input), /exact issue item/u);
+      assert.deepEqual(f.events, ['add', 'readback']);
+    } else {
+      f.setMember();
+      await assert.rejects(
+        projectDelivery.syncIssueProjectStatus({ ...f.input, status: 'In Progress' }),
+        /unsupported Project Status/u,
+      );
+      assert.deepEqual(f.events, ['status', 'readback']);
+    }
+  },
+);
 
 test('search applies the same case-insensitive label filter to authoritative result rows', async () => {
   const { context } = listingFixture();

@@ -8,6 +8,7 @@ export interface CommandIdentityPolicyEvaluation {
 }
 
 const AUTHOR_COMMANDS = new Set([
+  'board:reconcile',
   'runtime:stage',
   'runtime:admit',
   'cleanup',

@@ -7,6 +7,106 @@ import { test } from 'vitest';
 import { pathToFileURL } from 'node:url';
 import { DeliveryError, getMachineRequestDiagnostics, setMachineRequestDiagnostics } from './errors.js';
 
+test('actual CLI serializes incomplete native update evidence and exits nonzero', () => {
+  const cli = pathToFileURL(join(process.cwd(), 'dist', 'cli.js')).href;
+  const dispatch = pathToFileURL(join(process.cwd(), 'dist', 'dispatch.js')).href;
+  const owner = pathToFileURL(join(process.cwd(), 'dist', 'issue.js')).href;
+  const partial = {
+    status: 'update-incomplete',
+    native: { status: 'unknown', repository: 'example/widget', issueNumber: 17, readback: null },
+    project: { status: 'pending', desiredStatus: 'Done' },
+    recovery: { tool: 'issue_batch_update' },
+  };
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--experimental-test-module-mocks',
+      '--no-warnings',
+      '--input-type=module',
+      '-e',
+      `import assert from 'node:assert/strict'; import { mock } from 'node:test'; import { IssueUpdateIncompleteError } from ${JSON.stringify(owner)};
+      mock.module(${JSON.stringify(dispatch)}, { exports: {
+        contextFor: () => { throw new Error('Unexpected configuration access'); },
+        executeTool: async (name, input) => { assert.equal(name, 'issue_update'); assert.equal(input.issueNumber, 17); throw new IssueUpdateIncompleteError(${JSON.stringify(partial)}); }
+      }});
+      process.argv = [process.execPath, ${JSON.stringify(cli)}, '--repo', 'example/widget', 'update', '--issue', '17', '--state', 'closed', '--close-reason', 'completed'];
+      await import(${JSON.stringify(cli)});`,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 1);
+  assert.deepEqual(JSON.parse(result.stdout), partial);
+  assert.equal(result.stderr, '');
+});
+
+test.each<[unknown, number]>([
+  [{ schemaVersion: 'ai-delivery.board-reconcile-plan@1', scopeComplete: true, summary: { unresolved: 4 } }, 0],
+  [{ schemaVersion: 'ai-delivery.board-reconcile-plan@1', scopeComplete: false }, 1],
+  ...['failed', 'drifted', 'refused', 'unknown', 'unresolved'].map((key): [unknown, number] => [
+    { schemaVersion: 'ai-delivery.board-reconcile-result@1', scopeComplete: true, summary: { applied: 1, [key]: 1 } },
+    1,
+  ]),
+  [
+    {
+      schemaVersion: 'ai-delivery.board-reconcile-result@1',
+      scopeComplete: true,
+      summary: { applied: 2, satisfied: 1, failed: 0, drifted: 0, refused: 0, unknown: 0, unresolved: 0 },
+    },
+    0,
+  ],
+])('CLI prints the complete reconciliation result before selecting its exit status (%j)', (value, exit) => {
+  const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { printCommandResult } from ${JSON.stringify(helper)}; printCommandResult('board_reconcile', ${JSON.stringify(value)});`,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, exit);
+  assert.deepEqual(JSON.parse(result.stdout), value);
+  assert.equal(result.stderr, '');
+});
+
+test('actual board CLI advertises bounded data-only files and validates them before credentials', () => {
+  const root = mkdtempSync(join(tmpdir(), 'board-cli-input-'));
+  const cli = join(process.cwd(), 'dist', 'cli.js');
+  try {
+    const help = spawnSync(process.execPath, [cli, 'board:reconcile', '--help'], { cwd: root, encoding: 'utf8' });
+    assert.equal(help.status, 0);
+    for (const option of [
+      '--repositories',
+      '--checkouts-file',
+      '--dry-run',
+      '--apply',
+      '--plan-file',
+      '--prior-result-file',
+    ])
+      assert.ok(help.stdout.includes(option));
+    const huge = join(root, 'huge.json');
+    writeFileSync(huge, ' '.repeat(16 * 1024 * 1024 + 1));
+    const invalid = spawnSync(
+      process.execPath,
+      [cli, 'board:reconcile', '--repositories', 'example/widget', '--apply', '--plan-file', huge],
+      { cwd: root, env: { ...process.env, AI_DELIVERY_CONFIG: join(root, 'missing-settings') }, encoding: 'utf8' },
+    );
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /16 MiB/u);
+    assert.doesNotMatch(invalid.stderr, /missing-settings|credential/u);
+    const exclusive = spawnSync(
+      process.execPath,
+      [cli, 'board:reconcile', '--repositories', 'example/widget', '--dry-run', '--apply'],
+      { cwd: root, encoding: 'utf8' },
+    );
+    assert.equal(exclusive.status, 1);
+    assert.match(exclusive.stderr, /dry-run.*apply|apply.*dry-run/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('CLI version agrees with its adjacent package independently of caller cwd', () => {
   const metadata: unknown = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(typeof metadata === 'object' && metadata !== null && 'version' in metadata);

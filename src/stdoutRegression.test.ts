@@ -10,6 +10,7 @@ import { afterEach, test, vi } from 'vitest';
 import { parseDeliveryConfig } from './config/deliveryConfig.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import type { GitHubClients } from './github/client.js';
+import type { ProjectDeliveryStatus, ProjectDeliveryStatusReadback } from './github/projectDelivery.js';
 import { replaceParentIssue } from './github/relationships.js';
 import type { DeliveryContext } from './issue.js';
 import { IssueFields, renderIssueBody } from './issueContract.js';
@@ -28,6 +29,7 @@ import { addWorktreeEntry, removeWorktreeEntry, type WorktreeEntry } from './ser
 
 // Project/field metadata is unrelated to stream routing. Keep these provider
 // adapters local while exercising real parent linking, issue start and dispatch.
+const projectReadback = vi.hoisted(() => ({ value: null as ProjectDeliveryStatusReadback | null }));
 vi.mock('./github/nativeIssueMetadata.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./github/nativeIssueMetadata.js')>()),
   getConfiguredNativeIssueMetadata: async () => ({ points: 2 }),
@@ -36,11 +38,14 @@ vi.mock('./github/nativeIssueMetadata.js', async (importOriginal) => ({
 }));
 vi.mock('./github/projectDelivery.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./github/projectDelivery.js')>()),
-  getIssueProjectStatus: async () => null,
-  syncIssueProjectStatus: async () => null,
+  assertIssueProjectWritable: async () => {},
+  getIssueProjectStatus: async () => projectReadback.value,
+  syncIssueProjectStatus: async ({ status }: { status: ProjectDeliveryStatus }) =>
+    (projectReadback.value = { itemId: 'SYNTHETIC-PROJECT-ITEM', status }),
 }));
 
 afterEach(() => {
+  projectReadback.value = null;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   setLogsSuppressed(false);
