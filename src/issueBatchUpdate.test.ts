@@ -33,6 +33,7 @@ function batchFixture() {
     }),
   );
   const writes: string[] = [];
+  const dateWrites: number[][] = [];
   const controls = {
     failAfterWrite: 0,
     failReadback: 0,
@@ -41,6 +42,13 @@ function batchFixture() {
     ignoreLabels: false,
     parentRepository: 'example/widget',
     parentNodeId: '',
+    archived: false,
+    archiveAfterWrite: false,
+    loseProjectAck: false,
+    projectUnavailableAfterDependency: false,
+    nativeUnavailableAfterDependency: false,
+    moveProjectToTodoAfterWrite: false,
+    projectReadsAfterWrite: 0,
   };
   const reads = new Map<number, number>();
   const metadata = new Map<number, Record<string, string>>();
@@ -50,9 +58,10 @@ function batchFixture() {
   const duplicates = new Map<number, number>();
   const fieldValues = (number: number) =>
     Object.entries(metadata.get(number) ?? {}).map(([id, value]) => ({
-      data_type: 'single_select',
+      data_type: Number(id) >= 103 ? 'date' : 'single_select',
       issue_field_id: Number(id),
-      issue_field_name: id === '101' ? 'Estimate' : 'Urgency',
+      issue_field_name:
+        id === '101' ? 'Estimate' : id === '102' ? 'Urgency' : id === '103' ? 'Start date' : 'Target date',
       value,
     }));
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
@@ -83,6 +92,8 @@ function batchFixture() {
       rest: {
         issues: {
           get: async ({ issue_number }: { issue_number: number }) => {
+            if (controls.nativeUnavailableAfterDependency && writes.includes('dependency'))
+              throw new Error('PRIVATE_NATIVE_READ_FAILURE');
             reads.set(issue_number, (reads.get(issue_number) ?? 0) + 1);
             if (controls.failReadback === issue_number && writes.includes(`update:${issue_number}`))
               throw new Error('Synthetic readback transport failure');
@@ -124,6 +135,8 @@ function batchFixture() {
           }),
           update: async ({ issue_number, ...patch }: { issue_number: number; [key: string]: unknown }) => {
             writes.push(`update:${issue_number}`);
+            if (controls.moveProjectToTodoAfterWrite) statuses.set(issue_number, 'Queued');
+            if (controls.archiveAfterWrite) controls.archived = true;
             if (controls.rateLimited === issue_number)
               throw Object.assign(new Error('PRIVATE_REMOTE_CONTENT'), {
                 status: 429,
@@ -174,19 +187,25 @@ function batchFixture() {
         ) => {
           if (route.startsWith('GET /orgs'))
             return {
-              data: Object.values(syntheticDiscoveryConfig.native)
-                .filter(
-                  (field): field is typeof syntheticDiscoveryConfig.native.points =>
-                    typeof field === 'object' && field !== null && 'databaseId' in field,
-                )
-                .map((field) => ({
-                  id: Number(field.databaseId),
-                  name: field.name,
-                  data_type: 'single_select',
-                  options: field.values.map((name) => ({ name })),
-                })),
+              data: [
+                ...Object.values(syntheticDiscoveryConfig.native)
+                  .filter(
+                    (field): field is typeof syntheticDiscoveryConfig.native.points =>
+                      typeof field === 'object' && field !== null && 'databaseId' in field,
+                  )
+                  .map((field) => ({
+                    id: Number(field.databaseId),
+                    name: field.name,
+                    data_type: 'single_select',
+                    options: field.values.map((name) => ({ name })),
+                  })),
+                { id: 103, name: 'Start date', data_type: 'date' },
+                { id: 104, name: 'Target date', data_type: 'date' },
+              ],
             };
           if (route.startsWith('POST ')) {
+            const dates = params.issue_field_values!.filter((value) => value.field_id >= 103);
+            if (dates.length) dateWrites.push(dates.map((value) => value.field_id));
             writes.push('metadata');
             metadata.set(params.issue_number, {
               ...metadata.get(params.issue_number),
@@ -194,6 +213,7 @@ function batchFixture() {
             });
           }
           if (route.startsWith('DELETE ')) {
+            if (params.issue_field_id! >= 103) dateWrites.push([params.issue_field_id!]);
             writes.push('metadata');
             delete metadata.get(params.issue_number)![String(params.issue_field_id)];
           }
@@ -201,6 +221,19 @@ function batchFixture() {
         },
       },
       graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (
+          controls.moveProjectToTodoAfterWrite &&
+          writes.includes('update:1') &&
+          query.includes('ProjectDeliveryItems') &&
+          ++controls.projectReadsAfterWrite === 2
+        )
+          throw new Error('PRIVATE_SYNC_READ_FAILURE');
+        if (
+          controls.projectUnavailableAfterDependency &&
+          writes.includes('dependency') &&
+          query.includes('ProjectDelivery')
+        )
+          throw new Error('PRIVATE_PROJECT_READ_FAILURE');
         const numeric = variables.number ?? variables.issueNumber;
         const nodeId = variables.issueNodeId ?? variables.itemId ?? '1';
         const number =
@@ -262,7 +295,7 @@ function batchFixture() {
                 items: {
                   nodes: [...rows.keys()].map((n) => ({
                     id: `ITEM${n}`,
-                    isArchived: false,
+                    isArchived: controls.archived,
                     content: { id: `ISSUE${n}` },
                     fieldValueByName: {
                       name: statuses.get(n),
@@ -293,6 +326,10 @@ function batchFixture() {
                   ? 'Active'
                   : 'Queued',
           );
+          if (controls.loseProjectAck) {
+            controls.loseProjectAck = false;
+            throw new Error('PRIVATE_PROJECT_ACK');
+          }
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: `ITEM${number}` } } };
         }
         if (query.includes('ProjectDeliveryItemReadback'))
@@ -323,7 +360,7 @@ function batchFixture() {
     roles: { author: { identity: 'host-author', authSource: 'personal' }, reviewer: { identity: 'app-reviewer' } },
   } as never);
   vi.spyOn(issue, 'loadDeliveryContext').mockResolvedValue(context);
-  return { context, rows, writes, comments, controls, metadata, parents, blockers, statuses };
+  return { context, rows, writes, dateWrites, comments, controls, metadata, parents, blockers, statuses };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -532,10 +569,223 @@ test('lost acknowledgement exposes partial state and a rerun completes remaining
   );
   assert.equal(second.results[0]!.readback!.projectStatus, 'Todo');
   assert.equal(f.comments.length, historyCount);
+  assert.equal(
+    f.writes.filter((write) => write.startsWith('update:1')).length,
+    1,
+    'recovery must not replay the committed native update',
+  );
   assert.deepEqual(
     (await runBatch(input)).results.map((item) => item.status),
     ['unchanged', 'unchanged'],
   );
+});
+
+test('archived partial closure resumes only Project work after separate restoration and then becomes a no-op', async () => {
+  const f = batchFixture();
+  const unrelated = structuredClone(f.rows.get(2));
+  f.rows.get(1)!.labels.push('enhancement');
+  f.controls.archiveAfterWrite = true;
+  const input = {
+    items: [
+      {
+        issueNumber: 1,
+        title: 'Closed item',
+        state: 'closed' as const,
+        closeReason: 'not_planned' as const,
+        preserveHistory: true,
+      },
+    ],
+  };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  assert.equal(f.rows.get(1)!.state, 'closed');
+  const nativeWrites = f.writes.filter((write) => write !== 'project');
+  const comments = structuredClone(f.comments);
+  const archived = await runBatch(input);
+  assert.equal(archived.summary.failed, 1);
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  assert.deepEqual(f.comments, comments);
+  f.controls.archiveAfterWrite = false;
+  f.controls.archived = false; // A separately authorized restoration, outside recovery.
+  const resumed = await runBatch(input);
+  assert.equal(resumed.summary.applied, 1);
+  assert.equal(resumed.results[0]!.readback!.projectStatus, 'Done');
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  assert.deepEqual(f.comments, comments);
+  const count = f.writes.length;
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+  assert.equal(f.writes.length, count);
+  assert.deepEqual(f.rows.get(1)!.labels, ['enhancement']);
+  assert.deepEqual(f.rows.get(2), unrelated);
+});
+
+test('archived date and parent updates resume only Project work without replaying committed native fields', async () => {
+  const f = batchFixture();
+  f.metadata.set(1, { '104': '2028-03-31' });
+  f.controls.archiveAfterWrite = true;
+  const input = {
+    items: [
+      {
+        issueNumber: 1,
+        title: 'Dated item',
+        startDate: '2028-02-29',
+        targetDate: null,
+        parentIssueNumber: 5,
+        preserveHistory: true,
+      },
+    ],
+  };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  assert.equal(first.results[0]!.incomplete?.native.status, 'confirmed');
+  assert.equal(first.results[0]!.incomplete?.native.readback?.startDate, '2028-02-29');
+  assert.equal(first.results[0]!.incomplete?.native.readback?.targetDate, null);
+  const nativeWrites = f.writes.filter((write) => write !== 'project');
+  const comments = structuredClone(f.comments);
+  assert.equal((await runBatch(input)).summary.failed, 1);
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  f.controls.archiveAfterWrite = false;
+  f.controls.archived = false; // Separately authorized restoration, outside recovery.
+  const resumed = await runBatch(input);
+  assert.equal(resumed.summary.applied, 1);
+  assert.deepEqual(
+    f.writes.filter((write) => write !== 'project'),
+    nativeWrites,
+  );
+  assert.deepEqual(f.comments, comments);
+  assert.deepEqual(f.dateWrites, [[103], [104]]);
+  assert.equal(f.parents.get(1), 5);
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+});
+
+for (const [committedId, pendingId] of [
+  [103, 104],
+  [104, 103],
+]) {
+  test(`mixed date retry writes only pending field ${pendingId} and preserves committed field ${committedId}`, async () => {
+    const f = batchFixture();
+    f.metadata.set(1, { [committedId!]: '2028-02-29', [pendingId!]: '2028-03-31' });
+    const first = await runBatch({
+      items: [
+        {
+          issueNumber: 1,
+          startDate: committedId === 103 ? '2028-02-29' : null,
+          targetDate: committedId === 104 ? '2028-02-29' : null,
+        },
+      ],
+    });
+    assert.equal(first.summary.applied, 1);
+    assert.deepEqual(f.dateWrites, [[pendingId]]);
+    assert.equal(f.metadata.get(1)![String(committedId)], '2028-02-29');
+    assert.equal(f.metadata.get(1)![String(pendingId)], undefined);
+  });
+}
+
+test('lost Project acknowledgement is incomplete until a read-only batch reconciliation proves a no-op', async () => {
+  const f = batchFixture();
+  f.controls.loseProjectAck = true;
+  const input = { items: [{ issueNumber: 1, state: 'closed' as const, closeReason: 'completed' as const }] };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  assert.equal(first.results[0]!.incomplete?.native.status, 'confirmed');
+  assert.equal(first.results[0]!.incomplete?.project.status, 'unknown');
+  assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+  const writes = [...f.writes];
+  const comments = structuredClone(f.comments);
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+  assert.deepEqual(f.writes, writes);
+  assert.deepEqual(f.comments, comments);
+});
+
+test.each(['add', 'remove'] as const)(
+  'remaining Project target reflects the committed %s blocker change after Project reads fail',
+  async (action) => {
+    const f = batchFixture();
+    f.controls.projectUnavailableAfterDependency = true;
+    f.statuses.set(1, action === 'remove' ? 'Waiting' : 'Queued');
+    if (action === 'remove') f.blockers.set(1, [2]);
+    const blockers = action === 'remove' ? [] : [2];
+    const first = await runBatch({ items: [{ issueNumber: 1, blockedBy: blockers }] });
+    const partial = first.results[0]!.incomplete;
+    assert.equal(first.summary.failed, 1);
+    assert.equal(partial?.native.status, 'confirmed');
+    assert.deepEqual(partial?.native.readback?.blockedBy, blockers);
+    assert.equal(partial?.project.desiredStatus, action === 'remove' ? 'Todo' : 'Blocked');
+    assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+    const nativeWrites = f.writes.filter((write) => write !== 'project');
+    f.controls.projectUnavailableAfterDependency = false;
+    assert.equal((await runBatch({ items: [{ issueNumber: 1, blockedBy: blockers }] })).summary.applied, 1);
+    assert.deepEqual(
+      f.writes.filter((write) => write !== 'project'),
+      nativeWrites,
+    );
+  },
+);
+
+test('unknown native blocker evidence does not claim a stale remaining Project target', async () => {
+  const f = batchFixture();
+  f.blockers.set(1, [2]);
+  f.statuses.set(1, 'Waiting');
+  f.controls.nativeUnavailableAfterDependency = true;
+  const first = await runBatch({ items: [{ issueNumber: 1, blockedBy: [] }] });
+  const partial = first.results[0]!.incomplete;
+  assert.equal(partial?.native.status, 'unknown');
+  assert.equal(partial?.project.desiredStatus, null);
+  assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+});
+
+test('a successful newer Project observation is retained when the subsequent synchronization fails', async () => {
+  const f = batchFixture();
+  f.controls.moveProjectToTodoAfterWrite = true;
+  const input = { items: [{ issueNumber: 1, status: { latestJournal: 'Native journal updated' } }] };
+  const first = await runBatch(input);
+  assert.equal(first.summary.failed, 1);
+  const partial = first.results[0]!.incomplete;
+  assert.equal(partial?.native.status, 'confirmed');
+  assert.equal(partial?.project.desiredStatus, 'Todo');
+  assert.equal(JSON.stringify(first).includes('PRIVATE_'), false);
+  const writes = [...f.writes];
+  assert.equal((await runBatch(input)).summary.unchanged, 1);
+  assert.deepEqual(f.writes, writes);
+});
+
+test('MCP serializes the actual incomplete update payload with error semantics', async () => {
+  const f = batchFixture();
+  f.controls.archiveAfterWrite = true;
+  const server = createAiDeliveryMcpServer({ repoRoot: '/synthetic', identity: 'host-author' });
+  const client = new Client({ name: 'partial-update-synthetic', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({
+      name: 'issue_update',
+      arguments: { repo: 'example/widget', issueNumber: 1, state: 'closed', closeReason: 'completed' },
+    });
+    assert.equal(result.isError, true);
+    const content = result.content as { type: string; text: string }[];
+    const partial = JSON.parse(content[0]!.text) as {
+      status: string;
+      native: { status: string; readback: issue.IssueInfo };
+      project: { desiredStatus: string };
+    };
+    assert.equal(partial.status, 'update-incomplete');
+    assert.equal(partial.native.status, 'confirmed');
+    assert.equal(partial.native.readback.state, 'closed');
+    assert.equal(partial.project.desiredStatus, 'Done');
+  } finally {
+    await client.close();
+    await server.close();
+  }
 });
 
 test('dry run plans close, defer, metadata, parent Points and dependency side effects without writes', async () => {

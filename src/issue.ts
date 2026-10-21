@@ -14,6 +14,7 @@ import {
   DeliveryError,
   getRateLimitDiagnostics,
   getMachineRequestDiagnostics,
+  setMachineRequestDiagnostics,
   type RateLimitDiagnostics,
 } from './errors.js';
 import { createDeliveryGitHubClients, type GitHubClients } from './github/client.js';
@@ -30,6 +31,7 @@ import {
 } from './github/nativeIssueMetadata.js';
 import {
   getIssueProjectStatus,
+  assertIssueProjectWritable,
   getProjectDeliveryConfiguration,
   type ProjectDeliveryConfiguration,
   projectSettingsFromDeliveryConfig,
@@ -1195,6 +1197,37 @@ export interface UpdateIssueResult extends IssueInfo {
   closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
 }
 
+interface IncompleteIssueUpdateResult {
+  status: 'update-incomplete';
+  rateLimit?: RateLimitDiagnostics;
+  native: {
+    status: 'confirmed' | 'unknown';
+    repository: string;
+    issueNumber: number;
+    readback: IssueInfo | null;
+    readbackError?: string;
+    closure?: UpdateIssueResult['closure'];
+    historyComment?: IssueCommentReadback;
+  };
+  project: { status: 'pending' | 'unknown'; desiredStatus: string | null; reason: 'archived' | 'unavailable' };
+  recovery: { tool: 'issue_batch_update'; instruction: string };
+}
+
+const incompleteUpdates = new WeakMap<object, IncompleteIssueUpdateResult>();
+
+/** Native writes may have committed; this is never an ordinary success or a safe full retry. */
+export class IssueUpdateIncompleteError extends DeliveryError {
+  constructor(readonly result: IncompleteIssueUpdateResult) {
+    super('Issue update is incomplete; reconcile native state and only remaining Project work.');
+    incompleteUpdates.set(this, result);
+  }
+}
+
+/** Identity-bound results do not inspect hostile error proxies or accessors. */
+export function getIncompleteIssueUpdate(error: unknown): IncompleteIssueUpdateResult | undefined {
+  return typeof error === 'object' && error !== null ? incompleteUpdates.get(error) : undefined;
+}
+
 function updateProjectStatus(info: IssueInfo, input: UpdateIssueInput) {
   return info.state === 'closed' || info.projectStatus === 'Done'
     ? 'Done'
@@ -1349,6 +1382,23 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     closeReason === undefined
       ? undefined
       : `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`;
+  const target = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
+  if (
+    target.number !== input.issueNumber ||
+    'pull_request' in target ||
+    !target.node_id ||
+    target.html_url !== currentContent.url ||
+    new URL(target.html_url).pathname.toLowerCase() !==
+      `/${repo.owner}/${repo.repo}/issues/${String(input.issueNumber)}`.toLowerCase()
+  )
+    throw new DeliveryError('History target is not the requested issue.');
+  await assertIssueProjectWritable({
+    graphql: clients.graphql,
+    issueNodeId: target.node_id,
+    org: config.native.organization,
+    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+    settings: projectSettingsFromDeliveryConfig(config),
+  });
   return {
     input,
     prepared,
@@ -1358,6 +1408,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     supersedingIssueId,
     assertClosure,
     currentContent,
+    nativeTarget: { nodeId: target.node_id, url: target.html_url },
     dateChanges,
     priorContent,
     historyBody,
@@ -1371,7 +1422,11 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
   return applyIssueUpdate(context, await prepareIssueUpdate(context, input));
 }
 
-async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpdate): Promise<UpdateIssueResult> {
+async function applyIssueUpdate(
+  context: DeliveryContext,
+  plan: PreparedIssueUpdate,
+  changes?: Record<string, unknown>,
+): Promise<UpdateIssueResult> {
   const { clients, config, repo } = context;
   const {
     input,
@@ -1385,6 +1440,7 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
     historyBody,
     closureBody,
   } = plan;
+  const pending = (key: string) => changes === undefined || key in changes;
   const historyComment =
     historyBody === undefined
       ? undefined
@@ -1405,31 +1461,34 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
     )
       throw new DeliveryError('Issue content changed after preparation; retry against the current title and body.');
   }
-  await clients.rest.issues.update({
-    issue_number: input.issueNumber,
-    owner: repo.owner,
-    repo: repo.repo,
-    ...(input.body === undefined ? {} : { body: input.body }),
-    ...(input.issueType === undefined ? {} : { type: input.issueType }),
-    ...(acceptedLabels === undefined ? {} : { labels: acceptedLabels }),
-    ...(input.milestone === undefined ? {} : { milestone: input.milestone }),
-    ...(input.state === undefined ? {} : { state: input.state }),
-    ...(closeReason === undefined
-      ? {}
-      : { state_reason: closeReason, headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION } }),
-    ...(closeReason !== 'duplicate' || supersedingIssueId === undefined
-      ? {}
-      : { duplicate_issue_id: supersedingIssueId }),
-    ...(input.title === undefined ? {} : { title: input.title }),
-  });
+  if (['body', 'issueType', 'labels', 'milestone', 'state', 'closeReason', 'supersededBy', 'title'].some(pending))
+    await clients.rest.issues.update({
+      issue_number: input.issueNumber,
+      owner: repo.owner,
+      repo: repo.repo,
+      ...(input.body === undefined || !pending('body') ? {} : { body: input.body }),
+      ...(input.issueType === undefined || !pending('issueType') ? {} : { type: input.issueType }),
+      ...(acceptedLabels === undefined || !pending('labels') ? {} : { labels: acceptedLabels }),
+      ...(input.milestone === undefined || !pending('milestone') ? {} : { milestone: input.milestone }),
+      ...(input.state === undefined || !pending('state') ? {} : { state: input.state }),
+      ...(closeReason === undefined || (!pending('closeReason') && !pending('state'))
+        ? {}
+        : { state_reason: closeReason, headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION } }),
+      ...(closeReason !== 'duplicate' ||
+      supersedingIssueId === undefined ||
+      (!pending('supersededBy') && !pending('state'))
+        ? {}
+        : { duplicate_issue_id: supersedingIssueId }),
+      ...(input.title === undefined || !pending('title') ? {} : { title: input.title }),
+    });
   const closure = closeReason === undefined ? undefined : await readIssueClosure(context, input.issueNumber);
   if (closure !== undefined) assertClosure(closure);
-  if (input.points !== undefined || input.priority !== undefined)
+  if ((input.points !== undefined && pending('points')) || (input.priority !== undefined && pending('priority')))
     await setConfiguredNativeIssueMetadata({
       issueNumber: input.issueNumber,
       metadata: {
-        ...(input.points === undefined ? {} : { points: input.points }),
-        ...(input.priority === undefined ? {} : { priority: input.priority }),
+        ...(input.points === undefined || !pending('points') ? {} : { points: input.points }),
+        ...(input.priority === undefined || !pending('priority') ? {} : { priority: input.priority }),
       },
       org: config.native.organization,
       owner: repo.owner,
@@ -1438,12 +1497,12 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
       settings: nativeIssueSettingsFromDeliveryConfig(config),
     });
   await applyNativeIssueDates({
-    changes: plan.dateChanges,
+    changes: plan.dateChanges.filter((change) => pending(change.name === 'Start date' ? 'startDate' : 'targetDate')),
     issueNumber: input.issueNumber,
     ...repo,
     rest: clients.rest,
   });
-  if (input.parentIssueNumber !== undefined)
+  if (input.parentIssueNumber !== undefined && pending('parentIssueNumber'))
     await replaceParentIssue({
       graphql: clients.graphql,
       issueNumber: input.issueNumber,
@@ -1451,7 +1510,7 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
       repo,
       rest: clients.rest,
     });
-  if (input.parentIssueNumber !== undefined && input.parentIssueNumber !== null)
+  if (input.parentIssueNumber !== undefined && input.parentIssueNumber !== null && pending('parentPoints'))
     await clearConfiguredNativeIssuePoints({
       issueNumber: input.parentIssueNumber,
       org: config.native.organization,
@@ -1461,7 +1520,7 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
       settings: nativeIssueSettingsFromDeliveryConfig(config),
     });
   try {
-    if (input.blockedBy !== undefined)
+    if (input.blockedBy !== undefined && pending('blockedBy'))
       await replaceBlockedBy({
         ...(beforeAdd === undefined ? {} : { beforeAdd }),
         blockers: input.blockedBy,
@@ -1470,7 +1529,7 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
         repo,
         rest: clients.rest,
       });
-    for (const dependent of new Set(input.blocks ?? []))
+    for (const dependent of new Set(pending('blocks') ? (input.blocks ?? []) : []))
       await linkBlockedBy({
         ...(beforeAdd === undefined ? {} : { beforeAdd }),
         blockers: [input.issueNumber],
@@ -1484,18 +1543,108 @@ async function applyIssueUpdate(context: DeliveryContext, plan: PreparedIssueUpd
       `Issue #${input.issueNumber} content or metadata may have changed, but dependency tracking did not complete: ${error instanceof Error ? error.message : String(error)}. Inspect native state and resume this existing issue.`,
     );
   }
-  const info = await issueInfo(context, input.issueNumber);
-  const status = updateProjectStatus(info, input);
-  const issue = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
-  await syncIssueProjectStatus({
-    graphql: clients.graphql,
-    issueNodeId: issue.node_id,
-    org: config.native.organization,
-    ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-    settings: projectSettingsFromDeliveryConfig(config),
-    status,
-  });
-  const readback = await issueInfo(context, input.issueNumber);
+  let status: ReturnType<typeof updateProjectStatus> = updateProjectStatus(
+    { ...plan.currentContent, state: input.state ?? plan.currentContent.state },
+    input,
+  );
+  let readback: IssueInfo;
+  let latestProjectStatus = plan.currentContent.projectStatus;
+  const priorRateObservation = clients.rateLimitObservation?.();
+  try {
+    const info = await issueInfo(context, input.issueNumber);
+    latestProjectStatus = info.projectStatus;
+    status = updateProjectStatus(info, input);
+    const target = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
+    if (
+      target.node_id !== plan.nativeTarget.nodeId ||
+      target.html_url !== plan.nativeTarget.url ||
+      target.number !== input.issueNumber ||
+      'pull_request' in target
+    )
+      throw new DeliveryError('Native closure readback returned a foreign issue identity.');
+    await syncIssueProjectStatus({
+      graphql: clients.graphql,
+      issueNodeId: target.node_id,
+      org: config.native.organization,
+      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+      settings: projectSettingsFromDeliveryConfig(config),
+      status,
+    });
+    readback = await issueInfo(context, input.issueNumber);
+    if (readback.projectStatus !== status)
+      throw new DeliveryError('Project Status readback disagrees with the requested outcome.');
+  } catch (error) {
+    const observedRate = clients.rateLimitObservation?.();
+    const limit = getRateLimitDiagnostics(error) ?? (observedRate !== priorRateObservation ? observedRate : undefined);
+    const diagnostic = getMachineRequestDiagnostics(error);
+    const cancelled =
+      diagnostic?.code === 'ABORT_ERR' ||
+      (!types.isProxy(error) && error instanceof DOMException && error.name === 'AbortError');
+    const result: IncompleteIssueUpdateResult = {
+      status: 'update-incomplete',
+      ...(limit === undefined ? {} : { rateLimit: limit }),
+      native: {
+        status: 'unknown',
+        repository: `${repo.owner}/${repo.repo}`,
+        issueNumber: input.issueNumber,
+        readback: null,
+        readbackError:
+          limit !== undefined || cancelled
+            ? 'Readback deferred after rate-limit exhaustion or cancellation.'
+            : 'Native issue evidence is unavailable or inconsistent.',
+      },
+      project: {
+        status:
+          localBatchFailureReason(error) === 'The issue delivery Project item is archived and cannot be updated.'
+            ? 'pending'
+            : 'unknown',
+        desiredStatus: input.blockedBy === undefined ? status : null,
+        reason:
+          localBatchFailureReason(error) === 'The issue delivery Project item is archived and cannot be updated.'
+            ? 'archived'
+            : 'unavailable',
+      },
+      recovery: {
+        tool: 'issue_batch_update',
+        instruction:
+          'Reconcile this existing issue with the original desired fields through issue_batch_update. Do not replay the full issue_update. An archived Project item requires separately authorized restoration before projection-only recovery.',
+      },
+    };
+    if (limit === undefined && !cancelled) {
+      try {
+        const native = await updateProjection(context, plan, true);
+        const desired = await desiredUpdateValues(context, plan);
+        delete desired.projectStatus;
+        if (Object.keys(pendingUpdateValues(desired, native.values)).length)
+          throw new DeliveryError('Issue update readback disagrees with the requested content or state.');
+        if (historyBody !== undefined && !(await hasUpdateComment(context, input.issueNumber, historyBody)))
+          throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
+        result.project.desiredStatus = updateProjectStatus(
+          { ...native.readback, projectStatus: latestProjectStatus },
+          input,
+        );
+        result.native = {
+          ...result.native,
+          status: 'confirmed',
+          readback: native.readback,
+          ...(historyComment === undefined ? {} : { historyComment }),
+          ...(closure === undefined || closureComment === undefined
+            ? {}
+            : { closure: { ...closure, supersededBy: input.supersededBy ?? null, comment: closureComment } }),
+        };
+        delete result.native.readbackError;
+      } catch (readbackError) {
+        const latest = clients.rateLimitObservation?.();
+        const readbackLimit =
+          getRateLimitDiagnostics(readbackError) ?? (latest !== priorRateObservation ? latest : undefined);
+        if (readbackLimit !== undefined) result.rateLimit = readbackLimit;
+        /* Missing or contradictory native evidence must remain unknown. */
+      }
+    }
+    const incomplete = new IssueUpdateIncompleteError(result);
+    if (diagnostic !== undefined) setMachineRequestDiagnostics(incomplete, diagnostic);
+    throw incomplete;
+  }
   if (
     (input.title !== undefined && readback.title !== input.title) ||
     (input.body !== undefined && readback.body !== input.body) ||
@@ -1532,6 +1681,7 @@ interface BatchUpdateItemResult {
   reason?: string;
   readbackError?: string;
   diagnostics?: ReturnType<typeof getMachineRequestDiagnostics>;
+  incomplete?: IncompleteIssueUpdateResult;
 }
 
 /** Read-only inspection of the same authenticated closure journal used by updateIssue. */
@@ -1567,9 +1717,18 @@ async function hasUpdateComment(context: DeliveryContext, issueNumber: number, b
   return true;
 }
 
-async function updateProjection(context: DeliveryContext, plan: PreparedIssueUpdate): Promise<UpdateProjection> {
+async function updateProjection(
+  context: DeliveryContext,
+  plan: PreparedIssueUpdate,
+  nativeOnly = false,
+): Promise<UpdateProjection> {
   const { input } = plan;
-  const readback = await issueInfo(context, input.issueNumber);
+  const { info: readback } = await readIssueInfo(
+    context,
+    input.issueNumber,
+    !nativeOnly,
+    nativeOnly ? plan.nativeTarget : undefined,
+  );
   const values: Record<string, unknown> = { ...readback };
   const relationships = async (issueNumber: number) => {
     const native = await getNativeBlockerRelationships({
@@ -1622,6 +1781,7 @@ async function updateProjection(context: DeliveryContext, plan: PreparedIssueUpd
   }
   if (plan.closeReason !== undefined) {
     const closure = await readIssueClosure(context, input.issueNumber);
+    if (nativeOnly) plan.assertClosure(closure);
     values.closeReason = closure.closeReason;
     if (plan.closeReason === 'duplicate' && input.supersededBy !== undefined)
       values.supersededBy = closure.duplicateOf?.number ?? null;
@@ -1757,6 +1917,7 @@ function localBatchFailureReason(error: unknown): string | undefined {
       'Native parent changed during batch readback; reconcile the current state.',
       'Native issue changed during batch preparation; reconcile the current state.',
       'Native batch readback disagrees with the requested outcomes.',
+      'The issue delivery Project item is archived and cannot be updated.',
     ].includes(message)
   )
     return message;
@@ -1817,10 +1978,14 @@ export async function batchUpdateIssues(context: DeliveryContext, input: BatchUp
         continue;
       }
       phase = 'application';
-      await applyIssueUpdate(context, {
-        ...plan,
-        priorContent: { title: before.readback.title, body: before.readback.body },
-      });
+      await applyIssueUpdate(
+        context,
+        {
+          ...plan,
+          priorContent: { title: before.readback.title, body: before.readback.body },
+        },
+        changes,
+      );
       phase = 'readback';
       const after = await updateProjection(context, plan);
       if (Object.keys(pendingUpdateValues(desired, after.values)).length)
@@ -1834,7 +1999,11 @@ export async function batchUpdateIssues(context: DeliveryContext, input: BatchUp
       });
     } catch (error) {
       const observed = context.clients.rateLimitObservation?.();
-      const limit = getRateLimitDiagnostics(error) ?? (observed !== priorRateObservation ? observed : undefined);
+      const incomplete = getIncompleteIssueUpdate(error);
+      const limit =
+        getRateLimitDiagnostics(error) ??
+        incomplete?.rateLimit ??
+        (observed !== priorRateObservation ? observed : undefined);
       if (limit !== undefined) {
         limited = true;
         rateLimits.push(limit);
@@ -1850,6 +2019,7 @@ export async function batchUpdateIssues(context: DeliveryContext, input: BatchUp
             : (localBatchFailureReason(error) ??
               `Issue update ${phase} failed; inspect native readback before retrying.`),
         ...(diagnostics === undefined ? {} : { diagnostics }),
+        ...(incomplete === undefined ? {} : { incomplete }),
       };
       if (!limited && !signal?.aborted) {
         try {
@@ -1924,11 +2094,25 @@ export interface IssueInfo {
   worktree: string | null;
 }
 
-async function readIssueInfo(context: DeliveryContext, issueNumber: number) {
+async function readIssueInfo(
+  context: DeliveryContext,
+  issueNumber: number,
+  includeProject = true,
+  expectedTarget?: { nodeId: string; url: string },
+) {
   const { clients, config, repo } = context;
   const issue = (await clients.rest.issues.get({ issue_number: issueNumber, owner: repo.owner, repo: repo.repo })).data;
   if ('pull_request' in issue) throw new DeliveryError('Requested issue number is a pull request.');
-  const children = await readDirectIssueChildren(context, issueNumber, issue);
+  if (
+    !includeProject &&
+    (issue.number !== issueNumber ||
+      issue.node_id !== expectedTarget?.nodeId ||
+      issue.html_url !== expectedTarget?.url ||
+      new URL(issue.html_url).pathname.toLowerCase() !==
+        `/${repo.owner}/${repo.repo}/issues/${String(issueNumber)}`.toLowerCase())
+  )
+    throw new DeliveryError('Native closure readback returned a foreign issue identity.');
+  const children = includeProject ? await readDirectIssueChildren(context, issueNumber, issue) : [];
   const strictRead = children.length > 0;
   const [nativeFields, relationships, project] = await Promise.all([
     readIssueNativeFields(context, issueNumber, strictRead),
@@ -1940,14 +2124,16 @@ async function readIssueInfo(context: DeliveryContext, issueNumber: number) {
         ? {}
         : { maxPages: context.readPageLimit, requireRepositoryIdentity: true, issueNodeId: issue.node_id }),
     }),
-    getIssueProjectStatus({
-      graphql: clients.graphql,
-      issueNodeId: issue.node_id,
-      org: config.native.organization,
-      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
-      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-      settings: projectSettingsFromDeliveryConfig(config),
-    }),
+    includeProject
+      ? getIssueProjectStatus({
+          graphql: clients.graphql,
+          issueNodeId: issue.node_id,
+          org: config.native.organization,
+          ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
+          ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+          settings: projectSettingsFromDeliveryConfig(config),
+        })
+      : Promise.resolve(null),
   ]);
   const metadata = parseConfiguredNativeIssueMetadata(
     nativeFields.values,
