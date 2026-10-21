@@ -957,6 +957,8 @@ test('strict Project observation retains exact identities and verified non-issue
     projectId: 'PROJECT',
     projectNumber: 1,
     contentKind: 'issue',
+    statusRead: 'unset',
+    statusName: null,
     repository: 'example/widget',
     issueNumber: 17,
   });

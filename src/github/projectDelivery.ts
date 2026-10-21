@@ -625,7 +625,7 @@ async function fetchProjectDeliveryItemNodes(
     if (!Array.isArray(items.nodes)) {
       throw new DeliveryError('GitHub returned invalid delivery Project items.');
     }
-    nodes.push(...items.nodes);
+    nodes.push(...(items.nodes as unknown[]));
     const pageInfo = requireRecord(items.pageInfo, 'GitHub omitted delivery Project item pagination.');
     if ((input.capacityRead || input.strictProjection) && typeof pageInfo.hasNextPage !== 'boolean')
       throw new DeliveryError('WIP capacity Project pagination is incomplete.');
@@ -660,6 +660,8 @@ export interface ProjectItemObservation extends ProjectDeliveryItem {
   projectId: string;
   projectNumber: number;
   contentKind: 'issue' | 'draft' | 'pull-request';
+  statusRead: 'verified' | 'unset' | 'unreadable';
+  statusName: string | null;
   repository?: string;
   issueNumber?: number;
 }
@@ -675,19 +677,34 @@ export async function readProjectDeliveryItems(input: {
   const ids = new Set<string>();
   for (const raw of await fetchProjectDeliveryItemNodes({ ...input, strictProjection: true })) {
     const record = requireRecord(raw, 'GitHub returned invalid Project membership.');
-    if (typeof record.isArchived !== 'boolean' || record.fieldValueByName === undefined)
-      throw new DeliveryError('Project archive/Status projection is incomplete.');
+    if (typeof record.isArchived !== 'boolean') throw new DeliveryError('Project archive projection is incomplete.');
     const content = requireRecord(record.content, 'Project content is unreadable; absence cannot be proved.');
     const kind = content.__typename;
     if (kind !== 'Issue' && kind !== 'DraftIssue' && kind !== 'PullRequest')
       throw new DeliveryError('Project content type is unreadable.');
-    const item = parseProjectItem(record, input.configuration);
+    // Membership identity is independent of whether this item's Status is usable.
+    let item = parseProjectItem({ ...record, fieldValueByName: null }, input.configuration);
     if (!item || ids.has(item.id)) throw new DeliveryError('Project item identity is missing or repeated.');
+    let statusRead: ProjectItemObservation['statusRead'] = record.fieldValueByName === null ? 'unset' : 'unreadable';
+    const rawStatus = isRecord(record.fieldValueByName) ? record.fieldValueByName : null;
+    const safeText = (value: unknown): string | null =>
+      typeof value === 'string' && value.length > 0 && value.length <= 512 ? value : null;
+    const statusName = safeText(rawStatus?.name);
+    if (record.fieldValueByName !== undefined && record.fieldValueByName !== null) {
+      try {
+        item = parseProjectItem(record, input.configuration)!;
+        statusRead = 'verified';
+      } catch {
+        item.statusOptionId = safeText(rawStatus?.optionId);
+      }
+    }
     ids.add(item.id);
     const identity = {
       ...item,
       projectId: input.configuration.projectId,
       projectNumber: input.configuration.projectNumber,
+      statusRead,
+      statusName,
     };
     if (kind === 'Issue') {
       const repository = requireString(

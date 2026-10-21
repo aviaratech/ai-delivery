@@ -673,7 +673,7 @@ export interface ListedTrackingIssue {
   updatedAt: string;
 }
 
-function capacityNextPage(
+export function capacityNextPage(
   response: { data: unknown; headers?: { link?: string } },
   page: number,
   perPage: number,
@@ -840,6 +840,11 @@ async function readIssueFields(
   return { fields, values, catalog };
 }
 
+/** The same native-field composition used by issue-info, without unrelated Project/relationship reads. */
+export async function readIssueNativeFields(context: DeliveryContext, issueNumber: number) {
+  return readIssueFields(context, issueNumber, await readIssueFieldCatalog(context));
+}
+
 async function prepareIssueDates(context: DeliveryContext, patch: NativeIssueDatePatch) {
   if (patch.startDate === undefined && patch.targetDate === undefined) return [];
   return prepareNativeIssueDates(patch, await readIssueFieldCatalog(context));
@@ -949,7 +954,7 @@ export async function listIssues(
       issueNumber: current.number,
       repo: context.repo,
       requireRepositoryIdentity: true,
-      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
+      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit, issueNodeId: current.node_id }),
     });
     const localParent =
       relationships.parentRepository?.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
@@ -1821,14 +1826,14 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
   const issue = (await clients.rest.issues.get({ issue_number: issueNumber, owner: repo.owner, repo: repo.repo })).data;
   if ('pull_request' in issue) throw new DeliveryError('Requested issue number is a pull request.');
   const [nativeFields, relationships, project] = await Promise.all([
-    readIssueFieldCatalog(context).then((catalog) => readIssueFields(context, issueNumber, catalog)),
+    readIssueNativeFields(context, issueNumber),
     getNativeBlockerRelationships({
       graphql: clients.graphql,
       issueNumber,
       repo,
       ...(context.readPageLimit === undefined
         ? {}
-        : { maxPages: context.readPageLimit, requireRepositoryIdentity: true }),
+        : { maxPages: context.readPageLimit, requireRepositoryIdentity: true, issueNodeId: issue.node_id }),
     }),
     getIssueProjectStatus({
       graphql: clients.graphql,
@@ -1897,7 +1902,12 @@ export async function listIssueSubissues(context: DeliveryContext, issueNumber: 
 
 export async function readyCheck(context: DeliveryContext, issueNumber: number): Promise<AgentReadinessResult> {
   const info = await issueInfo(context, issueNumber);
-  const trackingParent = await hasNativeSubIssues({ issueNumber, repo: context.repo, rest: context.clients.rest });
+  const trackingParent = await hasNativeSubIssues({
+    issueNumber,
+    repo: context.repo,
+    rest: context.clients.rest,
+    requireComplete: context.readPageLimit !== undefined,
+  });
   return evaluateAgentReadiness({
     blockedBy: info.blockedBy,
     body: info.body,

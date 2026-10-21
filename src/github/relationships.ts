@@ -146,10 +146,12 @@ export async function getNativeBlockerRelationships({
   repo,
   requireRepositoryIdentity = false,
   maxPages,
+  issueNodeId,
 }: Omit<RelationshipContext, 'rest'> & {
   issueNumber: number;
   requireRepositoryIdentity?: boolean;
   maxPages?: number;
+  issueNodeId?: string;
 }): Promise<NativeBlockerRelationshipReadback> {
   const blockers = new Map<string, NativeBlockerRelationship>();
   let cursor: null | string = null;
@@ -159,6 +161,8 @@ export async function getNativeBlockerRelationships({
   let parentNumber: null | number = null;
   const seenCursors = new Set<string>();
   let pages = 0;
+  let observedSubject: string | undefined;
+  let observedParent: string | undefined;
   while (hasNextPage) {
     if (maxPages !== undefined && pages >= maxPages)
       throw new CollectionLimitError({
@@ -210,11 +214,22 @@ export async function getNativeBlockerRelationships({
     if (
       maxPages !== undefined &&
       (!issue.id ||
+        (issueNodeId !== undefined && issue.id !== issueNodeId) ||
+        (observedSubject !== undefined && issue.id !== observedSubject) ||
         issue.number !== issueNumber ||
         issue.repository?.nameWithOwner.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase())
     )
       throw new CLIError('Native blocker evidence does not identify its exact selected source issue.');
+    if (maxPages !== undefined) {
+      const parent = JSON.stringify(issue.parent);
+      if (observedParent !== undefined && observedParent !== parent)
+        throw new CLIError('Native parent identity changed while reading blocker pages.');
+      observedParent = parent;
+      observedSubject = issue.id;
+    }
     for (const blocker of issue.blockedBy.nodes) {
+      if (maxPages !== undefined && blockers.has(blocker.id))
+        throw new CLIError('Native blocker pagination repeats an identity.');
       if (requireRepositoryIdentity && !blocker.repository?.nameWithOwner.match(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u))
         throw new CLIError('Native blocker omitted its repository identity.');
       const { repository, ...identity } = blocker;
@@ -315,10 +330,12 @@ export async function hasNativeSubIssues({
   issueNumber,
   repo,
   rest,
+  requireComplete = false,
 }: {
   issueNumber: number;
   repo: RepoCoordinates;
   rest: Octokit;
+  requireComplete?: boolean;
 }): Promise<boolean> {
   const response = await rest.issues.listSubIssues({
     issue_number: issueNumber,
@@ -326,6 +343,34 @@ export async function hasNativeSubIssues({
     per_page: 1,
     repo: repo.repo,
   });
+  if (requireComplete) {
+    if (
+      !Array.isArray(response.data) ||
+      response.data.length > 1 ||
+      (response.data.length === 0 && response.headers?.link)
+    )
+      throw new CLIError('Native child existence evidence is incomplete.');
+    for (const child of response.data) {
+      const parsed = z
+        .object({
+          number: z.number().int().positive().safe(),
+          node_id: z.string().min(1),
+          id: z.number().int().positive().safe(),
+          html_url: z.string().url(),
+        })
+        .safeParse(child);
+      if (!parsed.success || 'pull_request' in child) throw new CLIError('Native child identity is unreadable.');
+      const url = new URL(parsed.data.html_url);
+      if (
+        url.protocol !== 'https:' ||
+        url.hostname !== 'github.com' ||
+        url.search ||
+        url.hash ||
+        !new RegExp(`^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/${String(parsed.data.number)}$`, 'u').test(url.pathname)
+      )
+        throw new CLIError('Native child identity is unreadable.');
+    }
+  }
   return response.data.length > 0;
 }
 

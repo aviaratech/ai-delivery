@@ -208,6 +208,7 @@ const DeliveryConfigSchema = z
   });
 
 export type DeliveryConfig = z.infer<typeof DeliveryConfigSchema>;
+export const NativeDeliveryConfigSchema = DeliveryConfigSchema.shape.native;
 export type DeliveryRole = keyof DeliveryConfig['roles'];
 
 const ModulePath = z.string().regex(/^\.\/(?!.*(?:^|\/)\.\.(?:\/|$))[^\s]+\.(?:mjs|js)$/u);
