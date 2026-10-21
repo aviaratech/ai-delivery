@@ -19,7 +19,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as atomicJson from './utils/atomicJson.js';
-import { processSnapshot, retainedWorktreeTransitionProducerDigest } from './verification.js';
+import * as pluginTools from '@aviaratech/ai-plugin-tools';
+import {
+  processSnapshot,
+  retainedWorktreeTransitionProducerDigest,
+  retainedWorktreeTransitionDependencyManifests,
+} from './verification.js';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { PassThrough } from 'node:stream';
 
@@ -36,6 +41,14 @@ const fixture = vi.hoisted(() => ({
   respond: undefined as ((args: string[]) => string | undefined) | undefined,
   packArchive: '',
 }));
+vi.mock('@aviaratech/ai-plugin-tools', async (original) => {
+  const actual = await original<typeof import('@aviaratech/ai-plugin-tools')>();
+  return {
+    ...actual,
+    marketplaceDocuments: vi.fn(actual.marketplaceDocuments),
+    nativePluginArgs: vi.fn(actual.nativePluginArgs),
+  };
+});
 vi.mock('node:child_process', async (original) => {
   const actual = await original<typeof import('node:child_process')>();
   return {
@@ -293,6 +306,7 @@ test.each(['migrate', 'apply', 'retire', 'restore-settings'])(
 );
 
 beforeEach(() => {
+  vi.clearAllMocks();
   fixture.home = mkdtempSync(join(tmpdir(), 'ai-delivery-installer-'));
   vi.stubEnv('CODEX_HOME', join(fixture.home, '.codex'));
   vi.stubEnv('CLAUDE_CONFIG_DIR', join(fixture.home, '.claude'));
@@ -1724,6 +1738,162 @@ test('compiled doctor CLI requires explicit repository for auth and keeps dry-ru
   assert.equal(defaultDoctor.status, 0, defaultDoctor.stderr);
   assert.equal((JSON.parse(defaultDoctor.stdout) as { authProbe?: unknown }).authProbe, undefined);
   assert.ok(!existsSync(join(fixture.home, '.cache')));
+});
+
+function producerDependencyFixture(esm = true) {
+  const root = join(fixture.home, 'producer');
+  const manifests = new Map<string, unknown>([
+    ['package.json', { name: 'synthetic-producer', dependencies: { 'synthetic-dependency': '1' } }],
+    [
+      'node_modules/synthetic-dependency/package.json',
+      {
+        name: 'synthetic-dependency',
+        type: 'module',
+        exports: esm ? { '.': { import: './entry.js' } } : { '.': './entry.js' },
+        dependencies: { 'synthetic-leaf': '1' },
+      },
+    ],
+    ['node_modules/synthetic-dependency/node_modules/synthetic-leaf/package.json', { name: 'synthetic-leaf' }],
+  ]);
+  for (const [path, value] of manifests) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), JSON.stringify(value));
+  }
+  const entry = join(root, 'node_modules/synthetic-dependency/entry.js');
+  writeFileSync(entry, 'throw new Error("Dependency discovery must not evaluate this entry.");');
+  mkdirSync(join(root, 'dist'));
+  writeFileSync(join(root, 'dist/index.js'), 'export const synthetic = true;');
+  return { root, dist: join(root, 'dist'), paths: [...manifests.keys()].map((path) => join(root, path)) };
+}
+
+test.each([true, false])('producer discovery preserves inert full-byte transitive manifests (ESM-only=%s)', (esm) => {
+  const { dist, paths } = producerDependencyFixture(esm);
+  const expected = paths
+    .map((source) => ({
+      source,
+      digest: `sha256:${createHash('sha256').update(readFileSync(source)).digest('hex')}`,
+    }))
+    .sort((a, b) => a.source.localeCompare(b.source));
+  assert.deepEqual(retainedWorktreeTransitionDependencyManifests(dist), expected);
+  const before = retainedWorktreeTransitionProducerDigest(dist);
+  writeFileSync(paths[2]!, `${readFileSync(paths[2]!, 'utf8')}\n`);
+  assert.notEqual(retainedWorktreeTransitionProducerDigest(dist), before);
+  assert.equal(
+    retainedWorktreeTransitionDependencyManifests(dist).find(({ source }) => source === paths[2])!.digest,
+    `sha256:${createHash('sha256').update(readFileSync(paths[2]!)).digest('hex')}`,
+  );
+});
+
+test('producer discovery refuses missing transitive dependencies and mismatched ESM identity', () => {
+  const { dist, paths } = producerDependencyFixture();
+  rmSync(dirname(paths[2]!), { recursive: true });
+  assert.throws(() => retainedWorktreeTransitionDependencyManifests(dist), { code: 'MODULE_NOT_FOUND' });
+  writeFileSync(paths[1]!, JSON.stringify({ name: 'different-identity', exports: { '.': { import: './entry.js' } } }));
+  assert.throws(
+    () => retainedWorktreeTransitionDependencyManifests(dist),
+    /Producer dependency identity is unavailable/u,
+  );
+});
+
+// Independent golden bytes captured from a4808e1 catalogDocuments before toolkit substitution.
+test.each(['codex', 'claude-code'] as const)(
+  'toolkit adoption preserves catalog bytes and publication order for %s',
+  async (host) => {
+    const { catalog } = host === 'codex' ? replacementFixture() : claudeReplacementFixture();
+    const paths = ['.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json'].map((path) =>
+      join(catalog, path),
+    );
+    const published: string[] = [];
+    const actual = atomicJson.writePrivateJsonFileAtomically;
+    vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+      if (paths.includes(path)) published.push(path);
+      actual(path, value);
+    });
+    await managePlugin({ ...input(), host, action: 'update', version: '0.3.22' });
+    assert.deepEqual(published, paths);
+    assert.ok(
+      vi.mocked(pluginTools.marketplaceDocuments).mock.calls.some(
+        ([spec]) =>
+          JSON.stringify(spec) ===
+          JSON.stringify({
+            marketplaceName: 'ai-delivery-user',
+            pluginName: 'ai-delivery',
+            relativeSource: './versions/0.3.22/plugins/ai-delivery',
+            version: '0.3.22',
+            ownerName: 'AviaraTech',
+            metadata: {
+              kind: 'interface-policy',
+              displayName: 'ai-delivery',
+              policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+              category: 'Productivity',
+            },
+          }),
+      ),
+      'installer calls real marketplaceDocuments with its existing interface-policy inputs',
+    );
+    assert.deepEqual(
+      vi.mocked(pluginTools.nativePluginArgs).mock.calls.map(([spec]) => spec),
+      [
+        { host, action: 'remove', pluginId: 'ai-delivery@ai-delivery-user', scope: 'user' },
+        { host, action: 'update', pluginId: 'ai-delivery@ai-delivery-user', scope: 'user' },
+      ],
+    );
+    for (const args of fixture.commandArguments.filter(
+      (args) =>
+        args[1] === 'plugin' &&
+        ['add', 'remove', 'install', 'update', 'uninstall'].includes(args[2] ?? '') &&
+        !args.includes('--help'),
+    )) {
+      assert.ok(
+        vi
+          .mocked(pluginTools.nativePluginArgs)
+          .mock.results.some(
+            (result) => result.type === 'return' && JSON.stringify(result.value) === JSON.stringify(args.slice(1)),
+          ),
+        'native dispatch uses the real helper result unchanged',
+      );
+    }
+    for (const [index, name] of ['codex', 'claude'].entries()) {
+      const golden = join(
+        dirname(fileURLToPath(import.meta.url)),
+        '../fixtures/plugin-installer-toolkit',
+        `interface-policy.${name}.json`,
+      );
+      assert.deepEqual(readFileSync(paths[index]!), readFileSync(golden));
+    }
+  },
+);
+
+test.each(['codex', 'claude-code'] as const)(
+  'toolkit adoption loads compatible completed state unchanged for %s',
+  async (host) => {
+    doctorFixture(true, host);
+    const directory = join(fixture.home, '.cache/ai-delivery/plugins', host, 'user');
+    const paths = [join(directory, 'state.json'), join(directory, 'marketplace/versions/0.3.21/version.json')];
+    const before = paths.map((path) => readFileSync(path));
+    const digests = before.map((bytes) => createHash('sha256').update(bytes).digest('hex'));
+    const result = await managePlugin({ ...input(), host, action: 'doctor', version: undefined });
+    assert.equal(result.version, '0.3.21');
+    assert.deepEqual(
+      paths.map((path) => readFileSync(path)),
+      before,
+    );
+    assert.deepEqual(
+      paths.map((path) => createHash('sha256').update(readFileSync(path)).digest('hex')),
+      digests,
+    );
+  },
+);
+
+test.each(['project', 'local'])('toolkit adoption preserves early scope refusal for %s', async (scope) => {
+  await assert.rejects(managePlugin({ ...input(), scope }), {
+    name: 'Error',
+    message: 'Codex currently supports user plugin installation; select --scope user.',
+  });
+  assert.deepEqual(fixture.commandArguments, []);
+  assert.deepEqual(vi.mocked(pluginTools.nativePluginArgs).mock.calls, []);
+  assert.deepEqual(vi.mocked(pluginTools.marketplaceDocuments).mock.calls, []);
+  assert.deepEqual(readdirSync(fixture.home), []);
 });
 
 test('plugin management rejects unsupported native scopes and nonliteral versions before writing', async () => {
