@@ -9,6 +9,7 @@ import { afterEach, describe, it, vi } from 'vitest';
 
 import { assertDeliveryRolePermissions, createDeliveryGitHubClients, withAuthorGitToken } from '../github/client.js';
 import { evaluateCommandIdentityPolicy } from '../github/commandIdentityPolicy.js';
+import { discoverDeliveryRouting } from '../github/discovery.js';
 import { contextFor } from '../dispatch.js';
 import {
   clearConfiguredNativeIssuePoints,
@@ -130,6 +131,77 @@ function syntheticProject(config: Pick<ReturnType<typeof parseDeliveryConfig>, '
 }
 
 afterEach(() => vi.unstubAllEnvs());
+
+it.each(['issueFields', 'issueTypes', 'projectsV2', 'projectFields'] as const)(
+  'reconciliation bounds %s discovery before a context exists',
+  async (collection) => {
+    const root = mkdtempSync(join(tmpdir(), 'delivery-discovery-bound-'));
+    try {
+      const configured = parseDeliveryConfig(syntheticConfig({ owner: 'example', repo: 'widget', projectNumber: 1 }));
+      const path = join(root, 'settings.json');
+      userConfig(path, configured);
+      for (const [finalPage, limit] of [
+        [21, 20],
+        [20, 20],
+        [21, undefined],
+      ] as const) {
+        let requests = 0;
+        const base = syntheticDiscoveryClients(configured);
+        const graphql = (async (query: string, variables: Record<string, unknown>) => {
+          assert.ok(!query.includes('mutation'));
+          const response = await base.graphql(query, variables);
+          const selected =
+            collection === 'projectFields'
+              ? query.includes('query ProjectDeliveryConfiguration')
+              : query.includes(`${collection}(first:`);
+          if (!selected) return response;
+          requests++;
+          const cloned = JSON.parse(JSON.stringify(response)) as {
+            repository: Record<string, { nodes: unknown[]; pageInfo: unknown }>;
+            organization: { projectV2: { fields: { nodes: unknown[]; pageInfo: unknown } } };
+          };
+          const connection =
+            collection === 'projectFields' ? cloned.organization.projectV2.fields : cloned.repository[collection]!;
+          if (requests > 1) connection.nodes = [];
+          connection.pageInfo = { hasNextPage: requests < finalPage, endCursor: `cursor-${String(requests)}` };
+          return cloned;
+        }) as typeof base.graphql;
+        const options = {
+          clients: { graphql },
+          repository: configured.repository,
+          ...(limit === undefined ? {} : { readPageLimit: limit }),
+        };
+        const load = () => {
+          if (collection !== 'projectsV2') return loadDeliveryConfig(root, options);
+          // Current user settings require an explicit Project; exercise the existing optional linked-routing owner directly.
+          const { project: _project, ...overrides } = syntheticOverrides(configured);
+          return discoverDeliveryRouting({
+            clients: { graphql },
+            repository: configured.repository,
+            overrides,
+            ...(limit === undefined ? {} : { maxPages: limit }),
+          });
+        };
+        if (finalPage === 21 && limit === 20) {
+          await assert.rejects(load(), (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.equal(error.name, 'CollectionLimitError', error.message);
+            assert.equal(Reflect.get(error, 'pagesRequested'), 20);
+            assert.equal(Reflect.get(error, 'limit'), 20);
+            return true;
+          });
+          assert.equal(requests, 20);
+        } else {
+          await load();
+          assert.equal(requests, finalPage);
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
 function userConfig(path: string, config: ReturnType<typeof parseDeliveryConfig>) {
   const {
     policy: _policy,

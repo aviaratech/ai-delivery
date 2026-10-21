@@ -5,6 +5,7 @@ import * as z from 'zod/v4';
 import type { RepoCoordinates } from './repo.js';
 
 import { CLIError, formatError, logInfo } from '../logger.js';
+import { CollectionLimitError } from '../errors.js';
 
 export interface NativeBlockerRelationship {
   id: string;
@@ -66,6 +67,9 @@ const NativeBlockerPageSchema = z
       .object({
         issue: z
           .object({
+            id: z.string().min(1).optional(),
+            number: z.number().int().positive().optional(),
+            repository: z.object({ nameWithOwner: z.string() }).strict().optional(),
             blockedBy: z
               .object({
                 nodes: z.array(
@@ -141,9 +145,11 @@ export async function getNativeBlockerRelationships({
   issueNumber,
   repo,
   requireRepositoryIdentity = false,
+  maxPages,
 }: Omit<RelationshipContext, 'rest'> & {
   issueNumber: number;
   requireRepositoryIdentity?: boolean;
+  maxPages?: number;
 }): Promise<NativeBlockerRelationshipReadback> {
   const blockers = new Map<string, NativeBlockerRelationship>();
   let cursor: null | string = null;
@@ -152,12 +158,22 @@ export async function getNativeBlockerRelationships({
   let parentRepository: null | string = null;
   let parentNumber: null | number = null;
   const seenCursors = new Set<string>();
+  let pages = 0;
   while (hasNextPage) {
+    if (maxPages !== undefined && pages >= maxPages)
+      throw new CollectionLimitError({
+        collection: 'native-blockers',
+        pagesRequested: pages,
+        rowsObserved: blockers.size,
+        limit: maxPages,
+      });
+    pages++;
     const response: unknown = await graphql(
       `
         query ($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           repository(owner: $owner, name: $name) {
             issue(number: $number) {
+              ${maxPages === undefined ? '' : 'id number repository { nameWithOwner }'}
               parent {
                 id
                 number
@@ -191,6 +207,13 @@ export async function getNativeBlockerRelationships({
       throw new CLIError(`GitHub returned invalid blocked-by relationship evidence for issue #${String(issueNumber)}.`);
     }
     const issue = parsed.data.repository.issue;
+    if (
+      maxPages !== undefined &&
+      (!issue.id ||
+        issue.number !== issueNumber ||
+        issue.repository?.nameWithOwner.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase())
+    )
+      throw new CLIError('Native blocker evidence does not identify its exact selected source issue.');
     for (const blocker of issue.blockedBy.nodes) {
       if (requireRepositoryIdentity && !blocker.repository?.nameWithOwner.match(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u))
         throw new CLIError('Native blocker omitted its repository identity.');

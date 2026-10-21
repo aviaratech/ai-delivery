@@ -79,7 +79,12 @@ export function resumedIssueUpdate(input: Record<string, unknown>): UpdateIssueI
   } = input;
   return { ...fields, issueNumber: requiredNumber({ issueNumber }, 'issueNumber') } as UpdateIssueInput;
 }
-export async function contextFor(input: ExecutionContext, commandName: string, role: 'author' | 'reviewer' = 'author') {
+export async function contextFor(
+  input: ExecutionContext,
+  commandName: string,
+  role: 'author' | 'reviewer' = 'author',
+  readPageLimit?: number,
+) {
   const settings = await loadDeliverySettings();
   const identity = input.identity ?? settings.roles[role].identity;
   const policy = evaluateCommandIdentityPolicy({
@@ -96,6 +101,7 @@ export async function contextFor(input: ExecutionContext, commandName: string, r
     ...(input.repo === undefined ? {} : { repository: input.repo }),
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(readPageLimit === undefined ? {} : { readPageLimit }),
   });
 }
 /** GitHub owns branch linkage; hosts own worktree preparation. */

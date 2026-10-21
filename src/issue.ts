@@ -10,6 +10,7 @@ import type {
 import { loadDeliveryConfig, WipLimits, type WipLane } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/legacy.js';
 import {
+  CollectionLimitError,
   DeliveryError,
   getRateLimitDiagnostics,
   getMachineRequestDiagnostics,
@@ -199,6 +200,7 @@ export async function journalIssueStart(context: DeliveryContext, issueNumber: n
 }
 
 export interface DeliveryContext {
+  readPageLimit?: number;
   clients: GitHubClients;
   reviewerClients?: GitHubClients;
   configuration?: LoadedDeliveryConfig | LoadedGitHubConfig;
@@ -209,6 +211,7 @@ export interface DeliveryContext {
 }
 
 export async function loadDeliveryContext(input: {
+  readPageLimit?: number;
   identity: string;
   personalAuth?: boolean;
   repoRoot: string;
@@ -217,6 +220,7 @@ export async function loadDeliveryContext(input: {
   signal?: AbortSignal;
 }): Promise<DeliveryContext> {
   const loaded = await loadDeliveryConfig(input.repoRoot, {
+    ...(input.readPageLimit === undefined ? {} : { readPageLimit: input.readPageLimit }),
     ...(input.repository === undefined ? {} : { repository: input.repository }),
     ...(input.personalAuth === undefined ? {} : { personalAuth: input.personalAuth }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -244,7 +248,15 @@ export async function loadDeliveryContext(input: {
     settings: projectSettingsFromDeliveryConfig(config),
     writable: true,
   };
-  return { clients, config, configuration: loaded, projectConfiguration, repo, root: '' };
+  return {
+    clients,
+    config,
+    configuration: loaded,
+    projectConfiguration,
+    repo,
+    root: '',
+    ...(input.readPageLimit === undefined ? {} : { readPageLimit: input.readPageLimit }),
+  };
 }
 
 async function labels(context: DeliveryContext, input: readonly string[] | undefined): Promise<string[]> {
@@ -257,6 +269,13 @@ async function labels(context: DeliveryContext, input: readonly string[] | undef
   if (selected.length === 0) return [];
   const available = new Set<string>();
   for (let page = 1; page <= 100; page++) {
+    if (context.readPageLimit !== undefined && page > context.readPageLimit)
+      throw new CollectionLimitError({
+        collection: 'repository-labels',
+        pagesRequested: page - 1,
+        rowsObserved: available.size,
+        limit: context.readPageLimit,
+      });
     const batch = (await context.clients.rest.issues.listLabelsForRepo({ ...context.repo, page, per_page: 100 })).data;
     for (const label of batch) available.add(label.name.toLowerCase());
     if (batch.length < 100) {
@@ -694,8 +713,16 @@ async function issueFieldPages(
   const values: unknown[] = [];
   const seenPages = new Set<string>();
   for (let page = 1; ; page += 1) {
-    if (maxPages !== undefined && page > maxPages)
+    if (maxPages !== undefined && page > maxPages) {
+      if (context.readPageLimit !== undefined)
+        throw new CollectionLimitError({
+          collection: route.includes('/orgs/') ? 'native-field-catalog' : 'native-field-values',
+          pagesRequested: page - 1,
+          rowsObserved: values.length,
+          limit: maxPages,
+        });
       throw new DeliveryError('WIP capacity native field pagination is incomplete.');
+    }
     const response = await context.clients.rest.request(route, {
       ...parameters,
       headers: { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION },
@@ -721,7 +748,7 @@ async function readIssueFieldCatalog(context: DeliveryContext, capacityRead = fa
         context,
         'GET /orgs/{org}/issue-fields',
         { org: context.config.native.organization },
-        capacityRead ? 20 : undefined,
+        capacityRead ? Math.min(context.readPageLimit ?? 20, 20) : context.readPageLimit,
       ),
     );
   if (
@@ -747,7 +774,7 @@ async function readIssueFields(
         ...context.repo,
         issue_number: issueNumber,
       },
-      capacityRead ? 20 : undefined,
+      capacityRead ? Math.min(context.readPageLimit ?? 20, 20) : context.readPageLimit,
     ),
   );
   const observed = new Set<number>();
@@ -922,6 +949,7 @@ export async function listIssues(
       issueNumber: current.number,
       repo: context.repo,
       requireRepositoryIdentity: true,
+      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
     });
     const localParent =
       relationships.parentRepository?.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
@@ -936,6 +964,9 @@ export async function listIssues(
       graphql: context.clients.graphql,
       issueNodeId: current.node_id,
       ...(options.capacityRead ? { capacityRead: true, maxPages: 20 } : {}),
+      ...(context.readPageLimit === undefined
+        ? {}
+        : { maxPages: Math.min(context.readPageLimit, options.capacityRead ? 20 : context.readPageLimit) }),
       org: context.config.native.organization,
       ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
       settings: projectSettingsFromDeliveryConfig(context.config),
@@ -1791,11 +1822,19 @@ export async function issueInfo(context: DeliveryContext, issueNumber: number): 
   if ('pull_request' in issue) throw new DeliveryError('Requested issue number is a pull request.');
   const [nativeFields, relationships, project] = await Promise.all([
     readIssueFieldCatalog(context).then((catalog) => readIssueFields(context, issueNumber, catalog)),
-    getNativeBlockerRelationships({ graphql: clients.graphql, issueNumber, repo }),
+    getNativeBlockerRelationships({
+      graphql: clients.graphql,
+      issueNumber,
+      repo,
+      ...(context.readPageLimit === undefined
+        ? {}
+        : { maxPages: context.readPageLimit, requireRepositoryIdentity: true }),
+    }),
     getIssueProjectStatus({
       graphql: clients.graphql,
       issueNodeId: issue.node_id,
       org: config.native.organization,
+      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
       ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
       settings: projectSettingsFromDeliveryConfig(config),
     }),
@@ -1891,7 +1930,8 @@ export async function linkedIssueBranches(context: DeliveryContext, issueNumber:
   const branches: LinkedIssueBranch[] = [];
   const cursors = new Set<string>();
   let cursor: string | null = null;
-  for (let page = 0; page < 20; page++) {
+  const limit = Math.min(context.readPageLimit ?? 20, 20);
+  for (let page = 0; page < limit; page++) {
     const response: BranchQuery = await context.clients.graphql<{
       repository: {
         issue: {
@@ -1923,6 +1963,13 @@ export async function linkedIssueBranches(context: DeliveryContext, issueNumber:
     cursors.add(next);
     cursor = next;
   }
+  if (context.readPageLimit !== undefined)
+    throw new CollectionLimitError({
+      collection: 'linked-branches',
+      pagesRequested: limit,
+      rowsObserved: branches.length,
+      limit,
+    });
   throw new DeliveryError('GitHub linked issue branches exceed the bounded readback window.');
 }
 export async function issueBranch(context: DeliveryContext, issueNumber: number, selected?: string): Promise<string> {
@@ -2022,6 +2069,7 @@ export async function assertIssueStartCapacity(
       graphql: context.clients.graphql,
       org: context.config.native.organization,
       settings: projectSettingsFromDeliveryConfig(context.config),
+      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
     }));
   const capacityContext = { ...context, projectConfiguration: configuration };
   const reason = overrideReason === undefined ? undefined : OverrideReason.parse(overrideReason);
@@ -2035,6 +2083,13 @@ export async function assertIssueStartCapacity(
   const rows: ListedTrackingIssue[] = [];
   const seen = new Set<number>();
   for (let page = 1; ; page++) {
+    if (context.readPageLimit !== undefined && page > Math.min(context.readPageLimit, 20))
+      throw new CollectionLimitError({
+        collection: 'wip-issues',
+        pagesRequested: page - 1,
+        rowsObserved: rows.length,
+        limit: Math.min(context.readPageLimit, 20),
+      });
     if (page > 20) throw new DeliveryError('WIP capacity issue pagination is incomplete.');
     const batch = await listIssues(capacityContext, { state: 'open', page, perPage: 100 }, { capacityRead: true });
     for (const row of batch.issues) {

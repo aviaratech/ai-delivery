@@ -1,7 +1,7 @@
 import type { graphql as GraphQLType } from '@octokit/graphql';
 import type { DeliveryConfig } from '../config/deliveryConfig.js';
 
-import { DeliveryError } from '../errors.js';
+import { CollectionLimitError, DeliveryError } from '../errors.js';
 
 export const PROJECT_DELIVERY_STATUSES = ['Todo', 'In Progress', 'Blocked', 'Done'] as const;
 
@@ -134,12 +134,14 @@ export async function getProjectDeliveryConfiguration(input: {
   org: string;
   requireWritable?: boolean;
   settings: ProjectDeliverySettings;
+  maxPages?: number;
 }): Promise<ProjectDeliveryConfiguration> {
   const settings = requireProjectSettings(input.settings);
   const project = await readProjectDeliveryDefinition({
     graphql: input.graphql,
     org: input.org,
     number: settings.number,
+    ...(input.maxPages === undefined ? {} : { maxPages: input.maxPages }),
   });
   return resolveProjectDeliveryConfiguration(project, { requireWritable: input.requireWritable === true, settings });
 }
@@ -148,6 +150,7 @@ export async function readProjectDeliveryDefinition(input: {
   graphql: typeof GraphQLType;
   org: string;
   number: number;
+  maxPages?: number;
 }): Promise<Record<string, unknown>> {
   const nodes: unknown[] = [];
   let cursor: null | string = null;
@@ -155,8 +158,17 @@ export async function readProjectDeliveryDefinition(input: {
   const seenCursors = new Set<string>();
   const fieldIds = new Set<string>();
   let project: null | Record<string, unknown> = null;
+  let pages = 0;
 
   while (hasNextPage) {
+    if (input.maxPages !== undefined && pages >= input.maxPages)
+      throw new CollectionLimitError({
+        collection: 'project-fields',
+        pagesRequested: pages,
+        rowsObserved: nodes.length,
+        limit: input.maxPages,
+      });
+    pages++;
     const response: unknown = await input.graphql(
       `
         query ProjectDeliveryConfiguration($org: String!, $number: Int!, $cursor: String) {

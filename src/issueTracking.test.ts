@@ -8,6 +8,7 @@ import * as issue from './issue.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import type { DeliveryContext } from './issue.js';
+import { getNativeBlockerRelationships } from './github/relationships.js';
 
 function updateFixture() {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-history-'));
@@ -656,6 +657,133 @@ test('native field pagination fails closed on a repeated nonadvancing page', asy
     })),
   })) as unknown as typeof context.clients.rest.request;
   await assert.rejects(issue.listIssues(context, {}), /repeated a pagination page/u);
+});
+
+test.each([
+  ['catalog', 'list'],
+  ['values', 'list'],
+  ['catalog', 'ready'],
+  ['values', 'ready'],
+  ['catalog', 'capacity'],
+  ['values', 'capacity'],
+] as const)('reconciliation bounds native %s through %s reads', async (collection, entry) => {
+  const { context } = listingFixture();
+  Object.assign(context, { readPageLimit: 20 });
+  context.clients.rest.issues.get = (async () => ({
+    data: {
+      number: 17,
+      node_id: 'ISSUE17',
+      state: 'open',
+      body: '',
+      title: 'Repair widget',
+      html_url: 'https://github.com/example/widget/issues/17',
+    },
+  })) as typeof context.clients.rest.issues.get;
+  if (entry === 'capacity')
+    context.config = {
+      ...context.config,
+      wipLimits: [{ repository: 'example/widget', name: 'Native', match: { field: 'Estimate', value: '4' }, limit: 2 }],
+    };
+  const originalGraphql = context.clients.graphql;
+  context.clients.graphql = (async (query: string) => {
+    const response = await originalGraphql(query);
+    if (query.includes('ProjectDeliveryItems')) {
+      const parsed = response as { organization: { projectV2: Record<string, unknown> } };
+      Object.assign(parsed.organization.projectV2, { id: 'PROJECT', number: 1 });
+    }
+    if (!query.includes('blockedBy(first:')) return response;
+    const parsed = response as { repository: { issue: Record<string, unknown> } };
+    Object.assign(parsed.repository.issue, {
+      id: 'ISSUE17',
+      number: 17,
+      repository: { nameWithOwner: 'example/widget' },
+    });
+    return parsed;
+  }) as unknown as typeof context.clients.graphql;
+  const original = context.clients.rest.request;
+  let requests = 0;
+  context.clients.rest.request = (async (route: string, params: { page: number }) => {
+    if (route.includes('/orgs/') !== (collection === 'catalog')) return original(route);
+    requests++;
+    return {
+      data:
+        params.page > 20
+          ? []
+          : Array.from({ length: 100 }, (_, index) => {
+              const id = 1000 + params.page * 100 + index;
+              return collection === 'catalog'
+                ? { id, name: `Extra ${String(id)}`, data_type: 'text' }
+                : { issue_field_id: id, issue_field_name: `Extra ${String(id)}`, data_type: 'text', value: 'value' };
+            }),
+    };
+  }) as typeof context.clients.rest.request;
+  const operation =
+    entry === 'list'
+      ? issue.listIssues(context, {})
+      : entry === 'ready'
+        ? issue.readyCheck(context, 17)
+        : issue.assertIssueStartCapacity(context, 17);
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'CollectionLimitError');
+    assert.equal(Reflect.get(error, 'pagesRequested'), 20);
+    return true;
+  });
+  assert.equal(requests, 20);
+});
+
+test('reconciliation bounds blocker pages and binds their source issue', async () => {
+  const { context } = listingFixture();
+  let requests = 0;
+  context.clients.graphql = (async () => {
+    requests++;
+    return {
+      repository: {
+        issue: {
+          id: 'ISSUE17',
+          number: 17,
+          repository: { nameWithOwner: 'example/widget' },
+          parent: null,
+          blockedBy: { nodes: [], pageInfo: { hasNextPage: requests < 21, endCursor: `page-${String(requests)}` } },
+        },
+      },
+    };
+  }) as unknown as typeof context.clients.graphql;
+  const input = { graphql: context.clients.graphql, repo: context.repo, issueNumber: 17, maxPages: 20 };
+  await assert.rejects(getNativeBlockerRelationships(input), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'CollectionLimitError');
+    assert.equal(Reflect.get(error, 'pagesRequested'), 20);
+    return true;
+  });
+  assert.equal(requests, 20);
+});
+
+test('reconciliation WIP guards bound their label catalog', async () => {
+  const { context } = listingFixture();
+  Object.assign(context, { readPageLimit: 20 });
+  context.config = {
+    ...context.config,
+    wipLimits: [{ repository: 'example/widget', name: 'Urgent', match: { label: 'urgent' }, limit: 2 }],
+  };
+  let requests = 0;
+  context.clients.rest.issues.listLabelsForRepo = (async () => {
+    requests++;
+    return {
+      data:
+        requests > 20
+          ? []
+          : Array.from({ length: 100 }, (_, index) => ({
+              name: index === 0 && requests === 1 ? 'urgent' : `label-${String(requests)}-${String(index)}`,
+            })),
+    };
+  }) as typeof context.clients.rest.issues.listLabelsForRepo;
+  await assert.rejects(issue.assertIssueStartCapacity(context, 17), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'CollectionLimitError');
+    return true;
+  });
+  assert.equal(requests, 20);
 });
 
 test('search applies the same case-insensitive label filter to authoritative result rows', async () => {

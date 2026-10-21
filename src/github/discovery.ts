@@ -1,7 +1,7 @@
 import type { graphql as GraphQLType } from '@octokit/graphql';
 
 import type { DeliveryConfig, DeliveryOverrides } from '../config/deliveryConfig.js';
-import { DeliveryError } from '../errors.js';
+import { CollectionLimitError, DeliveryError } from '../errors.js';
 import {
   readProjectDeliveryDefinition,
   resolveProjectDeliveryConfiguration,
@@ -50,12 +50,22 @@ async function repositoryConnection(input: {
   repo: string;
   field: 'issueTypes' | 'issueFields' | 'projectsV2';
   selection: string;
+  maxPages?: number;
 }): Promise<Record<string, unknown>[]> {
   const nodes: Record<string, unknown>[] = [];
   const ids = new Set<string>();
   const cursors = new Set<string>();
   let cursor: string | null = null;
+  let pages = 0;
   for (;;) {
+    if (input.maxPages !== undefined && pages >= input.maxPages)
+      throw new CollectionLimitError({
+        collection: input.field,
+        pagesRequested: pages,
+        rowsObserved: nodes.length,
+        limit: input.maxPages,
+      });
+    pages++;
     const result: unknown = await input.clients.graphql(
       `query DeliveryDiscovery($owner: String!, $repo: String!, $cursor: String) {
       repository(owner: $owner, name: $repo) {
@@ -105,6 +115,7 @@ export async function discoverDeliveryRouting(input: {
   repository: string;
   overrides: DeliveryOverrides;
   repositorySelected?: boolean;
+  maxPages?: number;
 }): Promise<DeliveryRouting> {
   const [owner, repo] = input.repository.split('/');
   if (!owner || !repo) throw new DeliveryError('Invalid delivery repository.');
@@ -187,7 +198,12 @@ export async function discoverDeliveryRouting(input: {
     }
     const number = positive(candidate.number, 'Project number');
     // API/permission/partial-read failures propagate; only complete incompatible schemas are excluded.
-    const project = await readProjectDeliveryDefinition({ graphql: input.clients.graphql, org: owner, number });
+    const project = await readProjectDeliveryDefinition({
+      graphql: input.clients.graphql,
+      org: owner,
+      number,
+      ...(input.maxPages === undefined ? {} : { maxPages: input.maxPages }),
+    });
     if (typeof project.viewerCanUpdate !== 'boolean' || project.number !== number)
       throw new DeliveryError('Incomplete or drifting Project identity.');
     if (typeof project.closed !== 'boolean') throw new DeliveryError('GitHub omitted Project closed state.');
