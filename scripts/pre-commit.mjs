@@ -7,19 +7,22 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { errorMessage, executeCommand, safeEnvironment } from './checks.mjs';
+import { errorMessage, executeCommand, safeEnvironment, selectFocusedTests } from './checks.mjs';
 
 /** @typedef {{root:string,index:string,originalIndexSha256:string,tree:string,snapshot:string,directory:string,fileCount:number}} StagedSnapshot */
+/** @typedef {{lockfileVersion:number,packages:Record<string,Record<string,unknown>>}} DependencyLock */
 /** @typedef {{schemaVersion:string,startedAt:string,status:string,resultsDir:string,ownedDirectory:string,cleanupConfirmed:boolean,fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], stagedTree?:string,fileCount?:number,sourceIndexPath?:string,sourceIndexSha256?:string,command?:string[],process?:import('./checks.mjs').CommandRecord,error?:string,completedAt?:string,exitCode?:number,sourceIndexUnchanged?:boolean}} StagedReport */
-/** @typedef {{cwd?:string,resultsDir?:string,signal?:AbortSignal,execute?:typeof executeCommand}} StagedOptions */
+/** @typedef {{cwd?:string,resultsDir?:string,testFiles?:string[],buildPlugin?:boolean,signal?:AbortSignal,execute?:typeof executeCommand}} StagedOptions */
 
 /** @param {string} cwd @param {string[]} args @param {NodeJS.ProcessEnv} env */
 function git(cwd, args, env) {
@@ -83,7 +86,14 @@ export function prepareStagedSnapshot(cwd, directory) {
 }
 
 /** @param {StagedOptions} [options] @returns {Promise<StagedReport>} */
-export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal, execute = executeCommand } = {}) {
+export async function runStagedChecks({
+  cwd = process.cwd(),
+  resultsDir,
+  testFiles,
+  buildPlugin = false,
+  signal,
+  execute = executeCommand,
+} = {}) {
   const results = resolve(resultsDir ?? join(tmpdir(), `ai-delivery-staged-results-${randomUUID()}`));
   mkdirSync(results, { recursive: true, mode: 0o700 });
   assert.ok(
@@ -113,7 +123,12 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
   let snapshot;
   let launched = false;
   try {
+    assert.ok(
+      Array.isArray(testFiles) && testFiles.length,
+      'An explicit focused test selection is required; use --test-file or AI_DELIVERY_FOCUSED_TESTS.',
+    );
     snapshot = prepareStagedSnapshot(cwd, owned);
+    const selected = selectFocusedTests(snapshot.snapshot, testFiles);
     Object.assign(record, {
       stagedTree: snapshot.tree,
       fileCount: snapshot.fileCount,
@@ -129,17 +144,134 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
     writeFileSync(globalConfig, '');
     env.npm_config_userconfig = userConfig;
     env.npm_config_globalconfig = globalConfig;
-    env.npm_config_cache ??= join(owned, 'npm-cache');
+    env.npm_config_cache = join(owned, 'npm-cache');
+    // Reuse installed package bytes, while the snapshot owns the node_modules
+    // parent and all tool caches. Never provision or repair setup from a hook.
+    const modules = join(snapshot.root, 'node_modules');
+    const metadata = join(modules, '.package-lock.json');
+    assert.ok(
+      existsSync(metadata),
+      'Compatible installed dependency metadata is missing; complete explicit setup before committing.',
+    );
+    const moduleRoot = realpathSync(modules);
+    const metadataDigest = digest(metadata);
+    const installed = /** @type {DependencyLock} */ (JSON.parse(readFileSync(metadata, 'utf8')));
+    const stagedLock = /** @type {DependencyLock} */ (
+      JSON.parse(readFileSync(join(snapshot.snapshot, 'package-lock.json'), 'utf8'))
+    );
+    assert.ok(
+      stagedLock.lockfileVersion >= 2 && stagedLock.packages && installed.packages,
+      'Staged dependency lock or installed metadata is incompatible; complete explicit setup.',
+    );
+    const stagedManifest = /** @type {Record<string,unknown>} */ (
+      JSON.parse(readFileSync(join(snapshot.snapshot, 'package.json'), 'utf8'))
+    );
+    for (const field of [
+      'dependencies',
+      'devDependencies',
+      'optionalDependencies',
+      'peerDependencies',
+      'peerDependenciesMeta',
+    ])
+      assert.deepEqual(
+        stagedManifest[field] ?? {},
+        stagedLock.packages['']?.[field] ?? {},
+        'Staged dependency declarations differ from the lock; complete compatible setup.',
+      );
+    for (const [path, entry] of Object.entries(stagedLock.packages))
+      if (path && !entry.optional)
+        assert.ok(
+          installed.packages[path],
+          `Required staged dependency metadata is missing: ${path}; complete compatible setup.`,
+        );
+    /** @type {{path:string,sha256:string}[]} */
+    const packageMetadata = [];
+    for (const [path, entry] of Object.entries(installed.packages)) {
+      const expected = stagedLock.packages[path];
+      assert.ok(
+        path.startsWith('node_modules/') &&
+          !path.split('/').includes('..') &&
+          expected &&
+          !entry.link &&
+          !expected.link,
+        `Installed dependency is incompatible with the staged lock: ${path}`,
+      );
+      for (const field of ['version', 'resolved', 'integrity'])
+        assert.equal(
+          entry[field],
+          expected[field],
+          `Installed dependency differs from the staged lock: ${path} ${field}`,
+        );
+      const manifestPath = join(moduleRoot, path.slice('node_modules/'.length), 'package.json');
+      assert.ok(
+        existsSync(manifestPath),
+        `Installed dependency package metadata is missing: ${path}; complete compatible setup.`,
+      );
+      assert.ok(
+        realpathSync(manifestPath).startsWith(`${moduleRoot}${sep}`),
+        'External dependency package metadata is incompatible.',
+      );
+      const manifest = /** @type {Record<string,unknown>} */ (JSON.parse(readFileSync(manifestPath, 'utf8')));
+      assert.equal(
+        manifest.version,
+        entry.version,
+        `Installed dependency version differs: ${path}; complete compatible setup.`,
+      );
+      packageMetadata.push({ path: manifestPath, sha256: digest(manifestPath) });
+    }
+    const snapshotModules = join(snapshot.snapshot, 'node_modules');
+    mkdirSync(snapshotModules);
+    for (const entry of readdirSync(moduleRoot)) {
+      if (entry.startsWith('.') && entry !== '.bin') continue;
+      const source = join(moduleRoot, entry);
+      assert.ok(
+        realpathSync(source).startsWith(`${moduleRoot}${sep}`),
+        'External dependency link is incompatible with staged setup.',
+      );
+      symlinkSync(source, join(snapshotModules, entry), 'dir');
+    }
+    copyFileSync(metadata, join(snapshotModules, '.package-lock.json'));
+    // Physical package links make npm follow their uninstalled development
+    // dependencies. Check the staged lock graph, bound to installed metadata above.
+    const compatibilityCommand = ['ls', '--all', '--json', '--offline', '--ignore-scripts', '--package-lock-only'];
+    const compatibility = spawnSync('npm', compatibilityCommand, {
+      cwd: snapshot.snapshot,
+      env,
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    writeFileSync(
+      join(results, 'dependencies.json'),
+      JSON.stringify(
+        {
+          command: ['npm', ...compatibilityCommand],
+          exitCode: compatibility.status,
+          error: compatibility.error?.message,
+          stdout: compatibility.stdout,
+          stderr: compatibility.stderr,
+        },
+        null,
+        2,
+      ) + '\n',
+      { mode: 0o600 },
+    );
+    assert.ok(
+      !compatibility.error && compatibility.status === 0,
+      'Installed dependencies do not satisfy the staged manifest; complete explicit compatible setup.',
+    );
+    assert.equal(digest(metadata), metadataDigest, 'Installed dependency metadata changed during setup validation.');
     record.status = 'running';
     save();
     const command = [
       process.execPath,
       runner,
-      '--install',
+      '--fast',
+      ...selected.flatMap((file) => ['--test-file', file]),
+      ...(buildPlugin ? ['--build-plugin'] : []),
       '--staged-tree',
       snapshot.tree,
       '--results-dir',
-      join(results, 'full'),
+      join(results, 'focused'),
     ];
     record.command = command;
     launched = true;
@@ -155,23 +287,38 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
     });
     record.process = result;
     assert.equal(result.cleanupConfirmed, true, 'Staged child quiescence is unconfirmed; preserve the owned snapshot.');
+    assert.equal(digest(metadata), metadataDigest, 'Installed dependency metadata changed during focused validation.');
+    for (const manifest of packageMetadata)
+      assert.equal(
+        digest(manifest.path),
+        manifest.sha256,
+        'Installed dependency package metadata changed during focused validation.',
+      );
+    assert.equal(realpathSync(modules), moduleRoot, 'Installed dependency location changed during focused validation.');
     assert.equal(
       result.status,
       'passed',
       `Staged canonical graph ${result.status}; inspect retained results before retry.`,
     );
-    const full = /** @type {import('./checks.mjs').CheckReport} */ (
-      JSON.parse(readFileSync(join(results, 'full/result.json'), 'utf8'))
+    const focused = /** @type {import('./checks.mjs').CheckReport} */ (
+      JSON.parse(readFileSync(join(results, 'focused/result.json'), 'utf8'))
     );
-    assert.equal(full.fullSuccess, true, 'Staged hook requires full success, never fast/partial.');
-    assert.equal(full.tree.stagedGitTree, snapshot.tree, 'Returned checks are bound to a different staged tree.');
+    assert.equal(focused.scope, 'focused', 'Staged hook requires focused tests, not a fast-only result.');
+    assert.equal(focused.status, 'partial-passed');
+    assert.equal(focused.fullSuccess, false);
+    assert.equal(focused.artifactQualified, false);
+    assert.deepEqual(focused.selectedTestFiles, selected);
+    assert.ok(
+      focused.tests && focused.tests.total > 0 && focused.tests.total === focused.tests.passed,
+      'Selected tests must pass.',
+    );
+    assert.equal(focused.tree.stagedGitTree, snapshot.tree, 'Returned checks are bound to a different staged tree.');
     assert.equal(
       digest(snapshot.index),
       snapshot.originalIndexSha256,
       'Source index changed while checks ran; do not restore or overwrite it.',
     );
-    record.status = 'passed';
-    record.fullSuccess = true;
+    record.status = 'partial-passed';
     record.sourceIndexUnchanged = true;
   } catch (error) {
     record.status = signal?.aborted ? 'cancelled' : 'failed';
@@ -194,7 +341,7 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
     if (!launched || record.process?.cleanupConfirmed === true) rmSync(owned, { recursive: true, force: true });
     record.cleanupConfirmed = !existsSync(owned);
     record.completedAt = new Date().toISOString();
-    record.exitCode = record.status === 'passed' ? 0 : record.status === 'cancelled' ? 130 : 1;
+    record.exitCode = record.status === 'partial-passed' ? 0 : record.status === 'cancelled' ? 130 : 1;
     save();
     writeFileSync(
       join(results, 'staged.txt'),
@@ -207,12 +354,19 @@ export async function runStagedChecks({ cwd = process.cwd(), resultsDir, signal,
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  assert.ok(
-    process.argv.length === 2 || (process.argv.length === 4 && process.argv[2] === '--results-dir'),
-    'Usage: pre-commit.mjs [--results-dir directory]',
-  );
+  /** @type {StagedOptions} */
+  const options = {};
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--results-dir') options.resultsDir = args[++i];
+    else if (args[i] === '--test-file') (options.testFiles ??= []).push(args[++i]);
+    else if (args[i] === '--build-plugin') options.buildPlugin = true;
+    else throw new Error(`Unknown staged check option: ${args[i]}`);
+  }
+  if (options.testFiles === undefined && process.env.AI_DELIVERY_FOCUSED_TESTS !== undefined)
+    options.testFiles = /** @type {string[]} */ (JSON.parse(process.env.AI_DELIVERY_FOCUSED_TESTS));
   const controller = new AbortController();
   for (const kind of ['SIGINT', 'SIGTERM']) process.once(kind, () => controller.abort(kind));
-  const result = await runStagedChecks({ resultsDir: process.argv[3], signal: controller.signal });
+  const result = await runStagedChecks({ ...options, signal: controller.signal });
   process.exitCode = result.exitCode;
 }
