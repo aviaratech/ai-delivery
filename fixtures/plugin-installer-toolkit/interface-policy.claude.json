@@ -1,0 +1,13 @@
+{
+  "name": "ai-delivery-user",
+  "owner": {
+    "name": "AviaraTech"
+  },
+  "plugins": [
+    {
+      "name": "ai-delivery",
+      "source": "./versions/0.3.22/plugins/ai-delivery",
+      "version": "0.3.22"
+    }
+  ]
+}

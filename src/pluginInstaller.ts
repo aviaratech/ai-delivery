@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
+import { marketplaceDocuments, nativePluginArgs } from '@aviaratech/ai-plugin-tools';
 
 import { loadDeliverySettings, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
 import { captureAuthenticationProbe } from './pluginAuthProbe.js';
@@ -886,29 +887,27 @@ async function stageVersion(
 }
 function catalogDocuments(target: Target, version: string): { path: string; value: unknown }[] {
   const source = `./versions/${version}/plugins/ai-delivery`;
+  const { codexDocument, claudeDocument } = marketplaceDocuments({
+    marketplaceName: target.marketplace,
+    pluginName: 'ai-delivery',
+    relativeSource: source,
+    version,
+    ownerName: 'AviaraTech',
+    metadata: {
+      kind: 'interface-policy',
+      displayName: 'ai-delivery',
+      policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+      category: 'Productivity',
+    },
+  });
   return [
     {
       path: join(target.catalog, '.agents/plugins/marketplace.json'),
-      value: {
-        name: target.marketplace,
-        interface: { displayName: 'ai-delivery' },
-        plugins: [
-          {
-            name: 'ai-delivery',
-            source: { source: 'local', path: source },
-            policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
-            category: 'Productivity',
-          },
-        ],
-      },
+      value: codexDocument,
     },
     {
       path: join(target.catalog, '.claude-plugin/marketplace.json'),
-      value: {
-        name: target.marketplace,
-        owner: { name: 'AviaraTech' },
-        plugins: [{ name: 'ai-delivery', source, version }],
-      },
+      value: claudeDocument,
     },
   ];
 }
@@ -1370,14 +1369,12 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       };
       const native = (args: string[]) => command(target.tool, args, target.projectRoot, controller.signal, publish);
       const selector = `ai-delivery@${target.marketplace}`;
-      const removeArgs =
+      const nativeTarget =
         input.host === 'codex'
-          ? ['plugin', 'remove', selector, '--json']
-          : ['plugin', 'uninstall', selector, '--scope', input.scope, '--keep-data'];
-      const installArgs =
-        input.host === 'codex'
-          ? ['plugin', 'add', selector, '--json']
-          : ['plugin', prior ? 'update' : 'install', selector, '--scope', input.scope];
+          ? ({ host: input.host, scope: 'user', pluginId: selector } as const)
+          : { host: input.host, scope: input.scope, pluginId: selector };
+      const removeArgs = nativePluginArgs({ ...nativeTarget, action: 'remove' });
+      const installArgs = nativePluginArgs({ ...nativeTarget, action: prior ? 'update' : 'install' });
       let selectionStarted = false;
       try {
         state.nativeVersion = (await native(['--version'])).trim();
