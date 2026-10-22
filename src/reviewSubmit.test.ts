@@ -570,7 +570,14 @@ test('read-only doctor uses the selected source and actual App actor outside Git
   }
 });
 
-test('credential process observation excludes ambient credentials and executable injection selectors', () => {
+test('credential process observation excludes ambient credentials and executable injection selectors', async () => {
+  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  let observedEnv: NodeJS.ProcessEnv | undefined;
+  vi.mocked(spawnSync).mockImplementationOnce((command, args, options) => {
+    // Node may add NODE_V8_COVERAGE to this object while normalizing the spawn.
+    observedEnv = { ...options?.env };
+    return actual.spawnSync(command, args, options);
+  });
   vi.stubEnv('GH_PRIVATE_KEY_UNSELECTED', 'FICTIONAL_UNUSED_PRIVATE_KEY');
   vi.stubEnv('AUTHOR_TOKEN', 'FICTIONAL_AUTHOR_TOKEN');
   try {
@@ -578,7 +585,7 @@ test('credential process observation excludes ambient credentials and executable
     assert.ok(processSnapshot().has(process.pid));
     const observed = vi.mocked(spawnSync).mock.calls.slice(calls);
     assert.equal(observed.length, 1);
-    assert.deepEqual((observed[0]![2] as { env: NodeJS.ProcessEnv }).env, { LC_ALL: 'C' });
+    assert.deepEqual(observedEnv, { LC_ALL: 'C' });
   } finally {
     vi.unstubAllEnvs();
   }

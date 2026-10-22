@@ -15,6 +15,19 @@ import { MACHINE_AUTH_ENV_NAMES } from '../github/machineAuth.js';
 export const DELIVERY_CONFIG_FILE = 'ai-delivery.config.json';
 export const DELIVERY_POLICY_CONTRACT = 'RepositoryDeliveryPolicy@1';
 
+function configurationIssueMessages(
+  issues: readonly z.core.$ZodIssue[],
+  root: string,
+  prefix: PropertyKey[] = [],
+): string[] {
+  return issues.flatMap((issue) => {
+    const path = [...prefix, ...issue.path];
+    return issue.code === 'invalid_union'
+      ? issue.errors.flatMap((branch) => configurationIssueMessages(branch, root, path))
+      : [`${path.join('.') || root}: ${issue.message}`];
+  });
+}
+
 const Name = z.string().trim().min(1);
 export const WipLimits = z
   .array(
@@ -440,9 +453,7 @@ export async function loadDeliverySettings(
   }
   const result = UserSettingsSchema.safeParse(raw);
   if (!result.success) {
-    const details = result.error.issues
-      .map((issue) => `${issue.path.join('.') || 'configuration'}: ${issue.message}`)
-      .join('; ');
+    const details = configurationIssueMessages(result.error.issues, 'configuration').join('; ');
     throw new DeliveryError(`Invalid user configuration ${path}: ${details}`);
   }
   const sourceDigest = digestValue(result.data);
@@ -596,9 +607,7 @@ export async function loadDeliveryConfig(
 export function parseDeliveryConfig(input: unknown): DeliveryConfig {
   const result = DeliveryConfigSchema.safeParse(input);
   if (!result.success) {
-    const details = result.error.issues
-      .map((issue) => `${issue.path.join('.') || 'config'}: ${issue.message}`)
-      .join('; ');
+    const details = configurationIssueMessages(result.error.issues, 'config').join('; ');
     throw new DeliveryError(`Invalid ${DELIVERY_CONFIG_FILE}: ${details}`);
   }
   return result.data;
