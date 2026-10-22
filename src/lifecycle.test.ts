@@ -19,6 +19,13 @@ import { afterAll, test, vi } from 'vitest';
 import { digestValue } from './delivery/common.js';
 import { withRuntimeSetupWriter, type VerificationResourceBounds } from './verification.js';
 
+const qualificationOwner = (await import(new URL('../scripts/current-qualification.mjs', import.meta.url).href)) as {
+  copyReleaseArchive(
+    contractPath: string,
+    cwd: string,
+    destination: string,
+  ): { archivePath: string; archiveSha256: string };
+};
 let node26Package: { executable: string; root: string; temporary: string } | undefined;
 const scripts = new Map<string, string>();
 async function fixture(input: { firstStageScript?: string } = {}) {
@@ -58,23 +65,19 @@ function packedNode26Consumer(): { executable: string; root: string; temporary: 
   const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-node26-')));
   try {
     const source = fileURLToPath(new URL('../', import.meta.url));
-    const pack = JSON.parse(
-      execFileSync('npm', ['pack', '--json', '--pack-destination', temporary], {
-        cwd: source,
-        encoding: 'utf8',
-        maxBuffer: 4 * 1024 * 1024,
-      }),
-    ) as [{ filename: string }];
-    execFileSync('tar', ['-xzf', join(temporary, pack[0].filename), '-C', temporary]);
+    const archive = qualificationOwner.copyReleaseArchive(
+      process.env.AI_DELIVERY_RELEASE_CONTRACT ?? '',
+      source,
+      join(temporary, 'qualified.tgz'),
+    );
+    execFileSync('tar', ['-xzf', archive.archivePath, '-C', temporary]);
     const root = join(temporary, 'package');
     symlinkSync(join(source, 'node_modules'), join(root, 'node_modules'), 'dir');
     process.stderr.write(
       `ai-delivery.node26-consumer ${JSON.stringify({
         controller: process.version,
         consumer: 'v26.2.0',
-        archiveSha256: createHash('sha256')
-          .update(readFileSync(join(temporary, pack[0].filename)))
-          .digest('hex'),
+        archiveSha256: archive.archiveSha256,
         manifestSha256: createHash('sha256')
           .update(readFileSync(join(root, 'package.json')))
           .digest('hex'),
@@ -199,157 +202,156 @@ function filesystemFixtureScript(
   return runtime === 'node26' ? node26ConsumerScript(script) : script;
 }
 
-test.each([
-  ['pass', 'node24'],
-  ['assertion', 'node24'],
-  ['pass', 'node26'],
-  ['assertion', 'node26'],
-] as const)(
-  'filesystem fixture gate deterministically queues a scan through reader rejection and %s teardown on %s',
-  async (mode, runtime) => {
-    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-gate-')));
-    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
-    try {
-      const row = await hostFixtureCheckout({
-        baseRef: 'main',
-        identity: 'synthetic-author',
-        issueNumber: 17,
-        repoRoot: root,
-      });
-      const run = runRuntimeFixture({
-        issueNumber: 17,
-        repoRoot: row.path,
-        resourceBounds: {
-          maxAggregateRssBytes: 1_000_000_000,
-          minFreeDiskBytes: 1,
-          maxNewOutputBytes: 2048,
-          outputRoots: [output],
-        },
-      });
-      if (mode === 'assertion') await assert.rejects(run, /exit 1/u);
-      else await run;
-      assert.equal(existsSync(join(output, 'fifo')), false);
-      const events = readFileSync(join(output, 'events'), 'utf8').trim().split('\n');
-      assert.deepEqual(
-        events,
-        mode === 'pass'
-          ? ['created', 'scan-queued', 'reader-rejected', 'cleaned', 'released']
-          : ['created', 'scan-queued', 'reader-rejected', 'cleaned'],
-      );
-      const capability = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
-      assert.equal(existsSync(capability.directory), false);
-      assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-      rmSync(output, { recursive: true, force: true });
-    }
-  },
-);
-
-test.each([
-  ['abrupt', 'node24'],
-  ['block', 'node24'],
-  ['cancel', 'node24'],
-  ['abrupt', 'node26'],
-  ['block', 'node26'],
-  ['cancel', 'node26'],
-] as const)(
-  'filesystem fixture gate preserves leaked FIFO and unrelated files after %s on %s',
-  async (mode, runtime) => {
-    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-failure-')));
-    writeFileSync(join(output, 'unrelated'), 'preserved');
-    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
-    const controller = new AbortController();
-    let running: Promise<unknown> | undefined;
-    const progress = vi.spyOn(process.stderr, 'write');
-    try {
-      const row = await hostFixtureCheckout({
-        baseRef: 'main',
-        identity: 'synthetic-author',
-        issueNumber: 17,
-        repoRoot: root,
-      });
-      const bounds = {
-        maxAggregateRssBytes: 1_000_000_000,
-        minFreeDiskBytes: 1,
-        maxNewOutputBytes: 2048,
-        outputRoots: [output],
-      };
-      running = runRuntimeFixture({
-        issueNumber: 17,
-        repoRoot: row.path,
-        resourceBounds: bounds,
-        signal: controller.signal,
-      }).catch((error: unknown) => error);
-      if (mode === 'cancel') {
-        for (let attempt = 0; attempt < 300 && !existsSync(join(output, 'capability')); attempt++)
-          await new Promise((resolve) => setTimeout(resolve, 20));
-        assert.ok(existsSync(join(output, 'capability')));
-        const cap = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
-        for (let attempt = 0; attempt < 300 && readdirSync(join(cap.directory, 'requests')).length === 0; attempt++)
-          await new Promise((resolve) => setTimeout(resolve, 20));
-        assert.ok(readdirSync(join(cap.directory, 'requests')).length > 0);
-        controller.abort();
-      }
-      const failure = String(await running);
-      assert.match(
-        failure,
-        mode === 'abrupt' ? /exit 9/u : mode === 'block' ? /reader or teardown is stalled/u : /cancelled/u,
-      );
-      assert.doesNotMatch(failure, /cleanup failed|live holder/u);
-      const capability = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
-      assert.equal(existsSync(capability.directory), false);
-      assert.ok(existsSync(join(output, 'fifo')));
-      assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
-      if (mode !== 'abrupt')
-        assert.ok(progress.mock.calls.filter(([line]) => String(line).includes('sampledAggregateRssBytes')).length > 2);
-      await assert.rejects(
-        runRuntimeFixture({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }),
-        /unsupported file/u,
-      );
-    } finally {
-      controller.abort();
-      await running;
-      progress.mockRestore();
-      rmSync(root, { recursive: true, force: true });
-      rmSync(output, { recursive: true, force: true });
-    }
-  },
-);
-
-test.each(['node24', 'node26'] as const)(
-  'filesystem fixture gate still enforces positive byte limits after deterministic contention on %s',
-  async (runtime) => {
-    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-limit-')));
-    const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, 'pass', runtime) });
-    try {
-      const row = await hostFixtureCheckout({
-        baseRef: 'main',
-        identity: 'synthetic-author',
-        issueNumber: 17,
-        repoRoot: root,
-      });
-      await assert.rejects(
-        runRuntimeFixture({
+for (const runtime of ['node24', 'node26'] as const) {
+  test.each(['pass', 'assertion'] as const)(
+    `filesystem fixture gate deterministically queues a scan through reader rejection and %s teardown on ${runtime}`,
+    { tags: runtime === 'node26' ? ['release'] : [] },
+    async (mode) => {
+      const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-gate-')));
+      const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
+      try {
+        const row = await hostFixtureCheckout({
+          baseRef: 'main',
+          identity: 'synthetic-author',
+          issueNumber: 17,
+          repoRoot: root,
+        });
+        const run = runRuntimeFixture({
           issueNumber: 17,
           repoRoot: row.path,
           resourceBounds: {
             maxAggregateRssBytes: 1_000_000_000,
             minFreeDiskBytes: 1,
-            maxNewOutputBytes: 64,
+            maxNewOutputBytes: 2048,
             outputRoots: [output],
           },
-        }),
-        /filesystem output.*exceeded/u,
-      );
-      assert.equal(existsSync(join(output, 'fifo')), false);
-      assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-      rmSync(output, { recursive: true, force: true });
-    }
-  },
-);
+        });
+        if (mode === 'assertion') await assert.rejects(run, /exit 1/u);
+        else await run;
+        assert.equal(existsSync(join(output, 'fifo')), false);
+        const events = readFileSync(join(output, 'events'), 'utf8').trim().split('\n');
+        assert.deepEqual(
+          events,
+          mode === 'pass'
+            ? ['created', 'scan-queued', 'reader-rejected', 'cleaned', 'released']
+            : ['created', 'scan-queued', 'reader-rejected', 'cleaned'],
+        );
+        const capability = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+        assert.equal(existsSync(capability.directory), false);
+        assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(output, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+for (const runtime of ['node24', 'node26'] as const) {
+  test.each(['abrupt', 'block', 'cancel'] as const)(
+    `filesystem fixture gate preserves leaked FIFO and unrelated files after %s on ${runtime}`,
+    { tags: runtime === 'node26' ? ['release'] : [] },
+    async (mode) => {
+      const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-failure-')));
+      writeFileSync(join(output, 'unrelated'), 'preserved');
+      const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
+      const controller = new AbortController();
+      let running: Promise<unknown> | undefined;
+      const progress = vi.spyOn(process.stderr, 'write');
+      try {
+        const row = await hostFixtureCheckout({
+          baseRef: 'main',
+          identity: 'synthetic-author',
+          issueNumber: 17,
+          repoRoot: root,
+        });
+        const bounds = {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 2048,
+          outputRoots: [output],
+        };
+        running = runRuntimeFixture({
+          issueNumber: 17,
+          repoRoot: row.path,
+          resourceBounds: bounds,
+          signal: controller.signal,
+        }).catch((error: unknown) => error);
+        if (mode === 'cancel') {
+          for (let attempt = 0; attempt < 300 && !existsSync(join(output, 'capability')); attempt++)
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.ok(existsSync(join(output, 'capability')));
+          const cap = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+          for (let attempt = 0; attempt < 300 && readdirSync(join(cap.directory, 'requests')).length === 0; attempt++)
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.ok(readdirSync(join(cap.directory, 'requests')).length > 0);
+          controller.abort();
+        }
+        const failure = String(await running);
+        assert.match(
+          failure,
+          mode === 'abrupt' ? /exit 9/u : mode === 'block' ? /reader or teardown is stalled/u : /cancelled/u,
+        );
+        assert.doesNotMatch(failure, /cleanup failed|live holder/u);
+        const capability = JSON.parse(readFileSync(join(output, 'capability'), 'utf8')) as { directory: string };
+        assert.equal(existsSync(capability.directory), false);
+        assert.ok(existsSync(join(output, 'fifo')));
+        assert.equal(readFileSync(join(output, 'unrelated'), 'utf8'), 'preserved');
+        if (mode !== 'abrupt')
+          assert.ok(
+            progress.mock.calls.filter(([line]) => String(line).includes('sampledAggregateRssBytes')).length > 2,
+          );
+        await assert.rejects(
+          runRuntimeFixture({ issueNumber: 17, repoRoot: row.path, resourceBounds: bounds }),
+          /unsupported file/u,
+        );
+      } finally {
+        controller.abort();
+        await running;
+        progress.mockRestore();
+        rmSync(root, { recursive: true, force: true });
+        rmSync(output, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+for (const runtime of ['node24', 'node26'] as const) {
+  test(
+    `filesystem fixture gate still enforces positive byte limits after deterministic contention on ${runtime}`,
+    { tags: runtime === 'node26' ? ['release'] : [] },
+    async () => {
+      const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-limit-')));
+      const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, 'pass', runtime) });
+      try {
+        const row = await hostFixtureCheckout({
+          baseRef: 'main',
+          identity: 'synthetic-author',
+          issueNumber: 17,
+          repoRoot: root,
+        });
+        await assert.rejects(
+          runRuntimeFixture({
+            issueNumber: 17,
+            repoRoot: row.path,
+            resourceBounds: {
+              maxAggregateRssBytes: 1_000_000_000,
+              minFreeDiskBytes: 1,
+              maxNewOutputBytes: 64,
+              outputRoots: [output],
+            },
+          }),
+          /filesystem output.*exceeded/u,
+        );
+        assert.equal(existsSync(join(output, 'fifo')), false);
+        assert.equal(readFileSync(join(output, 'regular'), 'utf8').length, 128);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(output, { recursive: true, force: true });
+      }
+    },
+  );
+}
 
 test.each(['verification', 'runtime'] as const)(
   'filesystem fixture gate preserves observation and cancellation after direct %s command closure',
@@ -466,13 +468,16 @@ test.each(['verification', 'runtime'] as const)(
   },
 );
 
-test('Node 26 packed public exports preserve standalone and malformed-capability behavior', () => {
-  const consumer = packedNode26Consumer();
-  execFileSync(
-    consumer.executable,
-    [
-      '-e',
-      `
+test(
+  'Node 26 packed public exports preserve standalone and malformed-capability behavior',
+  { tags: ['release'] },
+  () => {
+    const consumer = packedNode26Consumer();
+    execFileSync(
+      consumer.executable,
+      [
+        '-e',
+        `
 (async () => {
   const assert = require('node:assert/strict');
   assert.equal(process.version, 'v26.2.0');
@@ -497,10 +502,11 @@ test('Node 26 packed public exports preserve standalone and malformed-capability
   else process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE = prior;
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `,
-    ],
-    { cwd: consumer.root, stdio: 'pipe' },
-  );
-});
+      ],
+      { cwd: consumer.root, stdio: 'pipe' },
+    );
+  },
+);
 
 test('filesystem fixture helper runs standalone and fails closed on malformed capability', async () => {
   const { withVerificationFilesystemFixture } = await import('./agent.js');
