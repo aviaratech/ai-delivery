@@ -2,17 +2,23 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { Script } from 'node:vm';
 import { test } from 'vitest';
@@ -123,6 +129,273 @@ type LaneChecks = {
 };
 const laneChecks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as LaneChecks;
 const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
+
+function diagnosticStep(name: string) {
+  const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  const step = workflow.split(/(?=^ {6}- )/mu).find((value) => value.includes(`name: ${name}\n`));
+  assert.ok(step, name);
+  return step;
+}
+
+function diagnosticFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-diagnostic-')));
+  const qualificationRoot = join(root, 'release-qualification');
+  const runId = '11111111-1111-4111-8111-111111111111';
+  const releaseDirectory = join(qualificationRoot, `release-tests-${runId}`);
+  const consumerDirectory = join(qualificationRoot, `consumer-${runId}`);
+  const sensitive = 'SENSITIVE_DIAGNOSTIC_SENTINEL';
+  const save = (path: string, value: unknown) => {
+    const destination = join(qualificationRoot, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, JSON.stringify(value));
+  };
+  save('result.json', {
+    schemaVersion: 'ai-delivery.current-qualification@1',
+    runId,
+    status: 'failed',
+    qualified: false,
+    source: { commit: 'a'.repeat(40) },
+    error: sensitive,
+    environment: { token: sensitive },
+    pack: { status: 'passed', exitCode: 0, signal: null, cleanupConfirmed: true, command: [sensitive] },
+  });
+  save('producer/result.json', {
+    status: 'passed',
+    fullSuccess: true,
+    commands: gates.map((stage) => ({
+      stage,
+      status: 'passed',
+      exitCode: 0,
+      signal: null,
+      cleanupConfirmed: true,
+      error: sensitive,
+    })),
+  });
+  save('pack/producer.json', { archiveSha256: 'b'.repeat(64), error: sensitive });
+  save('release-tests-attempt.json', {
+    stage: 'release-tests',
+    runId,
+    status: 'completed',
+    directory: releaseDirectory,
+    resultPath: join(releaseDirectory, 'result.json'),
+  });
+  save(`release-tests-${runId}/result.json`, {
+    status: 'failed',
+    commands: [
+      {
+        stage: 'tests',
+        status: 'failed',
+        exitCode: 1,
+        signal: null,
+        cleanupConfirmed: true,
+        stdoutPath: sensitive,
+        error: sensitive,
+      },
+    ],
+    release: { temporary: { removed: false, quiescent: true, error: sensitive } },
+  });
+  const entry = laneChecks.RELEASE_CASES[0]!;
+  save(`release-tests-${runId}/vitest.json`, {
+    numTotalTests: 24,
+    numPassedTests: 22,
+    numFailedTests: 1,
+    testResults: [
+      {
+        name: join('/synthetic/source', entry.file),
+        assertionResults: [
+          { fullName: entry.title, status: 'failed', failureMessages: [sensitive] },
+          { fullName: sensitive, status: 'passed' },
+        ],
+      },
+    ],
+  });
+  save('consumer-attempt.json', {
+    schemaVersion: 'ai-delivery.current-consumer-attempt@1',
+    runId,
+    status: 'running',
+    directory: consumerDirectory,
+    consumerPath: join(consumerDirectory, 'result.json'),
+    command: { status: 'cancelled', signal: 'SIGTERM', cleanupConfirmed: false },
+  });
+  save(`consumer-${runId}/result.json`, {
+    status: 'incomplete',
+    qualified: false,
+    cleanup: { removed: false, quiescent: false, retainedDirectory: sensitive },
+    error: sensitive,
+  });
+  save(`release-tests-${runId}/temporary/.npmrc`, sensitive);
+  save('producer/command/stderr.txt', sensitive);
+  const execute = (outcome = 'failure') => {
+    const step = diagnosticStep('Prepare failed qualification diagnostics');
+    const script = /node --input-type=module <<'JS'\n([\s\S]*?)\n\s+JS/u.exec(step)?.[1];
+    assert.ok(script);
+    const program = script.replace(/^\s*import .+;\n/gmu, '');
+    const output = join(root, 'output');
+    writeFileSync(output, '');
+    new Script(program).runInNewContext({
+      constants,
+      closeSync,
+      fstatSync,
+      lstatSync,
+      mkdirSync,
+      mkdtempSync,
+      openSync,
+      readFileSync,
+      readSync,
+      realpathSync,
+      writeFileSync,
+      appendFileSync: (path: string, value: string) => {
+        assert.equal(path, output);
+        writeFileSync(path, value, { flag: 'a' });
+      },
+      basename,
+      dirname,
+      join,
+      resolve,
+      Buffer,
+      RELEASE_CASES: laneChecks.RELEASE_CASES,
+      process: {
+        env: {
+          RUNNER_TEMP: root,
+          GITHUB_WORKSPACE: '/synthetic/source',
+          GITHUB_OUTPUT: output,
+          GITHUB_RUN_ID: '101',
+          GITHUB_RUN_ATTEMPT: '1',
+          REVIEWED_SOURCE_SHA: 'a'.repeat(40),
+          QUALIFICATION_OUTCOME: outcome,
+          SECRET_VALUE: sensitive,
+        },
+      },
+    });
+    const path = /^file=(.+)\n$/u.exec(readFileSync(output, 'utf8'))?.[1];
+    assert.ok(path);
+    assert.equal(dirname(dirname(path)), root);
+    const bytes = readFileSync(path, 'utf8');
+    assert.ok(Buffer.byteLength(bytes) <= 64 * 1024);
+    assert.ok(!bytes.includes(sensitive));
+    return JSON.parse(bytes) as Json;
+  };
+  return { root, qualificationRoot, releaseDirectory, runId, save, execute, sensitive };
+}
+
+test('failed qualification diagnostics have an isolated nonpromotable workflow boundary', () => {
+  const prepare = diagnosticStep('Prepare failed qualification diagnostics');
+  const upload = diagnosticStep('Upload failed qualification diagnostics');
+  assert.match(prepare, /always\(\) && inputs\.qualification_only && steps\.origin\.outcome == 'success'/u);
+  assert.match(
+    prepare,
+    /steps\.qualification\.outcome == 'failure' \|\| steps\.qualification\.outcome == 'cancelled'/u,
+  );
+  assert.match(upload, /always\(\) && inputs\.qualification_only && steps\.diagnostics\.outcome == 'success'/u);
+  assert.match(upload, /name: npm-qualification-diagnostics-\$\{\{ github\.run_attempt \}\}/u);
+  assert.match(upload, /path: \$\{\{ steps\.diagnostics\.outputs\.file \}\}/u);
+  assert.match(upload, /retention-days: 1/u);
+  assert.match(upload, /if-no-files-found: error/u);
+  assert.match(upload, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u);
+  assert.doesNotMatch(prepare + upload, /continue-on-error|overwrite:|id-token:|npm run|npm pack/u);
+  const fixture = originFixture();
+  fixture.metadata.artifact['name'] = 'npm-qualification-diagnostics-2';
+  assert.throws(() => api.validateQualificationOrigin(fixture.metadata, fixture.inputs));
+});
+
+test.each(['failure', 'cancelled'])(
+  'diagnostics project bounded observations after %s without exposing raw evidence',
+  (outcome) => {
+    const f = diagnosticFixture();
+    try {
+      symlinkSync(process.cwd(), join(f.releaseDirectory, 'temporary', 'linked-source'));
+      const observed = f.execute(outcome);
+      assert.equal(observed['observationOnly'], true);
+      assert.equal(observed['qualified'], false);
+      assert.equal(observed['promotionEligible'], false);
+      assert.equal(observed['qualificationOutcome'], outcome);
+      const release = observed['release'] as Json;
+      assert.equal(release['status'], 'failed');
+      assert.deepEqual(release['cleanup'], { removed: false, quiescent: true });
+      const cases = release['cases'] as Json[];
+      assert.equal(cases.length, laneChecks.RELEASE_CASES.length);
+      assert.equal(cases[0]!['status'], 'failed');
+      assert.equal(cases[1]!['status'], 'unknown');
+      assert.deepEqual((observed['consumer'] as Json)['cleanup'], { removed: false, quiescent: false });
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([
+  'missing',
+  'malformed',
+  'oversized',
+  'leaf-link',
+  'parent-link',
+  'root-link',
+  'redirect',
+  'wrong-run',
+  'malformed-run',
+  'duplicate',
+  'unknown-fields',
+] as const)('diagnostics preserve missing or unsafe %s evidence as unknown', (failure) => {
+  const f = diagnosticFixture();
+  try {
+    const receipt = join(f.releaseDirectory, 'result.json');
+    if (failure === 'missing') rmSync(receipt);
+    if (failure === 'malformed') writeFileSync(receipt, '{');
+    if (failure === 'malformed-run')
+      f.save('result.json', { schemaVersion: 'ai-delivery.current-qualification@1', runId: { toString: null } });
+    if (failure === 'oversized') writeFileSync(receipt, 'x'.repeat(4 * 1024 * 1024 + 1));
+    if (failure === 'leaf-link') {
+      rmSync(receipt);
+      symlinkSync(join(f.qualificationRoot, 'result.json'), receipt);
+    }
+    if (failure === 'parent-link') {
+      rmSync(f.releaseDirectory, { recursive: true });
+      symlinkSync(join(f.qualificationRoot, 'producer'), f.releaseDirectory);
+    }
+    if (failure === 'root-link') {
+      const retained = join(f.root, 'retained');
+      mkdirSync(retained);
+      rmSync(f.qualificationRoot, { recursive: true });
+      symlinkSync(retained, f.qualificationRoot);
+    }
+    if (failure === 'redirect' || failure === 'wrong-run')
+      f.save('release-tests-attempt.json', {
+        stage: 'release-tests',
+        runId: failure === 'wrong-run' ? '22222222-2222-4222-8222-222222222222' : f.runId,
+        status: 'completed',
+        directory: failure === 'redirect' ? f.root : f.releaseDirectory,
+        resultPath: receipt,
+      });
+    if (failure === 'duplicate') {
+      const entry = laneChecks.RELEASE_CASES[0]!;
+      f.save(`release-tests-${f.runId}/vitest.json`, {
+        testResults: [
+          {
+            name: join('/synthetic/source', entry.file),
+            assertionResults: [1, 2].map(() => ({ fullName: entry.title, status: 'passed' })),
+          },
+        ],
+      });
+    }
+    if (failure === 'unknown-fields')
+      f.save(`release-tests-${f.runId}/result.json`, {
+        status: f.sensitive,
+        release: { temporary: { removed: f.sensitive, quiescent: f.sensitive } },
+        commands: [{ signal: f.sensitive, error: f.sensitive }],
+      });
+    const observed = f.execute();
+    const release = observed['release'] as Json;
+    if (failure === 'duplicate') assert.equal((release['cases'] as Json[])[0]!['status'], 'ambiguous');
+    else {
+      assert.equal(release['status'], 'unknown');
+      assert.deepEqual(release['cleanup'], { removed: null, quiescent: null });
+    }
+    assert.equal(observed['qualified'], false);
+    assert.equal(observed['promotionEligible'], false);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
 
 test('qualification without a digest cannot enter publication', () => {
   assert.equal(typeof api.releaseDispatch, 'function');
