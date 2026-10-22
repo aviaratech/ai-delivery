@@ -3,6 +3,7 @@ import { describe, it } from 'vitest';
 import { publishPr, mergePr, finishIssue, prChecks } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
+import { recordedBaseDrift, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
@@ -10,6 +11,8 @@ const merge = 'b'.repeat(40);
 function fixture(
   state: string | null = 'clean',
   option: {
+    headSha?: string;
+    baseSha?: string;
     configuredRequiredChecks?: string[];
     requirementsViaClassic?: boolean;
     requirementsUnavailable?: boolean;
@@ -40,6 +43,8 @@ function fixture(
       | 'wrong-role';
   } = {},
 ) {
+  const head = option.headSha ?? 'a'.repeat(40);
+  const base = option.baseSha ?? 'c'.repeat(40);
   let merged = false;
   let decisionRead = false;
   let closes = 0;
@@ -93,7 +98,7 @@ function fixture(
     mergeable_state: state,
     head: { sha: head, ref: 'issue/17', repo: { full_name: 'example/widget' } },
     base: {
-      sha: decisionRead && option.baseChangedAfterDecision === 'sha' ? 'd'.repeat(40) : 'c'.repeat(40),
+      sha: decisionRead && option.baseChangedAfterDecision === 'sha' ? 'd'.repeat(40) : base,
       ref: decisionRead && option.baseChangedAfterDecision === 'name' ? 'other' : 'main',
       repo: { full_name: 'example/widget' },
     },
@@ -167,12 +172,7 @@ function fixture(
           ref: `refs/${ref}`,
           object: {
             type: 'commit',
-            sha:
-              ref === 'heads/main' || ref === 'heads/other'
-                ? option.baseMoved
-                  ? 'e'.repeat(40)
-                  : 'c'.repeat(40)
-                : head,
+            sha: ref === 'heads/main' || ref === 'heads/other' ? (option.baseMoved ? 'e'.repeat(40) : base) : head,
           },
         },
       }),
@@ -284,7 +284,7 @@ function fixture(
             id: 'PR23',
             number: 23,
             headRefOid: head,
-            baseRefOid: 'c'.repeat(40),
+            baseRefOid: base,
             baseRefName: 'main',
             commits: {
               totalCount: 1,
@@ -295,7 +295,7 @@ function fixture(
                     message: option.commitMessage ?? 'Improve widget',
                     parents: {
                       totalCount: 1,
-                      nodes: [{ oid: 'c'.repeat(40) }],
+                      nodes: [{ oid: base }],
                       pageInfo: { hasNextPage: false, endCursor: null },
                     },
                   },
@@ -719,5 +719,176 @@ describe('retained issue guarded squash delivery', () => {
     assert.equal((await mergePr(context, input)).reused, true);
     assert.equal(merges.length, 1);
     assert.equal(closes(), 0);
+  });
+});
+
+// Recorded fragments are injected at the existing GitHub boundary. Ready/CLEAN,
+// issue/PR aliases and call interleaving below are explicitly synthetic.
+function recordedFlow(
+  input: {
+    headSha?: string;
+    baseSha?: string;
+    mainSha?: string;
+    draft?: boolean;
+    state?: string;
+    missingDecision?: boolean;
+    failedCheck?: boolean;
+    missingCheck?: boolean;
+  } = {},
+) {
+  const headSha = input.headSha ?? recordedZeroApproval.repository.pullRequest.headRefOid;
+  const baseSha = input.baseSha ?? recordedZeroApproval.repository.pullRequest.baseRefOid;
+  const current = fixture(input.state ?? 'clean', {
+    headSha,
+    baseSha,
+    reviewDecision: null,
+    configuredRequiredChecks: ['checks'],
+    nativeChecks: input.missingCheck
+      ? []
+      : [
+          {
+            name: 'checks',
+            required: true,
+            status: 'COMPLETED',
+            conclusion: input.failedCheck ? 'FAILURE' : 'SUCCESS',
+          },
+        ],
+  });
+  const { context } = current;
+  const events: string[] = [];
+  const { pulls, git, issues } = context.clients.rest;
+  const get = pulls.get;
+  pulls.get = (async (...args: Parameters<typeof get>) => {
+    assert.deepEqual(args[0], { owner: 'example', repo: 'widget', pull_number: 23 });
+    events.push('pr');
+    const result = await get(...args);
+    return { ...result, data: { ...result.data, draft: input.draft ?? false } };
+  }) as typeof get;
+  const graphql = context.clients.graphql;
+  context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
+    if (!query.includes('DeliveryReviewDecision')) return graphql(query, variables);
+    assert.deepEqual(variables, { owner: 'example', name: 'widget', number: 23 });
+    events.push('decision');
+    return {
+      repository: {
+        pullRequest: {
+          headRefOid: headSha,
+          ...(input.missingDecision
+            ? {}
+            : { reviewDecision: recordedZeroApproval.repository.pullRequest.reviewDecision }),
+        },
+      },
+    };
+  }) as typeof graphql;
+  const getRef = git.getRef;
+  git.getRef = (async (...args: Parameters<typeof getRef>) => {
+    const result = await getRef(...args);
+    if (args[0]?.ref !== 'heads/main') return result;
+    events.push('main');
+    return { ...result, data: { ...result.data, object: { type: 'commit', sha: input.mainSha ?? baseSha } } };
+  }) as typeof getRef;
+  const merge = pulls.merge;
+  pulls.merge = (async (...args: Parameters<typeof merge>) => {
+    events.push('merge');
+    assert.deepEqual(args[0], {
+      owner: 'example',
+      repo: 'widget',
+      pull_number: 23,
+      sha: headSha,
+      merge_method: 'squash',
+    });
+    return merge(...args);
+  }) as typeof merge;
+  const update = issues.update;
+  issues.update = (async (...args: Parameters<typeof update>) => {
+    events.push('close');
+    assert.deepEqual(args[0], {
+      owner: 'example',
+      repo: 'widget',
+      issue_number: 17,
+      state: 'closed',
+      state_reason: 'completed',
+    });
+    return update(...args);
+  }) as typeof update;
+  return { ...current, events };
+}
+
+describe('recorded public fragments with labeled synthetic transitions', () => {
+  it('keeps the observed zero-review draft ineligible without merge or closure', async () => {
+    const current = recordedFlow({ draft: recordedZeroApproval.repository.pullRequest.isDraft });
+    await assert.rejects(finishIssue(current.context, { issueNumber: 17, prNumber: 23 }), /open and ready/u);
+    assert.deepEqual(current.events, ['pr']);
+    assert.equal(current.merges.length + current.closes(), 0);
+  });
+
+  it('finishes a synthetic ready/CLEAN transition with observed null and exact head', async () => {
+    const current = recordedFlow();
+    const result = await finishIssue(current.context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(result.headSha, '4b54bd4b663a32957e4571e2af112f828fbc0a58');
+    assert.equal(current.closes(), 1);
+    assert.equal(current.merges.length, 1);
+    assert.deepEqual(current.events, ['pr', 'pr', 'decision', 'pr', 'main', 'merge', 'pr', 'pr', 'close']);
+  });
+
+  it('performs no mutation for the synthetic ready/null finish dry-run', async () => {
+    const current = recordedFlow();
+    const result = await finishIssue(current.context, { issueNumber: 17, prNumber: 23, dryRun: true });
+    assert.ok('dryRun' in result && result.dryRun);
+    assert.deepEqual(current.events, ['pr', 'pr', 'decision', 'pr', 'main']);
+    assert.equal(current.merges.length + current.closes(), 0);
+  });
+
+  it('refuses a synthetic missing decision rather than treating it as observed null', async () => {
+    const current = recordedFlow({ missingDecision: true });
+    await assert.rejects(finishIssue(current.context, { issueNumber: 17, prNumber: 23 }), /review eligibility/u);
+    assert.deepEqual(current.events, ['pr', 'pr', 'decision', 'pr']);
+    assert.equal(current.merges.length + current.closes(), 0);
+  });
+
+  for (const [name, input] of [
+    ['failed required check', { state: 'blocked', failedCheck: true }],
+    ['missing required check', { state: 'blocked', missingCheck: true }],
+    ['behind', { state: 'behind' }],
+    ['dirty', { state: 'dirty' }],
+  ] as const) {
+    it(`refuses synthetic native ${name} without merge or closure`, async () => {
+      const current = recordedFlow(input);
+      await assert.rejects(
+        finishIssue(current.context, { issueNumber: 17, prNumber: 23 }),
+        /GitHub merge eligibility/u,
+      );
+      assert.deepEqual(current.events, ['pr', 'pr', 'decision', 'pr']);
+      assert.equal(current.merges.length + current.closes(), 0);
+    });
+  }
+
+  it('refuses recorded UNKNOWN drift and a synthetic CLEAN interleaving, then accepts a fresh retry', async () => {
+    const before = recordedBaseDrift.before.repository.pullRequest;
+    const drift = recordedBaseDrift.after.repository;
+    const unknown = recordedFlow({
+      headSha: before.headRefOid,
+      baseSha: before.baseRefOid,
+      state: drift.pullRequest.mergeStateStatus.toLowerCase(),
+    });
+    await assert.rejects(mergePr(unknown.context, { issueNumber: 17, prNumber: 23 }), /GitHub merge eligibility/u);
+    assert.deepEqual(unknown.events, ['pr', 'pr', 'decision', 'pr']);
+    const race = recordedFlow({
+      headSha: before.headRefOid,
+      baseSha: before.baseRefOid,
+      mainSha: drift.defaultBranchRef.target.oid,
+    });
+    await assert.rejects(finishIssue(race.context, { issueNumber: 17, prNumber: 23 }), /base moved/u);
+    assert.deepEqual(race.events, ['pr', 'pr', 'decision', 'pr', 'main']);
+    assert.equal(unknown.merges.length + race.merges.length + race.closes(), 0);
+    // New synthetic refreshed candidate; no automatic approval carry-forward.
+    const retry = recordedFlow({ headSha: before.headRefOid, baseSha: drift.defaultBranchRef.target.oid });
+    await mergePr(retry.context, {
+      issueNumber: 17,
+      prNumber: 23,
+      reviewedHeadSha: '47cb7643c494c44bdecdfe8ca7449c7b3b884aaa',
+    });
+    assert.equal(retry.merges.length, 1);
+    assert.deepEqual(retry.events, ['pr', 'pr', 'decision', 'pr', 'main', 'merge', 'pr']);
   });
 });
