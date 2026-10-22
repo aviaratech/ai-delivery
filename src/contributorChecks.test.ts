@@ -14,8 +14,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'vitest';
 
 type CommandResult = {
@@ -44,12 +44,28 @@ type Report = {
   selectedTestFiles?: string[];
   error?: string;
   observedTests?: { total: number; passed: number; failed: number };
+  artifactQualified: boolean;
+};
+type CaseIdentity = { file: string; title: string };
+type ReleaseContext = {
+  contractPath: string;
+  checkpoint: { path: string; sha256: string };
+  sourceCommit: string;
+  sourceTree: string;
+  sourceManifestSha256: string;
+  sourceLockSha256: string;
+  producerSha256: string;
+  archiveSha256: string;
 };
 type TestReport = {
   success: boolean;
   numTotalTests: number;
   numPassedTests: number;
-  testResults: { name: string; status: string; assertionResults: { fullName: string; status: string }[] }[];
+  testResults: {
+    name: string;
+    status: string;
+    assertionResults: { fullName: string; status: string; tags?: string[] }[];
+  }[];
 };
 type Toolchain = {
   controller: { version: string; executable: string };
@@ -57,6 +73,7 @@ type Toolchain = {
   libraryConsumer: { version: string; executable: string };
 };
 type Checks = {
+  RELEASE_CASES: (CaseIdentity & { kind: 'mandatory' | 'external-historical-qualification' })[];
   FULL_GATES: string[];
   FAST_GATES: string[];
   safeEnvironment(input: Record<string, string>): Record<string, string>;
@@ -69,7 +86,15 @@ type Checks = {
     cwd: string,
     output: string,
     env?: Record<string, string>,
-  ): { files: number; total: number; passed: number; skips: object[] };
+    lane?: 'pr' | 'release',
+  ): {
+    files: number;
+    total: number;
+    passed: number;
+    skips: object[];
+    selectedCases: CaseIdentity[];
+    laneExcluded: CaseIdentity[];
+  };
   coverageBaseline(
     directory: string,
     cwd: string,
@@ -88,10 +113,408 @@ type Checks = {
     install?: boolean;
     toolchain?: () => Toolchain;
     execute?: Checks['executeCommand'];
+    environment?: Record<string, string>;
+    release?: ReleaseContext;
   }): Promise<Report>;
 };
 const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as Checks;
 const repository = fileURLToPath(new URL('../', import.meta.url));
+
+test('ordinary full and focused checks exclude release cases without claiming archive proof', async () => {
+  for (const focused of [false, true]) {
+    const f = fixture();
+    try {
+      const delegated = executor(f);
+      const report = await checks.runChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'checks'),
+        ...(focused ? { fast: true, testFiles: ['dist/original.test.js'] } : {}),
+        toolchain: () => f.toolchain,
+        environment: {
+          ...checks.safeEnvironment({}),
+          AI_DELIVERY_TEST_LANE: 'release',
+          AI_DELIVERY_RELEASE_CONTRACT: '/ambient/untrusted',
+        },
+        execute: (command, options) => {
+          assert.equal(options.env.AI_DELIVERY_TEST_LANE, 'pr');
+          assert.equal(options.env.AI_DELIVERY_RELEASE_CONTRACT, undefined);
+          return delegated(command, options);
+        },
+      });
+      assert.equal(report.status, focused ? 'partial-passed' : 'passed');
+      assert.equal(report.artifactQualified, false);
+      if (!focused) assert.deepEqual(report.omitted, []);
+      const command = report.commands.find((command) => command.stage === 'tests')?.command;
+      assert.ok(command?.includes('--tags-filter=!release'));
+      assert.ok(
+        !report.commands.some((command) =>
+          command.command.some((arg) => /current-consumer|current-qualification/u.test(arg)),
+        ),
+      );
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('PR reports exclude release identities while scoped release reports require all mandatory outcomes', () => {
+  assert.ok(Array.isArray(checks.RELEASE_CASES));
+  assert.equal(checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length, 23);
+  const f = fixture();
+  const files = [...new Set(checks.RELEASE_CASES.map((test) => test.file))];
+  const report = (release: boolean): TestReport => {
+    const testResults = files.map((file) => ({
+      name: join(f.cwd, file),
+      status: 'passed',
+      assertionResults: [
+        ...(release ? [] : [{ fullName: 'synthetic retained unit', status: 'passed' }]),
+        ...checks.RELEASE_CASES.filter((test) => test.file === file).map((test) => ({
+          fullName: test.title,
+          status: release && test.kind === 'mandatory' ? 'passed' : 'pending',
+        })),
+      ],
+    }));
+    const cases = testResults.flatMap((file) => file.assertionResults);
+    return {
+      success: true,
+      testResults,
+      numTotalTests: cases.length,
+      numPassedTests: cases.filter((test) => test.status === 'passed').length,
+    };
+  };
+  try {
+    const pr = checks.analyzeTests(
+      report(false),
+      files,
+      f.cwd,
+      '',
+      { AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/explicit-historical-input' },
+      'pr',
+    );
+    assert.equal(pr.passed, 4);
+    assert.equal(pr.total, 4);
+    assert.deepEqual(pr.skips, []);
+    assert.equal(pr.laneExcluded.length, 24);
+    const release = checks.analyzeTests(report(true), files, f.cwd, '', {}, 'release');
+    assert.equal(release.passed, 23);
+    assert.equal(release.skips.length, 1);
+    for (const failure of ['missing', 'duplicate', 'unexpected', 'failed', 'pr-executed', 'historical-input']) {
+      const data = report(failure !== 'pr-executed');
+      const tests = data.testResults[0]!.assertionResults;
+      if (failure === 'missing') tests.shift();
+      if (failure === 'duplicate') tests.push({ ...tests[0]! });
+      if (failure === 'unexpected') tests.push({ fullName: 'unreviewed release case', status: 'passed' });
+      if (failure === 'failed') tests[0]!.status = 'failed';
+      if (failure === 'pr-executed') tests[1]!.status = 'passed';
+      const cases = data.testResults.flatMap((file) => file.assertionResults);
+      data.numTotalTests = cases.length;
+      data.numPassedTests = cases.filter((test) => test.status === 'passed').length;
+      assert.throws(
+        () =>
+          checks.analyzeTests(
+            data,
+            files,
+            f.cwd,
+            '',
+            failure === 'historical-input' ? { AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/explicit-historical-input' } : {},
+            failure === 'pr-executed' ? 'pr' : 'release',
+          ),
+        failure,
+      );
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('runtime-expanded tags match every reviewed mandatory identity without executing cases', () => {
+  const f = fixture();
+  try {
+    const config = join(f.base, 'collection-only.config.mjs');
+    const base = pathToFileURL(join(repository, 'vitest.config.ts')).href;
+    writeFileSync(
+      config,
+      `if(!process.argv.includes('list'))throw new Error('Collection only');const base=(await import(${JSON.stringify(base)})).default;export default {...base,test:{...base.test,tags:base.test.tags.map(tag=>tag.name==='release'?{...tag,skip:false}:tag)}};`,
+    );
+    const output = join(f.base, 'inventory.json');
+    execFileSync(
+      process.execPath,
+      [
+        join(repository, 'node_modules/vitest/vitest.mjs'),
+        'list',
+        'dist/setup.test.js',
+        'dist/lifecycle.test.js',
+        'dist/targetPolicyLocal.test.js',
+        'dist/pluginPackaging.test.js',
+        '--tags-filter=release',
+        '--no-staticParse',
+        '--maxWorkers=1',
+        `--config=${config}`,
+        `--json=${output}`,
+      ],
+      {
+        cwd: repository,
+        env: { ...checks.safeEnvironment({ PATH: process.env.PATH ?? '' }), AI_DELIVERY_TEST_LANE: 'pr' },
+        encoding: 'utf8',
+        maxBuffer: 1024 ** 2,
+      },
+    );
+    const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; name: string }[];
+    const actual = rows.map((row) => ({
+      file: relative(repository, row.file).replaceAll('\\', '/'),
+      title: row.name.replaceAll(' > ', ' '),
+    }));
+    const expected = checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').map(({ file, title }) => ({
+      file,
+      title,
+    }));
+    assert.equal(actual.length, 23);
+    const compare = (a: CaseIdentity, b: CaseIdentity) => JSON.stringify(a).localeCompare(JSON.stringify(b));
+    assert.deepEqual(actual.sort(compare), expected.sort(compare));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('unknown lane and mismatched release context fail before child launch', async () => {
+  const f = fixture();
+  try {
+    let calls = 0;
+    const release: ReleaseContext = {
+      contractPath: join(f.base, 'missing/contract.json'),
+      checkpoint: { path: join(f.base, 'missing/checkpoint.json'), sha256: 'a'.repeat(64) },
+      sourceCommit: 'a'.repeat(40),
+      sourceTree: 'b'.repeat(40),
+      sourceManifestSha256: 'a'.repeat(64),
+      sourceLockSha256: 'b'.repeat(64),
+      producerSha256: 'c'.repeat(64),
+      archiveSha256: 'd'.repeat(64),
+    };
+    for (const options of [
+      { environment: { AI_DELIVERY_TEST_LANE: 'unknown' } },
+      { release },
+      { release, fast: true },
+    ]) {
+      const result = await checks.runChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, `invalid-${calls}-${Object.keys(options).join('-')}`),
+        toolchain: () => f.toolchain,
+        ...options,
+        execute: (command, options) => {
+          calls++;
+          return executor(f)(command, options);
+        },
+      });
+      assert.equal(result.status, 'failed');
+      assert.equal(calls, 0);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+function directFocus(f: ReturnType<typeof fixture>, title: string, env: Record<string, string>, name: string) {
+  const marker = join(f.base, `${name}-npm-launched`);
+  const loaded = join(f.base, `${name}-guard-loaded`);
+  const guard = join(f.base, `${name}-guard.mjs`);
+  writeFileSync(
+    guard,
+    `import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';import {appendFileSync,writeFileSync} from 'node:fs';appendFileSync(${JSON.stringify(loaded)},String(process.pid)+String.fromCharCode(10));for(const name of ['spawn','spawnSync','execFile','execFileSync','exec','execSync','fork']){const original=cp[name];cp[name]=function(command,args,...rest){if([command,...(Array.isArray(args)?args:[])].some(x=>['npm','npm-cli.js'].includes(String(x).split('/').at(-1)))){writeFileSync(${JSON.stringify(marker)},'forbidden npm launch');throw new Error('Controlled direct-focus guard forbids npm');}return Reflect.apply(original,this,[command,args,...rest]);};}syncBuiltinESMExports();`,
+  );
+  const guardUrl = pathToFileURL(guard).href;
+  const workerArgs = ['--maxWorkers=1', '--pool=forks', `--execArgv=--import=${guardUrl}`, '--no-cache'];
+  const childEnv = { ...checks.safeEnvironment({ PATH: process.env.PATH ?? '' }), ...env };
+  // Prove interception inside the pinned worker before selecting any real-case body.
+  // A broken preload can only try the probe's nonexistent script, which cannot run npm.
+  mkdirSync(join(f.cwd, 'dist'), { recursive: true });
+  if (!existsSync(join(f.cwd, 'node_modules')))
+    symlinkSync(join(repository, 'node_modules'), join(f.cwd, 'node_modules'));
+  const config = join(f.cwd, 'guard.config.mjs');
+  writeFileSync(
+    config,
+    `import {defineConfig} from 'vitest/config';export default defineConfig({test:{include:['dist/guard.test.js']}});`,
+  );
+  writeFileSync(
+    join(f.cwd, 'dist/guard.test.js'),
+    `import assert from 'node:assert/strict';import {execFileSync,spawnSync} from 'node:child_process';import {test} from 'vitest';test('controlled worker npm guard',()=>{assert.throws(()=>execFileSync(process.execPath,['/controlled/nonexistent/npm-cli.js']),/Controlled direct-focus guard forbids npm/);});test('controlled shell npm guard',()=>{assert.throws(()=>spawnSync('/bin/sh',['-c','exit 125','controlled','/controlled/nonexistent/npm']),/Controlled direct-focus guard forbids npm/);});`,
+  );
+  const probeReport = join(f.base, `${name}-probe.json`);
+  const probe = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      guardUrl,
+      join(repository, 'node_modules/vitest/vitest.mjs'),
+      'run',
+      '--root',
+      f.cwd,
+      '--config',
+      config,
+      ...workerArgs,
+      '--reporter=json',
+      `--outputFile.json=${probeReport}`,
+    ],
+    { cwd: f.cwd, env: childEnv, encoding: 'utf8', maxBuffer: 1024 ** 2 },
+  );
+  assert.equal(probe.status, 0, probe.stderr.slice(-1500));
+  assert.equal((JSON.parse(readFileSync(probeReport, 'utf8')) as TestReport).numPassedTests, 2);
+  assert.equal(existsSync(marker), true, 'The fake npm invocation must be intercepted inside the worker.');
+  assert.ok(readFileSync(loaded, 'utf8').trim().split(String.fromCharCode(10)).length >= 2);
+  rmSync(marker);
+  const reportPath = join(f.base, `${name}.json`);
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      guardUrl,
+      join(repository, 'node_modules/vitest/vitest.mjs'),
+      'run',
+      'dist/setup.test.js',
+      ...workerArgs,
+      '-t',
+      title,
+      '--reporter=json',
+      `--outputFile.json=${reportPath}`,
+    ],
+    { cwd: repository, env: childEnv, encoding: 'utf8', maxBuffer: 1024 ** 2 },
+  );
+  assert.equal(existsSync(marker), false, 'No npm subprocess may launch, even if the direct-entry guard regresses.');
+  assert.ok(existsSync(loaded), 'The direct-process npm guard must load.');
+  return { result, reportPath, loaded };
+}
+
+test('direct-focus npm interception reaches the pinned worker before real-case selection', () => {
+  const f = fixture();
+  try {
+    const run = directFocus(f, 'controlled nonexistent selection', {}, 'worker-probe');
+    assert.equal(run.result.status, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('historical archive input cannot override direct-focus PR exclusion', () => {
+  const f = fixture();
+  const title =
+    'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer';
+  try {
+    for (const lane of ['absent', 'pr']) {
+      const run = directFocus(
+        f,
+        title,
+        {
+          ...(lane === 'pr' ? { AI_DELIVERY_TEST_LANE: lane } : {}),
+          AI_DELIVERY_REAL_PACKAGE_ARCHIVE: join(f.base, 'explicit-unavailable-historical-input'),
+        },
+        lane,
+      );
+      assert.equal(run.result.status, 0, run.result.stderr.slice(-1500));
+      const report = JSON.parse(readFileSync(run.reportPath, 'utf8')) as TestReport;
+      const selected = report.testResults
+        .flatMap((file) => file.assertionResults)
+        .find((test) => test.fullName === title);
+      assert.ok(selected && ['pending', 'skipped'].includes(selected.status));
+      assert.ok(selected.tags?.includes('release'));
+      assert.ok(
+        readFileSync(run.loaded, 'utf8').trim().split('\n').length >= 2,
+        'The controlled guard must reach the forked worker.',
+      );
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('direct release focus rejects invalid contracts before any npm launch', () => {
+  const f = fixture();
+  try {
+    for (const kind of ['absent', 'missing', 'malformed']) {
+      const contractPath = join(f.base, kind, 'contract.json');
+      if (kind === 'malformed') {
+        mkdirSync(dirname(contractPath));
+        writeFileSync(contractPath, '{broken');
+      }
+      const run = directFocus(
+        f,
+        '(?!)',
+        {
+          AI_DELIVERY_TEST_LANE: 'release',
+          ...(kind === 'absent' ? {} : { AI_DELIVERY_RELEASE_CONTRACT: contractPath }),
+        },
+        kind,
+      );
+      assert.notEqual(run.result.status, 0);
+      assert.match(run.result.stderr + run.result.stdout, /contract|checkpoint/iu);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('qualification CLI finishes module loading before its owned graph reuses the validator', () => {
+  const f = fixture();
+  try {
+    const scripts = join(f.cwd, 'scripts');
+    mkdirSync(scripts);
+    const entry = join(scripts, 'current-qualification.mjs');
+    writeFileSync(entry, readFileSync(join(repository, 'scripts/current-qualification.mjs')));
+    const marker = join(f.base, 'module-ready');
+    writeFileSync(
+      join(scripts, 'checks.mjs'),
+      `export {RELEASE_CASES,confirmCommandQuiescence,errorMessage,executeCommand,safeEnvironment,treeIdentity} from ${JSON.stringify(pathToFileURL(join(repository, 'scripts/checks.mjs')).href)};import {writeFileSync} from 'node:fs';export async function runChecks(){await import('./current-qualification.mjs');writeFileSync(${JSON.stringify(marker)},'ready');throw new Error('Controlled stop before pack');}`,
+    );
+    writeFileSync(
+      join(scripts, 'current-consumer.mjs'),
+      `export {inspectCandidate,sha256,verifyProducerJoin} from ${JSON.stringify(pathToFileURL(join(repository, 'scripts/current-consumer.mjs')).href)};`,
+    );
+    writeFileSync(
+      join(f.cwd, 'package.json'),
+      JSON.stringify({ type: 'module', name: '@example/entry-fixture', version: '0.0.0' }),
+    );
+    writeFileSync(join(f.cwd, 'package-lock.json'), '{}\n');
+    execFileSync('git', ['add', '.'], { cwd: f.cwd });
+    execFileSync(
+      'git',
+      [
+        '-c',
+        'user.name=Fictional Fixture',
+        '-c',
+        'user.email=fixture@example.invalid',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-qm',
+        'controlled entry source',
+      ],
+      { cwd: f.cwd },
+    );
+    const output = join(f.base, 'entry-result');
+    const result = spawnSync(process.execPath, [entry, '--results-dir', output], {
+      cwd: f.cwd,
+      env: checks.safeEnvironment(process.env as Record<string, string>),
+      encoding: 'utf8',
+      maxBuffer: 1024 ** 2,
+    });
+    assert.equal(
+      existsSync(marker),
+      true,
+      'The entry module must finish evaluating before its graph awaits its validation exports.',
+    );
+    assert.equal(result.status, 1);
+    const report = JSON.parse(readFileSync(join(output, 'result.json'), 'utf8')) as {
+      status: string;
+      error: string;
+      pack?: unknown;
+      consumer?: unknown;
+    };
+    assert.equal(report.status, 'failed');
+    assert.match(report.error, /Controlled stop before pack/u);
+    assert.equal(report.pack, undefined);
+    assert.equal(report.consumer, undefined);
+  } finally {
+    f.cleanup();
+  }
+});
 
 function fixture() {
   const base = mkdtempSync(join(tmpdir(), 'contributor-check-fixture-'));
@@ -214,16 +637,19 @@ function executor(f: ReturnType<typeof fixture>, failStage = ''): Checks['execut
   };
 }
 
-test('local and CI share full entry; fast explicitly omits gates and no CI duplicate build', () => {
+test('local and CI share the PR producer while explicit release owns package qualification', () => {
   const manifest = JSON.parse(readFileSync(join(repository, 'package.json'), 'utf8')) as {
     scripts: Record<string, string>;
   };
-  assert.equal(manifest.scripts.checks, 'node scripts/current-qualification.mjs');
+  assert.equal(manifest.scripts.checks, 'node scripts/checks.mjs');
+  assert.equal(manifest.scripts['checks:release'], 'node scripts/current-qualification.mjs');
   assert.equal(manifest.scripts['checks:producer'], 'node scripts/current-qualification.mjs --producer-only');
   assert.equal(manifest.scripts['checks:fast'], 'node scripts/checks.mjs --fast');
   const ci = readFileSync(join(repository, '.github/workflows/ci.yml'), 'utf8');
   assert.match(ci, /npm run checks -- --results-dir/u);
   assert.doesNotMatch(ci, /npm run build|npm pack/u);
+  assert.doesNotMatch(ci, /checks:release|current-qualification/u);
+  assert.match(ci, /Retain PR producer and interrupted check evidence/u);
   assert.match(ci, /if: always\(\)/u);
   assert.deepEqual(checks.FULL_GATES, ['format', 'lint', 'types', 'build', 'tests', 'inventory']);
 });
@@ -456,15 +882,14 @@ test('selection, counts and explicit skip reasons reject unexpected/zero/exclude
   report.numTotalTests = 4;
   report.numPassedTests = 2;
   const result = checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT');
-  assert.equal(result.skips.length, 2);
-  assert.throws(
-    () =>
-      checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT', {
-        AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/synthetic/explicit.tgz',
-      }),
-    /skipped despite explicit/u,
+  assert.equal(result.skips.length, 1);
+  assert.equal(
+    checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT', {
+      AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/synthetic/explicit.tgz',
+    }).skips.length,
+    1,
   );
-  assert.match(JSON.stringify(result.skips), /qualification is unexecuted/u);
+  assert.ok(result.laneExcluded.some((test) => test.title.startsWith('actual reviewed 0.3.4')));
   assert.throws(() => checks.analyzeTests(report, ['dist/setup.test.js'], cwd, ''), /proof is missing/u);
   assert.throws(() => checks.analyzeTests(report, ['dist/other.test.js'], cwd, ''), /unexpected file/u);
   file.assertionResults[2]!.fullName = 'unexpected conditional skip';
@@ -728,7 +1153,11 @@ type QualificationOptions = {
   consumerResult?: string;
   reconcileConsumer?: boolean;
   signal?: AbortSignal;
-  checks?: (options: { resultsDir: string }) => Promise<Record<string, unknown>>;
+  checks?: (options: {
+    resultsDir: string;
+    release?: ReleaseContext;
+    signal?: AbortSignal;
+  }) => Promise<Record<string, unknown>>;
   execute?: (command: string[], options: CommandOptions) => Promise<CommandResult>;
   inspect?: (contract: SyntheticContract) => Candidate;
 };
@@ -739,9 +1168,14 @@ const qualification = (await import(new URL('../scripts/current-qualification.mj
     fingerprint: { kind: string; sha256: string; fileCount: number };
   };
   validateCheckpoint(path: string, cwd: string, inspect: NonNullable<QualificationOptions['inspect']>): unknown;
-  runQualification(
-    options: QualificationOptions,
-  ): Promise<{ status: string; qualified: boolean; exitCode: number; error?: string }>;
+  runQualification(options: QualificationOptions): Promise<{
+    status: string;
+    qualified: boolean;
+    exitCode: number;
+    error?: string;
+    omitted: string[];
+    releaseTests?: { path: string; sha256: string };
+  }>;
 };
 const consumerProof = (await import(new URL('../scripts/current-consumer.mjs', import.meta.url).href)) as {
   sha256(bytes: string | Buffer): string;
@@ -772,6 +1206,12 @@ function qualificationFixture() {
   let producers = 0;
   let packs = 0;
   let consumers = 0;
+  let releases = 0;
+  let releaseHook: (options: {
+    resultsDir: string;
+    signal?: AbortSignal;
+  }) => Promise<CommandResult | void> = async () => {};
+  const order: string[] = [];
   let packStatus = 'passed';
   let cleanup = true;
   let mutateProducer: (report: Record<string, unknown>) => void = () => {};
@@ -797,8 +1237,59 @@ function qualificationFixture() {
       skills: ['intake-create', 'worktree-lifecycle', 'pr-handoff'].map((path) => ({ path, sha256: 'a'.repeat(64) })),
     };
   };
-  const produce: NonNullable<QualificationOptions['checks']> = async ({ resultsDir }) => {
+  const produce: NonNullable<QualificationOptions['checks']> = async ({ resultsDir, release, signal }) => {
+    if (release) {
+      releases++;
+      order.push('release');
+      mkdirSync(resultsDir);
+      const observed = await releaseHook({ resultsDir, ...(signal ? { signal } : {}) });
+      const historical = checks.RELEASE_CASES.find((test) => test.kind === 'external-historical-qualification')!;
+      const cancelled = signal?.aborted === true;
+      const report = {
+        schemaVersion: 'contributor-checks@1',
+        runId: 'fictional-release',
+        scope: 'release',
+        status: cancelled ? 'cancelled' : 'passed',
+        exitCode: cancelled ? 130 : 0,
+        fullSuccess: false,
+        artifactQualified: false,
+        gates: ['tests'],
+        omitted: ['PR producer and consumer'],
+        resultsDir,
+        tree: qualification.sourceIdentity(f.cwd).fingerprint,
+        toolchain: f.toolchain,
+        release: {
+          ...release,
+          contractSha256: consumerProof.sha256(readFileSync(release.contractPath)),
+          historicalInputSupplied: false,
+          temporary: { path: join(resultsDir, 'temporary'), dev: 1, ino: 1, quiescent: true, removed: true },
+        },
+        commands: [
+          {
+            stage: 'tests',
+            status: cancelled ? 'cancelled' : 'passed',
+            exitCode: cancelled ? 130 : 0,
+            signal: cancelled ? 'SIGTERM' : null,
+            cleanupConfirmed: true,
+            ...observed,
+          },
+        ],
+        selectedTestFiles: [...new Set(checks.RELEASE_CASES.map((test) => test.file))],
+        tests: {
+          lane: 'release',
+          files: 4,
+          total: 24,
+          passed: 23,
+          skips: [historical],
+          selectedCases: checks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
+          laneExcluded: [],
+        },
+      };
+      writeFileSync(join(resultsDir, 'result.json'), JSON.stringify(report));
+      return report;
+    }
     producers++;
+    order.push('producer');
     mkdirSync(resultsDir);
     const report: Record<string, unknown> = {
       schemaVersion: 'contributor-checks@1',
@@ -858,6 +1349,7 @@ function qualificationFixture() {
       return result;
     }
     packs++;
+    order.push('pack');
     assert.deepEqual(command.slice(2, 5), ['pack', '--ignore-scripts', '--json']);
     mkdirSync(options.directory);
     const destination = command.at(-1)!;
@@ -879,6 +1371,7 @@ function qualificationFixture() {
   };
   const consume = async (contract: SyntheticContract, options: { authorizeInstall: boolean }) => {
     consumers++;
+    order.push('consumer');
     assert.equal(options.authorizeInstall, true);
     const candidate = inspect(contract);
     return {
@@ -930,6 +1423,11 @@ function qualificationFixture() {
     inspect,
     consume,
     counts: () => ({ producers, packs, consumers }),
+    releases: () => releases,
+    order,
+    releaseHook: (hook: typeof releaseHook) => {
+      releaseHook = hook;
+    },
     mutate: (fn: typeof mutateProducer) => {
       mutateProducer = fn;
     },
@@ -968,12 +1466,171 @@ test('qualification checkpoints one producer and pack, resumes without replay, a
   }
 });
 
-test('full qualification executes one producer, actual pack and consumer in order', async () => {
+test('qualification joins producer pack release tests and consumer in order', async () => {
   const f = qualificationFixture();
   try {
     const report = await qualification.runQualification(f.options);
     assert.equal(report.qualified, true);
     assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+    assert.equal(f.releases(), 1);
+    assert.deepEqual(f.order, ['producer', 'pack', 'release', 'consumer']);
+    assert.ok(report.releaseTests);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('producer-only omits release and consumer proof', async () => {
+  const f = qualificationFixture();
+  try {
+    const report = await qualification.runQualification({ ...f.options, producerOnly: true });
+    assert.equal(f.releases(), 0);
+    assert.match(report.omitted.join(' '), /release/u);
+    assert.equal(report.releaseTests, undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('resume reuses compatible completed release proof', async () => {
+  const f = qualificationFixture();
+  try {
+    const first = await qualification.runQualification(f.options);
+    assert.ok(first.releaseTests);
+    const original = readFileSync(first.releaseTests.path);
+    const resumed = await qualification.runQualification({
+      ...f.options,
+      resume: join(f.options.resultsDir, 'checkpoint.json'),
+      resultsDir: join(f.base, 'outer-reuse'),
+    });
+    assert.equal(resumed.qualified, true, resumed.error);
+    assert.deepEqual(resumed.releaseTests, first.releaseTests);
+    assert.deepEqual(readFileSync(first.releaseTests.path), original);
+    assert.equal(f.releases(), 1);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('uncertain release attempt blocks a duplicate launch through fresh outer results', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    f.releaseHook(async () => {
+      throw new Error('fictional lost release response');
+    });
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    const first = await qualification.runQualification({
+      ...f.options,
+      resume,
+      resultsDir: join(f.base, 'release-lost'),
+    });
+    assert.match(first.error!, /lost release/u);
+    const second = await qualification.runQualification({
+      ...f.options,
+      resume,
+      resultsDir: join(f.base, 'release-uncertain'),
+    });
+    assert.match(second.error!, /Unresolved release/u);
+    assert.equal(f.releases(), 1);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('interrupted release retry preserves prior evidence and skips completed producer and pack', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    const controller = new AbortController();
+    const sentinel = join(f.base, 'unrelated');
+    writeFileSync(sentinel, 'preserve');
+    f.releaseHook(async ({ resultsDir, signal }) =>
+      checks.executeCommand(
+        [process.execPath, '-e', "console.log('controlled release started');setInterval(()=>{},1000)"],
+        {
+          cwd: f.cwd,
+          env: checks.safeEnvironment({}),
+          directory: join(resultsDir, 'tests'),
+          ...(signal ? { signal } : {}),
+          progress: (partial) => {
+            if ((partial as CommandResult).observedProcesses?.length) controller.abort();
+          },
+        },
+      ),
+    );
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    const interrupted = await qualification.runQualification({
+      ...f.options,
+      resume,
+      signal: controller.signal,
+      resultsDir: join(f.base, 'release-interrupted'),
+    });
+    assert.equal(interrupted.status, 'cancelled');
+    const attemptPath = join(f.options.resultsDir, 'release-tests-attempt.json');
+    const old = readFileSync(attemptPath);
+    const prior = JSON.parse(old.toString()) as {
+      directory: string;
+      receipt: { path: string };
+      command: CommandResult;
+    };
+    assert.equal(prior.command.cleanupConfirmed, true);
+    assert.ok(prior.command.observedProcesses?.length);
+    const receipt = readFileSync(prior.receipt.path);
+    f.releaseHook(async () => {});
+    const retried = await qualification.runQualification({
+      ...f.options,
+      resume,
+      resultsDir: join(f.base, 'release-retry'),
+    });
+    assert.equal(retried.qualified, true, retried.error);
+    assert.deepEqual(readFileSync(join(prior.directory, 'retired-attempt.json')), old);
+    assert.deepEqual(readFileSync(prior.receipt.path), receipt);
+    assert.equal(readFileSync(sentinel, 'utf8'), 'preserve');
+    assert.equal(f.releases(), 2);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+    const uninterrupted = qualificationFixture();
+    try {
+      assert.equal((await qualification.runQualification(uninterrupted.options)).qualified, true);
+      assert.deepEqual(uninterrupted.order, ['producer', 'pack', 'release', 'consumer']);
+    } finally {
+      uninterrupted.cleanup();
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('two competing resumes release at most one checkpoint-owned test child', async () => {
+  const f = qualificationFixture();
+  try {
+    await qualification.runQualification({ ...f.options, producerOnly: true });
+    let started!: () => void, complete!: () => void;
+    const start = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    f.releaseHook(async () => {
+      started();
+      await gate;
+    });
+    const resume = join(f.options.resultsDir, 'checkpoint.json');
+    const first = qualification.runQualification({ ...f.options, resume, resultsDir: join(f.base, 'race-a') });
+    await Promise.race([
+      start,
+      first.then(() => {
+        throw new Error('Release stage never started.');
+      }),
+    ]);
+    const second = await qualification.runQualification({ ...f.options, resume, resultsDir: join(f.base, 'race-b') });
+    complete();
+    assert.equal((await first).qualified, true);
+    assert.match(second.error!, /Unresolved release/u);
+    assert.equal(f.releases(), 1);
   } finally {
     f.cleanup();
   }

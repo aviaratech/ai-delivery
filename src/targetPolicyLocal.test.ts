@@ -504,22 +504,18 @@ function scopedRuntimeCase<T extends object>(
         owned = undefined;
       }
     }, ASSERTED_MS + DRAIN_MS);
-    test(
-      name,
-      async ({ signal }) => {
-        const current = owned;
-        assert.ok(current?.ready, 'Real case prerequisites must finish before the asserted body');
-        assert.ok(current.prepared);
-        const prepared = current.prepared;
-        current.scope.forward(signal);
-        try {
-          await scopedPhase(current.scope, 'asserted body', ASSERTED_MS, () => observe(prepared));
-        } finally {
-          await current.scope.join();
-        }
-      },
-      ASSERTED_MS + DRAIN_MS,
-    );
+    test(name, { tags: ['release'], timeout: ASSERTED_MS + DRAIN_MS }, async ({ signal }) => {
+      const current = owned;
+      assert.ok(current?.ready, 'Real case prerequisites must finish before the asserted body');
+      assert.ok(current.prepared);
+      const prepared = current.prepared;
+      current.scope.forward(signal);
+      try {
+        await scopedPhase(current.scope, 'asserted body', ASSERTED_MS, () => observe(prepared));
+      } finally {
+        await current.scope.join();
+      }
+    });
   });
 }
 
