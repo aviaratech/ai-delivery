@@ -21,6 +21,14 @@ const head = 'a'.repeat(40);
 const base = 'b'.repeat(40);
 const tree = 'c'.repeat(40);
 const pageInfo = { hasNextPage: false, endCursor: null };
+const nonClosingCreation = {
+  issueNumber: 17,
+  nonClosing: true,
+  reconcileNonClosingReference: true,
+  expectedHeadSha: head,
+  expectedBaseSha: base,
+  body: `References ${repo}#17\n\nImprove widget.`,
+};
 
 function fixture(published = true, nonClosing = false) {
   const state = {
@@ -62,6 +70,16 @@ function fixture(published = true, nonClosing = false) {
     closingReadback: undefined as unknown,
     closingPages: [] as unknown[],
     closingPageIndex: 0,
+    closingOnCreate: false,
+    manualClosing: false,
+    manualReadback: undefined as unknown,
+    manualPages: [] as unknown[],
+    manualPageIndex: 0,
+    removals: 0,
+    failRemovalAck: false,
+    removalReadback: undefined as unknown,
+    keepClosingOnRemoval: false,
+    removalHook: undefined as (() => void) | undefined,
     branchReadback: undefined as unknown,
     reviewerActor: 'reviewer[bot]',
     movedOnRead: 0,
@@ -149,6 +167,10 @@ function fixture(published = true, nonClosing = false) {
         assert.equal(input.head, 'issue/17');
         state.creations++;
         state.body = input.body;
+        if (state.closingOnCreate) {
+          state.manualClosing = true;
+          state.referenceCloses = true;
+        }
         if (state.failCreateAck) {
           state.published = true;
           throw new Error('Transport lost after creation');
@@ -188,7 +210,21 @@ function fixture(published = true, nonClosing = false) {
       },
     },
   };
-  const graphql = async (query: string) => {
+  const graphql = async (query: string, variables: Record<string, unknown> = {}) => {
+    if (query.includes('DeliveryRemoveClosingReference')) {
+      assert.deepEqual(variables.issueId, 'ISSUE17');
+      assert.deepEqual(variables.pullRequestIds, ['PR23']);
+      assert.equal(typeof variables.clientMutationId, 'string');
+      state.removals++;
+      state.events.push('remove-exact-closing-pair');
+      if (!state.keepClosingOnRemoval) {
+        state.manualClosing = false;
+        state.referenceCloses = false;
+      }
+      state.removalHook?.();
+      if (state.failRemovalAck) throw new Error('Lost reference-removal acknowledgement');
+      return state.removalReadback ?? { removeCloseIssueReferences: { issue: { id: 'ISSUE17' } } };
+    }
     if (query.includes('DeliveryNonClosingReferences')) {
       if (state.referencePages.length) return state.referencePages[state.referencePageIndex++];
       return (
@@ -284,18 +320,23 @@ function fixture(published = true, nonClosing = false) {
           },
         }
       );
-    if (query.includes('DeliveryClosingIssues') && state.closingPages.length > 0)
+    const manual = query.includes('userLinkedOnly');
+    if (query.includes('DeliveryClosingIssues') && manual && state.manualPages.length > 0)
+      return state.manualPages[state.manualPageIndex++ % state.manualPages.length];
+    if (query.includes('DeliveryClosingIssues') && manual && state.manualReadback !== undefined)
+      return state.manualReadback;
+    if (query.includes('DeliveryClosingIssues') && !manual && state.closingPages.length > 0)
       return state.closingPages[state.closingPageIndex++];
     if (query.includes('DeliveryClosingIssues'))
       return (
-        state.closingReadback ?? {
+        (manual ? undefined : state.closingReadback) ?? {
           repository: {
             nameWithOwner: state.associationRepo,
             pullRequest: {
               id: state.nodeId,
               number: state.associationPr,
               closingIssuesReferences: {
-                nodes: state.nonClosing
+                nodes: (manual ? !state.manualClosing : state.nonClosing && !state.manualClosing)
                   ? []
                   : [
                       {
@@ -1089,6 +1130,9 @@ describe('directory-independent exact-PR contract', () => {
       assert.match(creationHelp, /promote an existing associated PR with --head and --ready/u);
       assert.match(creationHelp, /Explicit remote head/u);
       assert.match(creationHelp, /--pr <number>/u);
+      assert.match(creationHelp, /--reconcile-non-closing-reference/u);
+      assert.match(creationHelp, /--expected-head <sha>/u);
+      assert.match(creationHelp, /--expected-base <sha>/u);
       for (const command of ['pr:create', 'pr:info', 'pr:review', 'pr:merge', 'finish']) {
         const modeHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), command, '--help'], {
           cwd: root,
@@ -1121,9 +1165,9 @@ describe('explicit native non-closing reference delivery', () => {
         }
         await startIssueBranch(context, 17);
         state.remoteHead = head;
-        const preview = await publishPr(context, { issueNumber: 17, nonClosing: true, dryRun: true });
+        const preview = await publishPr(context, { ...nonClosingCreation, dryRun: true });
         assert.equal(state.creations, 0);
-        const created = await publishPr(context, { issueNumber: 17, nonClosing: true });
+        const created = await publishPr(context, nonClosingCreation);
         assert.equal(state.creations, 1);
         const route = await preflightReviewRoute(context, 'main');
         assert.equal(route.rules.visibility, 'complete');
@@ -1170,7 +1214,7 @@ describe('explicit native non-closing reference delivery', () => {
         state.remoteHead = head;
         Object.assign(evidence, change);
         for (const operation of [
-          () => publishPr(context, { issueNumber: 17, nonClosing: true }),
+          () => publishPr(context, nonClosingCreation),
           () => {
             state.published = true;
             return submitFormalReview(reviewerContext, { ...input, artifact });
@@ -1198,10 +1242,10 @@ describe('explicit native non-closing reference delivery', () => {
       vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
       await startIssueBranch(context, 17);
       state.remoteHead = head;
-      const preview = await publishPr(context, { issueNumber: 17, nonClosing: true, dryRun: true });
+      const preview = await publishPr(context, { ...nonClosingCreation, dryRun: true });
       assert.equal(preview.nonClosing, true);
       assert.equal(state.creations, 0);
-      await publishPr(context, { issueNumber: 17, nonClosing: true });
+      await publishPr(context, nonClosingCreation);
       assert.equal(state.creations, 1);
       assert.equal(state.issueState, 'open');
       assert.equal(state.issueBody, 'Four retained criteria');
@@ -1297,10 +1341,7 @@ describe('explicit native non-closing reference delivery', () => {
       Object.assign(evidence, change);
       await startIssueBranch(context, 17);
       state.remoteHead = head;
-      await assert.rejects(
-        publishPr(context, { issueNumber: 17, nonClosing: true }),
-        /complete native rule visibility/u,
-      );
+      await assert.rejects(publishPr(context, nonClosingCreation), /complete native rule visibility/u);
       assert.equal(state.creations, 0);
       state.published = true;
       await assert.rejects(
@@ -1504,14 +1545,14 @@ describe('explicit native non-closing reference delivery', () => {
 
   it('keeps new PR publication behind native start/branch linkage and checks introduced messages first', async () => {
     const { context, state } = fixture(false, true);
-    await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /branch/u);
+    await assert.rejects(publishPr(context, nonClosingCreation), /branch/u);
     state.linked = true;
     state.remoteHead = head;
     state.commitMessage = 'Fixes: example/widget#99';
-    await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /closing directives/u);
+    await assert.rejects(publishPr(context, nonClosingCreation), /closing directives/u);
     assert.equal(state.creations, 0);
     state.commitMessage = 'Improve widget';
-    await publishPr(context, { issueNumber: 17, nonClosing: true });
+    await publishPr(context, nonClosingCreation);
     assert.equal(state.creations, 1);
     assert.equal(state.linked, false);
     assert.equal(state.issueState, 'open');
@@ -1866,12 +1907,9 @@ describe('exact created intent and native reader bounds', () => {
         if (drift === 'closed') state.prState = 'closed';
         if (drift === 'base') state.baseSha = 'd'.repeat(40);
       };
-      await assert.rejects(
-        publishPr(context, { issueNumber: 17, nonClosing: true }),
-        /created PR #23.*differs from publication intent/u,
-      );
+      await assert.rejects(publishPr(context, nonClosingCreation), /created PR #23.*differs from publication intent/u);
       assert.equal(state.creations, 1);
-      await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }));
+      await assert.rejects(publishPr(context, nonClosingCreation));
       assert.equal(state.creations, 1);
     });
   }
@@ -1983,6 +2021,246 @@ describe('explicit metadata transition typed authority', () => {
   }
 });
 
+describe('explicit closing-reference reconciliation', () => {
+  function pending(published = false) {
+    const f = fixture(published, true);
+    f.state.linked = !published;
+    f.state.remoteHead = head;
+    f.state.closingOnCreate = true;
+    if (published) {
+      f.state.manualClosing = true;
+      f.state.referenceCloses = true;
+    }
+    return f;
+  }
+  it('refuses bare nonClosing before creating the linked-branch PR with supported prerequisites', async () => {
+    const { context, state } = pending();
+    await assert.rejects(
+      publishPr(context, { issueNumber: 17, nonClosing: true }),
+      /reconcile-non-closing-reference.*expected-head.*expected-base/u,
+    );
+    assert.equal(state.creations + state.removals, 0);
+  });
+  it('creates one draft and removes only the exact manual closing pair before strict success', async () => {
+    const { context, state } = pending();
+    const preview = await publishPr(context, { ...nonClosingCreation, dryRun: true });
+    assert.ok('nonClosingVerified' in preview);
+    assert.equal(preview.nonClosingVerified, false);
+    assert.equal(state.creations + state.removals, 0);
+    const result = await publishPr(context, nonClosingCreation);
+    assert.equal(result.prNumber, 23);
+    assert.ok('nonClosingVerified' in result);
+    assert.equal(result.nonClosingVerified, true);
+    assert.deepEqual(state.events, ['draft-publication-replaces-branch-link', 'remove-exact-closing-pair']);
+    assert.equal(state.creations, 1);
+    assert.equal(state.removals, 1);
+    assert.equal(state.updates + state.promotions + state.submissions, 0);
+    assert.equal(state.issueState, 'open');
+    assert.equal(state.issueBody, 'Four retained criteria');
+    await prInfo(context, { issueNumber: 17, prNumber: 23, nonClosing: true });
+  });
+  it('skips removal when the new draft already satisfies the complete non-closing graph', async () => {
+    const { context, state } = pending();
+    state.closingOnCreate = false;
+    await publishPr(context, nonClosingCreation);
+    assert.equal(state.creations, 1);
+    assert.equal(state.removals, 0);
+  });
+  for (const change of [
+    { nonClosing: false },
+    { draft: false },
+    { body: undefined },
+    { expectedHeadSha: undefined },
+    { expectedBaseSha: undefined },
+    { expectedHeadSha: 'd'.repeat(40) },
+    { expectedBaseSha: 'd'.repeat(40) },
+    { expectedHeadSha: 'bad' },
+    { body: 'Closes #17' },
+  ]) {
+    it(`refuses incompatible action ${JSON.stringify(change)} before publication`, async () => {
+      const { context, state } = pending();
+      await assert.rejects(publishPr(context, Object.assign({ ...nonClosingCreation }, change)));
+      assert.equal(state.creations + state.removals + state.updates + state.promotions, 0);
+    });
+  }
+  it('does not infer removal authority from an implicitly matched existing PR', async () => {
+    const { context, state } = pending(true);
+    state.linked = true;
+    await assert.rejects(publishPr(context, nonClosingCreation), /explicit.*PR|--pr/u);
+    assert.equal(state.creations + state.removals, 0);
+  });
+  it('continues a caller-admitted exact pending PR without creating another', async () => {
+    const { context, state } = pending(true);
+    await publishPr(context, { ...nonClosingCreation, prNumber: 23 });
+    assert.equal(state.creations, 0);
+    assert.equal(state.removals, 1);
+  });
+  it('reads the complete manual connection before acting and checks both connections afterward', async () => {
+    const { context, state } = pending(true);
+    const first = structuredClone(await context.clients.graphql('DeliveryClosingIssues', {})) as {
+      repository: {
+        pullRequest: {
+          closingIssuesReferences: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+        };
+      };
+    };
+    const last = structuredClone(first);
+    first.repository.pullRequest.closingIssuesReferences.nodes = [];
+    first.repository.pullRequest.closingIssuesReferences.pageInfo = { hasNextPage: true, endCursor: 'manual-next' };
+    state.manualPages = [first, last];
+    state.removalHook = () => {
+      state.manualPages = [];
+    };
+    await publishPr(context, { ...nonClosingCreation, prNumber: 23 });
+    assert.ok(state.manualPageIndex >= 4);
+    assert.equal(state.removals, 1);
+    assert.equal(state.creations, 0);
+    await prInfo(context, { issueNumber: 17, prNumber: 23, nonClosing: true });
+  });
+  for (const kind of [
+    'foreign-later',
+    'duplicate-later',
+    'missing-node',
+    'wrong-pr',
+    'wrong-repo',
+    'incomplete-page',
+  ] as const) {
+    it(`refuses manual graph ${kind} before removal`, async () => {
+      const { context, state } = pending(true);
+      const graph = structuredClone(await context.clients.graphql('DeliveryClosingIssues', {})) as {
+        repository: {
+          nameWithOwner: string;
+          pullRequest: {
+            id: string;
+            closingIssuesReferences: {
+              nodes: Array<{ id: string; number: number }>;
+              pageInfo?: { hasNextPage: boolean; endCursor: string | null };
+            };
+          };
+        };
+      };
+      if (kind === 'missing-node') graph.repository.pullRequest.closingIssuesReferences.nodes[0]!.id = '';
+      if (kind === 'wrong-pr') graph.repository.pullRequest.id = 'FOREIGN';
+      if (kind === 'wrong-repo') graph.repository.nameWithOwner = 'other/widget';
+      if (kind === 'incomplete-page') delete graph.repository.pullRequest.closingIssuesReferences.pageInfo;
+      state.manualReadback = graph;
+      if (kind.endsWith('-later')) {
+        const next = structuredClone(graph);
+        if (kind === 'foreign-later') next.repository.pullRequest.closingIssuesReferences.nodes[0]!.number = 18;
+        graph.repository.pullRequest.closingIssuesReferences.pageInfo = { hasNextPage: true, endCursor: 'next' };
+        state.manualReadback = undefined;
+        state.manualPages = [graph, next];
+      }
+      await assert.rejects(publishPr(context, { ...nonClosingCreation, prNumber: 23 }));
+      assert.equal(state.removals + state.creations, 0);
+    });
+  }
+  it('treats malformed removal acknowledgement as uncertain and does not retry even after the edge disappeared', async () => {
+    const { context, state } = pending();
+    state.removalReadback = { removeCloseIssueReferences: { issue: { id: 'OTHER' } } };
+    await assert.rejects(publishPr(context, nonClosingCreation), /removal.*uncertain/u);
+    await publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true });
+    assert.equal(state.removals, 1);
+    assert.equal(state.creations, 1);
+  });
+  for (const kind of [
+    'auto-only',
+    'foreign',
+    'duplicate',
+    'truncated',
+    'cursor',
+    'actor',
+    'crossref',
+    'keyword',
+  ] as const) {
+    it(`refuses ${kind} graph without removing any pair`, async () => {
+      const { context, state } = pending(true);
+      const graph = structuredClone(await context.clients.graphql('DeliveryClosingIssues', {})) as {
+        repository: {
+          pullRequest: {
+            closingIssuesReferences: {
+              nodes: Array<{
+                __typename: string;
+                id: string;
+                number: number;
+                repository: { id: string; nameWithOwner: string };
+              }>;
+              pageInfo: { hasNextPage: boolean; endCursor: string | null };
+            };
+          };
+        };
+      };
+      if (kind === 'auto-only') {
+        state.closingReadback = graph;
+        state.manualClosing = false;
+      }
+      if (kind === 'foreign')
+        graph.repository.pullRequest.closingIssuesReferences.nodes.push({
+          __typename: 'Issue',
+          id: 'OTHER',
+          number: 18,
+          repository: { id: 'REPO', nameWithOwner: repo },
+        });
+      if (kind === 'duplicate')
+        graph.repository.pullRequest.closingIssuesReferences.nodes.push(
+          graph.repository.pullRequest.closingIssuesReferences.nodes[0]!,
+        );
+      if (kind === 'truncated') graph.repository.pullRequest.closingIssuesReferences.pageInfo.hasNextPage = true;
+      if (kind === 'cursor')
+        graph.repository.pullRequest.closingIssuesReferences.pageInfo = { hasNextPage: true, endCursor: 'same' };
+      if (['foreign', 'duplicate', 'truncated', 'cursor'].includes(kind)) state.closingReadback = graph;
+      if (kind === 'actor') state.referenceActor = 'other';
+      if (kind === 'crossref') state.referenceCloses = false;
+      if (kind === 'keyword') state.commitMessage = 'Fixes #18';
+      await assert.rejects(publishPr(context, { ...nonClosingCreation, prNumber: 23 }));
+      assert.equal(state.creations + state.removals + state.promotions + state.updates, 0);
+    });
+  }
+  for (const remains of [false, true]) {
+    it(`reports uncertain removal once and permits only read-only reconciliation; edge remains ${remains}`, async () => {
+      const { context, state } = pending();
+      state.failRemovalAck = true;
+      state.keepClosingOnRemoval = remains;
+      await assert.rejects(publishPr(context, nonClosingCreation), /PR #23.*removal.*uncertain/u);
+      assert.equal(state.removals, 1);
+      assert.equal(state.creations, 1);
+      // An unresolved receipt does not authorize the trusted caller to request another removal.
+      if (remains) await assert.rejects(prInfo(context, { issueNumber: 17, prNumber: 23, nonClosing: true }));
+      else await publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true });
+      assert.equal(state.removals, 1);
+      assert.equal(state.creations, 1);
+    });
+  }
+  it('recovers a proven pre-action non-attempt with caller-admitted continuation on the same PR', async () => {
+    const { context, state } = pending();
+    state.referenceActor = 'other';
+    await assert.rejects(publishPr(context, nonClosingCreation), /removal not attempted/u);
+    assert.equal(state.removals, 0);
+    state.referenceActor = 'author';
+    await publishPr(context, { ...nonClosingCreation, prNumber: 23 });
+    assert.equal(state.creations, 1);
+    assert.equal(state.removals, 1);
+  });
+  it('does not remove anything after uncertain create acknowledgement or create again on read-only inspection', async () => {
+    const { context, state } = pending();
+    state.failCreateAck = true;
+    await assert.rejects(publishPr(context, nonClosingCreation), /acknowledgement is uncertain/u);
+    await assert.rejects(prInfo(context, { issueNumber: 17, prNumber: 23, nonClosing: true }));
+    assert.equal(state.creations, 1);
+    assert.equal(state.removals, 0);
+  });
+  it('refuses post-removal drift without rollback, promotion or another attempt', async () => {
+    const { context, state } = pending();
+    state.removalHook = () => {
+      state.draft = false;
+    };
+    await assert.rejects(publishPr(context, nonClosingCreation), /unresolved/u);
+    assert.equal(state.removals, 1);
+    assert.equal(state.creations, 1);
+    assert.equal(state.updates + state.promotions, 0);
+  });
+});
+
 describe('later-read publication and pre-creation parent bound', () => {
   for (const drift of ['body', 'title', 'draft', 'closed', 'merged', 'base'] as const) {
     it(`refuses later ${drift} drift after the first correct created PR read`, async () => {
@@ -2001,7 +2279,7 @@ describe('later-read publication and pre-creation parent bound', () => {
         }
         if (drift === 'base') state.baseSha = 'd'.repeat(40);
       };
-      await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /created PR #23.*unresolved/u);
+      await assert.rejects(publishPr(context, nonClosingCreation), /created PR #23.*unresolved/u);
       assert.equal(state.creations, 1);
     });
   }
@@ -2029,7 +2307,7 @@ describe('later-read publication and pre-creation parent bound', () => {
         { sha: head, commit: { message: 'Safe message' }, parents: Array.from({ length: 101 }, () => ({ sha: base })) },
       ],
     };
-    await assert.rejects(publishPr(context, { issueNumber: 17, nonClosing: true }), /Incomplete/u);
+    await assert.rejects(publishPr(context, nonClosingCreation), /Incomplete/u);
     assert.equal(state.creations, 0);
   });
 });
