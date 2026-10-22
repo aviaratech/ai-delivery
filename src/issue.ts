@@ -708,11 +708,70 @@ export function capacityNextPage(
   return page + 1;
 }
 
+function nativeReadNextPage(
+  response: { data: unknown; headers?: { link?: string } },
+  page: number,
+  path: string,
+): number | null {
+  if (!Array.isArray(response.data) || response.data.length > 100)
+    throw new DeliveryError('Parent progress native pagination returned invalid page data.');
+  const link = response.headers?.link;
+  if (link === undefined || link === '') return response.data.length === 100 ? page + 1 : null;
+  if (typeof link !== 'string') throw new DeliveryError('Parent progress native pagination is malformed.');
+  const parts = [...link.matchAll(/<([^>]+)>;\s*rel="([^"]+)"/gu)];
+  const residue = link.replace(/<([^>]+)>;\s*rel="([^"]+)"/gu, '').replace(/[,\s]/gu, '');
+  const next = parts.filter((part) => part[2] === 'next');
+  if (
+    !parts.length ||
+    residue ||
+    new Set(parts.map((part) => part[2])).size !== parts.length ||
+    parts.some((part) => !['first', 'prev', 'next', 'last'].includes(part[2]!))
+  )
+    throw new DeliveryError('Parent progress native pagination is malformed.');
+  for (const part of parts) {
+    let url: URL;
+    try {
+      url = new URL(part[1]!);
+    } catch {
+      throw new DeliveryError('Parent progress native pagination URL is malformed.');
+    }
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'api.github.com' ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.hash ||
+      url.pathname.toLowerCase() !== path.toLowerCase() ||
+      url.searchParams.getAll('page').length !== 1 ||
+      url.searchParams.getAll('per_page').length !== 1 ||
+      [...url.searchParams.keys()].some((key) => !['page', 'per_page'].includes(key)) ||
+      !/^[1-9]\d*$/u.test(url.searchParams.get('page') ?? '') ||
+      url.searchParams.get('per_page') !== '100'
+    )
+      throw new DeliveryError('Parent progress native pagination changed repository, endpoint or page scope.');
+    const declaredPage = Number(url.searchParams.get('page'));
+    const afterLast = response.data.length === 0 && declaredPage === page - 1 && !next.length;
+    if (
+      !Number.isSafeInteger(declaredPage) ||
+      (part[2] === 'next' && declaredPage !== page + 1) ||
+      (part[2] === 'prev' && declaredPage !== page - 1) ||
+      (part[2] === 'first' && declaredPage !== 1) ||
+      (part[2] === 'last' && !afterLast && (declaredPage < page || declaredPage > page !== next.length > 0))
+    )
+      throw new DeliveryError('Parent progress native pagination did not advance consistently.');
+  }
+  if (next.length && response.data.length === 0)
+    throw new DeliveryError('Parent progress native pagination claims continuation after an empty page.');
+  return next.length ? page + 1 : null;
+}
+
 async function issueFieldPages(
   context: DeliveryContext,
   route: string,
   parameters: Record<string, unknown>,
   maxPages?: number,
+  strictRead = false,
 ): Promise<unknown[]> {
   const values: unknown[] = [];
   const seenPages = new Set<string>();
@@ -739,12 +798,22 @@ async function issueFieldPages(
       throw new DeliveryError('Native issue fields repeated a pagination page.');
     seenPages.add(fingerprint);
     values.push(...(response.data as unknown[]));
-    if (maxPages === undefined ? response.data.length < 100 : capacityNextPage(response, page, 100) === null)
-      return values;
+    const next = strictRead
+      ? nativeReadNextPage(
+          response,
+          page,
+          route.slice(4).replace(/\{([^}]+)\}/gu, (_match, key: string) => encodeURIComponent(String(parameters[key]))),
+        )
+      : maxPages === undefined
+        ? response.data.length < 100
+          ? null
+          : page + 1
+        : capacityNextPage(response, page, 100);
+    if (next === null) return values;
   }
 }
 
-async function readIssueFieldCatalog(context: DeliveryContext, capacityRead = false) {
+async function readIssueFieldCatalog(context: DeliveryContext, capacityRead = false, strictRead = false) {
   const catalog = z
     .array(FieldCatalogEntry)
     .parse(
@@ -753,6 +822,7 @@ async function readIssueFieldCatalog(context: DeliveryContext, capacityRead = fa
         'GET /orgs/{org}/issue-fields',
         { org: context.config.native.organization },
         capacityRead ? Math.min(context.readPageLimit ?? 20, 20) : context.readPageLimit,
+        strictRead,
       ),
     );
   if (
@@ -768,6 +838,7 @@ async function readIssueFields(
   issueNumber: number,
   catalog: Awaited<ReturnType<typeof readIssueFieldCatalog>>,
   capacityRead = false,
+  strictRead = false,
 ) {
   const fields: ListedTrackingIssue['fields'] = Object.fromEntries(catalog.map((field) => [field.name, null]));
   const values = z.array(FieldValueEntry).parse(
@@ -779,6 +850,7 @@ async function readIssueFields(
         issue_number: issueNumber,
       },
       capacityRead ? Math.min(context.readPageLimit ?? 20, 20) : context.readPageLimit,
+      strictRead,
     ),
   );
   const observed = new Set<number>();
@@ -816,6 +888,15 @@ async function readIssueFields(
         ? field.value
         : undefined;
     if (
+      strictRead &&
+      (field.data_type === 'single_select'
+        ? field.single_select_option == null && configuredOptionName === undefined && field.value !== null
+        : field.data_type === 'multi_select'
+          ? field.multi_select_options === undefined && field.value !== null
+          : field.value === undefined)
+    )
+      throw new DeliveryError('Parent progress native field value payload is missing or malformed.');
+    if (
       ((field.data_type === 'single_select' && !field.single_select_option && configuredOptionName === undefined) ||
         (field.data_type === 'multi_select' && field.multi_select_options === undefined)) &&
       field.value !== null &&
@@ -845,8 +926,14 @@ async function readIssueFields(
 }
 
 /** The same native-field composition used by issue-info, without unrelated Project/relationship reads. */
-export async function readIssueNativeFields(context: DeliveryContext, issueNumber: number) {
-  return readIssueFields(context, issueNumber, await readIssueFieldCatalog(context));
+export async function readIssueNativeFields(context: DeliveryContext, issueNumber: number, strictRead = false) {
+  return readIssueFields(
+    context,
+    issueNumber,
+    await readIssueFieldCatalog(context, false, strictRead),
+    false,
+    strictRead,
+  );
 }
 
 async function prepareIssueDates(context: DeliveryContext, patch: NativeIssueDatePatch) {
@@ -1971,7 +2058,21 @@ export async function resumeCreatedIssue(context: DeliveryContext, input: Update
   return updateIssue(context, { ...input, preserveHistory: input.preserveHistory ?? false });
 }
 
+export interface IssueChildProgress {
+  childCount: number;
+  closedChildCount: number;
+  percentClosed: number;
+  pointsTotal: number | null;
+  inProgressChildren: number[] | null;
+  nextTargetDate: string | null;
+  missingPoints: number[];
+  missingProjectStatus: number[];
+  undatedOpenChildren: number[];
+  targetDateConfigured: boolean;
+}
+
 export interface IssueInfo {
+  childProgress?: IssueChildProgress;
   deferred?: IssueDeferralData | null;
   routing?: LoadedDeliveryConfig['routing'];
   blockedBy: number[];
@@ -2011,8 +2112,10 @@ async function readIssueInfo(
         `/${repo.owner}/${repo.repo}/issues/${String(issueNumber)}`.toLowerCase())
   )
     throw new DeliveryError('Native closure readback returned a foreign issue identity.');
+  const children = includeProject ? await readDirectIssueChildren(context, issueNumber, issue) : [];
+  const strictRead = children.length > 0;
   const [nativeFields, relationships, project] = await Promise.all([
-    readIssueNativeFields(context, issueNumber),
+    readIssueNativeFields(context, issueNumber, strictRead),
     getNativeBlockerRelationships({
       graphql: clients.graphql,
       issueNumber,
@@ -2037,6 +2140,7 @@ async function readIssueInfo(
     nativeIssueSettingsFromDeliveryConfig(config),
   );
   const info: IssueInfo = {
+    ...(children.length ? { childProgress: await readChildProgress(context, children, nativeFields.catalog) } : {}),
     ...deferralReadback(issue.body, issue.title),
     ...(context.configuration ? { routing: context.configuration.routing } : {}),
     blockedBy: relationships.blockers.filter((blocker) => blocker.state === 'OPEN').map((blocker) => blocker.number),
@@ -2081,15 +2185,164 @@ function deferralReadback(body: string | null | undefined, title: string): { def
   }
 }
 
+const DirectIssueChild = z.object({
+  id: z.number().int().positive().safe(),
+  number: z.number().int().positive().safe(),
+  node_id: z
+    .string()
+    .min(1)
+    .refine((value) => value.trim() === value && value.trim().length > 0),
+  state: z.enum(['open', 'closed']),
+  url: z.url(),
+  html_url: z.url(),
+  repository_url: z.url(),
+});
+
+async function readDirectIssueChildren(
+  context: DeliveryContext,
+  issueNumber: number,
+  parent: { id: number; node_id: string },
+) {
+  const children: z.infer<typeof DirectIssueChild>[] = [];
+  const numbers = new Set<number>(),
+    ids = new Set<number>(),
+    nodes = new Set<string>();
+  const repositoryPath = `/repos/${context.repo.owner}/${context.repo.repo}`;
+  for (let page = 1; ; page += 1) {
+    if (context.readPageLimit !== undefined && page > context.readPageLimit)
+      throw new CollectionLimitError({
+        collection: 'native-sub-issues',
+        pagesRequested: page - 1,
+        rowsObserved: children.length,
+        limit: context.readPageLimit,
+      });
+    const response = await context.clients.rest.issues.listSubIssues({
+      ...context.repo,
+      issue_number: issueNumber,
+      page,
+      per_page: 100,
+    });
+    const next = nativeReadNextPage(response, page, `${repositoryPath}/issues/${issueNumber}/sub_issues`);
+    for (const raw of response.data) {
+      if (Object.hasOwn(raw, 'pull_request')) throw new DeliveryError('Parent progress child is a pull request.');
+      const child = DirectIssueChild.parse(raw);
+      if (
+        child.number === issueNumber ||
+        child.id === parent.id ||
+        child.node_id === parent.node_id ||
+        numbers.has(child.number) ||
+        ids.has(child.id) ||
+        nodes.has(child.node_id)
+      )
+        throw new DeliveryError('Parent progress has duplicate or self-referencing child identities.');
+      for (const [value, host, path] of [
+        [child.url, 'api.github.com', `${repositoryPath}/issues/${child.number}`],
+        [child.repository_url, 'api.github.com', repositoryPath],
+        [child.html_url, 'github.com', `/${context.repo.owner}/${context.repo.repo}/issues/${child.number}`],
+      ]) {
+        const url = new URL(value!);
+        if (
+          url.protocol !== 'https:' ||
+          url.hostname !== host ||
+          url.port ||
+          url.username ||
+          url.password ||
+          url.search ||
+          url.hash ||
+          url.pathname.toLowerCase() !== path!.toLowerCase()
+        )
+          throw new DeliveryError('Parent progress child repository or issue-number identity disagrees.');
+      }
+      numbers.add(child.number);
+      ids.add(child.id);
+      nodes.add(child.node_id);
+      children.push(child);
+    }
+    if (next === null) return children.sort((left, right) => left.number - right.number);
+  }
+}
+
+async function readChildProgress(
+  context: DeliveryContext,
+  children: Awaited<ReturnType<typeof readDirectIssueChildren>>,
+  catalog: Awaited<ReturnType<typeof readIssueFieldCatalog>>,
+): Promise<IssueChildProgress> {
+  const date = catalog.find((field) => field.name === 'Target date');
+  if (date && date.data_type !== 'date')
+    throw new DeliveryError('Parent progress Target date has an incompatible type.');
+  const pointField = catalog.find((field) => field.name === context.config.native.points.name);
+  if (
+    pointField &&
+    (String(pointField.id) !== context.config.native.points.databaseId || pointField.data_type !== 'single_select')
+  )
+    throw new DeliveryError('Parent progress configured Points field identity or type disagrees.');
+  const configuration =
+    context.projectConfiguration ??
+    (await getProjectDeliveryConfiguration({
+      graphql: context.clients.graphql,
+      org: context.config.native.organization,
+      settings: projectSettingsFromDeliveryConfig(context.config),
+      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
+    }));
+  const progress: IssueChildProgress = {
+    childCount: children.length,
+    closedChildCount: children.filter((child) => child.state === 'closed').length,
+    percentClosed: 0,
+    pointsTotal: 0,
+    inProgressChildren: [],
+    nextTargetDate: null,
+    missingPoints: [],
+    missingProjectStatus: [],
+    undatedOpenChildren: [],
+    targetDateConfigured: date !== undefined,
+  };
+  let pointsTotal = 0;
+  const inProgress: number[] = [];
+  for (const child of children) {
+    const fields = await readIssueFields(context, child.number, catalog, false, true);
+    const points = fields.values.find(
+      (field) => String(field.issue_field_id) === context.config.native.points.databaseId,
+    );
+    if (!points || (points.value === null && points.single_select_option == null))
+      progress.missingPoints.push(child.number);
+    else {
+      const parsed = parseConfiguredNativeIssueMetadata(
+        [points],
+        nativeIssueSettingsFromDeliveryConfig(context.config),
+      );
+      if (parsed.points === undefined)
+        throw new DeliveryError('Parent progress configured Points readback is missing.');
+      pointsTotal += parsed.points;
+      if (!Number.isSafeInteger(pointsTotal))
+        throw new DeliveryError('Parent progress Points aggregate exceeds the safe integer range.');
+    }
+    const status = await getIssueProjectStatus({
+      graphql: context.clients.graphql,
+      org: context.config.native.organization,
+      issueNodeId: child.node_id,
+      configuration,
+      settings: projectSettingsFromDeliveryConfig(context.config),
+      capacityRead: true,
+      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
+    });
+    if (status === null) progress.missingProjectStatus.push(child.number);
+    else if (status.status === 'In Progress') inProgress.push(child.number);
+    if (child.state === 'open') {
+      const value = date === undefined ? null : fields.fields['Target date'];
+      if (typeof value !== 'string') progress.undatedOpenChildren.push(child.number);
+      else if (progress.nextTargetDate === null || value < progress.nextTargetDate) progress.nextTargetDate = value;
+    }
+  }
+  progress.percentClosed = Math.round((1000 * progress.closedChildCount) / progress.childCount) / 10;
+  progress.pointsTotal = progress.missingPoints.length ? null : pointsTotal;
+  progress.inProgressChildren = progress.missingProjectStatus.length ? null : inProgress;
+  return progress;
+}
+
 export async function listIssueSubissues(context: DeliveryContext, issueNumber: number): Promise<number[]> {
   const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
   if ('pull_request' in issue) throw new DeliveryError('Requested issue number is a pull request.');
-  const children = await context.clients.rest.paginate(context.clients.rest.issues.listSubIssues, {
-    ...context.repo,
-    issue_number: issueNumber,
-    per_page: 100,
-  });
-  return children.map((child) => child.number).sort((left, right) => left - right);
+  return (await readDirectIssueChildren(context, issueNumber, issue)).map((child) => child.number);
 }
 
 export async function readyCheck(

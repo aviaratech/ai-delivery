@@ -328,6 +328,25 @@ Setting fields uses additive native updates; clearing an already unset date is
 idempotent. A creation failure after a native issue exists reports that known
 issue so recovery never creates a replacement.
 
+For a parent with direct native subissues, `issue_info.childProgress` adds:
+
+| Property | Meaning |
+| --- | --- |
+| `childCount`, `closedChildCount` | Direct children and children whose native issue state is closed. Descendants are not counted again. |
+| `percentClosed` | Closed child count divided by child count, in percentage units rounded to one decimal. It is not weighted by Points. |
+| `pointsTotal`, `missingPoints` | Sum of configured Points across all direct children, or `null` with the unavailable children's numbers. Unsafe integer totals refuse. |
+| `inProgressChildren`, `missingProjectStatus` | Numerically sorted child numbers with live configured Project Status In Progress, including closed children with that status. If any status is unavailable, membership is `null` and those children are identified. |
+| `nextTargetDate`, `undatedOpenChildren` | Earliest calendar date among dated open children, including overdue dates, or `null`; open children without dates are listed separately. Closed-child dates are excluded. |
+| `targetDateConfigured` | Whether a date field named Target date exists. If false, the next date is `null` and every open child is listed as undated. |
+
+A complete empty child list leaves `childProgress` absent and preserves the leaf
+readback. Missing, archived or unset Project status is unavailable, not inferred
+from an open issue. Explicitly unset Points is unavailable; malformed values,
+wrong field types, ambiguous identities, cross-repository child relationships,
+failed reads and incomplete pagination refuse the aggregate. The read performs
+no issue, relationship or Project writes. CLI, MCP and library readback share
+these rules.
+
 Batch input is a UTF-8 JSON array of **1–50** complete `issue_update` inputs;
 MCP takes `{repo, items, dryRun}`. All items use the selected repository, including
 any per-item `repo`. Close, defer/undefer, parent, blockers, typed contract,

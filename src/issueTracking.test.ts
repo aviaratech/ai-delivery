@@ -41,6 +41,8 @@ function updateFixture() {
     driftAfterUpdate: false,
     projectFailure: '' as '' | 'rate-limit' | 'cancel',
     nativeReadsAfterUpdate: 0,
+    failChildReadAfterUpdate: false,
+    childReadsAfterUpdate: 0,
   };
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
   const updates: Record<string, unknown>[] = [];
@@ -58,6 +60,11 @@ function updateFixture() {
       },
       rest: {
         issues: {
+          listSubIssues: async () => {
+            if (updates.length) controls.childReadsAfterUpdate++;
+            if (updates.length && controls.failChildReadAfterUpdate) throw new Error('Child progress unavailable');
+            return { data: [] };
+          },
           get: async (input: { issue_number: number }) => {
             if (updates.length) controls.nativeReadsAfterUpdate++;
             if (updates.length && controls.nativeUnavailableAfterUpdate) throw new Error('Native unavailable');
@@ -314,6 +321,36 @@ test.each(['archive', 'unavailable'] as const)(
     }
   },
 );
+
+test('native fallback confirms committed closure without requiring child progress', async () => {
+  const f = updateFixture();
+  try {
+    f.controls.archiveAfterUpdate = true;
+    f.controls.failChildReadAfterUpdate = true;
+    await assert.rejects(
+      issue.updateIssue(f.context, {
+        issueNumber: 17,
+        body: 'Replacement',
+        draft: true,
+        state: 'closed',
+        closeReason: 'not_planned',
+      }),
+      (error: unknown) => {
+        const result = issue.getIncompleteIssueUpdate(error);
+        assert.equal(result?.native.status, 'confirmed');
+        assert.equal(result?.native.readback?.state, 'closed');
+        assert.match(result?.native.readback?.body ?? '', /Replacement/u);
+        assert.equal(result?.native.closure?.closeReason, 'not_planned');
+        assert.equal(result?.native.readback?.childProgress, undefined);
+        return true;
+      },
+    );
+    assert.equal(f.updates.length, 1);
+    assert.equal(f.controls.childReadsAfterUpdate, 1);
+  } finally {
+    f.cleanup();
+  }
+});
 
 test.each(['unavailable', 'foreign', 'drift', 'node'] as const)(
   'post-commit native %s evidence remains unknown',
@@ -830,6 +867,13 @@ test.each([
 ] as const)('reconciliation bounds native %s through %s reads', async (collection, entry) => {
   const { context } = listingFixture();
   Object.assign(context, { readPageLimit: 20 });
+  if (entry === 'ready')
+    context.clients.rest.issues.listSubIssues = (async (input: Record<string, unknown>) => {
+      assert.equal(input.owner, 'example');
+      assert.equal(input.repo, 'widget');
+      assert.equal(input.issue_number, 17);
+      return { data: [] };
+    }) as unknown as typeof context.clients.rest.issues.listSubIssues;
   context.clients.rest.issues.get = (async () => ({
     data: {
       number: 17,

@@ -644,7 +644,10 @@ async function fetchProjectDeliveryItemNodes(
     }
     nodes.push(...(items.nodes as unknown[]));
     const pageInfo = requireRecord(items.pageInfo, 'GitHub omitted delivery Project item pagination.');
-    if ((input.capacityRead || input.strictProjection) && typeof pageInfo.hasNextPage !== 'boolean')
+    if (
+      ((input.capacityRead || input.strictProjection) && typeof pageInfo.hasNextPage !== 'boolean') ||
+      (input.capacityRead && pageInfo.endCursor !== null && typeof pageInfo.endCursor !== 'string')
+    )
       throw new DeliveryError('WIP capacity Project pagination is incomplete.');
     hasNextPage = pageInfo.hasNextPage === true;
     const nextCursor = typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null;

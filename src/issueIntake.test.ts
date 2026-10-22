@@ -388,7 +388,21 @@ function fixture() {
       authenticatedAuthor: async () => ({ actorLogin: 'operator', credentialIdentity: 'user:1' }),
       rest: {
         issues: {
-          listSubIssues: async () => ({ data: controls.trackingParent ? [{ number: 18 }] : [] }),
+          listSubIssues: async () => ({
+            data: controls.trackingParent
+              ? [
+                  {
+                    ...live,
+                    number: 18,
+                    id: 118,
+                    node_id: 'ISSUE18',
+                    html_url: 'https://github.com/example/widget/issues/18',
+                    url: 'https://api.github.com/repos/example/widget/issues/18',
+                    repository_url: 'https://api.github.com/repos/example/widget',
+                  },
+                ]
+              : [],
+          }),
           get: async (input: { issue_number: number }) => {
             if (controls.driftBeforeUpdate && ++issueReads > 1) live.body = 'Concurrent operator edit';
             if (controls.capacityMode && input.issue_number !== 17) {
