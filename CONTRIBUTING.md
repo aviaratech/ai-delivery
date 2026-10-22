@@ -40,9 +40,13 @@ macOS synthetic fixtures do not mistake `/var` or `/tmp` aliases for managed
 plugin symlinks; this creates no new destination or host setting.
 The PR entry `npm run checks`, used by current CI, runs `scripts/checks.mjs`:
 formatting, native type-aware lint, strict TypeScript, a **clean single build**,
-all intended PR cases in the compiled Vitest files with one worker, and complete
+all intended PR cases in the compiled Vitest files, and complete
 dry inventory validation. Release cases are excluded by the native `release`
 tag and the default test configuration, including direct focused invocations.
+Independent files use a two-worker fork project; process/interruption fixtures
+use a serial project that runs after it. Both projects inherit a 60-second
+default test timeout. Existing case-specific operation and drain bounds remain;
+the existing 15-minute CI job limit is the backstop for native blocking.
 The immutable
 `contributor-checks@1` snapshot records those six gates; its `fullSuccess` means
 PR producer success. It reports `artifactQualified: false` and explicitly records

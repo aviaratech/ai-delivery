@@ -13,13 +13,46 @@ if (lane === 'release') {
   }
 }
 
+// These fixtures assert process ownership, interruption or shared checkout state.
+const serialFiles = [
+  'dist/contributorChecks.test.js',
+  'dist/currentConsumer.test.js',
+  'dist/delivery/delivery.test.js',
+  'dist/lifecycle.test.js',
+  'dist/pluginAuthProbe.test.js',
+  'dist/pluginInstaller.test.js',
+  'dist/pluginPackaging.test.js',
+  'dist/setup.test.js',
+  'dist/stagedChecks.test.js',
+  'dist/targetPolicyLocal.test.js',
+  'dist/worktreeTransition.test.js',
+];
+
 export default defineConfig({
   test: {
     tags: [{ name: 'release', description: 'Owned archive/install qualification', skip: lane !== 'release' }],
-    include: ['dist/**/*.test.js'],
-    fileParallelism: false,
-    maxWorkers: 1,
-    // Recovery checks prove bounded operations and cancellation; elapsed test time is not their completion contract.
-    testTimeout: 0,
+    pool: 'forks',
+    testTimeout: 60_000,
+    projects: [
+      {
+        test: {
+          name: 'parallel',
+          include: ['dist/**/*.test.js'],
+          exclude: serialFiles,
+          fileParallelism: true,
+          maxWorkers: 2,
+          sequence: { groupOrder: 0 },
+        },
+      },
+      {
+        test: {
+          name: 'serial',
+          include: serialFiles,
+          fileParallelism: false,
+          maxWorkers: 1,
+          sequence: { groupOrder: 1 },
+        },
+      },
+    ],
   },
 });
