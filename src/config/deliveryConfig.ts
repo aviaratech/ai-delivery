@@ -290,6 +290,8 @@ export interface LoadedDeliveryConfig {
   routing: DeliveryRouting;
 }
 export type GitHubDeliveryConfig = Pick<DeliveryConfig, 'roles' | 'repository' | 'native'> & {
+  /** Command-local names only, captured before profile selection. */
+  credentialKeyReferences?: readonly string[];
   schemaVersion: 'ai-delivery.github@1';
   wipLimits?: WipLane[] | undefined;
 };
@@ -367,6 +369,7 @@ const UserSettingsSchema = z
   });
 export type UserDeliverySettings = z.infer<typeof UserSettingsSchema>;
 export interface LoadedDeliverySettings {
+  credentialKeyReferences?: readonly string[];
   environment?: NodeJS.ProcessEnv;
   wipLimits?: WipLane[] | undefined;
   roles: DeliveryConfig['roles'];
@@ -442,7 +445,21 @@ export async function loadDeliverySettings(
       .join('; ');
     throw new DeliveryError(`Invalid user configuration ${path}: ${details}`);
   }
+  const sourceDigest = digestValue(result.data);
   const { roles, reviewerProfiles, checkoutRoots, wipLimits, schemaVersion: _schema, ...overrides } = result.data;
+  const credentialKeyReferences = [
+    ...new Set(
+      [roles.author, roles.reviewer, ...Object.values(reviewerProfiles ?? {})].flatMap((role) =>
+        'credentialEnv' in role
+          ? role.authSource === 'personal'
+            ? [role.credentialEnv.token]
+            : [role.credentialEnv.privateKeyPath]
+          : appCredentialSource(role).type === 'env'
+            ? [privateKeyVariable(role)]
+            : [],
+      ),
+    ),
+  ];
   if (options.reviewerIdentity !== undefined) {
     const identity = options.reviewerIdentity;
     const selected = identity === roles.reviewer.identity ? roles.reviewer : reviewerProfiles?.[identity];
@@ -454,6 +471,17 @@ export async function loadDeliverySettings(
   }
   const environment: NodeJS.ProcessEnv = {};
   if (options.prepareEnvironment) {
+    const selectors: readonly string[] = [...MACHINE_AUTH_ENV_NAMES, 'TMPDIR', 'TEMP', 'TMP'];
+    if (credentialKeyReferences.some((name) => selectors.includes(name)))
+      throw new DeliveryError('Credential reference conflicts with an implicit execution selector.');
+    const reviewerSource = 'appId' in roles.reviewer ? appCredentialSource(roles.reviewer) : undefined;
+    if (
+      reviewerSource?.type === 'command' &&
+      reviewerSource.env?.some((name) => credentialKeyReferences.includes(name))
+    )
+      throw new DeliveryError(
+        'Selected helper environment cannot include an author or configured private-key reference.',
+      );
     const names = new Set<string>([
       ...MACHINE_AUTH_ENV_NAMES,
       'TMPDIR',
@@ -472,13 +500,14 @@ export async function loadDeliverySettings(
     environment.AI_DELIVERY_CONFIG = path;
   }
   return {
+    credentialKeyReferences,
     ...(options.prepareEnvironment ? { environment } : {}),
     roles,
     checkoutRoots,
     ...(wipLimits === undefined ? {} : { wipLimits }),
     configPath: path,
     overrides,
-    sourceDigest: digestValue(result.data),
+    sourceDigest,
   };
 }
 
@@ -541,6 +570,9 @@ export async function loadDeliveryConfig(
     throw error;
   }
   const config: GitHubDeliveryConfig = {
+    ...(settings.credentialKeyReferences === undefined
+      ? {}
+      : { credentialKeyReferences: settings.credentialKeyReferences }),
     ...(settings.wipLimits === undefined ? {} : { wipLimits: settings.wipLimits }),
     schemaVersion: 'ai-delivery.github@1',
     repository: routing.repository,

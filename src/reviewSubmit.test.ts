@@ -240,6 +240,7 @@ globalThis.fetch=async(input,init={})=>{
       PATH: bin,
       AI_DELIVERY_CONFIG: settings,
       AUTHOR_TOKEN: 'fixture_author',
+      LOGNAME: 'fixture-user',
       FIXTURE_HELPER_AUTH: 'fixture_helper_auth',
       UNUSED_APP_KEY: 'FICTIONAL_UNUSED_PRIVATE_KEY',
       SELECTED_KEY: readFileSync(key, 'utf8'),
@@ -506,6 +507,21 @@ test('selected profile environment preserves machine selectors and excludes unus
     for (const name of ['UNUSED_KEY', 'DEFAULT_KEY', 'NODE_OPTIONS'])
       assert.equal(selected.environment[name], undefined);
     assert.equal(inherited.UNUSED_KEY, 'FICTIONAL_UNUSED_KEY');
+    const changed = JSON.parse(readFileSync(config, 'utf8')) as {
+      roles: { reviewer: { credentialSource: { variable: string } } };
+    };
+    changed.roles.reviewer.credentialSource.variable = 'NEW_DEFAULT_KEY';
+    writeFileSync(config, JSON.stringify(changed));
+    const next = await loadDeliverySettings(undefined, {
+      reviewerIdentity: 'custom-checker',
+      env: inherited,
+      prepareEnvironment: true,
+    });
+    assert.notEqual(
+      next.sourceDigest,
+      selected.sourceDigest,
+      'The source digest must bind unselected key references too.',
+    );
   } finally {
     vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
@@ -629,6 +645,7 @@ test('credential cancellation and response timeout await owned helper and descen
           HOME: fixture.root,
           PATH: '/usr/bin:/bin',
           AUTHOR_TOKEN: 'fixture_author',
+          LOGNAME: 'fixture-user',
         },
       });
       const controller = new AbortController();
@@ -675,4 +692,75 @@ test('ambiguous or reserved reviewer profiles fail closed before source selectio
   } finally {
     fixture.cleanup();
   }
+});
+
+test.each(['unselected-profile-key', 'implicit-author-selector'] as const)(
+  'credential reference collisions refuse before helper launch: %s',
+  (collision) => {
+    const fixture = commandFixture();
+    try {
+      const input = JSON.parse(readFileSync(fixture.settings, 'utf8')) as {
+        roles: { author: { credentialEnv: { token: string } }; reviewer: Record<string, unknown> };
+        reviewerProfiles: Record<string, unknown>;
+      };
+      if (collision === 'unselected-profile-key') {
+        input.reviewerProfiles['other-key'] = {
+          ...input.roles.reviewer,
+          identity: 'other-key',
+          credentialSource: { type: 'env', variable: 'UNUSED_APP_KEY' },
+        };
+        input.roles.reviewer.credentialSource = {
+          type: 'command',
+          argv: [fixture.helper, 'gpt-reviewer'],
+          encoding: 'base64',
+          env: ['UNUSED_APP_KEY'],
+        };
+      } else input.roles.author.credentialEnv.token = 'LOGNAME';
+      writeFileSync(fixture.settings, JSON.stringify(input));
+      const result = fixture.run({ doctor: true });
+      assert.notEqual(result.status, 0);
+      assert.equal(result.resolutions.length, 0);
+      assert.equal(result.requests.length, 0);
+      assert.equal((result.stdout + result.stderr).includes('FICTIONAL_UNUSED_PRIVATE_KEY'), false);
+    } finally {
+      fixture.cleanup();
+    }
+  },
+);
+
+test('verdict scope preserves valid Git filenames with edge whitespace', async () => {
+  const paths = [' change.ts '];
+  const parsed = reviews.parseReviewVerdict({ ...verdict(), scope: { ...verdict().scope, changedPaths: paths } });
+  assert.deepEqual(parsed.scope.changedPaths, paths);
+  const artifact = reviews.buildReviewArtifact({
+    verdict: parsed,
+    verdictFileSha256: 'sha256:' + 'd'.repeat(64),
+    identity: 'custom-checker',
+    provider: 'openai',
+    authorIdentity: 'host-author',
+    expectedHead: sha,
+    prNumber: 19,
+  });
+  const context = {
+    config: { repository: 'example/widget' },
+    repo: { owner: 'example', repo: 'widget' },
+    clients: {
+      rest: {
+        pulls: {
+          get: async () => ({
+            data: {
+              number: 19,
+              state: 'open',
+              head: { sha, repo: { full_name: 'example/widget' } },
+              base: { repo: { full_name: 'example/widget' } },
+              changed_files: 1,
+            },
+          }),
+          listFiles: async () => ({ data: paths.map((filename) => ({ filename })) }),
+        },
+        git: { getCommit: async () => ({ data: { sha, tree: { sha: tree } } }) },
+      },
+    },
+  } as unknown as Parameters<typeof reviews.validateReviewTarget>[0];
+  await reviews.validateReviewTarget(context, artifact, 19);
 });

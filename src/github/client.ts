@@ -7,7 +7,7 @@ import { createPrivateKey } from 'node:crypto';
 import { homedir } from 'node:os';
 import { types } from 'node:util';
 
-import type { DeliveryConfig, DeliveryRole } from '../config/deliveryConfig.js';
+import type { DeliveryConfig, DeliveryRole, LoadedDeliverySettings } from '../config/deliveryConfig.js';
 
 import {
   appCredentialSource,
@@ -110,7 +110,7 @@ export function assertDeliveryRolePermissions(input: {
 
 /** The author role may use a personal token only after an explicit operator opt-in. */
 export async function createDeliveryGitHubClients(input: {
-  config: Pick<DeliveryConfig, 'roles'>;
+  config: Pick<DeliveryConfig, 'roles'> & Pick<LoadedDeliverySettings, 'credentialKeyReferences'>;
   env?: NodeJS.ProcessEnv;
   identity: string;
   personalAuth?: { enabled: true; token?: string };
@@ -304,7 +304,7 @@ export async function createDeliveryGitHubClients(input: {
 async function selectedPrivateKey(
   profile: ConfiguredApp,
   env: NodeJS.ProcessEnv,
-  config: Pick<DeliveryConfig, 'roles'>,
+  config: Pick<DeliveryConfig, 'roles'> & Pick<LoadedDeliverySettings, 'credentialKeyReferences'>,
   signal?: AbortSignal,
 ): Promise<string> {
   const source = appCredentialSource(profile);
@@ -345,6 +345,16 @@ async function selectedPrivateKey(
       if (process.platform === 'win32')
         throw failure('command sources currently require a POSIX process supervisor; use env on Windows.');
       const commandEnv: NodeJS.ProcessEnv = {};
+      const forbidden = new Set([
+        ...(config.credentialKeyReferences ?? []),
+        ...Object.values(config.roles).flatMap((role) =>
+          'credentialEnv' in role
+            ? Object.values(role.credentialEnv)
+            : appCredentialSource(role).type === 'env'
+              ? [privateKeyVariable(role)]
+              : [],
+        ),
+      ]);
       for (const name of [
         'HOME',
         'USER',
@@ -359,17 +369,10 @@ async function selectedPrivateKey(
         'USERPROFILE',
         'APPDATA',
         'LOCALAPPDATA',
-      ])
+      ]) {
+        if (forbidden.has(name)) throw failure('credential reference conflicts with an implicit OS selector.');
         if (env[name] !== undefined) commandEnv[name] = env[name];
-      const forbidden = new Set(
-        Object.values(config.roles).flatMap((role) =>
-          'credentialEnv' in role
-            ? Object.values(role.credentialEnv)
-            : appCredentialSource(role).type === 'env'
-              ? [privateKeyVariable(role)]
-              : [],
-        ),
-      );
+      }
       for (const name of source.env ?? []) {
         if (
           forbidden.has(name) ||

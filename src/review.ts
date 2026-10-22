@@ -27,7 +27,12 @@ export const ReviewVerdictSchema = z.strictObject({
     headSha: Sha,
     headTree: Sha,
     changedPaths: z
-      .array(Text)
+      .array(
+        z
+          .string()
+          .min(1)
+          .refine((path) => !path.includes('\0'), 'Paths cannot contain NUL.'),
+      )
       .refine(
         (paths) => paths.every((path, index) => index === 0 || paths[index - 1]! < path),
         'Paths must be complete, sorted and unique.',
