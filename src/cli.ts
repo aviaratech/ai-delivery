@@ -1,12 +1,22 @@
 #!/usr/bin/env node
-import { readFileSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createDeliveryGitHubClients } from './github/client.js';
+import { appCredentialSource, loadDeliverySettings } from './config/deliveryConfig.js';
 import { Command } from 'commander';
 import { z } from 'zod';
 
 import { printCommandError, printCommandResult } from './cliResult.js';
 import { contextFor, executeTool, type ExecutionContext } from './dispatch.js';
 import { listIssueSubissues } from './issue.js';
-import { listPrs, preflightReviewRoute, prChecks } from './pr.js';
+import { listPrs, preflightReviewRoute, prChecks, submitFormalReview } from './pr.js';
+import {
+  assertReviewVerdictTarget,
+  buildReviewArtifact,
+  parseReviewVerdict,
+  ReviewSubmissionError,
+  validateReviewTarget,
+} from './review.js';
 import { serveAiDeliveryMcp } from './mcp/index.js';
 import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
@@ -574,6 +584,108 @@ program
       nonClosing: o.nonClosing,
     }),
   );
+program
+  .command('review')
+  .argument('<action>', 'submit or doctor')
+  .description('Submit an independent verdict or check its configured App')
+  .option('--pr <number>', 'Required for submit')
+  .option('--head <sha>', 'Required exact head for submit')
+  .option('--identity <name>', 'Required configured reviewer profile')
+  .option('--verdict <path>', 'Required for submit: UTF-8 JSON verdict, at most 64 KiB')
+  .action(async (action: string, o: { pr?: string; head?: string; identity?: string; verdict?: string }) => {
+    if (!['submit', 'doctor'].includes(action)) throw new DeliveryError('review action must be submit or doctor.');
+    const identity = o.identity ?? execution().identity ?? '';
+    const settings = await loadDeliverySettings(undefined, { reviewerIdentity: identity, prepareEnvironment: true });
+    const profile = settings.roles.reviewer;
+    if (!('appId' in profile))
+      throw new DeliveryError('identity: Select a reviewer profile with explicit App/provider binding.');
+    if (action === 'doctor') {
+      if (o.pr !== undefined || o.head !== undefined || o.verdict !== undefined)
+        throw new DeliveryError('review doctor does not accept submission inputs.');
+      const clients = await createDeliveryGitHubClients({
+        config: settings,
+        identity,
+        role: 'reviewer',
+        env: settings.environment!,
+      });
+      const actorLogin = await clients.appActorLogin!();
+      printCommandResult('review:doctor', {
+        status: 'authenticated',
+        identity,
+        provider: profile.provider,
+        appId: profile.appId,
+        installationId: profile.installationId,
+        actorLogin,
+        source: appCredentialSource(profile).type,
+      });
+      return;
+    }
+    if (o.pr === undefined || o.head === undefined || o.verdict === undefined)
+      throw new DeliveryError('review submit requires --pr, --head and --verdict.');
+    const fd = openSync(o.verdict, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let raw: string;
+    let verdictFileSha256: string;
+    try {
+      if (!fstatSync(fd).isFile()) throw new DeliveryError('verdict: Expected a regular file.');
+      const bytes = Buffer.alloc(64 * 1024 + 1);
+      let size = 0;
+      while (size < bytes.length) {
+        const count = readSync(fd, bytes, size, bytes.length - size, null);
+        if (count === 0) break;
+        size += count;
+      }
+      if (size > 64 * 1024) throw new DeliveryError('verdict: File exceeds 64 KiB.');
+      const content = bytes.subarray(0, size);
+      raw = content.toString('utf8');
+      if (!Buffer.from(raw, 'utf8').equals(content)) throw new DeliveryError('verdict: Expected valid UTF-8.');
+      verdictFileSha256 = `sha256:${createHash('sha256').update(content).digest('hex')}`;
+    } finally {
+      closeSync(fd);
+    }
+    const verdict = parseReviewVerdict(raw);
+    assertReviewVerdictTarget(verdict, profile.provider, o.head);
+    const prNumber = z.number().int().positive().parse(Number(o.pr));
+    const artifact = buildReviewArtifact({
+      verdict,
+      verdictFileSha256,
+      identity,
+      provider: profile.provider,
+      expectedHead: o.head,
+      prNumber,
+      authorIdentity: settings.roles.author.identity,
+    });
+    const authorContext = await contextFor(
+      { ...execution(), settings, identity, reviewSubmission: true },
+      'pr:info',
+      'author',
+    );
+    await validateReviewTarget(authorContext, artifact, prNumber);
+    const clients = await createDeliveryGitHubClients({
+      config: authorContext.config,
+      identity,
+      role: 'reviewer',
+      selectedAuthor: authorContext.clients,
+      ...(authorContext.credentialEnvironment === undefined ? {} : { env: authorContext.credentialEnvironment }),
+    });
+    const context = { ...authorContext, clients };
+    try {
+      printCommandResult(
+        'review:submit',
+        await submitFormalReview(context, {
+          artifact: JSON.stringify(artifact),
+          issueNumber: verdict.issueNumber,
+          prNumber,
+          ...(verdict.nonClosing === undefined ? {} : { nonClosing: verdict.nonClosing }),
+        }),
+      );
+    } catch (error) {
+      if (!(error instanceof ReviewSubmissionError)) throw error;
+      process.stdout.write(
+        `${JSON.stringify({ status: 'submission-unverified', submission: error.submission, nextAction: error.message })}\n`,
+      );
+      process.exitCode = 1;
+    }
+  });
 for (const [command, tool] of [
   ['pr:merge', 'issue_pr_merge'],
   ['finish', 'issue_finish'],

@@ -6,6 +6,7 @@ import type {
   GitHubDeliveryConfig,
   LoadedDeliveryConfig,
   LoadedGitHubConfig,
+  LoadedDeliverySettings,
 } from './config/deliveryConfig.js';
 import { loadDeliveryConfig, WipLimits, type WipLane } from './config/deliveryConfig.js';
 import { digestValue } from './delivery/legacy.js';
@@ -202,6 +203,7 @@ export async function journalIssueStart(context: DeliveryContext, issueNumber: n
 }
 
 export interface DeliveryContext {
+  credentialEnvironment?: NodeJS.ProcessEnv;
   readPageLimit?: number;
   clients: GitHubClients;
   reviewerClients?: GitHubClients;
@@ -213,6 +215,8 @@ export interface DeliveryContext {
 }
 
 export async function loadDeliveryContext(input: {
+  settings?: LoadedDeliverySettings;
+  env?: NodeJS.ProcessEnv;
   readPageLimit?: number;
   requireWritableProject?: boolean;
   identity: string;
@@ -223,6 +227,8 @@ export async function loadDeliveryContext(input: {
   signal?: AbortSignal;
 }): Promise<DeliveryContext> {
   const loaded = await loadDeliveryConfig(input.repoRoot, {
+    ...(input.settings === undefined ? {} : { settings: input.settings }),
+    ...(input.env === undefined ? {} : { env: input.env }),
     ...(input.readPageLimit === undefined ? {} : { readPageLimit: input.readPageLimit }),
     ...(input.requireWritableProject === undefined ? {} : { requireWritableProject: input.requireWritableProject }),
     ...(input.repository === undefined ? {} : { repository: input.repository }),
@@ -238,6 +244,7 @@ export async function loadDeliveryContext(input: {
     identity: input.identity,
     ...(input.personalAuth ? { personalAuth: { enabled: true as const } } : {}),
     role: input.role,
+    ...(input.env === undefined ? {} : { env: input.env }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   const routing = loaded.routing;
@@ -254,6 +261,7 @@ export async function loadDeliveryContext(input: {
   };
   return {
     clients,
+    ...(input.env === undefined ? {} : { credentialEnvironment: input.env }),
     config,
     configuration: loaded,
     ...(input.requireWritableProject === false ? {} : { projectConfiguration }),

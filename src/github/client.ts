@@ -2,12 +2,20 @@ import { createAppAuth } from '@octokit/auth-app';
 import { graphql } from '@octokit/graphql';
 import type { graphql as GraphQLType } from '@octokit/graphql';
 import { Octokit } from '@octokit/rest';
-import { readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
+import { createPrivateKey } from 'node:crypto';
+import { homedir } from 'node:os';
 import { types } from 'node:util';
 
-import type { DeliveryConfig, DeliveryRole } from '../config/deliveryConfig.js';
+import type { DeliveryConfig, DeliveryRole, LoadedDeliverySettings } from '../config/deliveryConfig.js';
 
-import { resolveDeliveryRoleCredentials } from '../config/deliveryConfig.js';
+import {
+  appCredentialSource,
+  privateKeyVariable,
+  resolveDeliveryRoleCredentials,
+  type ConfiguredApp,
+} from '../config/deliveryConfig.js';
+import { runStageCommand } from '../verification.js';
 import {
   DeliveryError,
   setMachineRequestDiagnostics,
@@ -102,7 +110,7 @@ export function assertDeliveryRolePermissions(input: {
 
 /** The author role may use a personal token only after an explicit operator opt-in. */
 export async function createDeliveryGitHubClients(input: {
-  config: Pick<DeliveryConfig, 'roles'>;
+  config: Pick<DeliveryConfig, 'roles'> & Pick<LoadedDeliverySettings, 'credentialKeyReferences'>;
   env?: NodeJS.ProcessEnv;
   identity: string;
   personalAuth?: { enabled: true; token?: string };
@@ -182,20 +190,40 @@ export async function createDeliveryGitHubClients(input: {
     input.selectedAuthor?.role === 'author' &&
     input.selectedAuthor.authSource === 'personal';
   if (!personalAuthorSelected && input.config.roles[otherRole].authSource !== 'personal') {
-    const other = resolveDeliveryRoleCredentials({ config: input.config, env, role: otherRole });
+    const otherRoleConfig = input.config.roles[otherRole];
+    // Explicit profiles compare only other-role metadata. Doctor must not need
+    // another identity's key reference or resolve its credential source.
+    const other =
+      credentials.profile === undefined
+        ? resolveDeliveryRoleCredentials({ config: input.config, env, role: otherRole })
+        : 'appId' in otherRoleConfig
+          ? {
+              appId: String(otherRoleConfig.appId),
+              installationId: otherRoleConfig.installationId,
+              privateKeyPath: undefined,
+            }
+          : {
+              appId: env[otherRoleConfig.credentialEnv.appId]?.trim(),
+              installationId: Number(env[otherRoleConfig.credentialEnv.installationId]),
+              privateKeyPath: undefined,
+            };
     if (
       credentials.appId === other.appId ||
       credentials.installationId === other.installationId ||
-      credentials.privateKeyPath === other.privateKeyPath
+      (credentials.privateKeyPath !== undefined && credentials.privateKeyPath === other.privateKeyPath)
     ) {
       throw new DeliveryError('Author and reviewer must use distinct GitHub App credentials.');
     }
   }
   let privateKey: string;
-  try {
-    privateKey = readFileSync(credentials.privateKeyPath, 'utf8');
-  } catch {
-    throw new DeliveryError(`GitHub App private key for ${input.role} role is unavailable.`);
+  if (credentials.profile !== undefined) {
+    privateKey = await selectedPrivateKey(credentials.profile, env, input.config, input.signal);
+  } else {
+    try {
+      privateKey = readFileSync(credentials.privateKeyPath!, 'utf8');
+    } catch {
+      throw new DeliveryError(`GitHub App private key for ${input.role} role is unavailable.`);
+    }
   }
   try {
     const auth = createAppAuth({
@@ -224,7 +252,10 @@ export async function createDeliveryGitHubClients(input: {
               if (!app.data || app.data.id !== Number(credentials.appId) || !app.data.slug) {
                 throw new DeliveryError('Reviewer GitHub App identity did not match its configured App ID.');
               }
-              return `${app.data.slug}[bot]`;
+              const actor = `${app.data.slug}[bot]`;
+              if (credentials.profile !== undefined && actor !== credentials.profile.actorLogin)
+                throw new DeliveryError('Reviewer GitHub App actor did not match its configured actorLogin.');
+              return actor;
             } catch (error) {
               if (error instanceof DeliveryError) throw error;
               throw new DeliveryError('Reviewer GitHub App actor lookup failed.');
@@ -266,6 +297,152 @@ export async function createDeliveryGitHubClients(input: {
   } catch (error) {
     if (error instanceof DeliveryError) throw error;
     throw new DeliveryError(`GitHub App authentication failed for ${input.role} role.`);
+  }
+}
+
+/** Selected-source output stays in memory; the existing runner owns command cleanup. */
+async function selectedPrivateKey(
+  profile: ConfiguredApp,
+  env: NodeJS.ProcessEnv,
+  config: Pick<DeliveryConfig, 'roles'> & Pick<LoadedDeliverySettings, 'credentialKeyReferences'>,
+  signal?: AbortSignal,
+): Promise<string> {
+  const source = appCredentialSource(profile);
+  const failure = (reason: string) =>
+    new DeliveryError(`Reviewer ${profile.identity} credential source ${source.type}: ${reason}`);
+  let bytes: Buffer;
+  try {
+    signal?.throwIfAborted();
+    if (source.type === 'env') {
+      const value = env[privateKeyVariable(profile)];
+      if (!value) throw failure('selected variable is missing or empty; configure this identity.');
+      if (Buffer.byteLength(value) > 64 * 1024) throw failure('response exceeds 64 KiB.');
+      bytes = Buffer.from(value);
+    } else if (source.type === 'file') {
+      const fd = openSync(source.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const stat = fstatSync(fd);
+        if (
+          !stat.isFile() ||
+          (stat.mode & 0o7777) !== 0o600 ||
+          stat.nlink !== 1 ||
+          (process.getuid !== undefined && stat.uid !== process.getuid())
+        )
+          throw failure('key file must be a regular, owned, single-link file with mode 0600.');
+        const buffer = Buffer.alloc(64 * 1024 + 1);
+        let size = 0;
+        for (;;) {
+          const read = readSync(fd, buffer, size, buffer.length - size, null);
+          if (read === 0) break;
+          size += read;
+          if (size === buffer.length) throw failure('response exceeds 64 KiB.');
+        }
+        bytes = buffer.subarray(0, size);
+      } finally {
+        closeSync(fd);
+      }
+    } else {
+      if (process.platform === 'win32')
+        throw failure('command sources currently require a POSIX process supervisor; use env on Windows.');
+      const commandEnv: NodeJS.ProcessEnv = {};
+      const forbidden = new Set([
+        ...(config.credentialKeyReferences ?? []),
+        ...Object.values(config.roles).flatMap((role) =>
+          'credentialEnv' in role
+            ? Object.values(role.credentialEnv)
+            : appCredentialSource(role).type === 'env'
+              ? [privateKeyVariable(role)]
+              : [],
+        ),
+      ]);
+      for (const name of [
+        'HOME',
+        'USER',
+        'LOGNAME',
+        'PATH',
+        'LANG',
+        'LC_ALL',
+        'TMPDIR',
+        'TEMP',
+        'TMP',
+        'SystemRoot',
+        'USERPROFILE',
+        'APPDATA',
+        'LOCALAPPDATA',
+      ]) {
+        if (forbidden.has(name)) throw failure('credential reference conflicts with an implicit OS selector.');
+        if (env[name] !== undefined) commandEnv[name] = env[name];
+      }
+      for (const name of source.env ?? []) {
+        if (
+          forbidden.has(name) ||
+          /^(?:NODE_|NPM_|DYLD_|LD_|BASH_|GIT_|GH_PRIVATE_KEY)/u.test(name) ||
+          ['ENV', 'SHELLOPTS', 'CDPATH'].includes(name)
+        )
+          throw failure('helper environment reference conflicts with author/key or execution selectors.');
+        if (env[name] === undefined) throw failure('a configured helper environment reference is missing.');
+        commandEnv[name] = env[name];
+      }
+      const timeout = new AbortController();
+      const timer = setTimeout(() => timeout.abort(), 30_000);
+      let cleanupFailed = false;
+      try {
+        bytes = await runStageCommand(
+          env.HOME ?? homedir(),
+          source.argv,
+          signal === undefined ? timeout.signal : AbortSignal.any([signal, timeout.signal]),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {
+            environment: commandEnv,
+            cwd: env.HOME ?? homedir(),
+            maxCapturedOutputBytes: 64 * 1024,
+            stdoutOnly: true,
+            failedOutput: () => '',
+            onCleanupFailure: () => {
+              cleanupFailed = true;
+            },
+          },
+        );
+      } catch {
+        throw failure(
+          cleanupFailed
+            ? 'helper failed and owned process cleanup is unverified; reconcile before retrying.'
+            : timeout.signal.aborted
+              ? 'helper response timed out; verify the selected command.'
+              : signal?.aborted
+                ? 'helper request cancelled.'
+                : 'helper failed; verify its executable, access and bounded output.',
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (bytes.length === 0 || bytes.length > 64 * 1024) throw failure('response is empty or exceeds 64 KiB.');
+    let pem = bytes.toString('utf8');
+    if (!Buffer.from(pem).equals(bytes)) throw failure('response must be valid UTF-8.');
+    if (source.type !== 'file' && source.encoding === 'base64') {
+      const encoded = pem.trim();
+      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded))
+        throw failure('response must be canonical base64.');
+      const decoded = Buffer.from(encoded, 'base64');
+      if (decoded.toString('base64') !== encoded) throw failure('response must be canonical base64.');
+      pem = decoded.toString('utf8');
+      if (!Buffer.from(pem).equals(decoded)) throw failure('decoded response must be UTF-8 PEM.');
+    }
+    if (
+      !/^-----BEGIN (?:RSA )?PRIVATE KEY-----\r?\n[\s\S]+\r?\n-----END (?:RSA )?PRIVATE KEY-----\s*$/u.test(pem) ||
+      createPrivateKey(pem).asymmetricKeyType !== 'rsa'
+    )
+      throw failure('response must be an unencrypted RSA private key in PEM format.');
+    signal?.throwIfAborted();
+    return pem;
+  } catch (error) {
+    if (error instanceof DeliveryError) throw error;
+    throw failure('selected key is unavailable or malformed; verify this source.');
   }
 }
 

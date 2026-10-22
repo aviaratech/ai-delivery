@@ -178,3 +178,9 @@ supplied-environment package CLI results, and synthetic fixtures in separate
 evidence categories. A fictional fixture validates a contract, not a real
 credential or native installation. Do not include environment values, private
 keys, private-key paths, headers, or raw authentication errors in shared reports.
+
+## Independent reviewer command
+
+The [five-minute reviewer setup](../../README.md#five-minute-reviewer-setup) configures a consumer-named App profile with an explicit provider, actual App actor and one env/default, protected-file or configured-argv credential source. `ai-delivery review doctor --identity <profile>` checks only that selected App without posting. A fresh independent reviewer writes the strict verdict, then uses `ai-delivery review submit --pr <number> --head <sha> --identity <profile> --verdict ./verdict.json --repo <owner/name>`. Both approval and request-changes retain their own events and readback states; inspect live required-review status after submission.
+
+The runtime needs no dotenvx or host launcher fork. It reads one selected key in memory, fails closed without fallback, and redacts source errors. Command sources reuse the bounded POSIX supervisor; native Windows commands are deferred, and Windows protected-file permission equivalence is unqualified. A plugin installation does not migrate host credentials or install the optional Claude permission pattern `Bash(ai-delivery review submit *)`. Existing native policies and refusals remain binding.

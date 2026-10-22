@@ -769,7 +769,8 @@ export function processSnapshot(): Map<number, ObservedProcess> {
   const started = performance.now();
   const result = spawnSync(psPath, ['-A', '-o', 'pid=,ppid=,pgid=,rss=,stat=,lstart='], {
     encoding: 'utf8',
-    env: { ...process.env, LC_ALL: 'C' },
+    // The absolute observer needs no author tokens, App keys or preload selectors.
+    env: { LC_ALL: 'C' },
     maxBuffer: 4 * 1024 * 1024,
     timeout: 1_000,
   });

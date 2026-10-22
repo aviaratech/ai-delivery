@@ -389,7 +389,9 @@ describe('portable delivery configuration', () => {
         const path = join(temp, `${role}.pem`);
         const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
         writeFileSync(path, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
-        const names = config.roles[role].credentialEnv;
+        const selectedRole = config.roles[role];
+        assert.ok('credentialEnv' in selectedRole);
+        const names = selectedRole.credentialEnv;
         assert.ok('appId' in names, 'Synthetic role must use App credentials');
         env[names.appId] = String(42 + index);
         env[names.installationId] = String(52 + index);

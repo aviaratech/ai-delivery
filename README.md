@@ -26,11 +26,11 @@ Create `~/.config/aviaratech-ai/ai-delivery.json`, or set `AI_DELIVERY_CONFIG` t
     },
     "reviewer": {
       "identity": "delivery-reviewer",
-      "credentialEnv": {
-        "appId": "DELIVERY_REVIEWER_APP_ID",
-        "installationId": "DELIVERY_REVIEWER_INSTALLATION_ID",
-        "privateKeyPath": "DELIVERY_REVIEWER_KEY_PATH"
-      }
+      "authSource": "app",
+      "appId": 12345,
+      "installationId": 67890,
+      "actorLogin": "your-reviewer-app[bot]",
+      "provider": "openai"
     }
   },
   "project": 7,
@@ -38,7 +38,7 @@ Create `~/.config/aviaratech-ai/ai-delivery.json`, or set `AI_DELIVERY_CONFIG` t
 }
 ```
 
-An App author uses the same `credentialEnv` shape as the reviewer. Roles and credential environment names must be distinct. Credential values and private keys remain outside source control. A configured personal author uses its named token variable. With the conventional `GH_TOKEN` reference **absent**, it instead uses the existing active personal account from GitHub CLI `gh` for `github.com`. A present empty, malformed or expired token fails without switching accounts. A custom reference such as `DELIVERY_AUTHOR_TOKEN` always requires that exact value; its absence does not select a machine session. Unrelated `GITHUB_TOKEN` values do not satisfy either configured reference. The optional `--identity` or `AI_DELIVERY_IDENTITY` override must select the command's configured role; neither is needed for normal operation. The explicit legacy `--identity personal --personal-auth` override is limited to development access diagnosis under an App author configuration; it requires an explicit token and does not use a missing-token machine fallback. Publication requires the configured author.
+Legacy App roles remain supported with `credentialEnv: { "appId": "APP_ID_VARIABLE", "installationId": "INSTALLATION_ID_VARIABLE", "privateKeyPath": "ABSOLUTE_PEM_PATH_VARIABLE" }`. Roles and credential environment names must be distinct. Credential values and private keys remain outside source control. A configured personal author uses its named token variable. With the conventional `GH_TOKEN` reference **absent**, it instead uses the existing active personal account from GitHub CLI `gh` for `github.com`. A present empty, malformed or expired token fails without switching accounts. A custom reference such as `DELIVERY_AUTHOR_TOKEN` always requires that exact value; its absence does not select a machine session. Unrelated `GITHUB_TOKEN` values do not satisfy either configured reference. The optional `--identity` or `AI_DELIVERY_IDENTITY` override must select the command's configured role; neither is needed for normal operation. The explicit legacy `--identity personal --personal-auth` override is limited to development access diagnosis under an App author configuration; it requires an explicit token and does not use a missing-token machine fallback. Publication requires the configured author.
 
 The machine route uses `gh auth status --hostname github.com --active --json hosts`, validates the selected account's state, then privately obtains that exact user's credential through `gh auth token --hostname github.com --user <active-user>`. An actual authenticated user read must match the selection. Repository discovery and command execution retain that account; failed identity/access never selects another account. Inactive accounts with errors do not invalidate a healthy active user. Only required non-secret home/PATH/gh configuration selectors reach `gh`; token overrides, debug flags and unrelated credentials are excluded. No login, switch, refresh, credential-store scraping or persistent configuration change occurs. The reviewer still uses its distinct configured App, with no personal-session fallback.
 
@@ -50,6 +50,81 @@ Every remote MCP tool accepts `repo: "owner/name"`; the CLI uses global `--repo`
 
 Local runtime setup and legacy transition calls select a matching `origin` per invocation. A matching current checkout wins; otherwise `checkoutRoots` may contain exact clone roots or parents whose immediate directories contain clones. Duplicate physical matches are collapsed. Zero or multiple matches refuse with a specific diagnostic; use `--repo-root` to select the intended matching clone. Git probes disable repository hooks, filters, fsmonitor and external diff/text conversion. Remote delivery never performs a checkout, push, or worktree mutation.
 
+## Five-minute reviewer setup
+
+1. Create or install a reviewer GitHub App distinct from the PR author. The runtime checks its installation permissions (`contents:read`, `pull_requests:write` at minimum), actual App ID and actor. Your repository may require additional approval eligibility; a successful authentication check does not establish a counted approval.
+2. Fill the reviewer profile above with your nonsecret App ID, installation ID, exact `slug[bot]` actor and provider. Profile names are consumer-defined. Providers are `openai`, `anthropic`, `google` or `qwen`; submission checks both requested and effective model families against that declaration. These declarations do not attest the external agent's model by themselves.
+3. Supply only that profile's selected credential source. With `credentialSource` omitted, the default is PEM in `GH_PRIVATE_KEY_DELIVERY_REVIEWER` for identity `delivery-reviewer`; other names replace punctuation with underscores and uppercase the identity. Set secrets through your existing environment/CI mechanism, outside source control. Explicit alternatives appear below.
+4. Check the App from any directory, then have a fresh independent read-only reviewer reproduce verification and write its verdict:
+
+```sh
+ai-delivery review doctor --identity delivery-reviewer
+ai-delivery review submit --pr 23 --head <reviewed-sha> --identity delivery-reviewer --verdict ./verdict.json --repo example/widget
+```
+
+`review doctor` mints the selected installation token and reads `GET /app`. It needs user settings but no checkout, issue or Project lookup, and posts no review. Submit uses the configured personal author for remote scope checks before reading the reviewer key; an App author requiring another key refuses this route. The existing lower-level artifact API remains available for established integrations.
+
+For Claude Code, the optional narrow permission pattern is `Bash(ai-delivery review submit *)`. Add it only through your host's normal policy workflow. It does not replace independent review, grant operator authority or override a platform refusal. No dotenvx binary, versioned plugin-cache path or separate artifact-building command is needed.
+
+A verdict is UTF-8 JSON, at most 64 KiB, with all of these fields. Replace the illustrative SHA/tree, issue and complete sorted paths with the exact independently reviewed state. Findings may be empty. Use `request-changes` for that verdict; it posts `REQUEST_CHANGES`, never approval. Add `"nonClosing": true` only for the existing explicit non-closing issue/PR contract.
+
+```json
+{
+  "schemaVersion": "ai-delivery.review-verdict@1",
+  "verdict": "approve",
+  "summary": "Reviewed the complete change independently.",
+  "issueNumber": 17,
+  "scope": {
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headTree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changedPaths": ["src/change.ts"]
+  },
+  "verificationReproduced": ["Reproduced the focused regression; integration not executed."],
+  "requestedModel": "gpt-6-astra",
+  "requestedEffort": "xhigh",
+  "effectiveModel": "gpt-6-astra",
+  "effectiveEffort": "xhigh",
+  "elapsedMs": 120000,
+  "findings": [],
+  "readOnly": true
+}
+```
+
+The visible review includes the exact raw verdict-file SHA256, requested/effective model and effort, elapsed time and findings, plus the existing hashed artifact. Unknown fields, missing metadata, provider mismatch and stale head/tree/scope refuse. The result includes the live required-review state; `still-required` is not a counted approval. A `submission-unverified` result preserves the artifact/head and any known review ID/URL: reconcile the original remote review before another submission. A matching acknowledged review is reused.
+
+### Credential sources and additional profiles
+
+Add `credentialSource` inside a reviewer profile. Sources are disjoint; a failure never selects another source. Keys remain in process memory, are validated as unencrypted RSA PEM, and are never printed or written by this runtime.
+
+```json
+{ "type": "env", "variable": "MY_REVIEWER_KEY", "encoding": "base64" }
+```
+
+```json
+{ "type": "file", "path": "/absolute/operator-owned/reviewer.pem" }
+```
+
+The file source requires a regular file opened without following a symlink, current-user ownership where supported, one hard link and exactly mode 0600. It does not change permissions. Native Windows file-permission equivalence has not been qualified; use the env source there.
+
+```json
+{ "type": "command", "argv": ["/absolute/credential-helper", "reviewer-key"], "encoding": "pem", "env": ["HELPER_SESSION"] }
+```
+
+The command's first argv entry must be absolute; arguments are literal, with no `$USER`, tilde, pipeline or shell interpolation. `encoding` defaults to `pem`; `base64` requires canonical base64 of the PEM. The existing POSIX supervisor uses a fixed wait/exec shell handshake, bounds combined stdout/stderr to 64 KiB, cancels an unresponsive credential request after 30 seconds, and verifies owned process cleanup. This is a credential-request timeout, not a review or task runtime limit. Errors name only the identity/source and safe reason; an unverified cleanup requires reconciliation. Native Windows command sources currently refuse before spawn; Windows Credential Manager integration is deferred. Env remains supported on Windows.
+
+Only a small OS selector set and explicitly listed helper `env` names reach the helper; the author token, other App keys and executable-injection selectors are excluded. Shared explicit helper-auth selectors are allowed. Commands are trusted operator configuration and are not a sandbox. Use an existing authenticated helper session and allow only its required selectors. The following are configuration examples, not credential provisioning or live qualification; replace executable paths, account names and references:
+
+| Store | `argv` | Encoding / helper environment |
+| --- | --- | --- |
+| macOS login Keychain (Aviara's choice) | `["/usr/bin/security","find-generic-password","-a","your-user","-s","aviaratech.github-app.delivery-reviewer","-w"]` | `base64`; item value is base64 PEM |
+| [1Password](https://www.1password.dev/cli/reference/commands/read) | `["/absolute/op","read","op://your-vault/your-item/private key"]` | `pem`; explicitly forward required existing session selectors such as `OP_SERVICE_ACCOUNT_TOKEN` |
+| [AWS Secrets Manager](https://docs.aws.amazon.com/cli/latest/reference/secretsmanager/get-secret-value.html) | `["/absolute/aws","secretsmanager","get-secret-value","--secret-id","reviewer-key","--query","SecretString","--output","text","--no-cli-pager"]` | `pem`; e.g. explicit `AWS_PROFILE`/`AWS_REGION` for an existing session |
+| Linux Secret Service | `["/usr/bin/secret-tool","lookup","service","delivery-reviewer"]` | `pem`; explicitly forward required desktop session selectors |
+| [HashiCorp Vault](https://developer.hashicorp.com/vault/docs/commands/kv/get) | `["/absolute/vault","kv","get","-mount=secret","-field=private_key","delivery-reviewer"]` | `pem`; e.g. explicit `VAULT_ADDR`/`VAULT_TOKEN` |
+| Windows Credential Manager | A consumer-owned helper would return the selected PEM or base64 on stdout. | Illustrative future integration; native command supervision is unavailable in this version. |
+
+Optional top-level `reviewerProfiles` maps additional names to the same complete explicit profile shape. Each map key must equal its `identity`, distinct from the configured author. For example a `claude-reviewer` profile uses its own App/installation/actor, `provider: "anthropic"` and selected source. `--identity` selects exactly one profile; no other profile's source is read. Legacy `credentialEnv` profiles remain valid for existing callers but must be migrated to explicit metadata for these new commands.
+
 ## GitHub-gated lifecycle
 
 ```sh
@@ -60,7 +135,7 @@ ai-delivery --repo example/widget start --issue 17
 ai-delivery --repo example/widget pr:create --issue 17 --body-file ./pr-body.md --dry-run
 ai-delivery --repo example/widget pr:create --issue 17 --body-file ./pr-body.md
 # Obtain an independent review of the exact remote PR head and diff.
-ai-delivery --repo example/widget pr:review --issue 17 --pr 23 --artifact ./review-artifact.json
+ai-delivery review submit --pr 23 --head <reviewed-sha> --identity delivery-reviewer --verdict ./verdict.json --repo example/widget
 ai-delivery --repo example/widget pr:create --issue 17 --ready
 ai-delivery --repo example/widget pr:checks --pr 23
 ai-delivery --repo example/widget finish --issue 17 --pr 23 --reviewed-head <reviewed-sha>
