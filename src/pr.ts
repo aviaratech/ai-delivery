@@ -536,7 +536,6 @@ async function verifyPrIssueAssociation(
   context: DeliveryContext,
   prNumber: number,
   issueNumber: number,
-  nonClosing = false,
   expectedPrId?: string,
   onlyIntended = false,
   expectedIssueId?: string,
@@ -576,7 +575,6 @@ async function verifyPrIssueAssociation(
         throw new DeliveryError(
           'Incomplete or conflicting typed closing issue/repository identity before body transition.',
         );
-      if (nonClosing) throw new DeliveryError('Non-closing PR has an unintended native closing association.');
       if (
         !issue ||
         !Number.isSafeInteger(issue.number) ||
@@ -594,7 +592,7 @@ async function verifyPrIssueAssociation(
         throw new DeliveryError('Existing PR has conflicting closing associations; body transition refused.');
     }
     if (!connection.pageInfo.hasNextPage) {
-      if (!nonClosing && matches !== 1)
+      if (matches !== 1)
         throw new DeliveryError('Native GitHub PR closing-issue association does not identify the intended issue.');
       return;
     }
@@ -1265,7 +1263,6 @@ export async function publishPr(
         context,
         current.number,
         input.issueNumber,
-        false,
         current.node_id,
         true,
         issue.node_id,
