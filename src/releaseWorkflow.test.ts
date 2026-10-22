@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { Script } from 'node:vm';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'vitest';
 
 type Json = { [key: string]: unknown };
@@ -139,6 +140,14 @@ function diagnosticStep(name: string) {
 
 function diagnosticFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-diagnostic-')));
+  const sourceRoot = join(root, 'public source');
+  for (const file of new Set(laneChecks.RELEASE_CASES.map((entry) => entry.file))) {
+    for (const relative of [file, file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts')]) {
+      const path = join(sourceRoot, relative);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, '// synthetic public coordinate bounds\n'.repeat(1200));
+    }
+  }
   const qualificationRoot = join(root, 'release-qualification');
   const runId = '11111111-1111-4111-8111-111111111111';
   const releaseDirectory = join(qualificationRoot, `release-tests-${runId}`);
@@ -201,7 +210,7 @@ function diagnosticFixture() {
     numFailedTests: 1,
     testResults: [
       {
-        name: join('/synthetic/source', entry.file),
+        name: join(sourceRoot, entry.file),
         assertionResults: [
           { fullName: entry.title, status: 'failed', failureMessages: [sensitive] },
           { fullName: sensitive, status: 'passed' },
@@ -252,12 +261,14 @@ function diagnosticFixture() {
       dirname,
       join,
       resolve,
+      fileURLToPath,
+      URL,
       Buffer,
       RELEASE_CASES: laneChecks.RELEASE_CASES,
       process: {
         env: {
           RUNNER_TEMP: root,
-          GITHUB_WORKSPACE: '/synthetic/source',
+          GITHUB_WORKSPACE: sourceRoot,
           GITHUB_OUTPUT: output,
           GITHUB_RUN_ID: '101',
           GITHUB_RUN_ATTEMPT: '1',
@@ -273,10 +284,176 @@ function diagnosticFixture() {
     const bytes = readFileSync(path, 'utf8');
     assert.ok(Buffer.byteLength(bytes) <= 64 * 1024);
     assert.ok(!bytes.includes(sensitive));
+    assert.ok(!bytes.includes(root), 'runtime paths must not cross the public projection');
     return JSON.parse(bytes) as Json;
   };
-  return { root, qualificationRoot, releaseDirectory, runId, save, execute, sensitive };
+  const failures = (failureMessages: unknown, status = 'failed') =>
+    save(`release-tests-${runId}/vitest.json`, {
+      testResults: [
+        {
+          name: join(sourceRoot, entry.file),
+          assertionResults: [{ fullName: entry.title, status, failureMessages, location: { line: 12, column: 1 } }],
+        },
+      ],
+    });
+  const frames = () => {
+    const cases = (execute()['release'] as Json)['cases'] as Json[];
+    return cases[0]!['failureFrames'];
+  };
+  return { root, sourceRoot, qualificationRoot, releaseDirectory, runId, save, execute, sensitive, failures, frames };
 }
+
+test.each([1110, 1114, 1122])('diagnostic frames preserve the public closure helper and caller at %s', (caller) => {
+  const f = diagnosticFixture();
+  try {
+    f.failures([
+      `AssertionError: ${f.sensitive}\n    at closure (${f.sourceRoot}/src/setup.test.ts:1108:7)\n    at test (${f.sourceRoot}/src/setup.test.ts:${caller}:3)`,
+    ]);
+    assert.deepEqual(f.frames(), {
+      status: 'matched',
+      truncated: false,
+      frames: [
+        { file: 'src/setup.test.ts', line: 1108, column: 7, message: 1 },
+        { file: 'src/setup.test.ts', line: caller, column: 3, message: 1 },
+      ],
+    });
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostic frames preserve message order, repeats, file URLs and distinct source/dist coordinates', () => {
+  const f = diagnosticFixture();
+  try {
+    const source = pathToFileURL(join(f.sourceRoot, 'src/setup.test.ts')).href;
+    f.failures([
+      `${f.sensitive}\n    at privateFrame (/private/unrelated/src/setup.test.ts:5:2)\n    at closure (\u001b[36m${source}:1108:7\u001b[0m)\n    at caller (${f.sourceRoot}/src/setup.test.ts:1110:3)`,
+      `Error: ${f.sensitive}\n    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)\n    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)`,
+    ]);
+    assert.deepEqual(f.frames(), {
+      status: 'matched',
+      truncated: false,
+      frames: [
+        { file: 'src/setup.test.ts', line: 1108, column: 7, message: 1 },
+        { file: 'src/setup.test.ts', line: 1110, column: 3, message: 1 },
+        { file: 'dist/setup.test.js', line: 100, column: 4, message: 2 },
+        { file: 'dist/setup.test.js', line: 100, column: 4, message: 2 },
+      ],
+    });
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  { messages: undefined, status: 'unknown' },
+  { messages: null, status: 'unknown' },
+  { messages: {}, status: 'unknown' },
+  { messages: [], status: 'unknown' },
+  { messages: [null], status: 'unknown' },
+  { messages: [''], status: 'no-match' },
+  { messages: ['an error without public frames'], status: 'no-match' },
+])(
+  'diagnostic frame availability distinguishes $status from test-declaration coordinates: $messages',
+  ({ messages, status }) => {
+    const f = diagnosticFixture();
+    try {
+      f.failures(messages);
+      assert.deepEqual(f.frames(), { status, truncated: false, frames: [] });
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['frames', 'messages', 'text', 'lines', 'line-bytes', 'partial-line', 'utf8-text'] as const)(
+  'diagnostic frames retain a bounded prefix and disclose %s truncation',
+  (bound) => {
+    const f = diagnosticFixture();
+    try {
+      const helper = `    at closure (${f.sourceRoot}/src/setup.test.ts:1108:7)`;
+      const caller = `    at caller (${f.sourceRoot}/src/setup.test.ts:1110:3)`;
+      let messages = [helper + '\n' + caller];
+      let expected = [{ file: 'src/setup.test.ts', line: 1108, column: 7, message: 1 }];
+      if (bound === 'frames') {
+        messages = [Array.from({ length: 5 }, () => helper).join('\n')];
+        expected = Array.from({ length: 4 }, () => expected[0]!);
+      }
+      if (bound === 'messages') {
+        messages = [helper, helper, helper];
+        expected = [expected[0]!, { ...expected[0]!, message: 2 }];
+      }
+      if (bound === 'text') messages = [helper + '\n' + 'x'.repeat(16 * 1024) + '\n' + caller];
+      if (bound === 'lines') messages = [helper + '\n' + 'header\n'.repeat(63) + caller];
+      if (bound === 'line-bytes') messages = [helper + '\n' + ' '.repeat(2048) + caller];
+      if (bound === 'partial-line' || bound === 'utf8-text') {
+        messages = [(bound === 'partial-line' ? ' '.repeat(16370) : 'é'.repeat(8190)) + caller];
+        expected = [];
+      }
+      f.failures(messages);
+      assert.deepEqual(f.frames(), {
+        status: expected.length ? 'matched' : 'unknown',
+        truncated: true,
+        frames: expected,
+      });
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['private-suffix', 'path-traversal', 'file-query', 'file-host', 'function-body'] as const)(
+  'diagnostic frames reject %s near-matches without exposing their bytes',
+  (kind) => {
+    const f = diagnosticFixture();
+    try {
+      const file = join(f.sourceRoot, 'src/setup.test.ts');
+      let frame = `    at fake (/private${file}:1108:7)`;
+      if (kind === 'path-traversal') frame = `    at fake (${f.sourceRoot}/src/../src/setup.test.ts:1108:7)`;
+      if (kind === 'file-query') frame = `    at fake (${pathToFileURL(file).href}?${f.sensitive}:1108:7)`;
+      if (kind === 'file-host') frame = `    at fake (file://unrelated${file}:1108:7)`;
+      if (kind === 'function-body') frame = `Error: (not a frame ${file}:1108:7)`;
+      f.failures([frame]);
+      assert.deepEqual(f.frames(), { status: 'no-match', truncated: false, frames: [] });
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['0:1', '-1:1', '1202:1', '1:999', '999999999999999999:1'])(
+  'diagnostic frames keep invalid public coordinates %s unknown',
+  (coordinates) => {
+    const f = diagnosticFixture();
+    try {
+      f.failures([`    at closure (${f.sourceRoot}/src/setup.test.ts:${coordinates})`]);
+      assert.deepEqual(f.frames(), { status: 'unknown', truncated: false, frames: [] });
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('diagnostic frames do not follow public-code symlinks or claim malformed messages are complete', () => {
+  const f = diagnosticFixture();
+  try {
+    const file = join(f.sourceRoot, 'src/setup.test.ts');
+    rmSync(file);
+    symlinkSync(join(f.sourceRoot, 'dist/setup.test.js'), file);
+    f.failures([`    at closure (${file}:1108:7)`]);
+    assert.deepEqual(f.frames(), { status: 'unknown', truncated: false, frames: [] });
+    f.failures([null, `    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)`]);
+    assert.deepEqual(f.frames(), {
+      status: 'unknown',
+      truncated: false,
+      frames: [{ file: 'dist/setup.test.js', line: 100, column: 4, message: 2 }],
+    });
+    f.failures([`    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)`], 'passed');
+    assert.equal(f.frames(), undefined);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
 
 test('failed qualification diagnostics have an isolated nonpromotable workflow boundary', () => {
   const prepare = diagnosticStep('Prepare failed qualification diagnostics');
@@ -371,7 +548,7 @@ test.each([
       f.save(`release-tests-${f.runId}/vitest.json`, {
         testResults: [
           {
-            name: join('/synthetic/source', entry.file),
+            name: join(f.sourceRoot, entry.file),
             assertionResults: [1, 2].map(() => ({ fullName: entry.title, status: 'passed' })),
           },
         ],
