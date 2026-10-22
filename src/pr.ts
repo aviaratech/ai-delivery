@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import { DeliveryError } from './errors.js';
 import * as githubClients from './github/client.js';
 import type { GitHubClients } from './github/client.js';
@@ -278,7 +279,7 @@ async function verifyUnpublishedCommits(context: DeliveryContext, baseSha: strin
   }
   throw new DeliveryError('Introduced commit range exceeds the bounded readback window.');
 }
-async function verifyNonClosingReference(context: DeliveryContext, issueNumber: number, pr: RemotePr) {
+async function readNonClosingReference(context: DeliveryContext, issueNumber: number, pr: RemotePr) {
   if (
     typeof pr.node_id !== 'string' ||
     !pr.node_id ||
@@ -303,6 +304,7 @@ async function verifyNonClosingReference(context: DeliveryContext, issueNumber: 
   const cursors = new Set<string>();
   const events = new Map<string, string>();
   let matched = false;
+  let closesTarget: boolean | undefined;
   for (let page = 0; page < 20; page++) {
     type Subject = {
       __typename: string;
@@ -402,10 +404,12 @@ async function verifyNonClosingReference(context: DeliveryContext, issueNumber: 
           source.repository.id !== repository.node_id ||
           source.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
           event.isCrossRepository ||
-          event.willCloseTarget !== false ||
           event.actor.login.toLowerCase() !== route.author.actorLogin.toLowerCase()
         )
           throw new DeliveryError('Conflicting, closing or unauthorized native PR reference.');
+        if (closesTarget !== undefined && closesTarget !== event.willCloseTarget)
+          throw new DeliveryError('Conflicting native PR closing-reference semantics.');
+        closesTarget = event.willCloseTarget;
         matched = true;
       }
     }
@@ -414,7 +418,15 @@ async function verifyNonClosingReference(context: DeliveryContext, issueNumber: 
     if (page === 19) throw new DeliveryError('Native non-closing references exceed the bounded readback window.');
   }
   if (!matched) throw new DeliveryError('Missing authorized native non-closing PR-to-issue reference.');
-  await verifyPrIssueAssociation(context, pr.number, issueNumber, true, pr.node_id);
+  const allClosing = await readClosingReferenceIds(context, issueNumber, issue.node_id, repository.node_id, pr);
+  const manualClosing = await readClosingReferenceIds(
+    context,
+    issueNumber,
+    issue.node_id,
+    repository.node_id,
+    pr,
+    true,
+  );
   await verifyNonClosingCommits(context, pr);
   if (!pr.merged) {
     const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data;
@@ -424,7 +436,62 @@ async function verifyNonClosingReference(context: DeliveryContext, issueNumber: 
   const after = await openReferenceIssue(context, issueNumber);
   sameReferenceIssue(issue, after);
   sameReferencePr(pr, await getPr(context, pr.number));
-  return issue;
+  return { issue, closesTarget: closesTarget!, allClosing, manualClosing };
+}
+
+// Both strict verification and the explicit action consume the same complete graph.
+// Reading a closing edge here never supplies authority to remove it.
+async function readClosingReferenceIds(
+  context: DeliveryContext,
+  issueNumber: number,
+  issueId: string,
+  repositoryId: string,
+  pr: RemotePr,
+  manual = false,
+) {
+  let cursor: string | null = null;
+  const cursors = new Set<string>();
+  const ids = new Set<string>();
+  for (let page = 0; page < 20; page++) {
+    const result: ClosingIssuesQuery = await context.clients.graphql(
+      `query DeliveryClosingIssues($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){nameWithOwner pullRequest(number:$number){id number closingIssuesReferences(first:100,after:$cursor${manual ? ',userLinkedOnly:true' : ''}){nodes{__typename id number repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}`,
+      { ...context.repo, number: pr.number, cursor },
+    );
+    const connection = result.repository?.pullRequest?.closingIssuesReferences;
+    if (
+      result.repository?.nameWithOwner?.toLowerCase() !== context.config.repository.toLowerCase() ||
+      result.repository.pullRequest?.id !== pr.node_id ||
+      result.repository.pullRequest.number !== pr.number ||
+      !connection ||
+      !Array.isArray(connection.nodes) ||
+      connection.nodes.length > 100
+    )
+      throw new DeliveryError('Incomplete or conflicting native closing-reference graph.');
+    for (const issue of connection.nodes) {
+      if (
+        !issue ||
+        issue.__typename !== 'Issue' ||
+        issue.id !== issueId ||
+        issue.number !== issueNumber ||
+        issue.repository?.id !== repositoryId ||
+        issue.repository.nameWithOwner?.toLowerCase() !== context.config.repository.toLowerCase() ||
+        ids.has(issue.id)
+      )
+        throw new DeliveryError(
+          'Non-closing PR has an unintended, duplicate or incomplete native closing association.',
+        );
+      ids.add(issue.id);
+    }
+    cursor = pageCursor(connection, cursors);
+    if (cursor === null) return [...ids];
+  }
+  throw new DeliveryError('Native closing-reference graph exceeds the bounded readback window.');
+}
+async function verifyNonClosingReference(context: DeliveryContext, issueNumber: number, pr: RemotePr) {
+  const graph = await readNonClosingReference(context, issueNumber, pr);
+  if (graph.closesTarget || graph.allClosing.length || graph.manualClosing.length)
+    throw new DeliveryError('Non-closing PR has a closing native PR reference/association.');
+  return graph.issue;
 }
 
 function nativeId(value: unknown): value is string {
@@ -469,7 +536,6 @@ async function verifyPrIssueAssociation(
   context: DeliveryContext,
   prNumber: number,
   issueNumber: number,
-  nonClosing = false,
   expectedPrId?: string,
   onlyIntended = false,
   expectedIssueId?: string,
@@ -509,7 +575,6 @@ async function verifyPrIssueAssociation(
         throw new DeliveryError(
           'Incomplete or conflicting typed closing issue/repository identity before body transition.',
         );
-      if (nonClosing) throw new DeliveryError('Non-closing PR has an unintended native closing association.');
       if (
         !issue ||
         !Number.isSafeInteger(issue.number) ||
@@ -527,7 +592,7 @@ async function verifyPrIssueAssociation(
         throw new DeliveryError('Existing PR has conflicting closing associations; body transition refused.');
     }
     if (!connection.pageInfo.hasNextPage) {
-      if (!nonClosing && matches !== 1)
+      if (matches !== 1)
         throw new DeliveryError('Native GitHub PR closing-issue association does not identify the intended issue.');
       return;
     }
@@ -1006,6 +1071,9 @@ export async function publishPr(
     issueNumber: number;
     prNumber?: number;
     nonClosing?: boolean;
+    reconcileNonClosingReference?: boolean;
+    expectedHeadSha?: string;
+    expectedBaseSha?: string;
     body?: string;
     title?: string;
     draft?: boolean;
@@ -1015,6 +1083,28 @@ export async function publishPr(
   },
 ) {
   const nonClosing = nonClosingMode(input.nonClosing);
+  const reconcileReference = nonClosingMode(input.reconcileNonClosingReference);
+  if (reconcileReference) {
+    if (
+      context.clients.role !== 'author' ||
+      context.clients.authSource !== (context.config.roles.author.authSource ?? 'app') ||
+      !context.clients.authenticatedAuthor
+    )
+      throw new DeliveryError('Reference reconciliation requires the configured authenticated author role.');
+    if (
+      !nonClosing ||
+      input.draft === false ||
+      !validSha(input.expectedHeadSha) ||
+      !validSha(input.expectedBaseSha) ||
+      typeof input.body !== 'string' ||
+      !input.body.trim()
+    )
+      throw new DeliveryError(
+        'Reference reconciliation requires nonClosing, DRAFT, explicit safe body and exact expected head/base SHAs.',
+      );
+    refuseClosingDirective(input.body);
+  } else if (input.expectedHeadSha !== undefined || input.expectedBaseSha !== undefined)
+    throw new DeliveryError('Expected head/base inputs require explicit reconcileNonClosingReference.');
   if (input.prNumber !== undefined && (!Number.isSafeInteger(input.prNumber) || input.prNumber <= 0))
     throw new DeliveryError('Existing PR selector must be a positive safe integer.');
   const issue = nonClosing
@@ -1057,6 +1147,16 @@ export async function publishPr(
   if (matches.length > 1 || (explicit && (matches.length !== 1 || matches[0]!.number !== explicit.number)))
     throw new DeliveryError('Remote issue branch has conflicting PR matches.');
   let pr = explicit ?? (matches[0] === undefined ? undefined : await getPr(context, matches[0].number));
+  if (reconcileReference && pr && !explicit)
+    throw new DeliveryError(
+      'Reference reconciliation of an existing match requires explicit --pr and caller-reconciled authority/attempt receipts.',
+    );
+  if (nonClosing && !pr && !reconcileReference)
+    throw new DeliveryError(
+      'New linked-branch non-closing publication requires explicitly authorized --reconcile-non-closing-reference --expected-head SHA --expected-base SHA and --body-file PATH; bare --non-closing grants no removal authority.',
+    );
+  if (reconcileReference && ref.object.sha !== input.expectedHeadSha)
+    throw new DeliveryError('Reference reconciliation expected head differs from the exact remote linked head.');
   const requestedBody =
     input.body ??
     (nonClosing ? (pr?.body ?? referenceLine(context, input.issueNumber)) : `Closes #${input.issueNumber}`);
@@ -1069,6 +1169,8 @@ export async function publishPr(
       ? requestedBody
       : `${requestedBody}\n\nCloses #${input.issueNumber}`;
   const transition = nonClosing && pr !== undefined && pr.body !== body;
+  if (reconcileReference && transition)
+    throw new DeliveryError('Reference reconciliation refuses body transition; retain exact original intent.');
   if (transition && (input.prNumber === undefined || input.body === undefined))
     throw new DeliveryError('Non-closing body transition requires an explicit existing PR number and body.');
   if (
@@ -1095,11 +1197,52 @@ export async function publishPr(
   let expectedBody = pr?.body;
   const transitionDraft = pr?.draft;
   let promotionApplied = false;
+  let removalState: 'not attempted' | 'acknowledged' | 'uncertain' = 'not attempted';
   const preserveIssue = async () => {
     if (nonClosing) sameReferenceIssue(issue, await openReferenceIssue(context, input.issueNumber));
   };
+  const readReconciliation = async (selected: RemotePr) => {
+    try {
+      if (
+        selected.state !== 'open' ||
+        selected.draft !== true ||
+        selected.merged ||
+        selected.head.sha !== input.expectedHeadSha ||
+        selected.base.sha !== input.expectedBaseSha ||
+        selected.head.ref !== branch ||
+        selected.base.ref !== base ||
+        selected.body !== body ||
+        selected.title !== (existing?.title ?? creationTitle) ||
+        selected.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase()
+      )
+        throw new DeliveryError('Reference reconciliation DRAFT, exact head/base, message or author drifted.');
+      const graph = await readNonClosingReference(context, input.issueNumber, selected);
+      sameReferenceIssue(issue, graph.issue);
+      const safe = !graph.closesTarget && !graph.allClosing.length && !graph.manualClosing.length;
+      if (!safe && !(graph.closesTarget && graph.allClosing.length === 1 && graph.manualClosing.length === 1))
+        throw new DeliveryError(
+          'Reference removal requires only the intended manual closing pair and closing cross-reference.',
+        );
+      const currentHead = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${branch}` })).data;
+      if (
+        currentHead.ref !== ref.ref ||
+        currentHead.object.type !== 'commit' ||
+        currentHead.object.sha !== input.expectedHeadSha
+      )
+        throw new DeliveryError('Reference reconciliation source head drifted.');
+      sameReferencePr(selected, await getPr(context, selected.number));
+      await preserveIssue();
+      return !safe;
+    } catch (error) {
+      throw new DeliveryError(
+        `PR #${selected.number}; reference removal ${removalState}. Reconcile read-only; do not retry without caller-established authority and attempt history. ${error instanceof Error ? error.message : 'Unknown failure'}`,
+      );
+    }
+  };
   const readExisting = async () => {
-    const current = await verifyIssuePr(context, input.issueNumber, existing!.number, nonClosing && !pendingTransition);
+    const current = reconcileReference
+      ? await getPr(context, existing!.number)
+      : await verifyIssuePr(context, input.issueNumber, existing!.number, nonClosing && !pendingTransition);
     if (
       current.state !== 'open' ||
       current.merged ||
@@ -1114,12 +1257,12 @@ export async function publishPr(
       current.title !== existing!.title
     )
       throw new DeliveryError('Existing PR publication head, identity, intent or author readback drifted.');
+    if (reconcileReference) await readReconciliation(current);
     if (pendingTransition) {
       await verifyPrIssueAssociation(
         context,
         current.number,
         input.issueNumber,
-        false,
         current.node_id,
         true,
         issue.node_id,
@@ -1146,6 +1289,8 @@ export async function publishPr(
     if (publicationBaseSha !== undefined && publicationBaseSha !== baseRef.object.sha)
       throw new DeliveryError('Publication default base drifted before creation.');
     publicationBaseSha = baseRef.object.sha;
+    if (reconcileReference && publicationBaseSha !== input.expectedBaseSha)
+      throw new DeliveryError('Reference reconciliation expected default base differs from the remote base.');
     if (nonClosing) await verifyUnpublishedCommits(context, baseRef.object.sha, ref.object.sha);
     const afterHead = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${branch}` })).data;
     const afterBase = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${base}` })).data;
@@ -1178,6 +1323,7 @@ export async function publishPr(
       headBranch: branch,
       baseBranch: base,
       reviewRoute,
+      ...(reconcileReference ? { referenceRemoval: 'pending', nonClosingVerified: false } : {}),
     };
   let created = false;
   if (pr) {
@@ -1255,6 +1401,28 @@ export async function publishPr(
     if (pr.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase())
       throw new DeliveryError('Published PR author differs from the configured authenticated author.');
     if (nonClosing) {
+      if (reconcileReference && (await readReconciliation(pr))) {
+        // The trusted caller owns the exact grant and prior-attempt history.
+        // This invocation never retries this non-transactional native action.
+        if (await readReconciliation(pr)) {
+          removalState = 'uncertain';
+          try {
+            const removed = await context.clients.graphql<{
+              removeCloseIssueReferences?: { issue?: { id: string } | null } | null;
+            }>(
+              'mutation DeliveryRemoveClosingReference($issueId:ID!,$pullRequestIds:[ID!]!,$clientMutationId:String!){removeCloseIssueReferences(input:{issueId:$issueId,pullRequestIds:$pullRequestIds,clientMutationId:$clientMutationId}){issue{id}}}',
+              { issueId: issue.node_id, pullRequestIds: [pr.node_id], clientMutationId: randomUUID() },
+            );
+            if (removed.removeCloseIssueReferences?.issue?.id !== issue.node_id)
+              throw new DeliveryError('Incomplete reference-removal acknowledgement.');
+            removalState = 'acknowledged';
+          } catch (error) {
+            throw new DeliveryError(
+              `PR #${pr.number}; reference removal acknowledgement is uncertain. Reconcile read-only; no automatic retry or rollback. ${error instanceof Error ? error.message : 'Unknown failure'}`,
+            );
+          }
+        }
+      }
       const verified = await verifyIssuePr(context, input.issueNumber, pr.number, true);
       sameReferencePr(pr, verified);
       pr = verified;
@@ -1266,9 +1434,9 @@ export async function publishPr(
       pr = final;
     }
   } catch (error) {
-    if (!created) throw error;
+    if (!created && !reconcileReference) throw error;
     throw new DeliveryError(
-      `GitHub created PR #${pr.number} (${pr.html_url}) at ${pr.head.sha}; post-publication association/identity verification is unresolved. Reconcile this PR read-only; do not create again. ${error instanceof Error ? error.message : 'Unknown failure'}`,
+      `GitHub ${created ? 'created' : 'selected'} PR #${pr.number} (${pr.html_url}) at ${pr.head.sha}; post-publication association/identity verification is unresolved.${reconcileReference ? ` Reference removal ${removalState}.` : ''} Reconcile this PR read-only; do not create again. ${error instanceof Error ? error.message : 'Unknown failure'}`,
     );
   }
   return {
@@ -1277,7 +1445,8 @@ export async function publishPr(
     headSha: pr.head.sha,
     draft: pr.draft,
     reviewRoute,
-    ...(nonClosing ? { nonClosing: true } : {}),
+    ...(nonClosing ? { nonClosing: true, nonClosingVerified: true } : {}),
+    ...(reconcileReference ? { referenceRemoval: removalState } : {}),
   };
 }
 

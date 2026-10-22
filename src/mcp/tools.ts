@@ -301,17 +301,38 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_pr_create',
     commandName: 'pr:create',
     description: 'Create or reuse a PR from its GitHub-linked issue branch',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      issueNumber: Positive,
-      prNumber: Positive.optional(),
-      nonClosing: z.boolean().optional(),
-      body: z.string().min(1).optional(),
-      draft: z.boolean().optional(),
-      dryRun: z.boolean().optional(),
-      title: z.string().min(1).optional(),
-      headBranch: z.string().min(1).optional(),
-    }),
+    inputSchema: z
+      .strictObject({
+        repo: Repo,
+        issueNumber: Positive,
+        prNumber: Positive.optional(),
+        nonClosing: z.boolean().optional(),
+        reconcileNonClosingReference: z.boolean().optional(),
+        expectedHeadSha: z
+          .string()
+          .regex(/^[a-f0-9]{40}$/u)
+          .optional(),
+        expectedBaseSha: z
+          .string()
+          .regex(/^[a-f0-9]{40}$/u)
+          .optional(),
+        body: z.string().min(1).optional(),
+        draft: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        title: z.string().min(1).optional(),
+        headBranch: z.string().min(1).optional(),
+      })
+      .refine(
+        (input) =>
+          input.reconcileNonClosingReference === true
+            ? input.nonClosing === true &&
+              input.draft !== false &&
+              input.body !== undefined &&
+              input.expectedHeadSha !== undefined &&
+              input.expectedBaseSha !== undefined
+            : input.expectedHeadSha === undefined && input.expectedBaseSha === undefined,
+        'Reference reconciliation requires explicit nonClosing, DRAFT, body and exact head/base; SHA inputs require the action.',
+      ),
   },
   {
     name: 'issue_pr_info',

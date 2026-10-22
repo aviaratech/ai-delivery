@@ -402,6 +402,11 @@ export async function executeTool(
         ...(input.prNumber === undefined ? {} : { prNumber: requiredNumber(input, 'prNumber') }),
         issueNumber: requiredNumber(input, 'issueNumber'),
         ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),
+        ...(input.reconcileNonClosingReference === undefined
+          ? {}
+          : { reconcileNonClosingReference: input.reconcileNonClosingReference === true }),
+        ...(input.expectedHeadSha === undefined ? {} : { expectedHeadSha: requireString(input, 'expectedHeadSha') }),
+        ...(input.expectedBaseSha === undefined ? {} : { expectedBaseSha: requireString(input, 'expectedBaseSha') }),
         ...(input.body === undefined ? {} : { body: requireString(input, 'body') }),
         ...(input.title === undefined ? {} : { title: requireString(input, 'title') }),
         ...(input.headBranch === undefined ? {} : { headBranch: requireString(input, 'headBranch') }),

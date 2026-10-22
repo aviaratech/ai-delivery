@@ -517,6 +517,12 @@ program
   .requiredOption('--issue <number>')
   .option('--pr <number>', 'Exact existing PR selector; never creates a replacement')
   .option('--non-closing', 'Retain the issue OPEN using native non-closing reference proof')
+  .option(
+    '--reconcile-non-closing-reference',
+    'Explicit native closing-pair removal request; caller must hold exact authority and reconcile prior attempts',
+  )
+  .option('--expected-head <sha>', 'Exact source SHA for the explicit reference action')
+  .option('--expected-base <sha>', 'Exact default-base SHA for the explicit reference action')
   .option('--title <title>')
   .option('--body-file <path>')
   .option('--head <branch>', 'Explicit remote head; existing PR promotion verifies its native issue association')
@@ -527,6 +533,9 @@ program
       issue: string;
       pr?: string;
       nonClosing?: boolean;
+      reconcileNonClosingReference?: boolean;
+      expectedHead?: string;
+      expectedBase?: string;
       title?: string;
       bodyFile?: string;
       head?: string;
@@ -537,6 +546,9 @@ program
         issueNumber: int(o.issue),
         prNumber: int(o.pr),
         nonClosing: o.nonClosing,
+        reconcileNonClosingReference: o.reconcileNonClosingReference,
+        expectedHeadSha: o.expectedHead,
+        expectedBaseSha: o.expectedBase,
         title: o.title,
         body: body(undefined, o.bodyFile),
         headBranch: o.head,

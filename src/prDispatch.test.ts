@@ -26,6 +26,36 @@ function routes() {
 }
 
 describe('validated PR mode dispatch', () => {
+  const action = {
+    ...ids,
+    nonClosing: true,
+    reconcileNonClosingReference: true,
+    expectedHeadSha: 'a'.repeat(40),
+    expectedBaseSha: 'b'.repeat(40),
+    body: 'References example/widget#17',
+  };
+  it('forwards the explicit exact-head/base action through the existing author owner', async () => {
+    const calls = routes();
+    await executeTool('issue_pr_create', action, execution);
+    assert.deepEqual(calls.create.mock.calls[0]![1], { ...action, draft: true, dryRun: false });
+    assert.equal(calls.load.mock.calls[0]![0].role, 'author');
+  });
+  for (const change of [
+    { nonClosing: false },
+    { draft: false },
+    { body: undefined },
+    { expectedHeadSha: undefined },
+    { expectedBaseSha: undefined },
+    { expectedHeadSha: 'bad' },
+    { reconcileNonClosingReference: 'true' },
+    { reconcileNonClosingReference: false },
+  ]) {
+    it(`rejects malformed or incompatible reference action ${JSON.stringify(change)} before credentials`, async () => {
+      const calls = routes();
+      await assert.rejects(executeTool('issue_pr_create', { ...action, ...change }, execution));
+      assert.equal(calls.load.mock.calls.length + calls.create.mock.calls.length, 0);
+    });
+  }
   it('preserves explicit existing-PR selector and mode for create, review and guarded merge', async () => {
     const calls = routes();
     await executeTool(
