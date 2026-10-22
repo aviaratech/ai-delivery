@@ -138,6 +138,7 @@ jobs:
           node --input-type=module <<'JS'
           import { appendFileSync, constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, writeFileSync } from 'node:fs';
           import { basename, dirname, join, resolve } from 'node:path';
+          import { fileURLToPath } from 'node:url';
           import { RELEASE_CASES } from './scripts/checks.mjs';
           const env = process.env;
           const temporary = realpathSync(env.RUNNER_TEMP);
@@ -193,10 +194,74 @@ jobs:
           const release = read('release', releaseDirectory && [releaseDirectory, 'result.json']);
           const vitest = read('vitest', releaseDirectory && [releaseDirectory, 'vitest.json']);
           const consumer = read('consumer', consumerDirectory && [consumerDirectory, 'result.json']);
+          const workspace = realpathSync(env.GITHUB_WORKSPACE);
+          const publicFiles = ['setup', 'lifecycle', 'targetPolicyLocal', 'pluginPackaging'].flatMap(name => [`src/${name}.test.ts`, `dist/${name}.test.js`]);
+          const codeBounds = new Map();
+          const bounds = file => {
+            if (codeBounds.has(file)) return codeBounds.get(file);
+            codeBounds.set(file, null);
+            let fd;
+            try {
+              const path = join(workspace, file);
+              const stat = lstatSync(path);
+              if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 4 * 1024 * 1024 || realpathSync(path) !== path) return null;
+              fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+              const opened = fstatSync(fd);
+              if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size) return null;
+              const buffer = Buffer.alloc(stat.size + 1);
+              const length = readSync(fd, buffer, 0, buffer.length, 0);
+              const after = fstatSync(fd);
+              if (length !== stat.size || after.size !== stat.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || realpathSync(path) !== path) return null;
+              const lines = buffer.subarray(0, length).toString('utf8').split(/\r?\n/).map(line => line.length);
+              codeBounds.set(file, lines);
+              return lines;
+            } catch { return null; }
+            finally { if (fd !== undefined) closeSync(fd); }
+          };
+          const failureFrames = messages => {
+            const frames = [];
+            let unknown = !Array.isArray(messages) || messages.length === 0;
+            let truncated = Array.isArray(messages) && messages.length > 2;
+            for (const [index, message] of (Array.isArray(messages) ? messages.slice(0, 2) : []).entries()) {
+              if (typeof message !== 'string') { unknown = true; continue; }
+              const bytes = Buffer.from(message);
+              const cut = bytes.length > 16 * 1024;
+              if (cut) truncated = true;
+              const lines = bytes.subarray(0, 16 * 1024).toString('utf8').split('\n');
+              if (cut || lines.at(-1) === '') lines.pop(); // Never inspect a partial final line.
+              if (lines.length > 64) truncated = true;
+              for (const raw of lines.slice(0, 64)) {
+                const line = raw.replace(/\r$/, '');
+                if (Buffer.byteLength(line) > 2 * 1024) { truncated = true; continue; }
+                const clean = line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+                const frame = /^\s*at (?:[^()\r\n]+ \(([^()\r\n]+)\)|([^()\r\n]+))$/.exec(clean);
+                const site = /^(.+):(-?\d+):(-?\d+)$/.exec(frame?.[1] ?? frame?.[2] ?? '');
+                if (!site) continue;
+                let path = site[1];
+                if (path.startsWith('file:')) {
+                  try {
+                    const url = new URL(path);
+                    if (url.protocol !== 'file:' || url.search || url.hash || url.href !== path) continue;
+                    path = fileURLToPath(url);
+                  } catch { continue; }
+                }
+                const file = publicFiles.find(file => path === file || path === join(workspace, file));
+                if (!file) continue;
+                const limits = bounds(file);
+                const row = number(Number(site[2]), 1, limits?.length ?? 0);
+                const column = row === null ? null : number(Number(site[3]), 1, limits[row - 1] + 1);
+                if (row === null || column === null) { unknown = true; continue; }
+                if (frames.length === 4) { truncated = true; continue; }
+                frames.push({ file, line: row, column, message: index + 1 });
+              }
+            }
+            return { status: unknown ? 'unknown' : frames.length ? 'matched' : truncated ? 'unknown' : 'no-match', truncated, frames };
+          };
           const testResults = Array.isArray(vitest?.testResults) ? vitest.testResults : [];
           const cases = RELEASE_CASES.map(({ file, title }) => {
             const matches = testResults.filter(test => test?.name === join(env.GITHUB_WORKSPACE, file)).flatMap(test => Array.isArray(test.assertionResults) ? test.assertionResults.filter(assertion => assertion?.fullName === title) : []);
-            return { file, title, status: matches.length > 1 ? 'ambiguous' : choice(matches[0]?.status, ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled']) };
+            const state = matches.length > 1 ? 'ambiguous' : choice(matches[0]?.status, ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled']);
+            return { file, title, status: state, ...(state === 'failed' ? { failureFrames: failureFrames(matches[0].failureMessages) } : {}) };
           });
           const commands = Array.isArray(producer?.commands) ? producer.commands : [];
           const releaseCommands = Array.isArray(release?.commands) ? release.commands : [];
