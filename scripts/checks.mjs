@@ -948,7 +948,6 @@ export async function runChecks({
         process.execPath,
         join(cwd, 'node_modules/vitest/vitest.mjs'),
         'run',
-        '--maxWorkers=1',
         `--tags-filter=${release ? 'release' : '!release'}`,
         '--reporter=default',
         '--reporter=json',

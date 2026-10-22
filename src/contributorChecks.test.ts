@@ -120,6 +120,55 @@ type Checks = {
 const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as Checks;
 const repository = fileURLToPath(new URL('../', import.meta.url));
 
+test('Vitest projects select every compiled file once with bounded parallelism and finite timeouts', async () => {
+  const f = fixture();
+  try {
+    const {
+      default: { test: config },
+    } = (await import(pathToFileURL(join(repository, 'vitest.config.ts')).href)) as {
+      default: {
+        test: {
+          testTimeout: number;
+          pool: string;
+          projects: {
+            test: { name: string; maxWorkers: number; fileParallelism: boolean; sequence: { groupOrder: number } };
+          }[];
+        };
+      };
+    };
+    assert.deepEqual(config.projects?.map((project) => project.test.name).sort(), ['parallel', 'serial']);
+    assert.ok(Number.isFinite(config.testTimeout) && config.testTimeout > 0);
+    assert.equal(config.pool, 'forks');
+    const parallel = config.projects.find((project) => project.test.name === 'parallel')!.test;
+    const serial = config.projects.find((project) => project.test.name === 'serial')!.test;
+    assert.ok(parallel.fileParallelism && parallel.maxWorkers > 1 && parallel.maxWorkers <= 2);
+    assert.equal(serial.fileParallelism, false);
+    assert.equal(serial.maxWorkers, 1);
+    assert.ok(parallel.sequence.groupOrder < serial.sequence.groupOrder);
+    const output = join(f.base, 'projects.json');
+    execFileSync(
+      process.execPath,
+      [join(repository, 'node_modules/vitest/vitest.mjs'), 'list', '--filesOnly', `--json=${output}`],
+      {
+        cwd: repository,
+        env: checks.safeEnvironment({ PATH: process.env.PATH ?? '' }),
+        encoding: 'utf8',
+        maxBuffer: 1024 ** 2,
+      },
+    );
+    const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; projectName: string }[];
+    const selected = rows.map((row) => relative(repository, row.file).replaceAll('\\', '/'));
+    assert.deepEqual([...selected].sort(), checks.assertCleanSelection(repository));
+    assert.equal(new Set(selected).size, selected.length, 'No file may belong to both projects');
+    assert.deepEqual([...new Set(rows.map((row) => row.projectName))].sort(), ['parallel', 'serial']);
+    for (const name of ['setup', 'lifecycle', 'contributorChecks']) {
+      assert.ok(rows.some((row) => row.file.endsWith(`/dist/${name}.test.js`) && row.projectName === 'serial'));
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('ordinary full and focused checks exclude release cases without claiming archive proof', async () => {
   for (const focused of [false, true]) {
     const f = fixture();
@@ -141,6 +190,11 @@ test('ordinary full and focused checks exclude release cases without claiming ar
           return delegated(command, options);
         },
       });
+      const testCommand = report.commands.find((command) => command.stage === 'tests')!.command;
+      assert.equal(
+        testCommand.some((argument) => argument.startsWith('--maxWorkers')),
+        false,
+      );
       assert.equal(report.status, focused ? 'partial-passed' : 'passed');
       assert.equal(report.artifactQualified, false);
       if (!focused) assert.deepEqual(report.omitted, []);
