@@ -25,6 +25,7 @@ function fixture(
     personalAuthor?: boolean;
     reviewLogin?: string;
     head?: typeof head;
+    verdict?: 'approve' | 'request-changes';
   } = {},
 ) {
   const fixtureHead = input.head ?? head;
@@ -47,12 +48,12 @@ function fixture(
     reviewerIdentity: 'synthetic-reviewer',
     schemaVersion: 'ai-delivery.review-artifact@1' as const,
     summary: 'Reviewed exact changes.',
-    verdict: 'approve' as const,
+    verdict: input.verdict ?? 'approve',
   };
   const artifact = ReviewArtifactSchema.parse({ ...artifactContent, artifactId: digestValue(artifactContent) });
   const review = {
     id: 41,
-    state: 'APPROVED',
+    state: input.verdict === 'request-changes' ? 'CHANGES_REQUESTED' : 'APPROVED',
     commit_id: fixtureHead.sha,
     user: { login: input.reviewLogin ?? 'synthetic-reviewer[bot]' },
     html_url: 'https://github.com/example/repo/pull/19#pullrequestreview-41',
@@ -62,6 +63,7 @@ function fixture(
   let created = 0;
   let actorLookups = 0;
   let currentPrHead = fixtureHead.sha;
+  const events: string[] = [];
   const context = {
     root,
     repo: { owner: 'example', repo: 'repo' },
@@ -102,7 +104,8 @@ function fixture(
           listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
           getReview: async () => ({ data: review }),
           listReviews: async () => ({ data: reviews }),
-          createReview: async (input: { body: string }) => {
+          createReview: async (input: { body: string; event?: string }) => {
+            events.push(input.event ?? 'missing');
             review.body = input.body;
             created += 1;
             reviews.push(review);
@@ -120,6 +123,7 @@ function fixture(
     context,
     artifact,
     reviews,
+    events,
     submit,
     setPrHead(sha: string) {
       currentPrHead = sha;
@@ -132,6 +136,22 @@ function fixture(
     },
   };
 }
+
+test('request-changes posts its own event and reuses only its exact rejection receipt', async () => {
+  const state = fixture({ verdict: 'request-changes' });
+  try {
+    const result = await state.submit();
+    assert.equal(result.state, 'CHANGES_REQUESTED');
+    assert.deepEqual(state.events, ['REQUEST_CHANGES']);
+    assert.equal((await state.submit()).receiptId, result.receiptId);
+    assert.equal(state.created, 1);
+    state.setPrHead('f'.repeat(40));
+    await assert.rejects(state.submit(), /head changed/u);
+    assert.equal(state.created, 1);
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
 
 test('reviewer App bot submits and reuses an exact-head approval without GET /user', async () => {
   const state = fixture();
@@ -643,6 +663,7 @@ test.each([
       PREFLIGHT_REVIEWER_INSTALLATION_ID: '202',
       PREFLIGHT_REVIEWER_KEY_PATH: keyPath,
     };
+    assert.ok('credentialEnv' in config.roles.author);
     const envNames = [...Object.values(config.roles.author.credentialEnv), ...Object.keys(reviewerEnv)];
     const savedEnv = new Map(envNames.map((name) => [name, process.env[name]]));
     const requests: string[] = [];

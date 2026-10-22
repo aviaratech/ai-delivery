@@ -463,7 +463,11 @@ else process.exit(91);
     rmSync(home, { recursive: true });
   };
   process.env = { HOME: home, PATH: bin };
-  context.config.roles.author.credentialEnv = { token: 'GH_TOKEN' };
+  context.config.roles.author = {
+    authSource: 'personal',
+    identity: context.config.roles.author.identity,
+    credentialEnv: { token: 'GH_TOKEN' },
+  };
   vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     assert.equal(url.origin, 'https://api.github.com');

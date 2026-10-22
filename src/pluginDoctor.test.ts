@@ -486,7 +486,11 @@ test('the actual SDK startup subprocess receives no inherited-name credential se
   const sdk = await vi.importActual<typeof import('@modelcontextprotocol/sdk/client/stdio.js')>(
     '@modelcontextprotocol/sdk/client/stdio.js',
   );
-  settings.roles.author.credentialEnv = { token: 'LOGNAME' };
+  settings.roles.author = {
+    authSource: 'personal',
+    identity: settings.roles.author.identity,
+    credentialEnv: { token: 'LOGNAME' },
+  };
   file(fixture.config, JSON.stringify(settings));
   for (const name of sdk.DEFAULT_INHERITED_ENV_VARS) vi.stubEnv(name, `fictional-inherited-${name}`);
   await doctor('example/widget', false);
@@ -567,7 +571,11 @@ test.each(['codex', 'claude-code'])(
   async (host) => {
     native(host);
     fixture.machine = true;
-    settings.roles.author.credentialEnv = { token: 'GH_TOKEN' };
+    settings.roles.author = {
+      authSource: 'personal',
+      identity: settings.roles.author.identity,
+      credentialEnv: { token: 'GH_TOKEN' },
+    };
     file(fixture.config, JSON.stringify(settings));
     vi.stubEnv('GH_TOKEN', undefined);
     vi.stubEnv('HOME', fixture.home);
@@ -602,7 +610,11 @@ test.each(['codex', 'claude-code'])(
   },
 );
 test('absent default author input still gates missing reviewer references before machine/session/key access', async () => {
-  settings.roles.author.credentialEnv = { token: 'GH_TOKEN' };
+  settings.roles.author = {
+    authSource: 'personal',
+    identity: settings.roles.author.identity,
+    credentialEnv: { token: 'GH_TOKEN' },
+  };
   file(fixture.config, JSON.stringify(settings));
   vi.stubEnv('GH_TOKEN', undefined);
   vi.stubEnv('DELIVERY_REVIEW_APP_ID', undefined);
@@ -616,7 +628,11 @@ test('invalid App references and reserved runtime credential names stop before k
   vi.stubEnv('DELIVERY_REVIEW_INSTALLATION_ID', 'not-an-id');
   assert.equal((await doctor()).authProbe?.reason, 'invalid_references');
   vi.stubEnv('DELIVERY_REVIEW_INSTALLATION_ID', '765432');
-  settings.roles.author.credentialEnv = { token: 'NODE_OPTIONS' };
+  settings.roles.author = {
+    authSource: 'personal',
+    identity: settings.roles.author.identity,
+    credentialEnv: { token: 'NODE_OPTIONS' },
+  };
   file(fixture.config, JSON.stringify(settings));
   vi.stubEnv('NODE_OPTIONS', 'fictional-runtime-value');
   assert.equal((await doctor()).authProbe?.reason, 'invalid_references');

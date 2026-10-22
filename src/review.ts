@@ -16,9 +16,120 @@ import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 const Sha = z.string().regex(/^[a-f0-9]{40}$/u);
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
+const Text = z.string().trim().min(1);
+const Effort = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+export const ReviewVerdictSchema = z.strictObject({
+  schemaVersion: z.literal('ai-delivery.review-verdict@1'),
+  verdict: z.enum(['approve', 'request-changes']),
+  summary: Text,
+  issueNumber: z.number().int().positive(),
+  scope: z.strictObject({
+    headSha: Sha,
+    headTree: Sha,
+    changedPaths: z
+      .array(Text)
+      .refine(
+        (paths) => paths.every((path, index) => index === 0 || paths[index - 1]! < path),
+        'Paths must be complete, sorted and unique.',
+      ),
+  }),
+  verificationReproduced: z.array(Text).min(1),
+  requestedModel: Text,
+  requestedEffort: Effort,
+  effectiveModel: Text,
+  effectiveEffort: Effort,
+  elapsedMs: z.number().int().nonnegative(),
+  findings: z.array(Text),
+  readOnly: z.literal(true),
+  nonClosing: z.boolean().optional(),
+});
+export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
+
+export function parseReviewVerdict(raw: unknown): ReviewVerdict {
+  let value: unknown;
+  try {
+    value = typeof raw === 'string' ? (JSON.parse(raw) as unknown) : raw;
+  } catch {
+    throw new DeliveryError('verdict: Invalid JSON.');
+  }
+  const result = ReviewVerdictSchema.safeParse(value);
+  if (!result.success)
+    throw new DeliveryError(
+      result.error.issues.map((issue) => `${issue.path.join('.') || 'verdict'}: ${issue.message}`).join('; '),
+    );
+  return result.data;
+}
+
+export function buildReviewArtifact(input: {
+  verdict: ReviewVerdict;
+  verdictFileSha256: string;
+  identity: string;
+  provider: string;
+  expectedHead: string;
+  prNumber: number;
+  authorIdentity: string;
+}): ReviewArtifact {
+  const verdict = parseReviewVerdict(input.verdict);
+  if (!Digest.safeParse(input.verdictFileSha256).success)
+    throw new DeliveryError('verdictFileSha256: Expected the exact verdict-file SHA256.');
+  if (input.identity.toLowerCase() === input.authorIdentity.toLowerCase())
+    throw new DeliveryError('identity: Reviewer and author must be distinct.');
+  assertReviewVerdictTarget(verdict, input.provider, input.expectedHead);
+  const content = {
+    schemaVersion: 'ai-delivery.review-artifact@1' as const,
+    verdictFileSha256: input.verdictFileSha256,
+    authorIdentity: input.authorIdentity,
+    reviewerIdentity: input.identity,
+    head: { sha: verdict.scope.headSha, tree: verdict.scope.headTree },
+    issueNumber: verdict.issueNumber,
+    prNumber: input.prNumber,
+    diffScopeHash: digestValue(verdict.scope.changedPaths),
+    checks: verdict.verificationReproduced,
+    elapsedMs: verdict.elapsedMs,
+    findings: verdict.findings,
+    readOnly: verdict.readOnly,
+    requestedModel: verdict.requestedModel,
+    requestedEffort: verdict.requestedEffort,
+    effectiveModel: verdict.effectiveModel,
+    effectiveEffort: verdict.effectiveEffort,
+    summary: verdict.summary,
+    verdict: verdict.verdict,
+  };
+  const artifact = ReviewArtifactSchema.parse({ ...content, artifactId: digestValue(content) });
+  githubReviewBody(artifact);
+  return artifact;
+}
+
+export function assertReviewVerdictTarget(
+  verdict: ReviewVerdict,
+  selectedProvider: string,
+  expectedHead: string,
+): void {
+  const provider = (model: string) =>
+    /^(?:gpt-|o[134](?:-|$))/u.test(model)
+      ? 'openai'
+      : model.startsWith('claude-')
+        ? 'anthropic'
+        : model.startsWith('gemini-')
+          ? 'google'
+          : /^qwen[\d.-]/iu.test(model)
+            ? 'qwen'
+            : null;
+  if (
+    provider(verdict.requestedModel) === null ||
+    provider(verdict.requestedModel) !== selectedProvider ||
+    provider(verdict.effectiveModel) !== selectedProvider
+  )
+    throw new DeliveryError(
+      'identity: Configured reviewer provider must match both requestedModel and effectiveModel families.',
+    );
+  if (!Sha.safeParse(expectedHead).success || expectedHead !== verdict.scope.headSha)
+    throw new DeliveryError('scope.headSha: Verdict and requested exact head differ.');
+}
 export const ReviewArtifactSchema = z
   .object({
     artifactId: Digest,
+    verdictFileSha256: Digest.optional(),
     authorIdentity: z.string().min(1),
     checks: z.array(z.string().min(1)).min(1),
     diffScopeHash: Digest,
@@ -90,7 +201,7 @@ export async function readRequiredReviewState(
   context: DeliveryContext,
   prNumber: number,
   expectedHead: string,
-  submittedReview?: { id: number; login: string },
+  submittedReview?: { id: number; login: string; state?: 'APPROVED' | 'CHANGES_REQUESTED' },
 ): Promise<RequiredReviewState> {
   let response: {
     repository: {
@@ -167,7 +278,7 @@ export async function readRequiredReviewState(
           String(review.fullDatabaseId) === String(submittedReview.id) &&
           review.author?.login.toLowerCase().replace(/\[bot\]$/u, '') === submittedActor &&
           review.commit?.oid === expectedHead &&
-          review.state === 'APPROVED',
+          review.state === (submittedReview.state ?? 'APPROVED'),
       );
       if (typeof exact?.authorCanPushToRepository === 'boolean') {
         submittedReviewAuthorCanPushToRepository = exact.authorCanPushToRepository;
@@ -244,7 +355,13 @@ export function parseGitHubReviewArtifact(body: string | null | undefined): Revi
 
 function githubReviewBody(artifact: ReviewArtifact): string {
   ReviewArtifactSchema.parse(artifact);
-  const body = `${artifact.summary}\n\n<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
+  const metadata =
+    artifact.verdictFileSha256 === undefined
+      ? ''
+      : `\n\nVerdict: ${artifact.verdict}\nRequested model/effort: ${artifact.requestedModel} / ${artifact.requestedEffort}\nEffective model/effort: ${artifact.effectiveModel} / ${artifact.effectiveEffort}\nElapsed milliseconds: ${artifact.elapsedMs}\nVerdict-file SHA256: ${artifact.verdictFileSha256}\nFindings: ${artifact.findings.length ? artifact.findings.join('; ') : 'none'}`;
+  const body = `${artifact.summary}${metadata}\n\n<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
+  if (Buffer.byteLength(body) > 64 * 1024)
+    throw new DeliveryError('Review body exceeds the 64 KiB publication limit; provide a concise verdict.');
   parseGitHubReviewArtifact(body);
   return body;
 }
@@ -370,30 +487,30 @@ export interface GitHubReviewReceipt {
   login: string;
   prNumber: number;
   schemaVersion: 'ai-delivery.github-review@1';
-  state: 'APPROVED';
+  state: 'APPROVED' | 'CHANGES_REQUESTED';
   receiptId: string;
+}
+export class ReviewSubmissionError extends DeliveryError {
+  constructor(
+    message: string,
+    readonly submission: {
+      artifactId: string;
+      repository: string;
+      headSha: string;
+      prNumber: number;
+      githubReviewId?: number;
+      githubReviewUrl?: string;
+    },
+  ) {
+    super(`${message} Reconcile this artifact's remote review before retrying; no automatic retry was attempted.`);
+  }
 }
 export interface ReviewDryRun {
   dryRun: true;
   artifactId: string;
   headSha: string;
 }
-export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
-export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
-export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
-export async function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun> {
-  const { artifact, context, issueNumber, prNumber } = input;
-  ReviewArtifactSchema.parse(artifact);
-  if (
-    artifact.verdict !== 'approve' ||
-    artifact.issueNumber !== issueNumber ||
-    artifact.authorIdentity !== context.config.roles.author.identity ||
-    artifact.reviewerIdentity !== context.config.roles.reviewer.identity ||
-    (artifact.prNumber !== null && artifact.prNumber !== prNumber)
-  )
-    throw new DeliveryError('Independent review artifact is foreign or rejected.');
-  if (context.clients.authSource !== 'app' || context.clients.role !== 'reviewer' || !context.clients.appActorLogin)
-    throw new DeliveryError('Formal review requires the independent reviewer GitHub App role.');
+export async function validateReviewTarget(context: DeliveryContext, artifact: ReviewArtifact, prNumber: number) {
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
   if (
     pr.number !== prNumber ||
@@ -403,15 +520,36 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
     pr.head.repo?.full_name.toLowerCase() !== context.config.repository.toLowerCase()
   )
     throw new DeliveryError('PR identity or head changed before formal review.');
-  const actor = await context.clients.appActorLogin();
-  if (!actor || !pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase())
-    throw new DeliveryError('Reviewer GitHub actor must differ from PR author.');
   const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: artifact.head.sha })).data;
   if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
     throw new DeliveryError('Independent review tree differs from the remote commit.');
   if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, prNumber, pr.changed_files)))
     throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
+  return pr;
+}
+
+export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
+export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
+export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
+export async function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun> {
+  const { artifact, context, issueNumber, prNumber } = input;
+  ReviewArtifactSchema.parse(artifact);
+  if (
+    artifact.issueNumber !== issueNumber ||
+    artifact.authorIdentity !== context.config.roles.author.identity ||
+    artifact.reviewerIdentity !== context.config.roles.reviewer.identity ||
+    (artifact.prNumber !== null && artifact.prNumber !== prNumber)
+  )
+    throw new DeliveryError('Independent review artifact is foreign or rejected.');
+  if (context.clients.authSource !== 'app' || context.clients.role !== 'reviewer' || !context.clients.appActorLogin)
+    throw new DeliveryError('Formal review requires the independent reviewer GitHub App role.');
+  const pr = await validateReviewTarget(context, artifact, prNumber);
+  const actor = await context.clients.appActorLogin();
+  if (!actor || !pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase())
+    throw new DeliveryError('Reviewer GitHub actor must differ from PR author.');
   const body = githubReviewBody(artifact);
+  const expectedState = artifact.verdict === 'approve' ? ('APPROVED' as const) : ('CHANGES_REQUESTED' as const);
+  const event = artifact.verdict === 'approve' ? ('APPROVE' as const) : ('REQUEST_CHANGES' as const);
   const marker = `<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->`;
   const history = await listAllReviews(context, prNumber);
   const matches = history.filter((review) => review.body?.includes(marker));
@@ -419,7 +557,7 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
   const prior = matches[0];
   if (
     prior &&
-    (prior.state !== 'APPROVED' ||
+    (prior.state !== expectedState ||
       prior.commit_id !== artifact.head.sha ||
       prior.user?.login.toLowerCase() !== actor.toLowerCase() ||
       !prior.html_url ||
@@ -430,55 +568,78 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
   if (fresh.head.sha !== artifact.head.sha || fresh.base.sha !== pr.base.sha || fresh.state !== 'open')
     throw new DeliveryError('PR moved during independent review validation.');
   if (input.dryRun) return { dryRun: true as const, artifactId: artifact.artifactId, headSha: artifact.head.sha };
-  const submitted =
-    prior ??
-    (
-      await context.clients.rest.pulls.createReview({
-        ...context.repo,
-        pull_number: prNumber,
-        commit_id: artifact.head.sha,
-        body,
-        event: 'APPROVE',
-      })
-    ).data;
-  if (
-    !submitted.id ||
-    submitted.state !== 'APPROVED' ||
-    submitted.commit_id !== artifact.head.sha ||
-    submitted.user?.login.toLowerCase() !== actor.toLowerCase() ||
-    !submitted.html_url
-  )
-    throw new DeliveryError('GitHub did not return complete exact-head independent approval.');
-  const content = {
-    artifact,
+  const pending = {
+    artifactId: artifact.artifactId,
     repository: context.config.repository,
-    baseSha: pr.base.sha,
     headSha: artifact.head.sha,
-    githubReviewId: submitted.id,
-    githubReviewUrl: submitted.html_url,
-    login: submitted.user.login,
     prNumber,
-    schemaVersion: 'ai-delivery.github-review@1' as const,
-    state: 'APPROVED' as const,
   };
-  const receipt = { ...content, receiptId: digestValue(content) };
-  const readback = (
-    await context.clients.rest.pulls.getReview({ ...context.repo, pull_number: prNumber, review_id: submitted.id })
-  ).data;
-  if (
-    readback.id !== receipt.githubReviewId ||
-    readback.html_url !== receipt.githubReviewUrl ||
-    readback.state !== 'APPROVED' ||
-    readback.commit_id !== receipt.headSha ||
-    readback.user?.login !== receipt.login ||
-    parseGitHubReviewArtifact(readback.body).artifactId !== artifact.artifactId
-  )
-    throw new DeliveryError('GitHub exact-head App review readback disagrees.');
+  let submitted;
+  try {
+    submitted =
+      prior ??
+      (
+        await context.clients.rest.pulls.createReview({
+          ...context.repo,
+          pull_number: prNumber,
+          commit_id: artifact.head.sha,
+          body,
+          event,
+        })
+      ).data;
+  } catch {
+    throw new ReviewSubmissionError('Review submission acknowledgement is unknown.', pending);
+  }
+  const known = {
+    ...pending,
+    ...(submitted.id ? { githubReviewId: submitted.id } : {}),
+    ...(submitted.html_url ? { githubReviewUrl: submitted.html_url } : {}),
+  };
+  try {
+    if (
+      !submitted.id ||
+      submitted.state !== expectedState ||
+      submitted.commit_id !== artifact.head.sha ||
+      submitted.user?.login.toLowerCase() !== actor.toLowerCase() ||
+      !submitted.html_url
+    )
+      throw new DeliveryError('GitHub did not return complete exact-head independent approval.');
+    const content = {
+      artifact,
+      repository: context.config.repository,
+      baseSha: pr.base.sha,
+      headSha: artifact.head.sha,
+      githubReviewId: submitted.id,
+      githubReviewUrl: submitted.html_url,
+      login: submitted.user.login,
+      prNumber,
+      schemaVersion: 'ai-delivery.github-review@1' as const,
+      state: expectedState,
+    };
+    const receipt = { ...content, receiptId: digestValue(content) };
+    const readback = (
+      await context.clients.rest.pulls.getReview({ ...context.repo, pull_number: prNumber, review_id: submitted.id })
+    ).data;
+    if (
+      readback.id !== receipt.githubReviewId ||
+      readback.html_url !== receipt.githubReviewUrl ||
+      readback.state !== expectedState ||
+      readback.commit_id !== receipt.headSha ||
+      readback.user?.login !== receipt.login ||
+      parseGitHubReviewArtifact(readback.body).artifactId !== artifact.artifactId
+    )
+      throw new DeliveryError('GitHub exact-head App review readback disagrees.');
 
-  const current = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
-  if (current.head.sha !== artifact.head.sha || current.base.sha !== pr.base.sha || current.state !== 'open')
-    throw new DeliveryError('PR moved during independent review submission; approval is not current.');
-  return receipt;
+    const current = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+    if (current.head.sha !== artifact.head.sha || current.base.sha !== pr.base.sha || current.state !== 'open')
+      throw new DeliveryError('PR moved during independent review submission; approval is not current.');
+    return receipt;
+  } catch (error) {
+    throw new ReviewSubmissionError(
+      error instanceof DeliveryError ? error.message : 'Review post-submission readback is unavailable.',
+      known,
+    );
+  }
 }
 
 export function loadSubmittedReview(

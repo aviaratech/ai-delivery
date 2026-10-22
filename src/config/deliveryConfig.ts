@@ -10,6 +10,7 @@ import { digestValue } from '../delivery/common.js';
 import { createDeliveryGitHubClients, retainMachineAuthorForConfiguration } from '../github/client.js';
 import { resolveRepoFromRemote } from '../github/repo.js';
 import { discoverDeliveryRouting, type DiscoveryClients, type DeliveryRouting } from '../github/discovery.js';
+import { MACHINE_AUTH_ENV_NAMES } from '../github/machineAuth.js';
 
 export const DELIVERY_CONFIG_FILE = 'ai-delivery.config.json';
 export const DELIVERY_POLICY_CONTRACT = 'RepositoryDeliveryPolicy@1';
@@ -56,7 +57,7 @@ const NativeField = z
   })
   .strict();
 
-const AppRole = z
+const LegacyAppRole = z
   .object({
     authSource: z.literal('app').optional(),
     credentialEnv: z
@@ -69,6 +70,54 @@ const AppRole = z
     identity: Name,
   })
   .strict();
+export const ReviewProvider = z.enum(['openai', 'anthropic', 'google', 'qwen']);
+const Encoding = z.enum(['pem', 'base64']).optional();
+const CredentialSource = z.union([
+  z.strictObject({ type: z.literal('env'), variable: EnvName.optional(), encoding: Encoding }),
+  z.strictObject({ type: z.literal('file'), path: Name.refine(isAbsolute, 'Key path must be absolute.') }),
+  z.strictObject({
+    type: z.literal('command'),
+    argv: z
+      .array(z.string().max(4096))
+      .min(1)
+      .max(64)
+      .refine(
+        (argv) => isAbsolute(argv[0]!) && argv.every((part) => !part.includes('\0')),
+        'Command requires an absolute executable and literal argv without NUL.',
+      ),
+    encoding: Encoding,
+    env: z.array(EnvName).max(32).optional(),
+  }),
+]);
+const ConfiguredAppRole = z.strictObject({
+  authSource: z.literal('app'),
+  identity: z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u),
+  appId: PositiveInteger.safe(),
+  installationId: PositiveInteger.safe(),
+  actorLogin: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,99}\[bot\]$/u),
+  provider: ReviewProvider,
+  credentialSource: CredentialSource.optional(),
+});
+const AppRole = z.union([LegacyAppRole, ConfiguredAppRole]);
+export type ConfiguredApp = z.infer<typeof ConfiguredAppRole>;
+export type AppCredentialSource = z.infer<typeof CredentialSource>;
+export function appCredentialSource(role: ConfiguredApp): AppCredentialSource {
+  return role.credentialSource ?? { type: 'env' };
+}
+export function privateKeyVariable(role: ConfiguredApp): string {
+  const source = appCredentialSource(role);
+  return source.type === 'env' && source.variable !== undefined
+    ? source.variable
+    : `GH_PRIVATE_KEY_${role.identity.toUpperCase().replace(/[^A-Z0-9]/gu, '_')}`;
+}
+/** Names only: readiness and environment selection must never resolve a secret. */
+export function credentialReferenceNames(
+  role: z.infer<typeof AppRole> | { credentialEnv: { token: string } },
+): string[] {
+  if ('credentialEnv' in role) return Object.values(role.credentialEnv);
+  const source = appCredentialSource(role);
+  return source.type === 'env' ? [privateKeyVariable(role)] : source.type === 'command' ? (source.env ?? []) : [];
+}
 const AuthorRole = z.union([
   AppRole,
   z
@@ -170,8 +219,8 @@ const DeliveryConfigSchema = z
         path: ['roles'],
       });
     }
-    const authorEnv = Object.values(value.roles.author.credentialEnv);
-    const reviewerEnv = Object.values(value.roles.reviewer.credentialEnv);
+    const authorEnv = credentialReferenceNames(value.roles.author);
+    const reviewerEnv = credentialReferenceNames(value.roles.reviewer);
     if (new Set([...authorEnv, ...reviewerEnv]).size !== authorEnv.length + reviewerEnv.length) {
       context.addIssue({
         code: 'custom',
@@ -255,9 +304,10 @@ const UserSettingsSchema = z
     wipLimits: WipLimits.optional(),
     schemaVersion: z.literal('ai-delivery.user@1'),
     roles: z.strictObject({
-      author: z.discriminatedUnion('authSource', [AppRole, AuthorRole.options[1]]),
+      author: AuthorRole,
       reviewer: AppRole,
     }),
+    reviewerProfiles: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u), ConfiguredAppRole).optional(),
     project: PositiveInteger,
     checkoutRoots: z.array(z.string().min(1).refine(isAbsolute, 'Checkout roots must be absolute.')),
     pointsField: Name.optional(),
@@ -286,12 +336,38 @@ const UserSettingsSchema = z
       });
     if (value.statuses && new Set(Object.values(value.statuses)).size !== 4)
       context.addIssue({ code: 'custom', path: ['statuses'], message: 'Project statuses must be distinct.' });
-    const names = [...Object.values(roles.author.credentialEnv), ...Object.values(roles.reviewer.credentialEnv)];
-    if (new Set(names).size !== names.length)
-      context.addIssue({ code: 'custom', path: ['roles'], message: 'Credential environment names must be distinct.' });
+    const profiles = [roles.reviewer, ...Object.values(value.reviewerProfiles ?? {})];
+    if (new Set(profiles.map((profile) => profile.identity.toLowerCase())).size !== profiles.length)
+      context.addIssue({
+        code: 'custom',
+        path: ['reviewerProfiles'],
+        message: 'Reviewer profile identities must be distinct; ambiguous selection is refused.',
+      });
+    for (const [name, profile] of Object.entries(value.reviewerProfiles ?? {})) {
+      if (
+        name !== profile.identity ||
+        profile.identity.toLowerCase() === roles.author.identity.toLowerCase() ||
+        /^personal(?:$|[-_])/iu.test(profile.identity)
+      )
+        context.addIssue({
+          code: 'custom',
+          path: ['reviewerProfiles', name],
+          message: 'Profile key must equal its distinct reviewer identity.',
+        });
+    }
+    for (const profile of profiles) {
+      const names = [...credentialReferenceNames(roles.author), ...credentialReferenceNames(profile)];
+      if (new Set(names).size !== names.length)
+        context.addIssue({
+          code: 'custom',
+          path: ['roles'],
+          message: 'Credential environment names must be distinct.',
+        });
+    }
   });
 export type UserDeliverySettings = z.infer<typeof UserSettingsSchema>;
 export interface LoadedDeliverySettings {
+  environment?: NodeJS.ProcessEnv;
   wipLimits?: WipLane[] | undefined;
   roles: DeliveryConfig['roles'];
   configPath: string;
@@ -334,8 +410,16 @@ export function readDeliveryOverrides(repositoryRoot: string): {
 }
 
 /** Only operator-owned JSON supplies settings. Target repository files are never loaded. */
-export async function loadDeliverySettings(_repositoryRoot?: string): Promise<LoadedDeliverySettings> {
-  const path = process.env.AI_DELIVERY_CONFIG ?? join(homedir(), '.config', 'aviaratech-ai', 'ai-delivery.json');
+export async function loadDeliverySettings(
+  _repositoryRoot?: string,
+  options: {
+    reviewerIdentity?: string;
+    prepareEnvironment?: boolean;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<LoadedDeliverySettings> {
+  const inherited = options.env ?? process.env;
+  const path = inherited.AI_DELIVERY_CONFIG ?? join(homedir(), '.config', 'aviaratech-ai', 'ai-delivery.json');
   if (!isAbsolute(path)) throw new DeliveryError('AI_DELIVERY_CONFIG must be an absolute user configuration path.');
   let bytes: Buffer;
   try {
@@ -358,8 +442,37 @@ export async function loadDeliverySettings(_repositoryRoot?: string): Promise<Lo
       .join('; ');
     throw new DeliveryError(`Invalid user configuration ${path}: ${details}`);
   }
-  const { roles, checkoutRoots, wipLimits, schemaVersion: _schema, ...overrides } = result.data;
+  const { roles, reviewerProfiles, checkoutRoots, wipLimits, schemaVersion: _schema, ...overrides } = result.data;
+  if (options.reviewerIdentity !== undefined) {
+    const identity = options.reviewerIdentity;
+    const selected = identity === roles.reviewer.identity ? roles.reviewer : reviewerProfiles?.[identity];
+    if (!selected || !('appId' in selected) || identity === roles.author.identity)
+      throw new DeliveryError(
+        'identity: Select an explicit configured reviewer profile with provider, App ID and actorLogin.',
+      );
+    roles.reviewer = selected;
+  }
+  const environment: NodeJS.ProcessEnv = {};
+  if (options.prepareEnvironment) {
+    const names = new Set<string>([
+      ...MACHINE_AUTH_ENV_NAMES,
+      'TMPDIR',
+      'TEMP',
+      'TMP',
+      ...Object.values(roles).flatMap(credentialReferenceNames),
+    ]);
+    for (const name of names) {
+      if (
+        /^(?:NODE_|NPM_|DYLD_|LD_|BASH_|GIT_)/u.test(name) ||
+        ['ENV', 'BASH_ENV', 'SHELLOPTS', 'CDPATH'].includes(name)
+      )
+        throw new DeliveryError('Credential environment reference conflicts with an execution selector.');
+      if (inherited[name] !== undefined) environment[name] = inherited[name];
+    }
+    environment.AI_DELIVERY_CONFIG = path;
+  }
   return {
+    ...(options.prepareEnvironment ? { environment } : {}),
     roles,
     checkoutRoots,
     ...(wipLimits === undefined ? {} : { wipLimits }),
@@ -378,10 +491,12 @@ export async function loadDeliveryConfig(
     repository?: string;
     readPageLimit?: number;
     requireWritableProject?: boolean;
+    settings?: LoadedDeliverySettings;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<LoadedGitHubConfig> {
   options.signal?.throwIfAborted();
-  const settings = await loadDeliverySettings();
+  const settings = options.settings ?? (await loadDeliverySettings());
   const repository =
     options.repository ??
     (() => {
@@ -394,6 +509,7 @@ export async function loadDeliveryConfig(
     options.clients ??
     (await createDeliveryGitHubClients({
       config: settings,
+      ...(options.env === undefined ? {} : { env: options.env }),
       identity:
         options.personalAuth === true && settings.roles.author.authSource !== 'personal'
           ? 'personal'
@@ -460,13 +576,16 @@ export function resolveDeliveryRoleCredentials(input: {
   config: Pick<DeliveryConfig, 'roles'>;
   env?: NodeJS.ProcessEnv;
   role: DeliveryRole;
-}): { appId: string; installationId: number; privateKeyPath: string } {
+}): { appId: string; installationId: number; privateKeyPath?: string; profile?: ConfiguredApp } {
   const { config, role } = input;
   if (config.roles[role].authSource === 'personal') {
     throw new DeliveryError('Personal author credentials use the configured token environment variable.');
   }
   const env = input.env ?? process.env;
-  const names = config.roles[role].credentialEnv as { appId: string; installationId: string; privateKeyPath: string };
+  const selected = config.roles[role];
+  if ('appId' in selected)
+    return { appId: String(selected.appId), installationId: selected.installationId, profile: selected };
+  const names = selected.credentialEnv as { appId: string; installationId: string; privateKeyPath: string };
   const values = {
     appId: env[names.appId]?.trim(),
     installationId: env[names.installationId]?.trim(),

@@ -28,7 +28,7 @@ import {
   registerInvestigationCustody,
   type InvestigationPreparation,
 } from './services/worktreeRegistry.js';
-import { parseReviewArtifact, readRequiredReviewState, submitReview } from './review.js';
+import { parseReviewArtifact, readRequiredReviewState, ReviewSubmissionError, submitReview } from './review.js';
 
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
@@ -138,6 +138,7 @@ async function nonClosingRoute(context: DeliveryContext, base: string) {
           ...context,
           clients: await githubClients.createDeliveryGitHubClients({
             config: context.config,
+            ...(context.credentialEnvironment === undefined ? {} : { env: context.credentialEnvironment }),
             identity: context.config.roles.author.identity,
             role: 'author',
           }),
@@ -1294,11 +1295,34 @@ export async function submitFormalReview(
     prNumber: input.prNumber,
     ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
   });
-  if (nonClosing) {
-    sameReferencePr(pr, await verifyIssuePr(context, input.issueNumber, input.prNumber, true));
-    sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
+  try {
+    if (nonClosing) {
+      sameReferencePr(pr, await verifyIssuePr(context, input.issueNumber, input.prNumber, true));
+      sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
+    }
+    if ('dryRun' in result) return result;
+    return {
+      ...result,
+      requiredReview: await readRequiredReviewState(context, input.prNumber, result.headSha, {
+        id: result.githubReviewId,
+        login: result.login,
+        state: result.state,
+      }),
+    };
+  } catch (error) {
+    if ('dryRun' in result) throw error;
+    throw new ReviewSubmissionError(
+      error instanceof DeliveryError ? error.message : 'Post-submission status is unavailable.',
+      {
+        artifactId: result.artifact.artifactId,
+        repository: result.repository,
+        headSha: result.headSha,
+        prNumber: result.prNumber,
+        githubReviewId: result.githubReviewId,
+        githubReviewUrl: result.githubReviewUrl,
+      },
+    );
   }
-  return result;
 }
 export async function mergePr(
   context: DeliveryContext,

@@ -276,6 +276,7 @@ describe('synthetic native-plugin credential contract', () => {
 
   it('rejects author/reviewer identity and reference collisions during settings validation', async () => {
     const fixture = settings(home);
+    assert.ok('credentialEnv' in fixture.roles.reviewer);
     for (const reviewer of [
       { ...fixture.roles.reviewer, identity: fixture.roles.author.identity },
       {

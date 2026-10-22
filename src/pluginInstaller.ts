@@ -25,7 +25,11 @@ import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from '@modelcontextp
 import { z } from 'zod';
 import { marketplaceDocuments, nativePluginArgs } from '@aviaratech/ai-plugin-tools';
 
-import { loadDeliverySettings, resolveDeliveryRoleCredentials } from './config/deliveryConfig.js';
+import {
+  credentialReferenceNames,
+  loadDeliverySettings,
+  resolveDeliveryRoleCredentials,
+} from './config/deliveryConfig.js';
 import { captureAuthenticationProbe } from './pluginAuthProbe.js';
 import { assertSupportedAuthorHost, machineAuthorEligible, MACHINE_AUTH_ENV_NAMES } from './github/machineAuth.js';
 import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
@@ -382,7 +386,7 @@ async function checkAuthentication(input: Input, root: string, probe: PluginAuth
     probe.reason = 'settings_unavailable_or_invalid';
     return;
   }
-  const names = Object.values(settings.roles).flatMap((role) => Object.values(role.credentialEnv));
+  const names = Object.values(settings.roles).flatMap(credentialReferenceNames);
   const author = settings.roles.author;
   const machineSession =
     author.authSource === 'personal' && machineAuthorEligible(author.credentialEnv.token, process.env);

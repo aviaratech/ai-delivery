@@ -5,7 +5,7 @@ import {
   parseBoardReconcileRequest,
   incompleteBoardReconcile,
 } from './services/boardReconcileService.js';
-import { loadDeliverySettings } from './config/deliveryConfig.js';
+import { loadDeliverySettings, type LoadedDeliverySettings } from './config/deliveryConfig.js';
 import { resolveCheckout, resolveRepoFromRemote } from './github/repo.js';
 import { DeliveryError } from './errors.js';
 import { digestValue } from './delivery/common.js';
@@ -51,6 +51,8 @@ import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js
 import { IssueValidationError } from './issueContract.js';
 
 export interface ExecutionContext {
+  settings?: LoadedDeliverySettings;
+  reviewSubmission?: boolean;
   identity?: string;
   personalAuth?: boolean;
   repo?: string;
@@ -92,8 +94,22 @@ export async function contextFor(
   readPageLimit?: number,
   requireWritableProject?: boolean,
 ) {
-  const settings = await loadDeliverySettings();
-  const identity = input.identity ?? settings.roles[role].identity;
+  const settings =
+    input.settings ??
+    (await loadDeliverySettings(
+      undefined,
+      input.reviewSubmission === true
+        ? { reviewerIdentity: input.identity ?? '', prepareEnvironment: true }
+        : undefined,
+    ));
+  if (input.reviewSubmission === true && role === 'author' && settings.roles.author.authSource !== 'personal')
+    throw new DeliveryError(
+      'review submit requires the configured personal author for pre-key reads; another App key will not be loaded.',
+    );
+  const identity =
+    input.reviewSubmission === true && role === 'author'
+      ? settings.roles.author.identity
+      : (input.identity ?? settings.roles[role].identity);
   const policy = evaluateCommandIdentityPolicy({
     commandName,
     deliveryConfig: settings,
@@ -102,6 +118,8 @@ export async function contextFor(
   });
   if (policy.error) throw new DeliveryError(policy.error);
   return loadDeliveryContext({
+    settings,
+    ...(settings.environment === undefined ? {} : { env: settings.environment }),
     identity,
     repoRoot: input.repoRoot,
     role,
