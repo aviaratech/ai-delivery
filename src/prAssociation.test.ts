@@ -2033,6 +2033,23 @@ describe('explicit closing-reference reconciliation', () => {
     }
     return f;
   }
+  for (const published of [false, true]) {
+    it(`refuses a reviewer-context library mutation before publication/removal; existing PR ${published}`, async () => {
+      const { context, reviewerContext, state } = pending(published);
+      vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+      await assert.rejects(
+        publishPr(reviewerContext, { ...nonClosingCreation, ...(published ? { prNumber: 23 } : {}) }),
+        /configured authenticated author/u,
+      );
+      assert.equal(state.creations + state.removals + state.promotions + state.updates, 0);
+    });
+  }
+  it('refuses the wrong credential source on the direct library mutation', async () => {
+    const { context, state } = pending(true);
+    const wrongSource = { ...context, clients: { ...context.clients, authSource: 'app' as const } };
+    await assert.rejects(publishPr(wrongSource, { ...nonClosingCreation, prNumber: 23 }), /configured.*author/u);
+    assert.equal(state.creations + state.removals + state.promotions + state.updates, 0);
+  });
   it('refuses bare nonClosing before creating the linked-branch PR with supported prerequisites', async () => {
     const { context, state } = pending();
     await assert.rejects(

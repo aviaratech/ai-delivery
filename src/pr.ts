@@ -1088,6 +1088,12 @@ export async function publishPr(
   const reconcileReference = nonClosingMode(input.reconcileNonClosingReference);
   if (reconcileReference) {
     if (
+      context.clients.role !== 'author' ||
+      context.clients.authSource !== (context.config.roles.author.authSource ?? 'app') ||
+      !context.clients.authenticatedAuthor
+    )
+      throw new DeliveryError('Reference reconciliation requires the configured authenticated author role.');
+    if (
       !nonClosing ||
       input.draft === false ||
       !validSha(input.expectedHeadSha) ||
