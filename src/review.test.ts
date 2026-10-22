@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { test } from 'vitest';
 
 import type { DeliveryConfig } from './config/deliveryConfig.js';
+import { recordedReassociation, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
 import { digestValue, type RepositoryClassificationReceipt } from './delivery/legacy.js';
 import { createDeliveryGitHubClients, withAuthorGitToken } from './github/client.js';
 import type { DeliveryContext } from './issue.js';
@@ -18,8 +19,15 @@ const publicationEvidenceId = `sha256:${'c'.repeat(64)}`;
 const marker = (id: string) => `<!-- ai-delivery-review-artifact: ${id} -->`;
 
 function fixture(
-  input: { authorLogin?: string | null; existingReview?: boolean; personalAuthor?: boolean; reviewLogin?: string } = {},
+  input: {
+    authorLogin?: string | null;
+    existingReview?: boolean;
+    personalAuthor?: boolean;
+    reviewLogin?: string;
+    head?: typeof head;
+  } = {},
 ) {
+  const fixtureHead = input.head ?? head;
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-review-'));
   execFileSync('git', ['init', '-q', root]);
   const artifactContent = {
@@ -28,7 +36,7 @@ function fixture(
     diffScopeHash: digestValue(['change.ts']),
     elapsedMs: 1,
     findings: [],
-    head,
+    head: fixtureHead,
     issueNumber: 17,
     prNumber: 19,
     readOnly: true as const,
@@ -45,7 +53,7 @@ function fixture(
   const review = {
     id: 41,
     state: 'APPROVED',
-    commit_id: head.sha,
+    commit_id: fixtureHead.sha,
     user: { login: input.reviewLogin ?? 'synthetic-reviewer[bot]' },
     html_url: 'https://github.com/example/repo/pull/19#pullrequestreview-41',
     body: `${artifact.summary}\n\n${marker(artifact.artifactId)}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`,
@@ -53,7 +61,7 @@ function fixture(
   const reviews = input.existingReview ? [review] : [];
   let created = 0;
   let actorLookups = 0;
-  let currentPrHead = head.sha;
+  let currentPrHead = fixtureHead.sha;
   const context = {
     root,
     repo: { owner: 'example', repo: 'repo' },
@@ -79,7 +87,7 @@ function fixture(
             throw new Error('installation token cannot call GET /user');
           },
         },
-        git: { getCommit: async () => ({ data: { sha: head.sha, tree: { sha: head.tree } } }) },
+        git: { getCommit: async () => ({ data: { sha: fixtureHead.sha, tree: { sha: fixtureHead.tree } } }) },
         pulls: {
           get: async () => ({
             data: {
@@ -104,11 +112,12 @@ function fixture(
       },
     },
   } as unknown as DeliveryContext;
-  const classification = { head, changedPaths: ['change.ts'] } as RepositoryClassificationReceipt;
+  const classification = { head: fixtureHead, changedPaths: ['change.ts'] } as RepositoryClassificationReceipt;
   const submit = () =>
     submitReview({ artifact, classification, context, issueNumber: 17, prNumber: 19, publicationEvidenceId });
   return {
     root,
+    context,
     artifact,
     reviews,
     submit,
@@ -917,5 +926,111 @@ test('App client resolves its bot from JWT GET /app and keeps author token scope
     if (originalGhToken === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = originalGhToken;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('recorded public draft null remains observed while synthetic missing decision is unknown', async () => {
+  const state = fixture();
+  try {
+    const response = structuredClone(recordedZeroApproval);
+    state.context.clients.graphql = (async () => response) as never;
+    const observed = await readRequiredReviewState(state.context, 55, '4b54bd4b663a32957e4571e2af112f828fbc0a58');
+    assert.equal(observed.observed, true);
+    assert.equal(observed.reviewDecision, null);
+    // Synthetic omission keeps the same envelope and head, never coerced to null.
+    const { reviewDecision: _decision, ...missing } = response.repository.pullRequest;
+    state.context.clients.graphql = (async () => ({ repository: { pullRequest: missing } })) as never;
+    const unavailable = await readRequiredReviewState(state.context, 55, '4b54bd4b663a32957e4571e2af112f828fbc0a58');
+    assert.equal(unavailable.observed, false);
+    assert.equal(unavailable.status, 'unknown');
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
+test('recorded reassociation submits a fresh artifact and retry reuses only that artifact', async () => {
+  const state = fixture({ head: recordedReassociation.currentArtifact.head });
+  const events: string[] = [];
+  const oldContent = { ...state.artifact, head: recordedReassociation.historicalArtifact.head };
+  const { artifactId: _oldId, ...oldFields } = oldContent;
+  // Only the observed head/tree discrepancy and REST review identities are retained.
+  // Roles, issue/PR/scope, summary and encoded artifact digest are synthetic aliases.
+  const oldArtifact = { ...oldFields, artifactId: digestValue(oldFields) };
+  const encode = (artifact: typeof state.artifact) =>
+    `${marker(artifact.artifactId)}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
+  const oldReview = {
+    ...recordedReassociation.historicalReview,
+    user: { login: 'synthetic-reviewer[bot]' },
+    body: encode(oldArtifact),
+  };
+  const freshReview = {
+    ...recordedReassociation.currentReview,
+    user: { login: 'synthetic-reviewer[bot]' },
+    body: encode(state.artifact),
+  };
+  const history: Array<typeof oldReview | typeof freshReview> = [oldReview];
+  const rest = state.context.clients.rest;
+  const get = rest.pulls.get;
+  rest.pulls.get = (async (...args: Parameters<typeof get>) => {
+    assert.deepEqual(args[0], { owner: 'example', repo: 'repo', pull_number: 19 });
+    events.push('pr');
+    return get(...args);
+  }) as typeof get;
+  const getCommit = rest.git.getCommit;
+  rest.git.getCommit = (async (...args: Parameters<typeof getCommit>) => {
+    events.push('commit');
+    assert.equal(args[0]?.commit_sha, 'aec1b0caa0d6acb44c025cdb4247d43b401e2166');
+    return getCommit(...args);
+  }) as typeof getCommit;
+  rest.pulls.listFiles = (async (input: { pull_number: number; page: number; per_page: number }) => {
+    events.push('files');
+    assert.equal(input.pull_number, 19);
+    assert.equal(input.page, 1);
+    assert.equal(input.per_page, 100);
+    return { data: [{ filename: 'change.ts' }] };
+  }) as unknown as typeof rest.pulls.listFiles;
+  rest.pulls.listReviews = (async (input: { pull_number: number; page: number; per_page: number }) => {
+    events.push('reviews');
+    assert.equal(input.pull_number, 19);
+    assert.equal(input.page, 1);
+    assert.equal(input.per_page, 100);
+    return { data: history };
+  }) as unknown as typeof rest.pulls.listReviews;
+  rest.pulls.createReview = (async (input: { commit_id: string; event: string; body: string; pull_number: number }) => {
+    events.push('create');
+    assert.equal(input.pull_number, 19);
+    assert.equal(input.commit_id, 'aec1b0caa0d6acb44c025cdb4247d43b401e2166');
+    assert.equal(input.event, 'APPROVE');
+    assert.ok(input.body.includes(marker(state.artifact.artifactId)));
+    assert.ok(!input.body.includes(marker(oldArtifact.artifactId)));
+    freshReview.body = input.body;
+    history.push(freshReview);
+    return { data: freshReview };
+  }) as unknown as typeof rest.pulls.createReview;
+  rest.pulls.getReview = (async (input: { review_id: number; pull_number: number }) => {
+    events.push('readback');
+    assert.equal(input.pull_number, 19);
+    assert.equal(input.review_id, 5607508810);
+    return { data: freshReview };
+  }) as unknown as typeof rest.pulls.getReview;
+  try {
+    const receipt = await state.submit();
+    assert.equal(receipt.githubReviewId, 5607508810);
+    assert.equal(receipt.headSha, 'aec1b0caa0d6acb44c025cdb4247d43b401e2166');
+    assert.deepEqual(receipt.artifact.head, {
+      sha: 'aec1b0caa0d6acb44c025cdb4247d43b401e2166',
+      tree: '2cd3b7f0fcfdf853e4f04ece00367c24df786570',
+    });
+    assert.equal(oldReview.commit_id, 'aec1b0caa0d6acb44c025cdb4247d43b401e2166');
+    assert.equal(oldArtifact.head.sha, '6534bdad0e431f966b541092df5c0881f3bbd3f9');
+    assert.deepEqual(events, ['pr', 'commit', 'files', 'reviews', 'pr', 'create', 'readback', 'pr']);
+    events.length = 0;
+    const retry = await state.submit();
+    assert.equal(retry.githubReviewId, 5607508810);
+    assert.equal(history.length, 2);
+    assert.deepEqual(events, ['pr', 'commit', 'files', 'reviews', 'pr', 'readback', 'pr']);
+    assert.equal(oldReview.body, encode(oldArtifact));
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
   }
 });
