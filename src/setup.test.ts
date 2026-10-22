@@ -31,6 +31,122 @@ import * as atomicJson from './utils/atomicJson.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
+function assertReviewedResolved(actual: unknown, expected: string): void {
+  try {
+    assert.equal(actual, expected);
+  } catch (cause) {
+    if (!(cause instanceof assert.AssertionError)) throw cause;
+    // Separate real construction sites make these lexical categories visible to the bounded frame projection.
+    if (actual === undefined) throw new Error('Resolved closure metadata is absent', { cause });
+    if (typeof actual !== 'string') throw new Error('Resolved closure metadata is not a string', { cause });
+    if (actual.startsWith('file:')) {
+      if (isAbsolute(actual.slice(5))) throw new Error('Resolved closure absolute file target differs', { cause });
+      throw new Error('Resolved closure relative file target differs', { cause });
+    }
+    throw new Error('Resolved closure metadata has another mismatch', { cause });
+  }
+}
+
+test('resolved closure diagnostics preserve strict equality and the original assertion', () => {
+  const expected = 'file:/expected/reviewed-archive.tgz';
+  assert.doesNotThrow(() => assertReviewedResolved(expected, expected));
+  const origins = new Map<string, string>();
+  const cases: [unknown, string][] = [
+    [undefined, 'Resolved closure metadata is absent'],
+    [null, 'Resolved closure metadata is not a string'],
+    [42, 'Resolved closure metadata is not a string'],
+    [{ privateValue: true }, 'Resolved closure metadata is not a string'],
+    ['file:reviewed-archive.tgz', 'Resolved closure relative file target differs'],
+    ['file:', 'Resolved closure relative file target differs'],
+    ['file:/different/reviewed-archive.tgz', 'Resolved closure absolute file target differs'],
+    ['private-value', 'Resolved closure metadata has another mismatch'],
+  ];
+  for (const [actual, message] of cases) {
+    const equal: typeof assert.equal = assert.equal;
+    let original: Error | undefined;
+    let properties: PropertyDescriptorMap | undefined;
+    const observer = vi.spyOn(assert, 'equal').mockImplementationOnce((...args) => {
+      try {
+        equal(...args);
+      } catch (error) {
+        assert.ok(error instanceof Error);
+        original = error;
+        void error.stack;
+        properties = Object.getOwnPropertyDescriptors(error);
+        throw error;
+      }
+    });
+    let failure: unknown;
+    try {
+      assertReviewedResolved(actual, expected);
+    } catch (error) {
+      failure = error;
+    } finally {
+      observer.mockRestore();
+    }
+    assert.ok(original instanceof assert.AssertionError);
+    assert.ok(failure instanceof Error && !(failure instanceof assert.AssertionError));
+    assert.equal(failure.message, message);
+    assert.equal(failure.cause, original);
+    assert.deepEqual(Object.getOwnPropertyDescriptors(original), properties);
+    assert.equal(original.actual, actual);
+    assert.equal(original.expected, expected);
+    assert.equal(original.operator, 'strictEqual');
+    const origin = failure.stack?.split('\n').find((line) => line.includes('at assertReviewedResolved '));
+    assert.ok(origin);
+    const previous = origins.get(message);
+    if (previous !== undefined) assert.equal(origin, previous);
+    else origins.set(message, origin);
+  }
+  assert.equal(new Set(origins.values()).size, 5);
+});
+
+test('resolved closure diagnostics preserve unexpected errors unchanged', () => {
+  const unexpected = new Error('Synthetic unexpected assertion failure');
+  const observer = vi.spyOn(assert, 'equal').mockImplementationOnce(() => {
+    throw unexpected;
+  });
+  try {
+    assert.throws(
+      () => assertReviewedResolved(undefined, 'file:/expected/reviewed-archive.tgz'),
+      (error) => error === unexpected,
+    );
+  } finally {
+    observer.mockRestore();
+  }
+});
+
+test('resolved closure diagnostics retain distinct closure invocation coordinates within four frames', () => {
+  const closure = () => assertReviewedResolved(undefined, 'file:/expected/reviewed-archive.tgz');
+  const failures: Error[] = [];
+  try {
+    closure();
+  } catch (error) {
+    assert.ok(error instanceof Error);
+    failures.push(error);
+  }
+  try {
+    closure();
+  } catch (error) {
+    assert.ok(error instanceof Error);
+    failures.push(error);
+  }
+  assert.equal(failures.length, 2);
+  const frames = failures.map((error) =>
+    error.stack
+      ?.split('\n')
+      .flatMap((line) => {
+        const coordinate = /setup\.test\.(?:ts|js):(\d+):(\d+)\)?$/.exec(line);
+        return coordinate ? [coordinate.slice(1).join(':')] : [];
+      })
+      .slice(0, 4),
+  );
+  assert.equal(frames[0]?.length, 3);
+  assert.equal(frames[1]?.length, 3);
+  assert.deepEqual(frames[0]?.slice(0, 2), frames[1]?.slice(0, 2));
+  assert.notEqual(frames[0]?.[2], frames[1]?.[2]);
+});
+
 // These two unit scenarios isolate the synthetic controller RSS contract from host-wide PS latency.
 // Every integration scenario retains native observation; this is never fallback for a failed native call.
 const controllerObservation = vi.hoisted(() => ({
@@ -1105,7 +1221,7 @@ test(
         assert.equal(target.version, '0.3.5');
         assert.equal(target.invalid, undefined);
         assert.equal(target.missing, undefined);
-        assert.equal(target.resolved, `file:${join(f.input.runtimeDirectory, 'reviewed-archive.tgz')}`);
+        assertReviewedResolved(target.resolved, `file:${join(f.input.runtimeDirectory, 'reviewed-archive.tgz')}`);
       };
       closure();
       const lockTime = lstatSync(hidden).mtime;
