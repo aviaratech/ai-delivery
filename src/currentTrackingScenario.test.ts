@@ -21,6 +21,8 @@ interface StoredIssue {
   type: { name: string };
   labels: string[];
   html_url: string;
+  url: string;
+  repository_url: string;
   updated_at: string;
   parent: number | null;
   points?: number;
@@ -54,6 +56,8 @@ function trackingRepository() {
       type: { name: 'Task' },
       labels: [],
       html_url: `https://github.com/example/widget/issues/${String(number)}`,
+      url: `https://api.github.com/repos/example/widget/issues/${String(number)}`,
+      repository_url: 'https://api.github.com/repos/example/widget',
       updated_at: '2026-10-07T00:00:00Z',
       parent,
       status: parent === null ? null : 'Active',
@@ -310,7 +314,11 @@ function trackingRepository() {
     if (query.includes('ProjectDeliveryItems'))
       return {
         organization: {
-          projectV2: { items: page([...issues.values()].filter((issue) => issue.status !== null).map(projectItem)) },
+          projectV2: {
+            id: 'PROJECT-1',
+            number: 1,
+            items: page([...issues.values()].filter((issue) => issue.status !== null).map(projectItem)),
+          },
         },
       };
     if (query.includes('AddProjectDeliveryItem')) {

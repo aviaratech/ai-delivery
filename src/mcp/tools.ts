@@ -288,7 +288,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_info',
     commandName: 'info',
     description:
-      'Read live GitHub issue metadata, relationships and Project status. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
+      'Read live GitHub issue metadata, relationships, Project status and direct-child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
     inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo }),
   },
   {
