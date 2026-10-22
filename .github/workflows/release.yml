@@ -129,6 +129,102 @@ jobs:
           cd "$RUNNER_TEMP/release-artifact"
           test "$(find . -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
           shasum -a 256 ./*.tgz > SHA256SUMS
+      - name: Prepare failed qualification diagnostics
+        id: diagnostics
+        if: ${{ always() && inputs.qualification_only && steps.origin.outcome == 'success' && (steps.qualification.outcome == 'failure' || steps.qualification.outcome == 'cancelled') }}
+        env:
+          QUALIFICATION_OUTCOME: ${{ steps.qualification.outcome }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync, constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, writeFileSync } from 'node:fs';
+          import { basename, dirname, join, resolve } from 'node:path';
+          import { RELEASE_CASES } from './scripts/checks.mjs';
+          const env = process.env;
+          const temporary = realpathSync(env.RUNNER_TEMP);
+          const root = join(temporary, 'release-qualification');
+          const inputs = {};
+          // No original bytes or free-form strings cross this observation boundary.
+          const read = (label, parts) => {
+            if (!parts) { inputs[label] = 'unavailable'; return null; }
+            let fd;
+            try {
+              let path = root;
+              for (const part of ['', ...parts.slice(0, -1)]) {
+                if (part) path = join(path, part);
+                const stat = lstatSync(path);
+                if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path) throw 0;
+              }
+              path = join(root, ...parts);
+              const stat = lstatSync(path);
+              if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(path) !== path) throw 0;
+              if (stat.size > 4 * 1024 * 1024) { inputs[label] = 'oversized'; return null; }
+              fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+              const opened = fstatSync(fd);
+              if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size) throw 0;
+              const buffer = Buffer.alloc(stat.size + 1);
+              const length = readSync(fd, buffer, 0, buffer.length, 0);
+              if (length !== stat.size || fstatSync(fd).size !== stat.size || realpathSync(path) !== path) throw 0;
+              let value;
+              try { value = JSON.parse(buffer.subarray(0, length).toString('utf8')); }
+              catch { inputs[label] = 'invalid'; return null; }
+              if (!value || typeof value !== 'object' || Array.isArray(value)) { inputs[label] = 'invalid'; return null; }
+              inputs[label] = 'read'; return value;
+            } catch (error) { inputs[label] = error?.code === 'ENOENT' ? 'missing' : 'unsafe'; return null; }
+            finally { if (fd !== undefined) closeSync(fd); }
+          };
+          const choice = (value, allowed) => allowed.includes(value) ? value : 'unknown';
+          const status = value => choice(value, ['starting', 'running', 'completed', 'reconciled', 'passed', 'failed', 'cancelled', 'incomplete']);
+          const number = (value, min = 0, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+          const boolean = value => typeof value === 'boolean' ? value : null;
+          const command = value => ({ status: status(value?.status), exitCode: number(value?.exitCode, -255, 255), signal: value?.signal === null ? null : choice(value?.signal, ['SIGINT', 'SIGTERM', 'SIGKILL']), cleanupConfirmed: boolean(value?.cleanupConfirmed), outputBytes: number(value?.outputBytes), peakRssBytes: number(value?.peakRssBytes) });
+          const cleanup = value => ({ removed: boolean(value?.removed), quiescent: boolean(value?.quiescent) });
+          const overall = read('overall', ['result.json']);
+          const producer = read('producer', ['producer', 'result.json']);
+          const releaseAttempt = read('releaseAttempt', ['release-tests-attempt.json']);
+          const consumerAttempt = read('consumerAttempt', ['consumer-attempt.json']);
+          const current = (attempt, prefix, receipt) => {
+            const directory = attempt?.directory;
+            const name = typeof directory === 'string' ? basename(directory) : '';
+            const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
+            return overall?.schemaVersion === 'ai-delivery.current-qualification@1' && typeof overall.runId === 'string' && new RegExp(`^${uuid}$`).test(overall.runId) && attempt?.runId === overall.runId && new RegExp(`^${prefix}-${uuid}$`).test(name) && directory === join(root, name) && attempt[receipt] === join(directory, 'result.json') ? name : null;
+          };
+          const releaseDirectory = current(releaseAttempt, 'release-tests', 'resultPath');
+          const consumerDirectory = current(consumerAttempt, 'consumer', 'consumerPath');
+          const release = read('release', releaseDirectory && [releaseDirectory, 'result.json']);
+          const vitest = read('vitest', releaseDirectory && [releaseDirectory, 'vitest.json']);
+          const consumer = read('consumer', consumerDirectory && [consumerDirectory, 'result.json']);
+          const testResults = Array.isArray(vitest?.testResults) ? vitest.testResults : [];
+          const cases = RELEASE_CASES.map(({ file, title }) => {
+            const matches = testResults.filter(test => test?.name === join(env.GITHUB_WORKSPACE, file)).flatMap(test => Array.isArray(test.assertionResults) ? test.assertionResults.filter(assertion => assertion?.fullName === title) : []);
+            return { file, title, status: matches.length > 1 ? 'ambiguous' : choice(matches[0]?.status, ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled']) };
+          });
+          const commands = Array.isArray(producer?.commands) ? producer.commands : [];
+          const releaseCommands = Array.isArray(release?.commands) ? release.commands : [];
+          const diagnostic = {
+            observationOnly: true, qualified: false, promotionEligible: false,
+            qualificationOutcome: choice(env.QUALIFICATION_OUTCOME, ['failure', 'cancelled']),
+            source: /^[a-f0-9]{40}$/.test(env.REVIEWED_SOURCE_SHA ?? '') ? env.REVIEWED_SOURCE_SHA : null,
+            runId: number(Number(env.GITHUB_RUN_ID), 1), runAttempt: number(Number(env.GITHUB_RUN_ATTEMPT), 1), inputs,
+            overall: { status: status(overall?.status) },
+            producer: { status: status(producer?.status), fullSuccess: boolean(producer?.fullSuccess), commands: ['format', 'lint', 'types', 'build', 'tests', 'inventory'].map(stage => ({ stage, ...command(commands.filter(value => value?.stage === stage).length === 1 ? commands.find(value => value?.stage === stage) : null) })) },
+            pack: command(overall?.pack),
+            release: { status: status(release?.status), command: command(releaseCommands.length === 1 ? releaseCommands[0] : null), cleanup: cleanup(release?.release?.temporary), counts: { total: number(vitest?.numTotalTests), passed: number(vitest?.numPassedTests), failed: number(vitest?.numFailedTests) }, cases },
+            consumer: { status: status(consumer?.status), command: command(consumerDirectory ? consumerAttempt?.command : null), cleanup: cleanup(consumer?.cleanup) },
+          };
+          const bytes = JSON.stringify(diagnostic, null, 2) + '\n';
+          if (Buffer.byteLength(bytes) > 64 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
+          const output = join(mkdtempSync(join(temporary, 'release-qualification-diagnostics-')), 'diagnostics.json');
+          writeFileSync(output, bytes, { flag: 'wx', mode: 0o600 });
+          appendFileSync(env.GITHUB_OUTPUT, `file=${output}\n`);
+          JS
+      - name: Upload failed qualification diagnostics
+        if: ${{ always() && inputs.qualification_only && steps.diagnostics.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-qualification-diagnostics-${{ github.run_attempt }}
+          path: ${{ steps.diagnostics.outputs.file }}
+          if-no-files-found: error
+          retention-days: 1
       - name: Scan source history
         if: ${{ inputs.qualification_only }}
         uses: trufflesecurity/trufflehog@f714bf454f350590f4a24c3ddb1aef02c35bf5b6 # v3.97.5
