@@ -608,6 +608,10 @@ export async function createIssue(
         'Created issue content or repository identity readback disagrees; reconcile this existing issue before retrying.',
       );
     const existing = prior === undefined ? undefined : await issueInfo(context, issueNumber);
+    const existingRelationships =
+      prior === undefined
+        ? undefined
+        : await getNativeBlockerRelationships({ graphql: clients.graphql, issueNumber, repo });
     if (
       existing &&
       (existing.projectStatus === 'In Progress' ||
@@ -618,7 +622,7 @@ export async function createIssue(
           (change) => existing.fields[change.name] != null && existing.fields[change.name] !== change.value,
         ) ||
         (existing.parentIssueNumber !== null && existing.parentIssueNumber !== (input.parentIssueNumber ?? null)) ||
-        existing.blockedBy.some((number) => !(input.blockedBy ?? []).includes(number)))
+        existingRelationships!.blockers.some((blocker) => !(input.blockedBy ?? []).includes(blocker.number)))
     )
       throw new DeliveryError('Prior create opId conflicts with later native tracking changes.');
     step = 'metadata';

@@ -58,13 +58,16 @@ function fixture() {
     if (query.includes('UpdateProjectDeliveryStatus') && recovery.failProject)
       throw new Error('Synthetic Project write failure');
     const result = (await originalGraphql(query, variables)) as {
-      repository: { issue: { parent: unknown } };
+      repository: { issue: { parent: unknown; blockedBy: { nodes: { number: number; state: string }[] } } };
       organization: { projectV2: { items: { nodes: { id: string }[] } } };
     };
     if (query.includes('ProjectDeliveryItems') && !recovery.member)
       result.organization.projectV2.items.nodes = result.organization.projectV2.items.nodes.filter(
         (row) => row.id !== 'ITEM20',
       );
+    if (query.includes('blockedBy(first:'))
+      for (const blocker of result.repository.issue.blockedBy.nodes)
+        blocker.state = f.rows.get(blocker.number)!.state.toUpperCase();
     if (query.includes('blockedBy(first:') && variables.number === 20 && parent !== null)
       result.repository.issue.parent = {
         id: 'ISSUE19',
@@ -205,4 +208,16 @@ test('partial create reports only the requested remaining operations', async () 
     assert.deepEqual(error.remainingSteps, ['project', 'readback']);
     return true;
   });
+});
+
+test('same opId preserves independently added closed blocker relationships', async () => {
+  const f = fixture();
+  const input = { ...f.ready, ...intent };
+  await createIssue(f.context, input);
+  f.rows.get(19)!.state = 'closed';
+  f.edges.get(20)!.add(19);
+  const writes = [...f.writes];
+  await assert.rejects(createIssue(f.context, input), /conflict/iu);
+  assert.deepEqual([...f.edges.get(20)!], [18, 19]);
+  assert.deepEqual(f.writes, writes);
 });
