@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -116,10 +117,29 @@ export function inertTarget(
     const tracked = payload('tracked'),
       edited = payload('edited');
     writeFileSync(join(root, 'ai-delivery.policy.mjs'), tracked);
+    for (const file of ['ai-delivery.config.mjs', 'ai-delivery.config.js']) writeFileSync(join(root, file), tracked);
+    writeFileSync(
+      join(root, 'consumer-trap.cjs'),
+      `require('node:fs').writeFileSync(${JSON.stringify(sentinel)},'repository script executed',{flag:'wx'});\n`,
+    );
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'synthetic-hostile-consumer',
+        version: '1.0.0',
+        type: 'module',
+        scripts: Object.fromEntries(['prepare', 'postinstall', 'test'].map((name) => [name, 'node consumer-trap.cjs'])),
+      }),
+    );
     fixtureGit(root, 'add', '.');
     fixtureGit(root, 'commit', '-qm', 'Owned inert consumer');
     const head = fixtureGit(root, 'rev-parse', 'HEAD');
     const tree = fixtureGit(root, 'rev-parse', 'HEAD^{tree}');
+    for (const name of ['pre-commit', 'post-commit', 'post-checkout', 'pre-push']) {
+      const hook = join(root, '.git', 'hooks', name);
+      writeFileSync(hook, `#!/bin/sh\nprintf 'repository hook executed' > '${sentinel.replaceAll("'", "'\\''")}'\n`);
+      chmodSync(hook, 0o755);
+    }
     fixtureGit(root, 'update-ref', 'refs/remotes/origin/main', head);
     writeFileSync(
       userPath,
@@ -282,6 +302,21 @@ export function inertTarget(
       },
     });
     const rest = {
+      paginate: async (
+        method: (input: unknown) => Promise<{ data: unknown[] }>,
+        input: unknown,
+      ): Promise<unknown[]> => {
+        assert.equal(method, rest.pulls.list, 'Only the synthetic PR listing port may paginate');
+        return (await method(input)).data;
+      },
+      checks: {
+        listForRef: async (input: unknown) => {
+          record('checks.listForRef', input);
+          return {
+            data: { total_count: 1, check_runs: [{ name: 'checks', status: 'completed', conclusion: 'success' }] },
+          };
+        },
+      },
       request: async (route: string, input: Record<string, unknown> = {}) => {
         record(route, input);
         if (route === 'GET /orgs/{org}/issue-fields')
@@ -314,6 +349,10 @@ export function inertTarget(
         throw new Error(`Unexpected synthetic REST route: ${route}`);
       },
       repos: {
+        getCombinedStatusForRef: async (input: unknown) => {
+          record('repos.getCombinedStatusForRef', input);
+          return { data: { state: 'success', total_count: 0, statuses: [] } };
+        },
         get: async (input: unknown) => {
           record('repos.get', input);
           return {
@@ -357,7 +396,10 @@ export function inertTarget(
           return { data: input.page === 2 ? [issue(18)] : input.page === 3 ? [] : [issue()] };
         },
         listLabelsForRepo: async () => ({ data: [] }),
-        listSubIssues: async () => ({ data: [] }),
+        listSubIssues: async (input: unknown) => {
+          record('issues.listSubIssues', input);
+          return { data: [] };
+        },
         listComments: async (input: unknown) => {
           record('issues.listComments', input);
           return { data: comments };
