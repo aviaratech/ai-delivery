@@ -3,6 +3,7 @@ import { test } from 'vitest';
 import { createIssue, CreatedTrackingIssueError, canonicalIssueBody } from './issue.js';
 import { issue63Fixture } from './fixtures/issue63.js';
 import { parseIssueBody, validateIssue } from './issueContract.js';
+import { inertTarget, fixtureFields } from './fixtures/inertTarget.js';
 
 function fixture() {
   const f = issue63Fixture();
@@ -221,3 +222,58 @@ test('same opId preserves independently added closed blocker relationships', asy
   assert.deepEqual([...f.edges.get(20)!], [18, 19]);
   assert.deepEqual(f.writes, writes);
 });
+
+for (const mode of ['partial', 'epic'] as const) {
+  test(`MCP ${mode} create retains retry identity across compact and verbose output`, async ({ signal }) => {
+    const f = inertTarget(signal);
+    const originalGet = f.rest.issues.get;
+    f.rest.issues.get = async (input) => ({
+      data: { ...(await originalGet(input)).data, user: { login: 'operator' } },
+    });
+    const originalList = f.rest.issues.listForRepo;
+    f.rest.issues.listForRepo = async (input) => ({
+      data: (await originalList(input)).data.map((row) => ({ ...row, user: { login: 'operator' } })),
+    });
+    const originalRequest = f.rest.request;
+    let fail = mode === 'partial';
+    f.rest.request = async (route, args) => {
+      const result = await originalRequest(route, args);
+      if (fail && route.startsWith('POST') && route.includes('/issue-field-values')) {
+        fail = false;
+        throw new Error('Synthetic metadata acknowledgement lost');
+      }
+      return result;
+    };
+    const { points: _points, ...unsized } = fixtureFields;
+    const input = { ...(mode === 'epic' ? { ...unsized, epic: true } : fixtureFields), opId: `synthetic-mcp-${mode}` };
+    const connection = await f.connect();
+    try {
+      if (mode === 'partial') {
+        const partial = await connection.call('issue_create', input);
+        assert.equal(partial.response.isError, true);
+        assert.match(partial.text, /Issue #17.*Failed step: metadata.*same opId/u);
+      }
+      const compact = await connection.call('issue_create', input);
+      assert.notEqual(compact.response.isError, true, compact.text);
+      assert.deepEqual(compact.value?.created, {
+        number: 17,
+        title: fixtureFields.title,
+        url: 'https://github.com/example/widget/issues/17',
+      });
+      assert.equal(Object.hasOwn(compact.value!, 'body'), false);
+      assert.ok(Array.isArray(compact.value?.warnings));
+      const verbose = await connection.call('issue_create', { ...input, verbose: true });
+      assert.notEqual(verbose.response.isError, true, verbose.text);
+      assert.match(String(verbose.value?.body), /State:\*\* Ready/u);
+      if (mode === 'epic')
+        assert.equal(parseIssueBody(String(verbose.value?.body), { title: fixtureFields.title }).issue.epic, true);
+      assert.equal(f.calls.filter((call) => call.name === 'issues.create').length, 1);
+      assert.equal(
+        f.calls.filter((call) => call.name.startsWith('POST') && call.name.includes('/issue-field-values')).length,
+        mode === 'partial' ? 1 : 0,
+      );
+    } finally {
+      await f.dispose(connection);
+    }
+  });
+}
