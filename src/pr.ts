@@ -698,6 +698,61 @@ async function verifyIssuePr(
   }
   return pr;
 }
+
+/** Queue admission shares the native association and configured author owners. */
+export async function queuePr(context: DeliveryContext, prNumber: number, issueNumber?: number) {
+  if (
+    context.clients.role !== 'author' ||
+    !context.clients.authenticatedAuthor ||
+    context.clients.authSource !== (context.config.roles.author.authSource ?? 'app')
+  )
+    throw new DeliveryError('Queue mutations require the configured authenticated author.');
+  const author = await context.clients.authenticatedAuthor();
+  if (!author.actorLogin || !author.credentialIdentity) throw new DeliveryError('Queue author identity is incomplete.');
+  let derivedPrId: string | undefined;
+  if (issueNumber === undefined) {
+    const result = await context.clients.graphql<ClosingIssuesQuery>(
+      'query DeliveryClosingIssues($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){nameWithOwner pullRequest(number:$number){id number closingIssuesReferences(first:100,after:$cursor){nodes{__typename id number repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}',
+      { ...context.repo, number: prNumber, cursor: null },
+    );
+    const native = result.repository?.pullRequest;
+    const link = native?.closingIssuesReferences;
+    if (
+      result.repository?.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
+      native?.number !== prNumber ||
+      typeof native.id !== 'string' ||
+      !native.id ||
+      !link ||
+      link.pageInfo?.hasNextPage !== false ||
+      !Array.isArray(link.nodes) ||
+      link.nodes.length !== 1
+    )
+      throw new DeliveryError(
+        'Queue add requires one complete native closing issue association or an explicit issue selector.',
+      );
+    const node = link.nodes[0];
+    if (
+      !node ||
+      node.__typename !== 'Issue' ||
+      typeof node.id !== 'string' ||
+      !node.id ||
+      typeof node.repository?.id !== 'string' ||
+      !node.repository.id ||
+      node.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
+      !Number.isSafeInteger(node.number) ||
+      node.number <= 0
+    )
+      throw new DeliveryError('Queue closing issue identity is invalid.');
+    issueNumber = node.number;
+    derivedPrId = native.id;
+  }
+  const pr = await verifyIssuePr(context, issueNumber, prNumber);
+  if (derivedPrId !== undefined && pr.node_id !== derivedPrId)
+    throw new DeliveryError('Queue native PR identity changed after issue derivation.');
+  if (pr.user.login.toLowerCase() !== author.actorLogin.toLowerCase())
+    throw new DeliveryError('Queue requires the configured PR author.');
+  return { pr, issueNumber, author };
+}
 export async function prInfo(
   context: DeliveryContext,
   input: { issueNumber?: number; prNumber?: number; nonClosing?: boolean },
@@ -756,9 +811,16 @@ export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' 
 /** Enumerate configured requirements even when a check has never reported. */
 async function readRequiredCheckNames(context: DeliveryContext, base: string) {
   const sources = await branchRuleSources(context, base);
+  const { confirmedUnprotected, confirmedRulesetOnly } = await corroborateClassicProtectionAbsence(
+    context,
+    base,
+    sources,
+  );
   const names = new Set<string>();
+  const required = new Map<string, { name: string; appId: number | null }>();
   let complete = true;
   for (const [index, result] of sources.entries()) {
+    if (index === 1 && (confirmedUnprotected || confirmedRulesetOnly)) continue;
     if (
       result.status !== 'fulfilled' ||
       result.value.status !== 200 ||
@@ -784,16 +846,107 @@ async function readRequiredCheckNames(context: DeliveryContext, base: string) {
     else {
       const checks = data?.required_status_checks;
       if (Array.isArray(checks?.checks)) lists.push(checks.checks);
-      if (Array.isArray(checks?.contexts)) lists.push(checks.contexts.map((context: unknown) => ({ context })));
+      if (Array.isArray(checks?.contexts))
+        lists.push(
+          checks.contexts
+            .filter(
+              (context: unknown) =>
+                !Array.isArray(checks?.checks) ||
+                !checks.checks.some((check: { context?: unknown } | null) => check?.context === context),
+            )
+            .map((context: unknown) => ({ context })),
+        );
       if (!Array.isArray(checks?.checks) && !Array.isArray(checks?.contexts)) complete = false;
     }
     for (const list of lists) {
-      const parsed = z.array(z.object({ context: z.string().min(1) })).safeParse(list);
+      const parsed = z
+        .array(
+          z.object({
+            context: z.string().min(1),
+            app_id: z.number().int().nullable().optional(),
+            integration_id: z.number().int().nullable().optional(),
+          }),
+        )
+        .safeParse(list);
       if (!parsed.success) complete = false;
-      else for (const check of parsed.data) names.add(check.context);
+      else
+        for (const check of parsed.data) {
+          names.add(check.context);
+          const selected = index === 0 ? check.integration_id : check.app_id;
+          if (selected !== undefined && selected !== null && selected !== -1 && selected <= 0) complete = false;
+          const appId = selected === undefined || selected === null || selected === -1 ? null : selected;
+          required.set(JSON.stringify([check.context, appId]), { name: check.context, appId });
+        }
     }
   }
-  return { names: [...names].sort(), complete };
+  return { names: [...names].sort(), complete, required: [...required.values()] };
+}
+
+/** @internal Queue proof belongs to the exact published SHA and the required check producer. */
+export async function queueChecks(context: DeliveryContext, base: string, sha: string) {
+  const requirements = await readRequiredCheckNames(context, base);
+  if (!requirements.complete || requirements.required.length === 0)
+    return { state: 'waiting' as const, reason: 'Required queue checks are absent or incompletely discovered.' };
+  const [runs, statuses] = await Promise.all([
+    context.clients.rest.checks.listForRef({ ...context.repo, ref: sha, filter: 'latest', per_page: 100 }),
+    context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: sha, per_page: 100 }),
+  ]);
+  if (
+    runs.status !== 200 ||
+    statuses.status !== 200 ||
+    !runs.headers ||
+    !statuses.headers ||
+    runs.headers?.link ||
+    statuses.headers?.link ||
+    runs.data.total_count !== runs.data.check_runs.length ||
+    statuses.data.total_count !== statuses.data.statuses.length ||
+    statuses.data.sha !== sha ||
+    runs.data.check_runs.some((run) => run.head_sha !== sha)
+  )
+    return { state: 'waiting' as const, reason: 'Queue SHA check/status pagination or identity is incomplete.' };
+  const proof: { name: string; appId: number | null; id: number }[] = [];
+  for (const required of requirements.required) {
+    const status = statuses.data.statuses.filter((s) => s.context === required.name).sort((a, b) => b.id - a.id)[0];
+    let waiting: string | undefined;
+    if (status) {
+      if (required.appId !== null) waiting = `Queue status ${required.name} required App source cannot be established.`;
+      else if (!Number.isSafeInteger(status.id) || status.id <= 0)
+        waiting = `Queue status ${required.name} attempt is unknown.`;
+      else if (status.state === 'failure' || status.state === 'error')
+        return { state: 'failed' as const, reason: `Queue status ${required.name} is ${status.state}.` };
+      else if (status.state !== 'success')
+        waiting = `Queue status ${required.name} is ${status.state === 'pending' ? 'pending' : 'unknown'}.`;
+      else proof.push({ ...required, id: status.id });
+    }
+    const candidates = runs.data.check_runs
+      .filter((run) => run.name === required.name && (required.appId === null || run.app?.id === required.appId))
+      .sort((a, b) => b.id - a.id);
+    const run = candidates[0];
+    if (run) {
+      if (!Number.isSafeInteger(run.id) || run.id <= 0 || !run.app?.id)
+        return { state: 'waiting' as const, reason: `Queue check ${required.name} producer/attempt is unknown.` };
+      if (run.status !== 'completed')
+        return { state: 'waiting' as const, reason: `Queue check ${required.name} is pending.` };
+      if (
+        run.conclusion !== 'success' &&
+        !['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(
+          run.conclusion ?? '',
+        )
+      )
+        return {
+          state: 'waiting' as const,
+          reason: `Queue check ${required.name} conclusion is unknown or not successful.`,
+        };
+      if (run.conclusion !== 'success')
+        return {
+          state: 'failed' as const,
+          reason: `Queue check ${required.name} concluded ${run.conclusion ?? 'unknown'}.`,
+        };
+      proof.push({ ...required, id: run.id });
+    } else if (!status) waiting = `Queue check ${required.name} has not reported from its required source.`;
+    if (waiting) return { state: 'waiting' as const, reason: waiting };
+  }
+  return { state: 'passed' as const, reason: 'Current required queue SHA checks passed.', proof };
 }
 
 export async function prChecks(context: DeliveryContext, prNumber: number) {
@@ -883,6 +1036,98 @@ function branchRuleSources(context: DeliveryContext, base: string, control?: { s
   ]);
 }
 
+async function corroborateClassicProtectionAbsence(
+  context: DeliveryContext,
+  base: string,
+  [rulesetResult, protectionResult]: Awaited<ReturnType<typeof branchRuleSources>>,
+  control?: { signal: AbortSignal; checkResources: () => Promise<void> },
+) {
+  let confirmedUnprotected = false;
+  let confirmedRulesetOnly = false;
+  if (
+    rulesetResult.status === 'fulfilled' &&
+    completeRulePage(rulesetResult.value) &&
+    protectionResult.status === 'rejected' &&
+    githubClients.hasBranchProtectionAbsence(protectionResult.reason, context.clients, context.repo, base)
+  ) {
+    // A generic/permission 404 is never absence. Corroborate the named branch,
+    // selected author's write access, and all repository/parent rulesets.
+    const parameters = { ...context.repo, ...(control === undefined ? {} : { request: { signal: control.signal } }) };
+    const [repository, branch, rulesets] = await Promise.allSettled([
+      context.clients.rest.request('GET /repos/{owner}/{repo}', parameters),
+      context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}', { ...parameters, branch: base }),
+      context.clients.rest.request('GET /repos/{owner}/{repo}/rulesets', {
+        ...parameters,
+        includes_parents: true,
+        per_page: 100,
+        page: 1,
+      }),
+    ]);
+    await control?.checkResources();
+    control?.signal.throwIfAborted();
+    if (repository.status === 'fulfilled' && branch.status === 'fulfilled' && rulesets.status === 'fulfilled') {
+      const repoData = repository.value.data as {
+        full_name?: string;
+        permissions?: { push?: boolean; admin?: boolean };
+      } | null;
+      const branchData = branch.value.data as {
+        name?: string;
+        protected?: boolean;
+        protection?: { enabled?: boolean };
+      } | null;
+      const corroborated =
+        repository.value.status === 200 &&
+        branch.value.status === 200 &&
+        typeof repoData?.full_name === 'string' &&
+        repoData.full_name.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase() &&
+        (repoData.permissions?.push === true || repoData.permissions?.admin === true) &&
+        branchData?.name === base;
+      confirmedUnprotected =
+        corroborated &&
+        emptyRulePage(rulesetResult.value) &&
+        branchData?.protected === false &&
+        branchData.protection?.enabled === false &&
+        emptyRulePage(rulesets.value);
+      // The applicable-rules endpoint includes all active repository/parent
+      // rules. A classic-protection 404 needs independent identity and active
+      // ruleset readbacks, not just an observed approval count. The aggregate
+      // protected flag and nested enabled summary need not be equal.
+      confirmedRulesetOnly =
+        corroborated &&
+        branchData?.protected === true &&
+        typeof branchData.protection?.enabled === 'boolean' &&
+        completeRulePage(rulesets.value) &&
+        rulesetResult.value.data.length > 0 &&
+        rulesetResult.value.data.every((rule) => {
+          if (
+            typeof rule !== 'object' ||
+            rule === null ||
+            typeof rule.type !== 'string' ||
+            !rule.type ||
+            typeof rule.ruleset_id !== 'number' ||
+            !Number.isSafeInteger(rule.ruleset_id) ||
+            rule.ruleset_id <= 0 ||
+            typeof rule.ruleset_source !== 'string' ||
+            (rule.ruleset_source_type === 'Repository'
+              ? rule.ruleset_source.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
+              : rule.ruleset_source_type !== 'Organization' ||
+                rule.ruleset_source.toLowerCase() !== context.repo.owner.toLowerCase()) ||
+            (rule.type === 'pull_request' && requiredApprovalCount(rule.parameters) === null)
+          )
+            return false;
+          const matches = rulesets.value.data.filter((ruleset) => ruleset?.id === rule.ruleset_id);
+          return (
+            matches.length === 1 &&
+            matches[0]?.source_type === rule.ruleset_source_type &&
+            matches[0]?.source === rule.ruleset_source &&
+            matches[0]?.enforcement === 'active'
+          );
+        });
+    }
+  }
+  return { confirmedUnprotected, confirmedRulesetOnly };
+}
+
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
 export async function preflightReviewRoute(
   context: DeliveryContext,
@@ -962,88 +1207,12 @@ export async function preflightReviewRoute(
   }
   const [rulesetResult, protectionResult] = await branchRuleSources(context, base, control);
   await check();
-  let confirmedUnprotected = false;
-  let confirmedRulesetOnly = false;
-  if (
-    rulesetResult.status === 'fulfilled' &&
-    completeRulePage(rulesetResult.value) &&
-    protectionResult.status === 'rejected' &&
-    githubClients.hasBranchProtectionAbsence(protectionResult.reason, context.clients, context.repo, base)
-  ) {
-    // A generic/permission 404 is never absence. Corroborate the named branch,
-    // selected author's write access, and all repository/parent rulesets.
-    const parameters = { ...context.repo, ...(control === undefined ? {} : { request: { signal: control.signal } }) };
-    const [repository, branch, rulesets] = await Promise.allSettled([
-      context.clients.rest.request('GET /repos/{owner}/{repo}', parameters),
-      context.clients.rest.request('GET /repos/{owner}/{repo}/branches/{branch}', { ...parameters, branch: base }),
-      context.clients.rest.request('GET /repos/{owner}/{repo}/rulesets', {
-        ...parameters,
-        includes_parents: true,
-        per_page: 100,
-        page: 1,
-      }),
-    ]);
-    await check();
-    if (repository.status === 'fulfilled' && branch.status === 'fulfilled' && rulesets.status === 'fulfilled') {
-      const repoData = repository.value.data as {
-        full_name?: string;
-        permissions?: { push?: boolean; admin?: boolean };
-      } | null;
-      const branchData = branch.value.data as {
-        name?: string;
-        protected?: boolean;
-        protection?: { enabled?: boolean };
-      } | null;
-      const corroborated =
-        repository.value.status === 200 &&
-        branch.value.status === 200 &&
-        typeof repoData?.full_name === 'string' &&
-        repoData.full_name.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase() &&
-        (repoData.permissions?.push === true || repoData.permissions?.admin === true) &&
-        branchData?.name === base;
-      confirmedUnprotected =
-        corroborated &&
-        emptyRulePage(rulesetResult.value) &&
-        branchData?.protected === false &&
-        branchData.protection?.enabled === false &&
-        emptyRulePage(rulesets.value);
-      // The applicable-rules endpoint includes all active repository/parent
-      // rules. A classic-protection 404 needs independent identity and active
-      // ruleset readbacks, not just an observed approval count. The aggregate
-      // protected flag and nested enabled summary need not be equal.
-      confirmedRulesetOnly =
-        corroborated &&
-        branchData?.protected === true &&
-        typeof branchData.protection?.enabled === 'boolean' &&
-        completeRulePage(rulesets.value) &&
-        rulesetResult.value.data.length > 0 &&
-        rulesetResult.value.data.every((rule) => {
-          if (
-            typeof rule !== 'object' ||
-            rule === null ||
-            typeof rule.type !== 'string' ||
-            !rule.type ||
-            typeof rule.ruleset_id !== 'number' ||
-            !Number.isSafeInteger(rule.ruleset_id) ||
-            rule.ruleset_id <= 0 ||
-            typeof rule.ruleset_source !== 'string' ||
-            (rule.ruleset_source_type === 'Repository'
-              ? rule.ruleset_source.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
-              : rule.ruleset_source_type !== 'Organization' ||
-                rule.ruleset_source.toLowerCase() !== context.repo.owner.toLowerCase()) ||
-            (rule.type === 'pull_request' && requiredApprovalCount(rule.parameters) === null)
-          )
-            return false;
-          const matches = rulesets.value.data.filter((ruleset) => ruleset?.id === rule.ruleset_id);
-          return (
-            matches.length === 1 &&
-            matches[0]?.source_type === rule.ruleset_source_type &&
-            matches[0]?.source === rule.ruleset_source &&
-            matches[0]?.enforcement === 'active'
-          );
-        });
-    }
-  }
+  const { confirmedUnprotected, confirmedRulesetOnly } = await corroborateClassicProtectionAbsence(
+    context,
+    base,
+    [rulesetResult, protectionResult],
+    control,
+  );
   const counts: number[] = [];
   let countsKnown = rulesetResult.status === 'fulfilled' && completeRulePage(rulesetResult.value);
   if (rulesetResult.status === 'fulfilled' && Array.isArray(rulesetResult.value.data)) {
@@ -1576,6 +1745,7 @@ export async function mergePr(
     dryRun?: boolean;
     nonClosing?: boolean;
   },
+  queue?: { expectedBase: string; checkProof(): Promise<void>; beforeMutation(): Promise<void> },
 ) {
   const nonClosing = nonClosingMode(input.nonClosing);
   if (nonClosing && input.strategy !== undefined && input.strategy !== 'squash')
@@ -1647,7 +1817,7 @@ export async function mergePr(
   }
   const currentBase = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data
     .object.sha;
-  if (!validSha(currentBase) || currentBase !== pr.base.sha)
+  if (!validSha(currentBase) || currentBase !== pr.base.sha || (queue && currentBase !== queue.expectedBase))
     throw new DeliveryError('GitHub base moved; refresh native merge eligibility before merge.');
   if (input.dryRun)
     return {
@@ -1656,6 +1826,14 @@ export async function mergePr(
       prNumber: pr.number,
       ...(squash === undefined ? {} : { nonClosing: true, ...squash }),
     };
+  if (queue) {
+    await queue.checkProof();
+    const finalBase = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data
+      .object.sha;
+    if (finalBase !== queue.expectedBase)
+      throw new DeliveryError('GitHub base moved after queue proof; merge was not sent.');
+    await queue.beforeMutation();
+  }
   const result = (
     await context.clients.rest.pulls.merge({
       ...context.repo,

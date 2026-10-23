@@ -393,20 +393,43 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_pr_merge',
     commandName: 'pr:merge',
-    description: 'Guarded exact-head merge with live blocker, check and review readback',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      verbose: Verbose,
-      issueNumber: Positive,
-      prNumber: Positive,
-      nonClosing: z.boolean().optional(),
-      reviewedHeadSha: z
-        .string()
-        .regex(/^[a-f0-9]{40}$/u)
-        .optional(),
-      strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
-      dryRun: z.boolean().optional(),
-    }),
+    description: 'Guarded exact-head merge, or durable host-local queue admission with queue:true',
+    inputSchema: z
+      .strictObject({
+        repo: Repo,
+        verbose: Verbose,
+        issueNumber: Positive.optional(),
+        prNumber: Positive,
+        queue: z.boolean().optional(),
+        nonClosing: z.boolean().optional(),
+        reviewedHeadSha: z
+          .string()
+          .regex(/^[a-f0-9]{40}$/u)
+          .optional(),
+        strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
+        dryRun: z.boolean().optional(),
+      })
+      .superRefine((input, ctx) => {
+        if (
+          input.queue === true &&
+          [input.nonClosing, input.reviewedHeadSha, input.strategy, input.dryRun].some((v) => v !== undefined)
+        )
+          ctx.addIssue({ code: 'custom', message: 'Queue requests cannot include direct-merge options.' });
+        if (input.queue !== true && input.issueNumber === undefined)
+          ctx.addIssue({ code: 'custom', path: ['issueNumber'], message: 'Direct merge requires issueNumber.' });
+      }),
+  },
+  {
+    name: 'issue_pr_merge_queue_status',
+    commandName: 'merge queue status',
+    description: 'Observe the host-local canonical repository queue without advancing it',
+    inputSchema: z.strictObject({ repo: Repo, verbose: Verbose }),
+  },
+  {
+    name: 'issue_pr_merge_queue_run',
+    commandName: 'merge queue run',
+    description: 'Drive the host-local merge queue in the foreground until completed, cancelled or halted',
+    inputSchema: z.strictObject({ repo: Repo, verbose: Verbose }),
   },
   {
     name: 'issue_finish',

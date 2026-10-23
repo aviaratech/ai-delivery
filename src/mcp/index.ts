@@ -63,9 +63,24 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
         try {
           const signal = context.signal === undefined ? extra.signal : AbortSignal.any([context.signal, extra.signal]);
           const { verbose, ...input } = parsed.data;
+          const progressToken = extra._meta?.progressToken;
+          let observations = 0;
+          const queueProgress: ExecutionContext['queueProgress'] =
+            tool.name !== 'issue_pr_merge_queue_run' || progressToken === undefined
+              ? undefined
+              : async (progress) =>
+                  extra.sendNotification({
+                    method: 'notifications/progress',
+                    params: {
+                      progressToken,
+                      progress: ++observations,
+                      message: `Observation ${observations}: ${progress.completed} entries complete, ${progress.remaining} remaining. ${progress.reason}`,
+                    },
+                  });
           const pending = executeTool(tool.name as AiDeliveryMcpToolName, input, {
             ...context,
             signal,
+            ...(queueProgress === undefined ? {} : { queueProgress }),
           });
           activeCalls?.add(pending);
           let value: unknown;

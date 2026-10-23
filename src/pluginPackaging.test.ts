@@ -52,12 +52,16 @@ test('README and delivery skill CLI examples name supported commands and require
       let index = 0;
       while (globals.has(words[index] ?? '')) index += 2;
       const command = words[index]!;
-      const subcommand = command === 'plugin' ? words[index + 1] : undefined;
-      const help = execFileSync(
-        process.execPath,
-        [join(packageRoot, 'dist', 'cli.js'), command, ...(subcommand === undefined ? [] : [subcommand]), '--help'],
-        { encoding: 'utf8', maxBuffer: 65536 },
-      );
+      const commandPath =
+        command === 'merge'
+          ? words.slice(index, index + 3)
+          : command === 'plugin'
+            ? words.slice(index, index + 2)
+            : [command];
+      const help = execFileSync(process.execPath, [join(packageRoot, 'dist', 'cli.js'), ...commandPath, '--help'], {
+        encoding: 'utf8',
+        maxBuffer: 65536,
+      });
       for (const flag of required.get(command) ?? [])
         assert.ok(words.includes(flag), `${path}: ${command} requires ${flag}`);
       for (const flag of words.filter((word) => word.startsWith('--')))

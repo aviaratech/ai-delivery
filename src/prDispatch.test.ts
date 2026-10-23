@@ -26,6 +26,21 @@ function routes() {
 }
 
 describe('validated PR mode dispatch', () => {
+  for (const extra of [
+    { dryRun: false },
+    { nonClosing: false },
+    { strategy: 'squash' },
+    { reviewedHeadSha: 'a'.repeat(40) },
+  ]) {
+    it(`rejects queue/direct merge option mixing ${JSON.stringify(extra)} before credentials`, async () => {
+      const calls = routes();
+      await assert.rejects(
+        executeTool('issue_pr_merge', { prNumber: 23, queue: true, ...extra }, execution),
+        /direct-merge options/u,
+      );
+      assert.equal(calls.load.mock.calls.length + calls.merge.mock.calls.length, 0);
+    });
+  }
   it('accepts head/base with the legacy headBranch alias and rejects disagreement before credentials', async () => {
     const calls = routes();
     await executeTool('issue_pr_create', { issueNumber: 17, head: 'topic', base: 'main' }, execution);

@@ -710,6 +710,20 @@ program
       process.exitCode = 1;
     }
   });
+const mergeQueue = program.command('merge').command('queue').description('Host-local canonical repository merge queue');
+mergeQueue
+  .command('add <pr>')
+  .option('--issue <number>')
+  .action((pr: string, o: { issue?: string }) =>
+    run('issue_pr_merge', {
+      prNumber: int(pr),
+      ...(o.issue === undefined ? {} : { issueNumber: int(o.issue) }),
+      queue: true,
+    }),
+  );
+mergeQueue.command('status').action(() => run('issue_pr_merge_queue_status', {}));
+mergeQueue.command('run').action(() => run('issue_pr_merge_queue_run', {}));
+
 for (const [command, tool] of [
   ['pr:merge', 'issue_pr_merge'],
   ['finish', 'issue_finish'],
