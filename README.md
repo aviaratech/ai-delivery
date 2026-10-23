@@ -215,6 +215,15 @@ An App submission does not prove that GitHub counted it. `pr:checks` exposes Git
 
 The removed `develop`, `verify`, `pr:checkout`, worktree creation/cleanup and local velocity record commands are no longer public CLI/MCP workflows. Preserve existing consumer checks, controller admissions and historical custody records. Their original schemas, digest identities, writer locks and operational closure rules remain separate. The legacy transition commands remain exposed, but this runtime cannot reproduce their historical repository-policy configuration binding: CLI/MCP inspection and apply refuse without executing policy or converting records. Complete those transitions with the original controller. Explicit runtime stage/admit remain supported.
 
+For `issue_create` / `create`, supply a stable `opId` / `--op-id` when a write
+must be recoverable. Repeat the same original arguments after a partial failure;
+the authored issue marker identifies the existing issue and remaining tracking
+steps complete without creating another issue. A conflicting intent, author,
+closed issue or later tracking change refuses recovery. Keep the same author
+and original issue body; the bounded search refuses when its complete window
+cannot be read. `epic: true` / `--epic` permits a Ready parent without Points.
+State and title edits preserve archived Project items and warn with the item ID.
+
 ## Plugin installation and explicit runtime setup
 
 The complete plugin is the canonical public installation for Codex and Claude

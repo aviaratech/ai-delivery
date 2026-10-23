@@ -243,6 +243,25 @@ test('history preserves exact prior content before a rewrite and retries a faile
   }
 });
 
+test.each([{ state: 'closed' as const }, { state: 'open' as const }, { title: 'Retitled archived issue safely' }])(
+  'archived native update preserves the item and returns its identity: %j',
+  async (patch) => {
+    const f = updateFixture();
+    try {
+      f.controls.archived = true;
+      if (patch.state === 'open') f.live.state = 'closed';
+      const result = await issue.updateIssue(f.context, { issueNumber: 17, ...patch });
+      assert.equal(f.live.state, patch.state ?? 'open');
+      if (patch.title) assert.equal(f.live.title, patch.title);
+      assert.equal(f.controls.archived, true);
+      assert.equal(f.events.includes('project-update'), false);
+      assert.ok(result.warnings.some((w) => w.code === 'project.archived' && w.message.includes('ITEM17')));
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
 test('initially archived issue update refuses before history, closure or native writes', async () => {
   const f = updateFixture();
   try {

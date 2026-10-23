@@ -760,7 +760,7 @@ test('a successful newer Project observation is retained when the subsequent syn
 
 test('MCP serializes the actual incomplete update payload with error semantics', async () => {
   const f = batchFixture();
-  f.controls.archiveAfterWrite = true;
+  f.controls.loseProjectAck = true;
   const server = createAiDeliveryMcpServer({ repoRoot: '/synthetic', identity: 'host-author' });
   const client = new Client({ name: 'partial-update-synthetic', version: '1' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

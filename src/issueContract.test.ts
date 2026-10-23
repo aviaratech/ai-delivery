@@ -116,7 +116,10 @@ test('portable JSON Schema snapshot carries Ready bounds and distinguishes incom
       openQuestions: { default: [], type: 'array', items: { type: 'string' }, maxItems: 0 },
     },
   );
-  assert.ok(ready.required?.includes('points'));
+  assert.deepEqual(ready.anyOf, [
+    { properties: { epic: { const: true } }, required: ['epic'] },
+    { required: ['points'] },
+  ]);
   assert.ok(!ISSUE_JSON_SCHEMAS.draft.required?.includes('points'));
 });
 
