@@ -104,7 +104,15 @@ test('preview observes a Codex registration candidate without executing or chang
   assert.equal(report.migration, 'refused');
   assert.equal(report.completeness, 'incomplete');
   assert.deepEqual(report.registrations, [
-    { kind: 'standalone', scope: 'user', ownership: 'unknown', source: 'unknown', version: null, enabled: null },
+    {
+      kind: 'standalone',
+      scope: 'user',
+      ownership: 'unknown',
+      source: 'unknown',
+      version: null,
+      behind: null,
+      enabled: null,
+    },
   ]);
   assert.equal(JSON.stringify(result).includes('fictional-private-value'), false);
   assert.equal(JSON.stringify(result).includes('unknown-launcher'), false);
@@ -167,13 +175,91 @@ test('doctor reports an external native marketplace plugin without adopting or s
   assert.ok(result.diagnostics);
   assert.ok(result.activation);
   assert.deepEqual(result.diagnostics.registrations, [
-    { kind: 'plugin', scope: 'user', ownership: 'external', source: 'unknown', version: '0.3.24', enabled: true },
+    {
+      kind: 'plugin',
+      scope: 'user',
+      ownership: 'external',
+      source: 'unknown',
+      version: '0.3.24',
+      behind: true,
+      enabled: true,
+    },
   ]);
   assert.equal(result.activation.loadedVersion, null);
   assert.equal(result.sourceIntegrity, undefined);
   assert.equal(result.mcp, undefined);
   assert.equal(existsSync(join(fixture.home, '.cache')), false);
 });
+
+for (const host of ['codex', 'claude-code'] as const) {
+  for (const [version, latest, behind] of [
+    ['0.3.29', '0.3.35', true],
+    ['0.3.35', '0.3.35', false],
+    ['0.3.36', '0.3.35', false],
+    ['0.3.9', '0.3.35', true],
+    ['0.3.35-beta.2', '0.3.35', true],
+    ['0.3.35+local', '0.3.35', false],
+    ['0.3.35-beta.2', '0.3.35-beta.10', true],
+  ] as const) {
+    test(`doctor compares ${host} installed ${version} against published ${latest}`, async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ latest }))));
+      const entry = { pluginId: 'ai-delivery@external', version, scope: 'user', enabled: true, installed: true };
+      fixture.responses.push(JSON.stringify(host === 'codex' ? { installed: [entry], available: [] } : [entry]));
+      const result = await managePlugin({ action: 'doctor', host, scope: 'user', repoRoot: fixture.home });
+      assert.ok(result.diagnostics);
+      assert.equal(Reflect.get(result.diagnostics, 'latestPublishedVersion'), latest);
+      assert.equal(result.diagnostics.registrations[0]!.version, version);
+      assert.equal(Reflect.get(result.diagnostics.registrations[0]!, 'behind'), behind);
+      assert.equal(vi.mocked(fetch).mock.calls.length, 1);
+      assert.equal(
+        vi.mocked(fetch).mock.calls[0]![0],
+        'https://registry.npmjs.org/-/package/@aviaratech%2fai-delivery/dist-tags',
+      );
+      assert.equal(result.changed, false);
+      assert.equal(result.sourceIntegrity, undefined);
+      assert.equal(result.mcp, undefined);
+      assert.equal(existsSync(join(fixture.home, '.cache')), false);
+    });
+  }
+}
+
+for (const failure of ['unavailable', 'http-error', 'malformed', 'oversized'] as const) {
+  test(`doctor keeps published-version uncertainty explicit when registry is ${failure}`, async () => {
+    const response = new Response(
+      failure === 'malformed' ? JSON.stringify({ latest: 'fictional-private-version' }) : ' '.repeat(8193),
+      { status: failure === 'http-error' ? 503 : 200 },
+    );
+    vi.stubGlobal(
+      'fetch',
+      failure === 'unavailable'
+        ? vi.fn().mockRejectedValue(new Error('fictional-private-registry-error'))
+        : vi.fn().mockResolvedValue(response),
+    );
+    fixture.responses.push(
+      JSON.stringify({
+        installed: [{ pluginId: 'ai-delivery@external', version: '0.3.29', enabled: true }],
+        available: [],
+      }),
+    );
+    const result = await managePlugin({ ...input(), action: 'doctor', version: undefined });
+    assert.ok(result.diagnostics);
+    assert.equal(Reflect.get(result.diagnostics, 'latestPublishedVersion'), null);
+    assert.equal(Reflect.get(result.diagnostics.registrations[0]!, 'behind'), null);
+    assert.ok(result.diagnostics.findings.includes('latest_published_version_unavailable'));
+    assert.equal(JSON.stringify(result).includes('fictional-private'), false);
+    if (failure !== 'unavailable') assert.equal(response.bodyUsed, true);
+    assert.equal(existsSync(join(fixture.home, '.cache')), false);
+  });
+}
+
+for (const value of [{ action: 'preview' }, { action: 'doctor', dryRun: true }]) {
+  test(`plugin ${value.action}${value.dryRun ? ' dry-run' : ''} does not query the published version`, async () => {
+    await managePlugin({ ...input(), version: undefined, ...value });
+    assert.equal(vi.mocked(fetch).mock.calls.length, 0);
+    assert.deepEqual(fixture.commands, []);
+    assert.deepEqual(readdirSync(fixture.home), []);
+  });
+}
 
 test('preview refuses incomplete oversized configuration without writes or native calls', async () => {
   const profile = join(fixture.home, '.codex');
@@ -223,7 +309,15 @@ test('doctor observes external installations after retained managed removal with
   const result = await managePlugin({ ...input(), action: 'doctor', version: undefined });
   assert.ok(result.diagnostics);
   assert.deepEqual(result.diagnostics.registrations, [
-    { kind: 'plugin', scope: 'user', ownership: 'external', source: 'unknown', version: '0.3.24', enabled: true },
+    {
+      kind: 'plugin',
+      scope: 'user',
+      ownership: 'external',
+      source: 'unknown',
+      version: '0.3.24',
+      behind: true,
+      enabled: true,
+    },
   ]);
   assert.equal(result.installed, false);
   assert.equal(result.sourceIntegrity, undefined);
@@ -307,6 +401,10 @@ test.each(['migrate', 'apply', 'retire', 'restore-settings'])(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(() => Promise.resolve(new Response('{"latest":"0.3.35"}'))),
+  );
   fixture.home = mkdtempSync(join(tmpdir(), 'ai-delivery-installer-'));
   vi.stubEnv('CODEX_HOME', join(fixture.home, '.codex'));
   vi.stubEnv('CLAUDE_CONFIG_DIR', join(fixture.home, '.claude'));
@@ -319,6 +417,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   rmSync(fixture.home, { recursive: true, force: true });
   for (const args of fixture.commandArguments)
@@ -1311,11 +1410,36 @@ test('Claude doctor binds managed provenance to the verified scope and source, e
       ownership: 'managed',
       source: 'managed_archive',
       version: '0.3.21',
+      behind: true,
       enabled: false,
     },
-    { kind: 'plugin', scope: 'project', ownership: 'external', source: 'unknown', version: '0.3.24', enabled: false },
-    { kind: 'plugin', scope: 'local', ownership: 'external', source: 'unknown', version: '0.3.21', enabled: false },
-    { kind: 'plugin', scope: 'local', ownership: 'external', source: 'unknown', version: '0.3.21', enabled: false },
+    {
+      kind: 'plugin',
+      scope: 'project',
+      ownership: 'external',
+      source: 'unknown',
+      version: '0.3.24',
+      behind: true,
+      enabled: false,
+    },
+    {
+      kind: 'plugin',
+      scope: 'local',
+      ownership: 'external',
+      source: 'unknown',
+      version: '0.3.21',
+      behind: true,
+      enabled: false,
+    },
+    {
+      kind: 'plugin',
+      scope: 'local',
+      ownership: 'external',
+      source: 'unknown',
+      version: '0.3.21',
+      behind: true,
+      enabled: false,
+    },
   ]);
   assert.ok(result.diagnostics.findings.includes('native_registration_project_unverified'));
   assert.deepEqual(fixture.commandArguments, [['claude', 'plugin', 'list', '--json']]);

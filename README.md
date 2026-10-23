@@ -300,6 +300,80 @@ and original issue body; the bounded search refuses when its complete window
 cannot be read. `epic: true` / `--epic` permits a Ready parent without Points.
 State and title edits preserve archived Project items and warn with the item ID.
 
+## Upgrade a host
+
+The operator runs these commands for an existing managed `ai-delivery-user`
+USER installation. The example target is **0.3.35**, the npm `latest` release
+checked on 2026-10-22. Check `npm view @aviaratech/ai-delivery dist-tags.latest`
+before choosing a newer target; replace both version literals together.
+Using the published CLI through `npx` avoids depending on the old host's CLI.
+Preserving updates are currently qualified for Claude Code **2.1.296** and
+Codex CLI **0.162.1**; the installer refuses other native versions.
+
+```sh
+# Claude Code
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin update --host claude-code --scope user --version 0.3.35 --json
+# Codex marketplace plugin
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin update --host codex --scope user --version 0.3.35 --json
+```
+
+Confirm the selected installation and its separate startup check:
+
+```sh
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin doctor --host claude-code --scope user --json
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin doctor --host codex --scope user --json
+```
+
+Require `installed: true`, `enabled: true`, `sourceIntegrity: true`,
+`version: "0.3.35"`, and `activation.startupVersion: "0.3.35"`.
+A `recoveryRequired` result needs the reported recovery before another version
+or rollback is selected; preserve the installer state and native cache.
+Compare each observed registration `version` with the published target from
+the npm command above.
+
+Confirm the **running conversation** separately. In Claude Code, `/plugin`'s
+Installed tab shows installed metadata. In an interactive terminal,
+`/reload-plugins` applies pending plugin changes without restarting the session;
+resolve any reload error. In desktop/noninteractive sessions, that reload does
+not connect or disconnect plugin MCP servers. See the
+[Claude Code reload reference](https://code.claude.com/docs/en/plugins/cli-reference#sessions-without-an-interactive-terminal)
+for the surface-specific behavior.
+
+The [OpenAI local-plugin guidance](https://developers.openai.com/plugins/build/plugins#install-a-local-plugin-manually)
+describes restarting the desktop app to load changed local plugin files.
+Preserve active jobs and their core sessions: wait until the affected jobs are
+clear and an operator window is agreed before a full desktop/core CLI restart.
+During that window, follow the host's activation guidance; for Codex CLI, exit
+and start a new session. A new chat, refreshed skills or other newer server
+processes do not by themselves prove which MCP version serves this conversation.
+
+From the host conversation being checked, call the native `issue_info` with
+`repo: "aviaratech/ai-delivery"` and `issueNumber: 163`. Record native-read success
+separately from any supported current loaded plugin and MCP version readouts,
+including the source of each readout. If a version is not exposed, record
+`not exposed/unverified`. A successful read or installed metadata does not attest
+the running MCP version. The doctor launches a separate process: its
+`activation.loadedVersion` stays `null`, so startup results also do not prove the
+running conversation's version.
+
+To roll back a completed Codex update, select its recorded previous version
+(`0.3.29` after a `0.3.29` → `0.3.35` update):
+
+```sh
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin rollback --host codex --scope user --json
+```
+
+Repeat doctor and the host activation/version checks for the previous version.
+
+Claude Code downgrades are not currently qualified. The installer refuses a
+lower-version replacement with `Claude preserving replacement is unqualified`
+before changing the catalog or native selection. Preserve the managed state and
+selected version. Claude's native [marketplace source pins](https://code.claude.com/docs/en/plugins/marketplace-reference#plugin-sources)
+can select git refs or SHAs in a catalog, but they do not retarget this managed
+installation's local catalog. Native `plugin update` selects the version that
+catalog offers. This managed installation has no supported Claude Code downgrade
+procedure.
+
 ## Plugin installation and explicit runtime setup
 
 The complete plugin is the canonical public installation for Codex and Claude
@@ -327,7 +401,8 @@ ai-delivery plugin remove --host codex --scope user --json
 Use `--host claude-code` for Claude Code. Its supported scopes are `user`,
 `project`, and `local`; select the project directory with the global
 `--repo-root` option. Codex currently supports `user`. Install and update require
-a literal version. Rollback selects the recorded previous version. The commands
+a literal version. Codex rollback selects the recorded previous version; Claude
+Code downgrade limits are described in **Upgrade a host** above. The commands
 keep verified version units in a private directory and use the native host's
 marketplace and plugin commands to select that exact local source. Removal keeps
 the managed version units for recovery and uses Claude Code's `--keep-data`.
@@ -347,6 +422,11 @@ Doctor can also observe native-marketplace plugins when managed state is absent.
 That observation does not establish ownership or permit startup of unknown
 bytes. It reports bounded registration candidates and incomplete scope evidence;
 the verified managed selection retains its separate integrity checks. Doctor
+compares observed registration versions with npm's `latest` tag in
+`diagnostics.latestPublishedVersion`; each registration's `behind` flags an older
+version. Unknown installed versions or an unavailable lookup leave the comparison
+`null`, with an explicit finding on lookup failure. Preview and dry-run make no
+registry request. Doctor
 reports managed installation and source integrity, skills, and a direct
 credential-free stdio startup check of the selected bundled MCP server. Startup
 means that the server initialized and listed its tools; it does not validate
