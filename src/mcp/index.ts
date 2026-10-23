@@ -6,6 +6,7 @@ import { executeTool, type ExecutionContext } from '../dispatch.js';
 import { setLogsSuppressed } from '../logger.js';
 import { PACKAGE_VERSION } from '../version.js';
 import { getIncompleteIssueUpdate } from '../issue.js';
+import { projectToolOutput } from '../toolOutput.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
@@ -56,7 +57,8 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
         }
         try {
           const signal = context.signal === undefined ? extra.signal : AbortSignal.any([context.signal, extra.signal]);
-          const pending = executeTool(tool.name as AiDeliveryMcpToolName, parsed.data, {
+          const { verbose, ...input } = parsed.data;
+          const pending = executeTool(tool.name as AiDeliveryMcpToolName, input, {
             ...context,
             signal,
           });
@@ -67,11 +69,25 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
           } finally {
             activeCalls?.delete(pending);
           }
-          return { content: [{ type: 'text' as const, text: JSON.stringify(value) }] };
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(projectToolOutput(tool.name, value, verbose === true)) },
+            ],
+          };
         } catch (error) {
           const incomplete = getIncompleteIssueUpdate(error);
           if (incomplete !== undefined)
-            return { content: [{ type: 'text' as const, text: JSON.stringify(incomplete) }], isError: true };
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    projectToolOutput(tool.name, incomplete, 'verbose' in args && args.verbose === true),
+                  ),
+                },
+              ],
+              isError: true,
+            };
           const message = error instanceof Error ? error.message : String(error);
           return { content: [{ type: 'text' as const, text: message }], isError: true };
         }

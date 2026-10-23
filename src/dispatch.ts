@@ -326,7 +326,7 @@ export async function executeTool(
       ...(execution.signal === undefined ? {} : { signal: execution.signal }),
     });
   }
-  const { repo: selected, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
+  const { repo: selected, verbose: _verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
   if (name === 'issue_finish' && input.nonClosing === true)
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)

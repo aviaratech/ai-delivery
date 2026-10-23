@@ -14,6 +14,7 @@ import {
   IssueDeferralPatch,
 } from '../issueContract.js';
 
+const Verbose = z.boolean().optional().describe('Return the full payload, including bodies, diffs and routing.');
 const Positive = z.number().int().positive();
 const Labels = z.array(z.string().trim().min(1));
 const REPO_HELP =
@@ -31,6 +32,7 @@ const IssueUpdateInput = issueInputSchema(
       ...NativeIssueDateFields,
       status: IssueStatusPatch.optional(),
       repo: Repo,
+      verbose: Verbose,
       blockedBy: z.array(Positive).optional(),
       blocks: z.array(Positive).optional(),
       overrideReason: OverrideReason.optional(),
@@ -64,6 +66,7 @@ const IssueUpdateInput = issueInputSchema(
 );
 
 const Tracking = {
+  verbose: Verbose,
   blockedBy: z.array(Positive).optional(),
   blocks: z.array(Positive).optional(),
   overrideReason: OverrideReason.optional(),
@@ -83,6 +86,7 @@ const Tracking = {
 };
 const InvestigationStart = z.strictObject({
   repo: Repo,
+  verbose: Verbose,
   issueNumber: Positive,
   investigationWorktree: z.string().min(1),
   expectedHeadSha: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -98,6 +102,7 @@ const NormalStart = z.strictObject({
 });
 const NormalFinish = z.strictObject({
   repo: Repo,
+  verbose: Verbose,
   issueNumber: Positive,
   prNumber: Positive,
   nonClosing: z.boolean().optional(),
@@ -110,6 +115,7 @@ const NormalFinish = z.strictObject({
 });
 const InvestigationFinish = z.strictObject({
   repo: Repo,
+  verbose: Verbose,
   issueNumber: Positive,
   investigation: z.literal(true),
   resultPath: z.string().min(1),
@@ -125,6 +131,7 @@ function validateMode(schema: z.ZodType, input: unknown, context: z.RefinementCt
 
 const IssueListing = {
   repo: Repo,
+  verbose: Verbose,
   state: z.enum(['open', 'closed', 'all']).optional(),
   labels: z
     .array(
@@ -176,8 +183,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description:
       'Post a typed issue journal with authoritative comment readback. Provide the fields required by kind: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: non-empty decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps. Omit fields belonging to other kinds.',
     inputSchema: z
-      .strictObject({ ...JournalInputSchema.shape, repo: Repo })
-      .superRefine(({ repo: _repo, ...journal }, ctx) => {
+      .strictObject({ ...JournalInputSchema.shape, repo: Repo, verbose: Verbose })
+      .superRefine(({ repo: _repo, verbose: _verbose, ...journal }, ctx) => {
         // Repository routing belongs to the MCP envelope, not the strict journal variants.
         const parsed = JournalInputSchema.safeParse(journal);
         if (!parsed.success)
@@ -281,7 +288,12 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'batch:update',
     description: 'Plan or apply 1–50 issue updates in one repository, with ordered partial results and readback',
     inputSchema: issueInputSchema(
-      z.strictObject({ repo: Repo, items: z.array(IssueUpdateInput).min(1).max(50), dryRun: z.boolean().optional() }),
+      z.strictObject({
+        repo: Repo,
+        verbose: Verbose,
+        items: z.array(IssueUpdateInput).min(1).max(50),
+        dryRun: z.boolean().optional(),
+      }),
     ),
   },
   {
@@ -289,13 +301,13 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'info',
     description:
       'Read live GitHub issue metadata, relationships, Project status and direct-child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
-    inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo }),
+    inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo, verbose: Verbose }),
   },
   {
     name: 'issue_ready_check',
     commandName: 'ready:check',
     description: 'Evaluate deterministic readiness from live native issue state',
-    inputSchema: z.strictObject({ issueNumber: Positive, repo: Tracking.repo }),
+    inputSchema: z.strictObject({ issueNumber: Positive, repo: Tracking.repo, verbose: Verbose }),
   },
   {
     name: 'issue_pr_create',
@@ -305,6 +317,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     inputSchema: z
       .strictObject({
         repo: Repo,
+        verbose: Verbose,
         issueNumber: Positive,
         prNumber: Positive.optional(),
         nonClosing: z.boolean().optional(),
@@ -347,6 +360,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Inspect a PR by number or its GitHub-linked issue branch',
     inputSchema: z.strictObject({
       repo: Repo,
+      verbose: Verbose,
       issueNumber: Positive.optional(),
       prNumber: Positive.optional(),
       nonClosing: z.boolean().optional(),
@@ -358,6 +372,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Submit one existing exact-head independent review with the reviewer App role',
     inputSchema: z.strictObject({
       repo: Repo,
+      verbose: Verbose,
       issueNumber: Positive,
       prNumber: Positive,
       nonClosing: z.boolean().optional(),
@@ -372,6 +387,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Guarded exact-head merge with live blocker, check and review readback',
     inputSchema: z.strictObject({
       repo: Repo,
+      verbose: Verbose,
       issueNumber: Positive,
       prNumber: Positive,
       nonClosing: z.boolean().optional(),
@@ -404,6 +420,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Read a legacy issue row, original evidence and exact closure gaps without changing ownership',
     inputSchema: z.strictObject({
       repo: Repo,
+      verbose: Verbose,
       issueNumber: Positive,
       purpose: z.enum(['active-resume', 'merged-cleanup']),
       disposition: z.enum(['retain', 'remove']).optional(),
@@ -420,6 +437,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       'Apply or resume one exact independently accepted transition with immutable preservation and closure proof',
     inputSchema: z.strictObject({
       repo: Repo,
+      verbose: Verbose,
       authority: z.literal('worktree:transition'),
       planPath: z.string().min(1),
       expectedPlanId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),

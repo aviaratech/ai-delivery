@@ -34,6 +34,8 @@ program
   .version(PACKAGE_VERSION)
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit legacy personal-token author override')
+  .option('--json', 'Print JSON output')
+  .option('--verbose', 'Include full bodies, diffs and routing with --json')
   .option('--repo <owner/name>', 'GitHub repository owner/name; works from any directory')
   .option('--repo-root <path>', 'Launch directory or explicit clone for local operations', process.cwd());
 
@@ -91,7 +93,10 @@ function fields(file: string | undefined, overrides: Record<string, unknown>): R
   };
 }
 function run(name: AiDeliveryMcpToolName, input: Record<string, unknown>): Promise<void> {
-  return executeTool(name, input, execution()).then((value) => printCommandResult(name, value));
+  const options = program.opts<{ json?: boolean; verbose?: boolean }>();
+  return executeTool(name, input, execution()).then((value) =>
+    printCommandResult(name, value, options.json === true && options.verbose === true),
+  );
 }
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -818,4 +823,7 @@ program
   });
 program.command('mcp:serve').action(async () => serveAiDeliveryMcp(execution()));
 
-program.parseAsync(process.argv).catch(printCommandError);
+program.parseAsync(process.argv).catch((error: unknown) => {
+  const options = program.opts<{ json?: boolean; verbose?: boolean }>();
+  printCommandError(error, options.json === true && options.verbose === true);
+});

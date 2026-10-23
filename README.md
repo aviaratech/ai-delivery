@@ -395,7 +395,9 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 | Record a typed journal | `issue_comment` | See the [typed journal contract](#typed-issue-journals); the MCP call returns the authored comment identity and readback |
 | Close with a reason | `issue_update` | `update --issue N --state closed --close-reason not_planned --superseded-by S` |
 
-Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
+Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Issue and PR tools return compact JSON by default: identities, native fields and relationships, warnings, and history-comment links. MCP `verbose: true` restores the complete prior payload, including bodies, conversion diffs and routing; CLI `--json --verbose` does the same. Recovery arguments, refusals and diagnostic fix hints remain available in compact output.
+
+Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
 
 `issue_create` and `issue_update` also accept optional native `startDate` and
 `targetDate` values, including in CLI `--fields-file` JSON. They resolve the
