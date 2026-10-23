@@ -273,14 +273,14 @@ try {
     [Runtime.InteropServices.Marshal]::WriteIntPtr($inherit, 16, $reads[1].Write)
     $operationStage = 'job-list-arguments'
     $lastNativeOperation = $null; $lastNativeReturned = $false; $lastNativeResult = $null; $lastNativeError = $null
-    $a = [object[]]@($attributes, [uint32]0, [UIntPtr]0x2000d, $jobArray, [UIntPtr]8, [IntPtr]::Zero, [IntPtr]::Zero)
+    $a = [object[]]@($attributes, [uint32]0, [UIntPtr]::new([uint64]0x2000d), $jobArray, [UIntPtr]::new([uint64]8), [IntPtr]::Zero, [IntPtr]::Zero)
     $operationStage = 'job-list-call'
     $jobListAccepted = N 'UpdateProcThreadAttribute' $a
     $operationStage = 'job-list-return'
     if (-not $jobListAccepted) { throw 'job-list-admission' }
     $operationStage = 'handle-list-arguments'
     $lastNativeOperation = $null; $lastNativeReturned = $false; $lastNativeResult = $null; $lastNativeError = $null
-    $a = [object[]]@($attributes, [uint32]0, [UIntPtr]0x20002, $inherit, [UIntPtr]24, [IntPtr]::Zero, [IntPtr]::Zero)
+    $a = [object[]]@($attributes, [uint32]0, [UIntPtr]::new([uint64]0x20002), $inherit, [UIntPtr]::new([uint64]24), [IntPtr]::Zero, [IntPtr]::Zero)
     $operationStage = 'handle-list-call'
     $handleListAccepted = N 'UpdateProcThreadAttribute' $a
     $operationStage = 'handle-list-return'

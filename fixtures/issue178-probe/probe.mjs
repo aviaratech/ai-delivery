@@ -8,7 +8,7 @@ import { release } from 'node:os';
 
 /** @typedef {import('node:child_process').ChildProcess} Child */
 /** @typedef {{pid:number,birth?:string}} Identity */
-/** @typedef {Identity & {state:string,sameIdentity?:boolean,observerFailure?:object}} Observation */
+/** @typedef {Identity & {state:string,sameIdentity?:boolean,observerFailure?:object,observerMethod?:string}} Observation */
 /** @typedef {{phase:string,identity:Identity,root?:Identity,jobZero?:boolean,pendingReadsSettled?:boolean,reason?:string}} Status */
 /** @typedef {{action:string,event:string,value:Status,request:unknown,code:number|null,signal:NodeJS.Signals|null,statuses:Status[],bytes:number,protocolBytes:number,nonProtocolLines:number,output:string}} Message */
 /** @typedef {{error:boolean,closed:boolean,code?:number|null,signal?:NodeJS.Signals|null,done:Promise<void>}} ChildOutcome */
@@ -16,7 +16,7 @@ import { release } from 'node:os';
 /** @typedef {{mode:string,startedAt:string,identities:Identity[],passed:boolean,requestSent?:boolean,actionSent?:boolean,statuses?:Status[],final?:Status|null,transport?:object,boundary?:string,supervisorAbsence?:Observation,jobZero?:string,literalArgumentsExact?:boolean,selectedRsaResponseExact?:boolean,sourceValidation?:string,nativeAbsence?:Observation[],peerPreserved?:boolean,completedAt?:string,driverRssBytes?:number}} Case */
 /** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean,observation?:Observation}} Cleanup */
 /** @typedef {{state?:string,directOwnedHandleExited?:boolean,launchFailed?:boolean}} PeerCleanup */
-/** @typedef {{schema:string,source:Manifest,manifestSha256:string,platform:string,arch:string,osRelease:string,node:string,powershell:string,startedAt:string,complete:boolean,productAcceptance:boolean,liveCredentialAccess:boolean,cases:Case[],cleanup:Cleanup[],errors:{category:string,reason:string}[],unexecuted:string[],limits:object,peer?:Observation,peerCleanup?:PeerCleanup,cleanupConfirmed?:boolean,cleanupContract?:string,completedAt?:string}} Report */
+/** @typedef {{schema:string,source:Manifest,manifestSha256:string,platform:string,arch:string,osRelease:string,node:string,powershell:string,startedAt:string,complete:boolean,productAcceptance:boolean,liveCredentialAccess:boolean,cases:Case[],cleanup:Cleanup[],errors:{category:string,reason:string}[],unexecuted:string[],limits:object,peer?:Observation,peerAfterCases?:Observation,peerCleanup?:PeerCleanup,cleanupConfirmed?:boolean,cleanupContract?:string,completedAt?:string}} Report */
 
 const here = dirname(fileURLToPath(import.meta.url));
 const script = join(here, 'supervisor.ps1');
@@ -62,6 +62,16 @@ function powershell() {
 }
 /** @param {Identity} identity @param {boolean} terminate @returns {Observation} */
 function inspect(identity, terminate = false) {
+  // ESRCH proves this retained identity is absent without starting another observer.
+  // Every other outcome uses the unchanged creation-identity inspector; this never terminates.
+  if (!terminate && Number.isInteger(identity.pid) && identity.pid > 0 && /^[0-9]+$/u.test(identity.birth ?? '')) {
+    try { process.kill(identity.pid, 0); }
+    catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
+        return { ...identity, state: 'absent', observerMethod: 'node-signal-zero-ESRCH' };
+      }
+    }
+  }
   const args = ['-NoProfile', '-NonInteractive', '-File', script, '-Mode', 'Inspect', '-TargetPid', String(identity.pid)];
   if (identity.birth) args.push('-ExpectedBirth', identity.birth);
   if (terminate) {
@@ -362,12 +372,14 @@ async function run(destination) {
       const identities = [...new Map(record.identities.map((identity) => [String(identity.pid), identity])).values()];
       record.nativeAbsence = identities.map((identity) => inspect(identity));
       check(record.nativeAbsence.every((value) => value.state === 'absent'), 'An owned helper identity survived');
-      const peerAfter = inspect(peerIdentity);
-      check(peerAfter.state === 'alive' && peerAfter.sameIdentity, 'Unrelated peer was changed');
-      record.peerPreserved = true; record.passed = true; record.completedAt = new Date().toISOString();
+      // Peer preservation stays pending until its original birth identity is alive after every case.
+      record.completedAt = new Date().toISOString();
       record.driverRssBytes = process.memoryUsage().rss;
       checkpoint();
     }
+    report.peerAfterCases = inspect(peerIdentity);
+    check(report.peerAfterCases.state === 'alive' && report.peerAfterCases.sameIdentity, 'Unrelated peer was changed');
+    for (const record of report.cases) { record.peerPreserved = true; record.passed = true; }
     report.complete = true;
   } catch (error) {
     report.errors.push({ category: 'probe-failure', reason: error instanceof Error ? error.message : 'Unknown probe failure' });
