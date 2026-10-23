@@ -10,10 +10,11 @@ import { release } from 'node:os';
 /** @typedef {{pid:number,birth?:string}} Identity */
 /** @typedef {Identity & {state:string,sameIdentity?:boolean,observerFailure?:object,observerMethod?:string}} Observation */
 /** @typedef {{phase:string,identity:Identity,root?:Identity,jobZero?:boolean,pendingReadsSettled?:boolean,reason?:string}} Status */
-/** @typedef {{action:string,event:string,value:Status,request:unknown,code:number|null,signal:NodeJS.Signals|null,statuses:Status[],bytes:number,protocolBytes:number,nonProtocolLines:number,output:string}} Message */
+/** @typedef {{id:string,childPid:number|null,supervisor:Identity|null,attempted:boolean,accepted:boolean,threw:boolean,signal:string,completedAt:string,exitCodeBefore:number|null,signalCodeBefore:NodeJS.Signals|null}} StopReceipt */
+/** @typedef {{action:string,event:string,value:Status,request:unknown,code:number|null,signal:NodeJS.Signals|null,statuses:Status[],bytes:number,protocolBytes:number,nonProtocolLines:number,trailingProtocolBytes:number,output:string,stopId:string,stop:StopReceipt}} Message */
 /** @typedef {{error:boolean,closed:boolean,code?:number|null,signal?:NodeJS.Signals|null,done:Promise<void>}} ChildOutcome */
 /** @typedef {{schema:string,sourceSha:string,sourceTree:string,platform:string,arch:string,node:string,files:Record<string,string>}} Manifest */
-/** @typedef {{mode:string,startedAt:string,identities:Identity[],passed:boolean,requestSent?:boolean,actionSent?:boolean,statuses?:Status[],final?:Status|null,transport?:object,boundary?:string,supervisorAbsence?:Observation,jobZero?:string,literalArgumentsExact?:boolean,selectedRsaResponseExact?:boolean,sourceValidation?:string,nativeAbsence?:Observation[],peerPreserved?:boolean,completedAt?:string,driverRssBytes?:number}} Case */
+/** @typedef {{mode:string,startedAt:string,identities:Identity[],passed:boolean,requestSent?:boolean,actionSent?:boolean,statuses?:Status[],final?:Status|null,transport?:object,boundary?:string,supervisorStop?:(StopReceipt & {observedAt:string}),supervisorAbsence?:Observation,jobZero?:string,literalArgumentsExact?:boolean,selectedRsaResponseExact?:boolean,sourceValidation?:string,nativeAbsence?:Observation[],peerPreserved?:boolean,completedAt?:string,driverRssBytes?:number}} Case */
 /** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean,observation?:Observation}} Cleanup */
 /** @typedef {{state?:string,directOwnedHandleExited?:boolean,launchFailed?:boolean}} PeerCleanup */
 /** @typedef {{schema:string,source:Manifest,manifestSha256:string,platform:string,arch:string,osRelease:string,node:string,powershell:string,startedAt:string,complete:boolean,productAcceptance:boolean,liveCredentialAccess:boolean,cases:Case[],cleanup:Cleanup[],errors:{category:string,reason:string}[],unexecuted:string[],limits:object,peer?:Observation,peerAfterCases?:Observation,peerCleanup?:PeerCleanup,cleanupConfirmed?:boolean,cleanupContract?:string,completedAt?:string}} Report */
@@ -134,6 +135,8 @@ async function helper(mode) {
 async function controller() {
   /** @type {import('node:child_process').ChildProcessWithoutNullStreams|undefined} */
   let child;
+  /** @type {Identity|undefined} */
+  let supervisorIdentity;
   /** @type {Buffer[]} */
   let output = [];
   let bytes = 0;
@@ -173,6 +176,7 @@ async function controller() {
           const line = pending.slice(0, index); pending = pending.slice(index + 1);
           try {
             const value = /** @type {Status} */ (JSON.parse(line));
+            if (value.phase === 'bootstrap') supervisorIdentity = value.identity;
             statuses.push(value);
             emit({ event: 'status', value });
           } catch { nonProtocolLines++; }
@@ -181,12 +185,27 @@ async function controller() {
       child.once('error', () => emit({ event: 'spawn-error' }));
       child.once('close', (code, signal) => {
         emit({ event: 'finished', code, signal, statuses, bytes, protocolBytes, nonProtocolLines,
+          trailingProtocolBytes: Buffer.byteLength(pending),
           output: Buffer.concat(output).toString('base64') }, () => process.exit(0));
       });
     } else if (message.action === 'request') child.stdin.write(JSON.stringify(message.request) + '\n');
     else if (message.action === 'cancel') child.stdin.write('cancel\n');
     else if (message.action === 'eof') endInput();
-    else if (message.action === 'stop') child?.kill();
+    else if (message.action === 'stop') {
+      const exitCodeBefore = child?.exitCode ?? null;
+      const signalCodeBefore = child?.signalCode ?? null;
+      let attempted = false;
+      let accepted = false;
+      let threw = false;
+      if (child && exitCodeBefore === null && signalCodeBefore === null) {
+        attempted = true;
+        try { accepted = child.kill('SIGTERM'); } catch { threw = true; }
+      }
+      const completedAt = new Date().toISOString();
+      emit({ event: 'supervisor-stop-result', stop: { id: message.stopId, childPid: child?.pid ?? null,
+        supervisor: supervisorIdentity ? { pid: supervisorIdentity.pid, birth: supervisorIdentity.birth } : null,
+        attempted, accepted, threw, signal: 'SIGTERM', completedAt, exitCodeBefore, signalCodeBefore } });
+    }
     } catch {
       endInput();
       emit({ event: 'controller-error' }, () => { if (!child) process.exit(2); });
@@ -320,8 +339,10 @@ async function run(destination) {
             if (mode === 'cancel') { actionSent = true; send({ action: 'cancel' }); }
             if (mode === 'eof') { actionSent = true; send({ action: 'eof' }); }
             if (mode === 'controller-loss') { actionSent = true; child.kill(); }
-            if (mode === 'supervisor-loss') { actionSent = true; inspect(supervisor, true); }
+            if (mode === 'supervisor-loss') { actionSent = true; send({ action: 'stop', stopId: 'supervisor-loss' }); }
           }
+        } else if (message.event === 'supervisor-stop-result' && message.stop.id === 'supervisor-loss') {
+          record.supervisorStop = { ...message.stop, observedAt: new Date().toISOString() };
         } else if (message.event === 'finished') completion = message;
         else if (message.event === 'spawn-error') eventFailure = 'Supervisor launch failed';
         else if (message.event === 'controller-error') eventFailure = 'Supervisor controller operation failed';
@@ -335,17 +356,28 @@ async function run(destination) {
       const observationDeadline = Date.now() + 43000;
       while (!completion && !controllerClosed && !eventFailure && Date.now() < observationDeadline) await delay(25);
       if (eventFailure) fail(eventFailure);
-      if (!completion && !controllerClosed) { send({ action: 'stop' }); fail('Supervisor protocol stalled after response and cleanup windows'); }
+      if (!completion && !controllerClosed) { send({ action: 'stop', stopId: 'protocol-stall' }); fail('Supervisor protocol stalled after response and cleanup windows'); }
       await exited(child); controllers.delete(child);
       record.requestSent = requestSent; record.actionSent = actionSent;
       record.statuses = statuses;
       const final = completion ? [...completion.statuses].reverse().find((value) => value.phase === 'complete') : undefined;
       record.final = final ?? null;
       record.transport = completion ? { code: completion.code, signal: completion.signal, bytes: completion.bytes,
-        protocolBytes: completion.protocolBytes, nonProtocolLines: completion.nonProtocolLines } : { controllerLost: true };
+        protocolBytes: completion.protocolBytes, nonProtocolLines: completion.nonProtocolLines,
+        trailingProtocolBytes: completion.trailingProtocolBytes } : { controllerLost: true };
       if (['initialization-loss', 'controller-loss', 'supervisor-loss'].includes(mode)) {
         if (mode === 'initialization-loss') record.boundary = 'awaiting-first-request-before-Reflection.Emit-or-native-allocation';
         check(actionSent && supervisor, 'Loss boundary was not reached');
+        if (mode === 'supervisor-loss') {
+          const stop = record.supervisorStop;
+          check(stop?.attempted && stop.accepted && !stop.threw && stop.signal === 'SIGTERM' && stop.childPid === supervisor.pid &&
+            stop.supervisor?.pid === supervisor.pid && stop.supervisor.birth === supervisor.birth &&
+            Date.parse(stop.completedAt) < Date.parse(request.deadline) && Date.parse(stop.observedAt) < Date.parse(request.deadline),
+          'Forced supervisor loss was not acknowledged before the original response deadline');
+          check(completion?.code === null && completion.signal === 'SIGTERM' && completion.nonProtocolLines === 0 &&
+            completion.trailingProtocolBytes === 0 && !completion.statuses.some((value) => value.phase === 'complete'),
+          'Supervisor loss requires a directly observed signal close without normal completion');
+        }
         await delay(1000);
         const observed = inspect(supervisor);
         record.supervisorAbsence = observed;
@@ -385,7 +417,7 @@ async function run(destination) {
     report.errors.push({ category: 'probe-failure', reason: error instanceof Error ? error.message : 'Unknown probe failure' });
   } finally {
     for (const child of controllers) {
-      try { if (child.connected) child.send({ action: 'stop' }, () => {}); } catch { /* Kill and retained close outcome follow. */ }
+      try { if (child.connected) child.send({ action: 'stop', stopId: 'cleanup' }, () => {}); } catch { /* Kill and retained close outcome follow. */ }
       await delay(100);
       if (child.exitCode === null && child.signalCode === null) child.kill();
       await exited(child);
