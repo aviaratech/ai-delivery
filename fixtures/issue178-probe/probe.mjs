@@ -8,13 +8,13 @@ import { release } from 'node:os';
 
 /** @typedef {import('node:child_process').ChildProcess} Child */
 /** @typedef {{pid:number,birth?:string}} Identity */
-/** @typedef {Identity & {state:string,sameIdentity?:boolean}} Observation */
+/** @typedef {Identity & {state:string,sameIdentity?:boolean,observerFailure?:object}} Observation */
 /** @typedef {{phase:string,identity:Identity,root?:Identity,jobZero?:boolean,pendingReadsSettled?:boolean,reason?:string}} Status */
 /** @typedef {{action:string,event:string,value:Status,request:unknown,code:number|null,signal:NodeJS.Signals|null,statuses:Status[],bytes:number,protocolBytes:number,nonProtocolLines:number,output:string}} Message */
 /** @typedef {{error:boolean,closed:boolean,code?:number|null,signal?:NodeJS.Signals|null,done:Promise<void>}} ChildOutcome */
 /** @typedef {{schema:string,sourceSha:string,sourceTree:string,platform:string,arch:string,node:string,files:Record<string,string>}} Manifest */
 /** @typedef {{mode:string,startedAt:string,identities:Identity[],passed:boolean,requestSent?:boolean,actionSent?:boolean,statuses?:Status[],final?:Status|null,transport?:object,boundary?:string,supervisorAbsence?:Observation,jobZero?:string,literalArgumentsExact?:boolean,selectedRsaResponseExact?:boolean,sourceValidation?:string,nativeAbsence?:Observation[],peerPreserved?:boolean,completedAt?:string,driverRssBytes?:number}} Case */
-/** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean}} Cleanup */
+/** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean,observation?:Observation}} Cleanup */
 /** @typedef {{state?:string,directOwnedHandleExited?:boolean,launchFailed?:boolean}} PeerCleanup */
 /** @typedef {{schema:string,source:Manifest,manifestSha256:string,platform:string,arch:string,osRelease:string,node:string,powershell:string,startedAt:string,complete:boolean,productAcceptance:boolean,liveCredentialAccess:boolean,cases:Case[],cleanup:Cleanup[],errors:{category:string,reason:string}[],unexecuted:string[],limits:object,peer?:Observation,peerCleanup?:PeerCleanup,cleanupConfirmed?:boolean,cleanupContract?:string,completedAt?:string}} Report */
 
@@ -69,17 +69,21 @@ function inspect(identity, terminate = false) {
     args.push('-TerminateOwned');
   }
   const observed = spawnSync(powershell(), args, { shell: false, env: safe(), encoding: 'utf8', maxBuffer: 16384 });
-  check(observed.status === 0, 'Identity observer failed: ' + observed.stderr.slice(0, 2048));
-  try { return /** @type {Observation} */ (JSON.parse(observed.stdout)); } catch { fail('Identity observer returned no structured proof'); }
+  const transport = { status: observed.status, signal: observed.signal,
+    errorCode: /** @type {NodeJS.ErrnoException|undefined} */ (observed.error)?.code ?? null,
+    stdoutBytes: Buffer.byteLength(observed.stdout ?? ''), stderrBytes: Buffer.byteLength(observed.stderr ?? '') };
+  if (observed.status !== 0) return { pid: identity.pid, state: 'unknown', observerFailure: { kind: 'transport', ...transport } };
+  try { return /** @type {Observation} */ (JSON.parse(observed.stdout)); }
+  catch { return { pid: identity.pid, state: 'unknown', observerFailure: { kind: 'structured-proof', ...transport } }; }
 }
 /** @param {Identity} identity */
 async function absent(identity) {
   const first = inspect(identity);
   if (first.state === 'absent') return { identity, absent: true, terminationNeeded: false };
-  check(first.state === 'alive' && first.sameIdentity, 'Owned identity is unknown or changed');
+  if (first.state !== 'alive' || !first.sameIdentity) return { identity, absent: 'unknown', observation: first };
   const stopped = inspect(identity, true);
-  check(stopped.state === 'absent' && stopped.sameIdentity, 'Owned diagnostic cleanup unverified');
-  return { identity, absent: true, terminationNeeded: true };
+  return { identity, absent: stopped.state === 'absent' && stopped.sameIdentity ? true : 'unknown',
+    terminationNeeded: true, observation: stopped };
 }
 /** @param {Child} child */
 async function exited(child) {

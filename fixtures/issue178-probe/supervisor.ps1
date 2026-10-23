@@ -10,6 +10,7 @@ Set-StrictMode -Version 2
 $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $errStream = [Console]::OpenStandardError()
 function Status($value) {
+    $value.observedAtUtc = [DateTime]::UtcNow.ToString('o')
     $data = $utf8.GetBytes(($value | ConvertTo-Json -Depth 10 -Compress) + [char]10)
     $errStream.Write($data, 0, $data.Length)
     $errStream.Flush()
@@ -94,10 +95,18 @@ Bind 'IsProcessInJob' $bool @($ptr, $ptr, $bool.MakeByRefType())
 Bind 'TerminateProcess' $bool @($ptr, $u32)
 Bind 'CloseHandle' $bool @($ptr)
 $native = $builder.CreateType()
+if ($Mode -eq 'Supervise') { Status @{ phase = 'native-ready' } }
+$lastNativeOperation = $null; $lastNativeReturned = $false; $lastNativeResult = $null; $lastNativeError = $null
 function N([string]$name, [object[]]$arguments) {
-    return $native.GetMethod($name).Invoke($null, $arguments)
+    $script:lastNativeOperation = $name; $script:lastNativeReturned = $false; $script:lastNativeResult = $null; $script:lastNativeError = $null
+    $result = $native.GetMethod($name).Invoke($null, $arguments)
+    $script:lastNativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $script:lastNativeReturned = $true
+    if ($result -is [bool] -or $result -is [uint32]) { $script:lastNativeResult = $result }
+    elseif ($result -is [IntPtr]) { $script:lastNativeResult = $(if ($result -eq [IntPtr]::Zero) { 'zero-handle' } else { 'nonzero-handle' }) }
+    return $result
 }
-function LastError { return [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+function LastError { return $script:lastNativeError }
 $allocations = New-Object 'System.Collections.Generic.List[System.IntPtr]'
 $handles = New-Object 'System.Collections.Generic.List[System.IntPtr]'
 function Alloc([int]$bytes) {
@@ -117,7 +126,7 @@ function Birth($h) {
     return [Runtime.InteropServices.Marshal]::ReadInt64($times).ToString()
 }
 if ($Mode -eq 'Inspect') {
-    $h = [IntPtr]::Zero
+    $h = [IntPtr]::Zero; $same = $null; $waitStatus = $null
     try {
         if ($TargetPid -le 0 -or ($TerminateOwned -and $ExpectedBirth -notmatch '^[0-9]+$')) { throw 'identity-input' }
         $access = [uint32]0x101000
@@ -130,14 +139,23 @@ if ($Mode -eq 'Inspect') {
             $birth = Birth $h
             $same = $ExpectedBirth -eq '' -or $ExpectedBirth -eq $birth
             if ($TerminateOwned -and -not $same) { throw 'identity-changed' }
-            if ($TerminateOwned -and (N 'WaitForSingleObject' @($h, [uint32]0)) -eq 258) {
+            $waitStatus = N 'WaitForSingleObject' @($h, [uint32]0)
+            if ($TerminateOwned -and $waitStatus -eq 258) {
                 if (-not (N 'TerminateProcess' @($h, [uint32]125))) { throw 'owned-terminate' }
                 [void](N 'WaitForSingleObject' @($h, [uint32]3000))
+                $waitStatus = N 'WaitForSingleObject' @($h, [uint32]0)
             }
-            $state = $(if ((N 'WaitForSingleObject' @($h, [uint32]0)) -eq 0) { 'absent' } else { 'alive' })
-            @{ pid = $TargetPid; birth = $birth; sameIdentity = $same; state = $state; terminated = [bool]$TerminateOwned } | ConvertTo-Json -Compress
+            $waitError = LastError
+            $state = $(if ($waitStatus -eq 0) { 'absent' } elseif ($waitStatus -eq 258) { 'alive' } else { 'unknown' })
+            @{ pid = $TargetPid; birth = $birth; sameIdentity = $same; state = $state; terminated = [bool]$TerminateOwned;
+                waitStatus = $waitStatus; errorCode = $(if ($waitStatus -eq [uint32]::MaxValue) { $waitError } else { $null }) } | ConvertTo-Json -Compress
         }
-    } catch { @{ pid = $TargetPid; state = 'unknown'; error = 'identity-observation-failed' } | ConvertTo-Json -Compress }
+    } catch {
+        @{ pid = $TargetPid; state = 'unknown'; error = 'identity-observation-failed';
+            failureLine = $_.InvocationInfo.ScriptLineNumber; failureType = $_.Exception.GetType().FullName;
+            sameIdentity = $same; waitStatus = $waitStatus; nativeOperation = $lastNativeOperation;
+            nativeReturned = $lastNativeReturned; nativeResult = $lastNativeResult; nativeError = $lastNativeError } | ConvertTo-Json -Compress
+    }
     finally {
         if ($h -ne [IntPtr]::Zero) { [void](N 'CloseHandle' @($h)) }
         foreach ($p in $allocations) { [Runtime.InteropServices.Marshal]::FreeHGlobal($p) }
@@ -151,6 +169,7 @@ $totalBytes = 0L; $stderrBytes = 0L; $stdoutBytes = 0L
 $reason = $null; $jobZero = $false; $admitted = $false; $rootExit = $null
 $stopping = $false; $cleanupStart = $null; $safeToFree = $true
 $failureLine = $null; $failureType = $null
+$operationStage = 'request-admission'; $failureNative = $null
 function Quote-Argument([string]$value) {
     # Windows CRT quoting only; this string is never evaluated by PowerShell/cmd.
     $b = New-Object Text.StringBuilder
@@ -252,8 +271,20 @@ try {
     [Runtime.InteropServices.Marshal]::WriteIntPtr($inherit, 0, $nullInput)
     [Runtime.InteropServices.Marshal]::WriteIntPtr($inherit, 8, $reads[0].Write)
     [Runtime.InteropServices.Marshal]::WriteIntPtr($inherit, 16, $reads[1].Write)
-    if (-not (N 'UpdateProcThreadAttribute' @($attributes, [uint32]0, [UIntPtr]0x2000d, $jobArray, [UIntPtr]8, [IntPtr]::Zero, [IntPtr]::Zero))) { throw 'job-list-admission' }
-    if (-not (N 'UpdateProcThreadAttribute' @($attributes, [uint32]0, [UIntPtr]0x20002, $inherit, [UIntPtr]24, [IntPtr]::Zero, [IntPtr]::Zero))) { throw 'handle-list-admission' }
+    $operationStage = 'job-list-arguments'
+    $lastNativeOperation = $null; $lastNativeReturned = $false; $lastNativeResult = $null; $lastNativeError = $null
+    $a = [object[]]@($attributes, [uint32]0, [UIntPtr]0x2000d, $jobArray, [UIntPtr]8, [IntPtr]::Zero, [IntPtr]::Zero)
+    $operationStage = 'job-list-call'
+    $jobListAccepted = N 'UpdateProcThreadAttribute' $a
+    $operationStage = 'job-list-return'
+    if (-not $jobListAccepted) { throw 'job-list-admission' }
+    $operationStage = 'handle-list-arguments'
+    $lastNativeOperation = $null; $lastNativeReturned = $false; $lastNativeResult = $null; $lastNativeError = $null
+    $a = [object[]]@($attributes, [uint32]0, [UIntPtr]0x20002, $inherit, [UIntPtr]24, [IntPtr]::Zero, [IntPtr]::Zero)
+    $operationStage = 'handle-list-call'
+    $handleListAccepted = N 'UpdateProcThreadAttribute' $a
+    $operationStage = 'handle-list-return'
+    if (-not $handleListAccepted) { throw 'handle-list-admission' }
     $startup = Alloc 112; $pi = Alloc 24
     [Runtime.InteropServices.Marshal]::WriteInt32($startup, 0, 112)
     [Runtime.InteropServices.Marshal]::WriteInt32($startup, 60, 0x100)
@@ -324,6 +355,8 @@ try {
 } catch {
     $failureLine = $_.InvocationInfo.ScriptLineNumber
     $failureType = $_.Exception.GetType().FullName
+    $failureNative = @{ stage = $operationStage; operation = $lastNativeOperation;
+        returned = $lastNativeReturned; result = $lastNativeResult; errorCode = $lastNativeError; hresult = $_.Exception.HResult }
     if (-not $reason) { $reason = $(if ($admitted) { 'native-observation-failure' } else { 'admission-failure' }) }
     if ($job -ne [IntPtr]::Zero) { [void](N 'TerminateJobObject' @($job, [uint32]125)) }
     foreach ($s in $reads) { if ($s.Pending) { [void](N 'CancelIoEx' @($s.Read, $s.Ov)) } }
@@ -353,6 +386,6 @@ Status @{ phase = 'complete'; reason = $reason; supervisor = $selfIdentity; targ
     jobCreated = ($job -ne [IntPtr]::Zero); jobZero = $jobZero; pendingReadsSettled = $safeToFree;
     rootExit = $rootExit; capturedBytes = $totalBytes; stdoutBytes = $stdoutBytes; stderrBytes = $stderrBytes;
     retainedStdoutBytes = $bytes.Length; observed = @($observed.Values); processRssBytes = $self.WorkingSet64;
-    failureLine = $failureLine; failureType = $failureType }
+    failureLine = $failureLine; failureType = $failureType; failureNative = $failureNative }
 if ($reason -eq 'success' -and $jobZero -and $safeToFree) { exit 0 }
 exit 2
