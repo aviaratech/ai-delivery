@@ -22,6 +22,7 @@ const AUTHOR_COMMANDS = new Set([
   'batch:update',
   'pr:create',
   'pr:merge',
+  'merge queue run',
   'worktree',
   'worktree:create',
   'worktree:transition:apply',

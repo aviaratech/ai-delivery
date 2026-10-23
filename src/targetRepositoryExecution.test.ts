@@ -7,7 +7,7 @@ import { Command } from 'commander';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { beforeAll, test, vi } from 'vitest';
-import { fixtureFields, inertTarget } from './fixtures/inertTarget.js';
+import { fixtureFields, inertTarget, queueScenario } from './fixtures/inertTarget.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './mcp/tools.js';
 
 type Fixture = ReturnType<typeof inertTarget>;
@@ -18,7 +18,7 @@ type Route = {
   witness?: string;
   refusal?: RegExp;
   verify?: (value: Record<string, unknown>) => void;
-  before?: (f: Fixture) => void;
+  before?: (f: Fixture) => void | Promise<void>;
 };
 const digest = `sha256:${'0'.repeat(64)}`;
 function inputFile(f: Fixture, name: string, value: unknown): string {
@@ -202,6 +202,29 @@ const routes: Route[] = [
     witness: 'pulls.merge',
   },
   {
+    name: 'issue_pr_merge_queue_status',
+    input: () => ({}),
+    cli: () => ['merge', 'queue', 'status'],
+    witness: 'repos.get',
+    verify: (value) => assert.deepEqual(value.entries, []),
+  },
+  {
+    name: 'issue_pr_merge_queue_run',
+    input: () => ({}),
+    cli: () => ['merge', 'queue', 'run'],
+    witness: 'pulls.merge',
+    before: async (f) => {
+      queueScenario(f, 1);
+      const c = await f.connect();
+      try {
+        const result = await c.call('issue_pr_merge', { prNumber: 23, queue: true });
+        assert.notEqual(result.response.isError, true, result.text);
+      } finally {
+        await c.close();
+      }
+    },
+  },
+  {
     name: 'issue_finish',
     input: () => ({ issueNumber: 17, prNumber: 23 }),
     cli: () => ['finish', '--issue', '17', '--pr', '23'],
@@ -305,7 +328,7 @@ for (const route of routes) {
       let connection: Awaited<ReturnType<Fixture['connect']>> | undefined;
       try {
         f.policy('tracked');
-        route.before?.(f);
+        await route.before?.(f);
         // A schema/authentication failure must never masquerade as owner coverage.
         AI_DELIVERY_MCP_TOOLS.find((tool) => tool.name === route.name)!.inputSchema.parse({
           repo: 'example/widget',
@@ -362,6 +385,7 @@ const cliOnly: {
   witness?: string;
   before?: (f: Fixture) => void;
 }[] = [
+  { command: 'merge queue add', args: () => ['merge', 'queue', 'add', '23'], witness: 'pulls.get' },
   { command: 'parent', args: () => ['parent', '--issue', '17'], witness: 'issues.get' },
   { command: 'blockers', args: () => ['blockers', '--issue', '17'], witness: 'issues.get' },
   { command: 'subissues', args: () => ['subissues', '--issue', '17'], witness: 'issues.listSubIssues' },
@@ -489,6 +513,10 @@ test('CLI mcp:serve initializes and serves a real stdio request without target c
     stderr: 'pipe',
   });
   let childClosed = false;
+  let childStderr = '';
+  transport.stderr?.on('data', (bytes: Buffer) => {
+    childStderr = (childStderr + bytes.toString('utf8')).slice(-64 * 1024);
+  });
   transport.onclose = () => {
     childClosed = true;
   };
@@ -504,6 +532,8 @@ test('CLI mcp:serve initializes and serves a real stdio request without target c
     const value = JSON.parse((result.content as { text: string }[])[0]!.text) as { issueNumber: number };
     assert.equal(value.issueNumber, 17);
     f.assertInert();
+  } catch (cause) {
+    throw new Error(`Real stdio MCP failed. Child stderr: ${childStderr}`, { cause });
   } finally {
     await client.close();
     await transport.close();

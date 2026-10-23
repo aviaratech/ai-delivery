@@ -83,6 +83,7 @@ export function resolveCheckout(input: {
   repository: string;
   launchDirectory: string;
   checkoutRoots: string[];
+  canonical?: boolean;
 }): string {
   const matches = (path: string): string | null => {
     try {
@@ -99,7 +100,7 @@ export function resolveCheckout(input: {
       return null;
     }
   };
-  const current = matches(input.launchDirectory);
+  const current = input.canonical ? null : matches(input.launchDirectory);
   if (current) return current;
   const candidates = new Set<string>();
   for (const root of input.checkoutRoots) {
@@ -119,6 +120,28 @@ export function resolveCheckout(input: {
       const path = matches(join(root, entry.name));
       if (path) candidates.add(path);
     }
+  }
+  if (input.canonical) {
+    const common = new Map<string, string>();
+    for (const path of candidates) {
+      const result = spawnSync(
+        GIT_EXECUTABLE,
+        [...inertGitArguments(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+        {
+          env: gitEnvironment(),
+          cwd: path,
+          encoding: 'utf8',
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      if (result.status !== 0) throw new DeliveryError('Canonical queue Git directory is unavailable.');
+      common.set(realpathSync(result.stdout.trim()), path);
+    }
+    if (common.size !== 1)
+      throw new DeliveryError(
+        'Select exactly one canonical configured clone; independent matching clones are ambiguous.',
+      );
+    return [...common.values()][0]!;
   }
   if (candidates.size !== 1)
     throw new DeliveryError(

@@ -1,12 +1,315 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'vitest';
-import { publishPr, mergePr, finishIssue, prChecks } from './pr.js';
+import { publishPr, mergePr, finishIssue, prChecks, queueChecks, queuePr } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
 import { recordedBaseDrift, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
+
+for (const mode of [
+  'complete',
+  'generic-404',
+  'forbidden',
+  'unreadable-repository',
+  'wrong-repository',
+  'no-write',
+  'wrong-branch',
+  'missing-summary',
+  'partial-rules',
+  'partial-rulesets',
+  'mismatched-ruleset',
+  'inactive-ruleset',
+  'wrong-source',
+]) {
+  it(`queue discovers ruleset-only required checks with ${mode} visibility`, async () => {
+    const { context } = fixture();
+    const rule = {
+      type: 'required_status_checks',
+      ruleset_id: 41,
+      ruleset_source_type: 'Repository',
+      ruleset_source: mode === 'wrong-source' ? 'elsewhere/widget' : 'example/widget',
+      parameters: { required_status_checks: [{ context: 'checks', integration_id: 7 }] },
+    };
+    Object.assign(context.clients.rest, {
+      request: async (route: string) => {
+        if (route.endsWith('/protection'))
+          throw mode === 'generic-404'
+            ? { status: 404 }
+            : mode === 'forbidden'
+              ? { status: 403 }
+              : { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } };
+        if (route.includes('/rules/branches/'))
+          return { status: 200, headers: mode === 'partial-rules' ? { link: 'next' } : {}, data: [rule] };
+        if (route.endsWith('/rulesets'))
+          return {
+            status: 200,
+            headers: mode === 'partial-rulesets' ? { link: 'next' } : {},
+            data: [
+              {
+                id: mode === 'mismatched-ruleset' ? 42 : 41,
+                source_type: 'Repository',
+                source: 'example/widget',
+                enforcement: mode === 'inactive-ruleset' ? 'disabled' : 'active',
+              },
+            ],
+          };
+        if (route.endsWith('/branches/{branch}'))
+          return {
+            status: 200,
+            data: {
+              name: mode === 'wrong-branch' ? 'other' : 'main',
+              protected: true,
+              ...(mode === 'missing-summary' ? {} : { protection: { enabled: false } }),
+            },
+          };
+        if (mode === 'unreadable-repository') throw { status: 403 };
+        return {
+          status: 200,
+          data: {
+            full_name: mode === 'wrong-repository' ? 'elsewhere/widget' : 'example/widget',
+            permissions: { push: mode !== 'no-write' },
+          },
+        };
+      },
+    });
+    const reads: string[] = [];
+    let appId = 7,
+      checkSha = head;
+    Object.assign(context.clients.rest.checks, {
+      listForRef: async ({ ref }: { ref: string }) => {
+        reads.push(ref);
+        return {
+          status: 200,
+          headers: {},
+          data: {
+            total_count: 1,
+            check_runs: [
+              {
+                id: 10,
+                name: 'checks',
+                head_sha: checkSha,
+                app: { id: appId },
+                status: 'completed',
+                conclusion: 'success',
+              },
+            ],
+          },
+        };
+      },
+    });
+    Object.assign(context.clients.rest.repos, {
+      getCombinedStatusForRef: async () => ({
+        status: 200,
+        headers: {},
+        data: { sha: head, total_count: 0, statuses: [] },
+      }),
+    });
+    const result = await queueChecks(context, 'main', head);
+    if (mode !== 'complete') {
+      assert.equal(result.state, 'waiting');
+      assert.deepEqual(reads, []);
+    } else {
+      assert.equal(result.state, 'passed');
+      assert.deepEqual(reads, [head]);
+      assert.deepEqual(result.proof, [{ name: 'checks', appId: 7, id: 10 }]);
+      appId = 8;
+      assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
+      appId = 7;
+      checkSha = 'e'.repeat(40);
+      assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
+    }
+  });
+}
+
+for (const appId of [null, 7]) {
+  for (const state of ['success', 'failure', 'error', 'pending', 'unknown']) {
+    it(`queue evaluates a same-name ${state} status alongside a successful ${appId === null ? 'wildcard' : 'App-pinned'} run`, async () => {
+      const { context } = fixture();
+      Object.assign(context.clients.rest, {
+        request: async (route: string) => ({
+          status: 200,
+          headers: {},
+          data: route.endsWith('/protection')
+            ? { required_status_checks: { checks: [{ context: 'checks', app_id: appId }] } }
+            : [],
+        }),
+      });
+      Object.assign(context.clients.rest.checks, {
+        listForRef: async () => ({
+          status: 200,
+          headers: {},
+          data: {
+            total_count: 1,
+            check_runs: [
+              { id: 10, name: 'checks', head_sha: head, app: { id: 7 }, status: 'completed', conclusion: 'success' },
+            ],
+          },
+        }),
+      });
+      Object.assign(context.clients.rest.repos, {
+        getCombinedStatusForRef: async () => ({
+          status: 200,
+          headers: {},
+          data: {
+            sha: head,
+            total_count: 1,
+            statuses: [{ id: 20, context: 'checks', state, creator: { id: 7, login: 'checks[bot]' } }],
+          },
+        }),
+      });
+      const result = await queueChecks(context, 'main', head);
+      assert.equal(
+        result.state,
+        appId !== null
+          ? 'waiting'
+          : state === 'success'
+            ? 'passed'
+            : ['failure', 'error'].includes(state)
+              ? 'failed'
+              : 'waiting',
+      );
+      if (appId !== null) assert.match(result.reason, /source/iu);
+    });
+  }
+}
+
+for (const mode of ['pagination', 'issue-type', 'pr-id']) {
+  it(`queue issue derivation refuses incomplete or inconsistent native ${mode}`, async () => {
+    const { context } = fixture();
+    const original = context.clients.graphql;
+    let first = true;
+    Object.assign(context.clients, {
+      graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (query.includes('DeliveryClosingIssues') && first) {
+          first = false;
+          return {
+            repository: {
+              nameWithOwner: 'example/widget',
+              pullRequest: {
+                id: mode === 'pr-id' ? 'OTHER' : 'PR23',
+                number: 23,
+                closingIssuesReferences: {
+                  nodes: [
+                    {
+                      __typename: mode === 'issue-type' ? 'PullRequest' : 'Issue',
+                      id: 'ISSUE',
+                      number: 17,
+                      repository: { id: 'REPO', nameWithOwner: 'example/widget' },
+                    },
+                  ],
+                  pageInfo: mode === 'pagination' ? { endCursor: null } : { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          };
+        }
+        return original(query, variables);
+      },
+    });
+    await assert.rejects(queuePr(context, 23), /complete|identity|issue/iu);
+  });
+}
+
+it('preserves legacy required contexts alongside pinned checks and requires the latest exact-SHA source', async () => {
+  const { context } = fixture();
+  const check = {
+    id: 10,
+    name: 'pinned',
+    head_sha: head,
+    app: { id: 7 },
+    status: 'completed',
+    conclusion: 'success' as string | null,
+  };
+  let runs = [check];
+  Object.assign(context.clients.rest, {
+    request: async (route: string) => ({
+      status: 200,
+      headers: {},
+      data: route.endsWith('/protection')
+        ? { required_status_checks: { checks: [{ context: 'pinned', app_id: 7 }], contexts: ['pinned', 'legacy'] } }
+        : [],
+    }),
+  });
+  Object.assign(context.clients.rest.checks, {
+    listForRef: async () => ({ status: 200, headers: {}, data: { total_count: runs.length, check_runs: runs } }),
+  });
+  Object.assign(context.clients.rest.repos, {
+    getCombinedStatusForRef: async () => ({
+      status: 200,
+      headers: {},
+      data: {
+        sha: head,
+        state: 'success',
+        total_count: 1,
+        statuses: [{ id: 20, context: 'legacy', state: 'success' }],
+      },
+    }),
+  });
+  assert.deepEqual(
+    (await prChecks(context, 23)).requiredChecks.map((c) => c.name),
+    ['legacy', 'pinned'],
+  );
+  assert.equal((await queueChecks(context, 'main', head)).state, 'passed');
+  runs = [{ ...check, app: { id: 8 } }];
+  assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
+  runs = [check, { ...check, id: 11, status: 'in_progress', conclusion: null }];
+  assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
+  runs = [{ ...check, head_sha: 'e'.repeat(40) }];
+  assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
+});
+
+it('queue guard retains native eligibility and records intent only after the last base/proof check', async () => {
+  for (const state of ['behind', 'blocked']) {
+    const f = fixture(state),
+      stages: string[] = [];
+    await assert.rejects(
+      mergePr(
+        f.context,
+        { issueNumber: 17, prNumber: 23 },
+        {
+          expectedBase: 'c'.repeat(40),
+          checkProof: async () => {
+            stages.push('proof');
+          },
+          beforeMutation: async () => {
+            stages.push('intent');
+          },
+        },
+      ),
+      /merge eligibility/u,
+    );
+    assert.deepEqual(stages, []);
+    assert.equal(f.merges.length, 0);
+  }
+  const f = fixture(),
+    stages: string[] = [];
+  await assert.rejects(
+    mergePr(
+      f.context,
+      { issueNumber: 17, prNumber: 23 },
+      {
+        expectedBase: 'c'.repeat(40),
+        checkProof: async () => {
+          stages.push('proof');
+          const get = f.context.clients.rest.git.getRef;
+          f.context.clients.rest.git.getRef = (async (input: { ref: string }) => {
+            const result = await get(input as Parameters<typeof get>[0]);
+            if (input.ref === 'heads/main') result.data.object.sha = 'd'.repeat(40);
+            return result;
+          }) as unknown as typeof get;
+        },
+        beforeMutation: async () => {
+          stages.push('intent');
+        },
+      },
+    ),
+    /base moved/u,
+  );
+  assert.deepEqual(stages, ['proof']);
+  assert.equal(f.merges.length, 0);
+});
 
 function fixture(
   state: string | null = 'clean',
