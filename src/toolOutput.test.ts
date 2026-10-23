@@ -8,6 +8,7 @@ import * as dispatch from './dispatch.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { IssueValidationError } from './issueContract.js';
 import { projectToolOutput } from './toolOutput.js';
+import { getAiDeliveryMcpTool } from './mcp/tools.js';
 
 const issue = {
   issueNumber: 17,
@@ -150,6 +151,16 @@ test('contract refusals retain the field and fix hint', async () => {
   expect(reply.isError).toBe(true);
   const refusal = JSON.parse((reply.content as Array<{ text: string }>)[0]!.text) as { failures: unknown };
   expect(refusal.failures).toEqual([warning]);
+});
+
+test('verbose belongs to the batch envelope and cannot alter an individual write', () => {
+  const schema = getAiDeliveryMcpTool('issue_batch_update')!.inputSchema;
+  expect(
+    schema.parse({ verbose: true, items: [{ issueNumber: 17, status: { latestJournal: 'Verified' } }] }),
+  ).toHaveProperty('verbose', true);
+  expect(() =>
+    schema.parse({ items: [{ issueNumber: 17, verbose: true, status: { latestJournal: 'Verified' } }] }),
+  ).toThrow();
 });
 
 test('compact output preserves recovery inputs, fields and diagnostics without mutating evidence', () => {
