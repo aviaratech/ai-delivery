@@ -1,6 +1,19 @@
 // Public GitHub response projections; see recordedGitHubFlows.md for hashes,
 // redaction, missing-field semantics and explicitly synthetic transitions.
 
+/** Synthetic native IssueComment refusal projections, not captured live approvals. */
+export const syntheticStandingApprovalRefusals = [
+  { kind: 'non-approver', reason: 'not a configured approver' },
+  { kind: 'expired', reason: 'expired' },
+  { kind: 'same-second-edit', reason: 'was edited after posting' },
+  { kind: 'missing-edit-proof', reason: 'missing native' },
+  { kind: 'unknown-condition', reason: 'conditions' },
+  { kind: 'duplicate-pr', reason: 'unique' },
+  { kind: 'wrong-repository', reason: 'different repository' },
+  { kind: 'missing-predecessor', reason: 'FIFO prefix' },
+  { kind: 'minimized', reason: 'minimized' },
+] as const;
+
 export const recordedZeroApproval = {
   repository: {
     pullRequest: {

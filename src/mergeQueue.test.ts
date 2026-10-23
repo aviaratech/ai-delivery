@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test, vi } from 'vitest';
 import { fixtureGit, inertTarget, queueScenario } from './fixtures/inertTarget.js';
 import { resolveCheckout } from './github/repo.js';
-import { recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
+import { recordedZeroApproval, syntheticStandingApprovalRefusals } from './fixtures/recordedGitHubFlows.js';
 import { digestValue } from './delivery/common.js';
 import { contextFor } from './dispatch.js';
 import { enqueuePr, queueStatus, runQueue } from './mergeQueue.js';
@@ -19,10 +19,337 @@ function barrier() {
   return { promise, resolve };
 }
 
+test('uncovered queue entry waits for approval without publishing or merging', async ({ signal }) => {
+  const f = inertTarget(signal),
+    s = queueScenario(f, 1);
+  f.comments.length = 0;
+  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+  const stop = new AbortController();
+  await runQueue(context, {
+    root: f.root,
+    signal: stop.signal,
+    onProgress: async () => {
+      stop.abort();
+    },
+  }).catch((error: unknown) => {
+    if (!stop.signal.aborted) throw error;
+  });
+  const status = await queueStatus(context, { root: f.root });
+  assert.equal(status.entries[0]!.state, 'needs-approval');
+  assert.equal(s.prs[0]!.merged, false);
+  assert.equal(s.events.includes('git.push'), false);
+  assert.equal(f.comments.filter((c) => /needs approval/iu.test(c.body) && /maintainer/u.test(c.body)).length, 1);
+  f.assertInert();
+});
+
+for (const { kind, reason } of syntheticStandingApprovalRefusals) {
+  test(`standing approval refuses ${kind} with one explanation`, async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1),
+      a = s.approval;
+    if (kind === 'non-approver') a.user.login = 'outsider';
+    if (kind === 'expired') a.body = a.body.replace('2099-01-01', '2000-01-01');
+    if (kind === 'same-second-edit') {
+      a.lastEditedAt = a.created_at;
+      a.editor = { login: 'maintainer' };
+    }
+    if (kind === 'missing-edit-proof') Reflect.deleteProperty(a, 'lastEditedAt');
+    if (kind === 'unknown-condition') a.body = a.body.replace('current-queue-checks', 'execute-code()');
+    if (kind === 'duplicate-pr') a.body = a.body.replace('pull-requests: 23', 'pull-requests: 23,23');
+    if (kind === 'wrong-repository') a.body = a.body.replace('repository: example/widget', 'repository: example/other');
+    if (kind === 'missing-predecessor') a.body = a.body.replace('pull-requests: 23', 'pull-requests: 23,24');
+    if (kind === 'minimized') a.isMinimized = true;
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    // Observe the same refusal twice, across compatible explicit runs.
+    for (let i = 0; i < 2; i++) {
+      const stop = new AbortController();
+      await runQueue(context, {
+        root: f.root,
+        signal: stop.signal,
+        onProgress: async () => {
+          stop.abort();
+        },
+      }).catch((error: unknown) => {
+        if (!stop.signal.aborted) throw error;
+      });
+    }
+    assert.equal((await queueStatus(context, { root: f.root })).entries[0]!.state, 'needs-approval');
+    assert.ok((await queueStatus(context, { root: f.root })).entries[0]!.reason);
+    assert.equal(f.comments.filter((c) => c.body.includes('ignored:') && c.body.includes(reason)).length, 1);
+    assert.equal(s.events.includes('git.push'), false);
+    assert.equal(s.prs[0]!.merged, false);
+    f.assertInert();
+  });
+}
+
+for (const mode of ['pagination', 'wrong-target', 'ambiguous', 'no-config', 'read-error'] as const) {
+  test(`standing approval refuses ${mode} evidence`, async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    if (mode === 'pagination' || mode === 'wrong-target' || mode === 'read-error') s.controls.approvalFault = mode;
+    if (mode === 'ambiguous') s.approve();
+    if (mode === 'no-config') {
+      const path = join(f.base, 'user.json'),
+        settings = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+      delete settings.mergeQueueApprovers;
+      writeFileSync(path, JSON.stringify(settings));
+    }
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    const stop = new AbortController();
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    assert.equal((await queueStatus(context, { root: f.root })).entries[0]!.state, 'needs-approval');
+    assert.equal(s.events.includes('git.push'), false);
+    assert.equal(s.prs[0]!.merged, false);
+    assert.doesNotMatch(JSON.stringify(f.comments), /Synthetic private diagnostic/u);
+    f.assertInert();
+  });
+}
+
+for (const outcome of ['present', 'absent', 'duplicate', 'spoofed', 'edited', 'same-second-restored'] as const) {
+  test(
+    `queue reconciles comment loss without duplicate POST, outcome=${outcome}`,
+    { timeout: 0 },
+    async ({ signal }) => {
+      const f = inertTarget(signal),
+        s = queueScenario(f, 1);
+      const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+      await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+      s.controls.loseCommentAck = true;
+      await assert.rejects(runQueue(context, { root: f.root, signal: f.signal }), /lost comment acknowledgement/u);
+      const before = f.comments.filter((c) => c.user.login === 'operator');
+      assert.equal(before.length, 1);
+      const posted = before[0]!,
+        writes = f.calls.filter((c) => c.name === 'issues.createComment').length;
+      if (outcome !== 'present') {
+        if (outcome === 'absent') f.comments.splice(f.comments.indexOf(posted), 1);
+        if (outcome === 'duplicate') f.addComment(999999, posted.body, false, 23);
+        if (outcome === 'spoofed') posted.user.login = 'outsider';
+        if (outcome === 'edited') posted.body += '\nedited';
+        if (outcome === 'same-second-restored') {
+          posted.lastEditedAt = posted.created_at;
+          posted.editor = { login: 'operator' };
+        }
+        await assert.rejects(
+          runQueue(context, { root: f.root, signal: f.signal }),
+          /acknowledgement is unknown|readback changed/u,
+        );
+        assert.equal(f.calls.filter((c) => c.name === 'issues.createComment').length, writes);
+        assert.equal(s.prs[0]!.merged, false);
+        assert.equal((await queueStatus(context, { root: f.root })).pending?.kind, 'comment');
+      } else {
+        await runQueue(context, { root: f.root, signal: f.signal });
+        assert.equal(s.prs[0]!.merged, true);
+        assert.equal(f.comments.filter((c) => c.body.includes('verifying')).length, 1);
+        assert.equal(s.events.filter((e) => e === 'native.merge:23').length, 1);
+      }
+      f.assertInert();
+    },
+  );
+}
+
+test(
+  'standing approval merges only its ordered prefix and mentions each native author',
+  { timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 3);
+    s.approval.body = s.approval.body.replace('23,24,25', '23,24');
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    for (const pr of s.prs) await enqueuePr(context, { prNumber: pr.number }, { root: f.root });
+    const stop = new AbortController();
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        if (s.prs[1]!.merged) stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    assert.deepEqual(
+      s.events.filter((e) => e.startsWith('native.merge')),
+      ['native.merge:23', 'native.merge:24'],
+    );
+    assert.equal((await queueStatus(context, { root: f.root })).entries[2]!.state, 'needs-approval');
+    for (const pr of s.prs.slice(0, 2)) {
+      const notices = f.comments.filter(
+        (c) => c.user.login === 'operator' && c.issue_url.endsWith(`/issues/${pr.number}`),
+      );
+      // The second prediction is rebuilt after the first squash changes its base identity.
+      for (const text of ['verifying', 'ready', `merged as ${pr.merge}`])
+        assert.equal(
+          notices.filter((c) => c.body.includes(text) && c.body.includes('@operator')).length,
+          text.startsWith('merged') || pr.number === 23 ? 1 : 2,
+        );
+    }
+    f.assertInert();
+  },
+);
+
+test('unchanged native eligibility waits do not repeat ready notices', { timeout: 0 }, async ({ signal }) => {
+  const f = inertTarget(signal),
+    s = queueScenario(f, 1);
+  s.controls.reviewDecision = 'REVIEW_REQUIRED';
+  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+  const stop = new AbortController();
+  let waits = 0;
+  await runQueue(context, {
+    root: f.root,
+    signal: stop.signal,
+    onProgress: async () => {
+      if ((await queueStatus(context, { root: f.root })).entries[0]!.state === 'waiting' && ++waits === 3) stop.abort();
+    },
+  }).catch((error: unknown) => {
+    if (!stop.signal.aborted) throw error;
+  });
+  assert.equal(waits, 3);
+  assert.equal(s.prs[0]!.merged, false);
+  assert.equal(f.comments.filter((c) => c.body.includes('PR #23 ready.')).length, 1);
+  f.assertInert();
+});
+
+test(
+  'standing approval retains the same native approver across login casing changes',
+  { timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    s.approval.user.login = 'Maintainer';
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    const stop = new AbortController();
+    let changed = false;
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        if (!changed) {
+          changed = true;
+          s.approval.user.login = 'MAINTAINER';
+        } else stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    assert.equal(s.prs[0]!.merged, true);
+    f.assertInert();
+  },
+);
+
+test('removed and re-enqueued entry cannot reuse an unconsumed old grant', { timeout: 0 }, async ({ signal }) => {
+  const f = inertTarget(signal),
+    s = queueScenario(f, 1);
+  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+  s.failed.add(23);
+  await runQueue(context, { root: f.root, signal: f.signal });
+  assert.equal((await queueStatus(context, { root: f.root })).entries[0]!.state, 'removed');
+  s.failed.clear();
+  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+  const stop = new AbortController();
+  await runQueue(context, {
+    root: f.root,
+    signal: stop.signal,
+    onProgress: async () => {
+      stop.abort();
+    },
+  }).catch((error: unknown) => {
+    if (!stop.signal.aborted) throw error;
+  });
+  assert.equal(s.prs[0]!.merged, false);
+  assert.equal((await queueStatus(context, { root: f.root })).entries[1]!.state, 'needs-approval');
+  s.approve();
+  await runQueue(context, { root: f.root, signal: f.signal });
+  assert.equal(s.prs[0]!.merged, true);
+  assert.equal(s.events.filter((e) => e === 'native.merge:23').length, 1);
+  f.assertInert();
+});
+
+test('standing approval discovery completes later native comment pages', { timeout: 0 }, async ({ signal }) => {
+  const f = inertTarget(signal),
+    s = queueScenario(f, 1);
+  f.comments.length = 0;
+  for (let i = 0; i < 100; i++) f.addComment(900000 + i, 'ordinary discussion', false, 23);
+  f.comments.push(s.approval);
+  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+  await runQueue(context, { root: f.root, signal: f.signal });
+  assert.equal(s.prs[0]!.merged, true);
+  f.assertInert();
+});
+
+for (const mode of ['expired', 'deleted', 'edited'] as const) {
+  test(
+    `standing approval ${mode} after first merge stops suffix and retains original receipt`,
+    { timeout: 0 },
+    async ({ signal }) => {
+      const f = inertTarget(signal),
+        s = queueScenario(f, 2);
+      const observedNow = Date.now();
+      let shift = 0,
+        changed = false;
+      const expires = new Date(observedNow + 120000).toISOString().replace(/\.\d{3}Z$/u, 'Z');
+      s.approval.body = s.approval.body.replace('2099-01-01T00:00:00Z', expires);
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => observedNow + shift);
+      try {
+        const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+        for (const pr of s.prs) await enqueuePr(context, { prNumber: pr.number }, { root: f.root });
+        const stop = new AbortController();
+        await runQueue(context, {
+          root: f.root,
+          signal: stop.signal,
+          onProgress: async () => {
+            if (s.prs[0]!.merged && !changed) {
+              changed = true;
+              if (mode === 'expired') shift = 120001;
+              if (mode === 'deleted') f.comments.splice(f.comments.indexOf(s.approval), 1);
+              if (mode === 'edited') s.approval.lastEditedAt = s.approval.created_at;
+            }
+            if (
+              changed &&
+              (await queueStatus(context, { root: f.root })).entries[1]!.state === 'needs-approval' &&
+              f.comments.some((c) => c.body.includes('ignored:'))
+            )
+              stop.abort();
+          },
+        }).catch((error: unknown) => {
+          if (!stop.signal.aborted) throw error;
+        });
+        assert.equal(changed, true);
+        assert.deepEqual(
+          s.events.filter((e) => e.startsWith('native.merge')),
+          ['native.merge:23'],
+        );
+        const status = await queueStatus(context, { root: f.root });
+        assert.equal(status.entries[0]!.merge!.sha, s.prs[0]!.merge);
+        assert.equal(status.entries[1]!.state, 'needs-approval');
+        assert.equal(f.comments.filter((c) => c.body.includes(`merged as ${s.prs[0]!.merge}`)).length, 1);
+      } finally {
+        clock.mockRestore();
+      }
+      f.assertInert();
+    },
+  );
+}
+
 test('queue refuses rebinding while the drained writer is still held', { timeout: 0 }, async ({ signal }) => {
   const f = inertTarget(signal),
     s = queueScenario(f, 2),
     linked = f.worktree();
+  s.approval.body = s.approval.body.replace('23,24', '23');
+  s.approve([24]);
   const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
   await enqueuePr(context, { prNumber: 23 }, { root: linked });
   const held = barrier(),
@@ -64,6 +391,8 @@ test('queue chooses the current lease after delayed authentication', { timeout: 
   const f = inertTarget(signal),
     s = queueScenario(f, 2),
     linked = f.worktree();
+  s.approval.body = s.approval.body.replace('23,24', '23');
+  s.approve([24]);
   const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
   await enqueuePr(context, { prNumber: 23 }, { root: linked });
   await runQueue(context, { root: f.root, signal: f.signal });
@@ -99,6 +428,8 @@ test(
     const f = inertTarget(signal),
       s = queueScenario(f, 2),
       linked = f.worktree();
+    s.approval.body = s.approval.body.replace('23,24', '23');
+    s.approve([24]);
     const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
     await enqueuePr(context, { prNumber: 23 }, { root: linked });
     await runQueue(context, { root: f.root, signal: f.signal });
@@ -162,6 +493,8 @@ test('queue keeps its process lease root across linked worktrees', { timeout: 0 
   const f = inertTarget(signal),
     s = queueScenario(f, 2),
     linked = f.worktree();
+  s.approval.body = s.approval.body.replace('23,24', '23');
+  s.approve([24]);
   const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
   await enqueuePr(context, { prNumber: 23 }, { root: linked, signal: f.signal });
   assert.equal(
@@ -229,6 +562,7 @@ test(
       assert.notEqual(r.response.isError, true, r.text);
     }
     const running = connection.call('issue_pr_merge_queue_run', {});
+    // Status resolves a real checkout; poll at the driver's cadence instead of starving its Git work.
     const waitFront = (prNumber: number, nativeState: 'behind' | 'blocked' = 'behind') =>
       vi.waitFor(
         async () => {
@@ -239,7 +573,7 @@ test(
           assert.equal(entry.state, 'waiting');
           assert.ok((entry.reason ?? '').includes(`eligibility is ${nativeState}`), entry.reason);
         },
-        { timeout: 120000 },
+        { timeout: 120000, interval: 1000 },
       );
     await Promise.race([running.then((r) => assert.notEqual(r.response.isError, true, r.text)), waitFront(24)]);
     assert.deepEqual(
@@ -281,6 +615,8 @@ test(
     const f = inertTarget(signal),
       s = queueScenario(f, 2),
       c = await f.connect();
+    s.approval.body = s.approval.body.replace('23,24', '23');
+    s.approve([24]);
     s.controls.missing = true;
     await c.call('issue_pr_merge', { prNumber: 23, queue: true });
     const running = c.call('issue_pr_merge_queue_run', {});
@@ -293,7 +629,7 @@ test(
         }[]
       )[0]!;
     const waitReason = (pattern: RegExp) =>
-      vi.waitFor(async () => assert.match((await entry()).reason ?? '', pattern), { timeout: 60000 });
+      vi.waitFor(async () => assert.match((await entry()).reason ?? '', pattern), { timeout: 60000, interval: 1000 });
     await waitReason(/not reported/u);
     assert.equal(s.prs[0]!.merged, false);
     const appended = await c.call('issue_pr_merge', { prNumber: 24, queue: true });
@@ -318,12 +654,13 @@ test(
         assert.equal(e.prediction!.base, s.main());
         assert.notEqual(e.prediction!.sha, original);
       },
-      { timeout: 60000 },
+      { timeout: 60000, interval: 1000 },
     );
     s.controls.reviewDecision = 'REVIEW_REQUIRED';
     s.controls.pendingChecks = false;
     await vi.waitFor(() => assert.ok(f.calls.some((call) => call.name === 'DeliveryReviewDecision')), {
       timeout: 60000,
+      interval: 1000,
     });
     assert.equal(s.prs[0]!.merged, false);
     // Reuse the recorded observed-null value; CLEAN/non-draft/checks here are explicitly synthetic.
@@ -354,15 +691,33 @@ test(
     await vi.waitFor(
       async () => {
         const status = await c.call('issue_pr_merge_queue_status', {});
-        assert.equal((status.value!.entries as { state: string }[])[0]!.state, 'merged');
+        const entries = status.value!.entries as {
+          state: string;
+          reason?: string;
+          published?: string;
+          notice?: unknown;
+        }[];
+        assert.equal(entries[0]!.state, 'merged');
+        assert.equal(entries[0]!.published, undefined);
+        assert.match(entries[1]!.reason ?? '', /pending/u);
+        assert.equal(status.value!.pending, undefined);
+        assert.ok(entries.every((entry) => entry.notice === undefined));
       },
-      { timeout: 60000 },
+      { timeout: 60000, interval: 1000 },
     );
     stop.abort();
     await running;
     await driver.close();
     const path = join(f.root, '.git', 'ai-delivery', 'merge-queue', 'queue.json');
     const bytes = readFileSync(path);
+    const oldSchema = JSON.parse(bytes.toString()) as { schemaVersion: string; stateId: string };
+    oldSchema.schemaVersion = 'ai-delivery.merge-queue@1';
+    const { stateId: _old, ...oldContent } = oldSchema;
+    writeFileSync(path, JSON.stringify({ ...oldContent, stateId: digestValue(oldContent) }), { mode: 0o600 });
+    const oldRefused = await c.call('issue_pr_merge_queue_status', {});
+    assert.equal(oldRefused.response.isError, true);
+    assert.match(oldRefused.text, /schemaVersion|merge-queue@2/u);
+    writeFileSync(path, bytes, { mode: 0o600 });
     const broken = JSON.parse(bytes.toString()) as { binding: string; stateId: string };
     broken.binding = 'different-runtime';
     const { stateId: _prior, ...content } = broken;
@@ -401,7 +756,18 @@ test(
       fixtureGit(s.author, 'push', s.remote, `${pr.head}:refs/heads/${pr.ref}`);
     }
     for (const pr of s.prs) await c.call('issue_pr_merge', { prNumber: pr.number, queue: true });
-    const result = await c.call('issue_pr_merge_queue_run', {});
+    const running = c.call('issue_pr_merge_queue_run', {});
+    await vi.waitFor(
+      async () => {
+        const status = await c.call('issue_pr_merge_queue_status', {});
+        const entries = status.value!.entries as { state: string }[];
+        assert.equal(entries[1]!.state, 'removed');
+        assert.equal(entries[0]!.state, 'needs-approval');
+      },
+      { timeout: 120000, interval: 1000 },
+    );
+    s.approve([23, 25]);
+    const result = await running;
     assert.notEqual(result.response.isError, true, result.text);
     assert.deepEqual(
       (result.value!.entries as { state: string }[]).map((e) => e.state),
@@ -418,7 +784,7 @@ test(
 );
 
 for (const mode of ['failed-check', 'lost-merge-ack', 'lost-push-ack', 'outside-race'] as const) {
-  test(`queue reconciles ${mode} without stale proof or duplicate merge`, async ({ signal }) => {
+  test(`queue reconciles ${mode} without stale proof or duplicate merge`, { timeout: 0 }, async ({ signal }) => {
     const f = inertTarget(signal);
     const s = queueScenario(f, 2);
     const c = await f.connect();
@@ -428,7 +794,18 @@ for (const mode of ['failed-check', 'lost-merge-ack', 'lost-push-ack', 'outside-
     if (mode === 'outside-race') s.controls.outsideAtMerge = true;
     for (const pr of s.prs)
       await c.call('issue_pr_merge', { issueNumber: pr.issueNumber, prNumber: pr.number, queue: true });
-    const first = await c.call('issue_pr_merge_queue_run', {});
+    const running = c.call('issue_pr_merge_queue_run', {});
+    if (mode === 'failed-check') {
+      await vi.waitFor(
+        async () => {
+          const status = await c.call('issue_pr_merge_queue_status', {});
+          assert.equal((status.value!.entries as { state: string }[])[0]!.state, 'removed');
+        },
+        { timeout: 60000, interval: 1000 },
+      );
+      s.approve([24]);
+    }
+    const first = await running;
     if (mode === 'outside-race') {
       assert.match(first.text, /mismatch|unexpected|parent/iu);
       assert.deepEqual(

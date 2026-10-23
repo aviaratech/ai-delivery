@@ -225,19 +225,31 @@ export function inertTarget(
     const reviews = [review];
     const comments: {
       id: number;
+      node_id: string;
       body: string;
       html_url: string;
       issue_url: string;
       created_at: string;
+      updated_at: string;
+      lastEditedAt: string | null;
+      editor: { login: string } | null;
+      isMinimized: boolean;
       user: { id: number; login: string; type: string };
     }[] = [];
-    const addComment = (id: number, body: string, app = false) => {
+    let nextCommentId = 101;
+    const addComment = (id: number, body: string, app = false, number = 17) => {
+      const created = new Date(Date.now() + 1000).toISOString();
       const comment = {
         id,
+        node_id: `COMMENT${id}`,
         body,
-        html_url: `https://github.com/example/widget/issues/17#issuecomment-${id}`,
-        issue_url: 'https://api.github.com/repos/example/widget/issues/17',
-        created_at: new Date(Date.now() + 1000).toISOString(),
+        html_url: `https://github.com/example/widget/issues/${number}#issuecomment-${id}`,
+        issue_url: `https://api.github.com/repos/example/widget/issues/${number}`,
+        created_at: created,
+        updated_at: created,
+        lastEditedAt: null as string | null,
+        editor: null as { login: string } | null,
+        isMinimized: false,
         user: app ? { id: 99, login: 'reviewer[bot]', type: 'Bot' } : { id: 42, login: 'operator', type: 'User' },
       };
       comments.push(comment);
@@ -401,13 +413,22 @@ export function inertTarget(
           record('issues.listSubIssues', input);
           return { data: [] };
         },
-        listComments: async (input: unknown) => {
+        listComments: async (input: { issue_number: number; page?: number; per_page?: number }) => {
           record('issues.listComments', input);
-          return { data: comments };
+          const size = input.per_page ?? 100,
+            start = ((input.page ?? 1) - 1) * size;
+          return {
+            data: comments
+              .filter((c) => c.issue_url.endsWith(`/issues/${input.issue_number}`))
+              .slice(start, start + size),
+          };
         },
-        createComment: async (input: { body: string }) => {
+        createComment: async (input: { body: string; issue_number: number }) => {
           record('issues.createComment', input);
-          return { data: addComment(101 + comments.length, input.body) };
+          let id = Math.max(nextCommentId, 101 + comments.length);
+          while (comments.some((c) => c.id === id)) id++;
+          nextCommentId = id + 1;
+          return { data: addComment(id, input.body, false, input.issue_number) };
         },
         getComment: async (input: { comment_id: number }) => {
           record('issues.getComment', input);
@@ -825,6 +846,23 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
     fixtureGit(author, 'push', remote, `${head}:refs/heads/${ref}`);
     return { number, issueNumber, ref, head, merged: false, merge: null as string | null, nativeReady: true };
   });
+  const settingsPath = join(f.base, 'user.json');
+  const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+  writeFileSync(
+    settingsPath,
+    JSON.stringify({ ...settings, mergeQueueApprovers: { 'example/widget': ['maintainer'] } }),
+  );
+  const approve = (numbers = prs.map((p) => p.number)) => {
+    const c = f.addComment(
+      800000 + f.comments.length,
+      `ai-delivery merge approval v1\nrepository: example/widget\npull-requests: ${numbers.join(',')}\nconditions: current-native-eligibility,current-queue-checks,predecessors-merged\nheads: current-native-eligible\nexpires: 2099-01-01T00:00:00Z`,
+      false,
+      numbers[0],
+    );
+    c.user = { id: 43, login: 'maintainer', type: 'User' };
+    return c;
+  };
+  const approval = approve();
   const events: string[] = [],
     checked: string[] = [];
   const failed = new Set<number>();
@@ -838,6 +876,8 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
     losePushAck: false,
     outsideAtMerge: false,
     pendingChecks: false,
+    loseCommentAck: false,
+    approvalFault: '' as '' | 'pagination' | 'wrong-target' | 'read-error',
     pendingFor: new Set<number>(),
     reviewDecision: 'APPROVED' as string | null,
   };
@@ -1016,6 +1056,46 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
   });
   f.setQueueRead((query, variables) => {
     const pr = prs.find((p) => p.number === Number(variables.number));
+    const nativeComment = (c: (typeof f.comments)[number]) => {
+      const number = Number(c.issue_url.split('/').at(-1));
+      return {
+        __typename: 'IssueComment',
+        id: c.node_id,
+        body: c.body,
+        author: { __typename: c.user.type, id: `USER${c.user.id}`, login: c.user.login },
+        repository: { id: 'REPO', nameWithOwner: 'example/widget' },
+        pullRequest: { id: `PR${number}`, number: controls.approvalFault === 'wrong-target' ? number + 100 : number },
+        createdAt: c.created_at,
+        updatedAt: c.updated_at,
+        lastEditedAt: c.lastEditedAt,
+        editor: c.editor,
+        isMinimized: c.isMinimized,
+      };
+    };
+    if (query.includes('DeliveryQueueApprovalNode')) {
+      const c = f.comments.find((c) => c.node_id === variables.id);
+      return { node: c ? nativeComment(c) : null };
+    }
+    if (query.includes('DeliveryQueueApprovalComments') && pr) {
+      if (controls.approvalFault === 'read-error') throw new Error('Synthetic private diagnostic');
+      const all = f.comments.filter((c) => c.issue_url.endsWith(`/issues/${pr.number}`));
+      const start = variables.cursor ? Number(variables.cursor) : 0;
+      return {
+        repository: {
+          id: 'REPO',
+          nameWithOwner: 'example/widget',
+          pullRequest: {
+            id: `PR${pr.number}`,
+            number: pr.number,
+            comments: {
+              totalCount: all.length + (controls.approvalFault === 'pagination' ? 1 : 0),
+              nodes: all.slice(start, start + 100).map(nativeComment),
+              pageInfo: { hasNextPage: start + 100 < all.length, endCursor: String(start + 100) },
+            },
+          },
+        },
+      };
+    }
     if (query.includes('DeliveryClosingIssues') && pr)
       return {
         repository: {
@@ -1051,6 +1131,17 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
   const auth = vi
     .spyOn(githubClients, 'withAuthorGitToken')
     .mockImplementation(async (_clients, callback) => callback('fictional-queue-token'));
+  const createComment = f.rest.issues.createComment;
+  Object.assign(f.rest.issues, {
+    createComment: async (input: Parameters<typeof createComment>[0]) => {
+      const result = await createComment(input);
+      if (controls.loseCommentAck) {
+        controls.loseCommentAck = false;
+        throw new Error('Synthetic lost comment acknowledgement');
+      }
+      return result;
+    },
+  });
   const launch = verification.withRuntimeSetupWriter;
   const transport = vi
     .spyOn(verification, 'withRuntimeSetupWriter')
@@ -1082,6 +1173,8 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
     auth.mockRestore();
   });
   return {
+    approval,
+    approve,
     remote,
     author,
     prs,

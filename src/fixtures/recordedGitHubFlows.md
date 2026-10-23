@@ -1,8 +1,12 @@
 # Recorded public GitHub fragments
 
+Issue #189 adds explicitly synthetic `IssueComment` response replays for standing approvals. No live approval was created or consumed. `queueScenario` projects one shared fictional native comment collection through REST target-aware comments and GraphQL discovery/node reads. The fields follow the [native IssueComment schema](https://docs.github.com/en/graphql/reference/issues#issuecomment): node/author/repository/containing-PR identities, body, creation/update time, nullable edit/editor evidence and minimization. Missing fields remain missing; a null editor/edit timestamp is not reconstructed from REST timestamp equality.
+
+`syntheticStandingApprovalRefusals` records the synthetic response mutations and expected reasons for non-approver, expired, same-second edit, missing edit evidence, unknown condition, duplicate PR, wrong repository, missing predecessor and minimized cases. Additional synthetic transitions cover complete/incomplete pagination, ambiguous grants, read failure redaction, absent configuration, later code changes with fresh native proof, revocation/expiry after a confirmed merge, removal/re-enqueue and acknowledged/absent/duplicate/spoofed/edited comment outcomes, including a same-second restored body with explicit native edit evidence. A controlled controller clock makes between-merge expiry independent of test runtime. Native comment IDs remain unique after deletion. These replays exercise the real queue/persistence/notification owners and inert Git transport; they do not claim an actual recorded standing approval, hosted queue-SHA qualification, installed capability or atomic GitHub comment/merge race.
+
 Issue #188's queue tests reuse the observed `reviewDecision: null` value below. Its non-draft eligibility, queue-SHA checks, ordered squashes, owner refresh/`BEHIND` transitions, head/base drift, conflict, failed check, cancellation and lost acknowledgements are explicitly synthetic. `queueScenario` uses real owned Git objects and the actual bounded process runner, substituting only remote transport, GitHub HTTP and selected-author credentials. These cases neither qualify a hosted queue-SHA workflow nor establish a production outside-writer race.
 
-These fixtures support issue #167's approved four-file design. On October 21,
+The original public projections below support issue #167's approved four-file design. On October 21,
 2026, the operator explicitly accepted recorded public fragments plus labeled
 synthetic transitions. They characterize the existing native GitHub eligibility
 and exact-artifact submission contracts; they introduce no merge policy or

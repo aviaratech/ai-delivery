@@ -23,31 +23,68 @@ import { withLock } from './utils/lockfile.js';
 
 const Sha = z.string().regex(/^[a-f0-9]{40}$/u);
 const Prediction = z.strictObject({ base: Sha, parent: Sha, sha: Sha, tree: Sha, inputs: z.string() });
+const Notice = z.strictObject({ key: z.string().min(1), body: z.string().min(1) });
+const Grant = z.strictObject({
+  id: z.string().min(1),
+  bodyDigest: z.string(),
+  authorId: z.string().min(1),
+  authorLogin: z.string().min(1),
+  repositoryId: z.string().min(1),
+  anchorId: z.string().min(1),
+  anchorNumber: z.number().int().positive(),
+  expiresAt: z.string(),
+  consumed: z.number().int().nonnegative(),
+  members: z
+    .array(z.strictObject({ entryId: z.uuid(), prId: z.string().min(1), prNumber: z.number().int().positive() }))
+    .min(1)
+    .max(100),
+});
+type QueueGrant = z.infer<typeof Grant>;
 const Entry = z.strictObject({
   id: z.string().uuid(),
   issueNumber: z.number().int().positive(),
   prNumber: z.number().int().positive(),
   prId: z.string().min(1),
   head: Sha,
-  state: z.enum(['waiting', 'verifying', 'ready', 'merged', 'removed']),
+  authorLogin: z.string().min(1),
+  sequence: z.number().int().nonnegative(),
+  notified: z.array(z.string()),
+  notice: Notice.optional(),
+  grantId: z.string().optional(),
+  state: z.enum(['needs-approval', 'waiting', 'verifying', 'ready', 'merged', 'removed']),
   reason: z.string().optional(),
   prediction: Prediction.optional(),
   published: Sha.optional(),
   merge: z.strictObject({ sha: Sha, tree: Sha }).optional(),
-  comment: z.string().optional(),
 });
 type QueueEntry = z.infer<typeof Entry>;
 const Pending = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('ref'), entryId: z.uuid(), before: Sha.nullable(), after: Sha.nullable() }),
-  z.strictObject({ kind: z.literal('merge'), entryId: z.uuid(), head: Sha, base: Sha, tree: Sha }),
-  z.strictObject({ kind: z.literal('comment'), entryId: z.uuid(), body: z.string() }),
+  z.strictObject({
+    kind: z.literal('merge'),
+    entryId: z.uuid(),
+    head: Sha,
+    base: Sha,
+    tree: Sha,
+    grantId: z.string(),
+    grantDigest: z.string(),
+  }),
+  z.strictObject({
+    kind: z.literal('comment'),
+    entryId: z.uuid(),
+    key: z.string(),
+    body: z.string(),
+    actor: z.string(),
+    prId: z.string(),
+  }),
 ]);
 const Record = z.strictObject({
-  schemaVersion: z.literal('ai-delivery.merge-queue@1'),
+  schemaVersion: z.literal('ai-delivery.merge-queue@2'),
   binding: z.string(),
   baseRef: z.string().min(1),
   writerRoot: z.string().refine(isAbsolute),
   entries: z.array(Entry),
+  grants: z.array(Grant),
   pending: Pending.optional(),
   halted: z.string().optional(),
   store: z
@@ -58,7 +95,262 @@ const Record = z.strictObject({
 type Queue = z.infer<typeof Record>;
 const active = (e: QueueEntry) => e.state !== 'merged' && e.state !== 'removed';
 const drained = (q: Queue) =>
-  !q.pending && !q.store && !q.halted && q.entries.every((e) => !active(e) && !e.published && !e.comment);
+  !q.pending && !q.store && !q.halted && q.entries.every((e) => !active(e) && !e.published && !e.notice);
+
+function configuredApprovers(context: DeliveryContext) {
+  const map = context.config.schemaVersion === 'ai-delivery.github@1' ? context.config.mergeQueueApprovers : undefined;
+  return (
+    Object.entries(map ?? {}).find(([repo]) => repo.toLowerCase() === context.config.repository.toLowerCase())?.[1] ??
+    []
+  );
+}
+function approvalWait(context: DeliveryContext, reason?: string) {
+  const logins = configuredApprovers(context);
+  const required = logins.length
+    ? `Needs approval from configured approvers: ${logins.map((login) => `@${login}`).join(', ')}.`
+    : `Needs approval; configure mergeQueueApprovers for ${context.config.repository}.`;
+  return reason && reason !== required ? `${reason} ${required}` : required;
+}
+function notice(entry: QueueEntry, key: string, text: string) {
+  if (entry.notified.includes(key)) return;
+  if (entry.notice) throw new DeliveryError('Queue notice must be reconciled before the next transition.');
+  entry.notice = { key, body: `<!-- ai-delivery:merge-queue:${entry.id}:${key} -->\n@${entry.authorLogin} ${text}` };
+}
+function transition(entry: QueueEntry, state: QueueEntry['state'], reason?: string) {
+  const changed = entry.state !== state;
+  if (changed && entry.notice) throw new DeliveryError('Queue transition has an undelivered predecessor notice.');
+  entry.state = state;
+  if (reason === undefined) delete entry.reason;
+  else entry.reason = reason;
+  if (changed) entry.sequence++;
+  if (state === 'needs-approval') {
+    if (entry.notice?.key !== 'needs-approval') notice(entry, 'needs-approval', reason!);
+  } else if (changed && state !== 'waiting') {
+    const text =
+      state === 'merged' ? `merged as ${entry.merge!.sha}` : state === 'removed' ? `removed: ${reason}` : state;
+    notice(entry, `transition-${entry.sequence}`, `PR #${entry.prNumber} ${text}.`);
+  }
+}
+
+const approvalFields = `__typename id body author{__typename login ... on User{id}} repository{id nameWithOwner}
+  pullRequest{id number} createdAt updatedAt lastEditedAt editor{login} isMinimized`;
+const NativeCommentEdit = z.object({
+  __typename: z.literal('IssueComment'),
+  id: z.string().min(1),
+  lastEditedAt: z.iso.datetime({ offset: true }).nullable(),
+  editor: z.object({ login: z.string().min(1) }).nullable(),
+  isMinimized: z.boolean(),
+});
+const NativeApproval = NativeCommentEdit.extend({
+  body: z.string(),
+  author: z.object({ __typename: z.literal('User'), id: z.string().min(1), login: z.string().min(1) }),
+  repository: z.object({ id: z.string().min(1), nameWithOwner: z.string() }),
+  pullRequest: z.object({ id: z.string().min(1), number: z.number().int().positive() }),
+  createdAt: z.iso.datetime({ offset: true }),
+  updatedAt: z.iso.datetime({ offset: true }),
+});
+function approvalFailure(error: unknown) {
+  return error instanceof DeliveryError
+    ? error.message
+    : 'Native GitHub approval read failed; authority is unavailable.';
+}
+function approvalDocument(body: string) {
+  const lines = body.replace(/\r\n/gu, '\n').replace(/\n$/u, '').split('\n');
+  if (
+    lines.length !== 6 ||
+    lines[0] !== 'ai-delivery merge approval v1' ||
+    !lines[1]!.startsWith('repository: ') ||
+    !lines[2]!.startsWith('pull-requests: ') ||
+    lines[3] !== 'conditions: current-native-eligibility,current-queue-checks,predecessors-merged' ||
+    lines[4] !== 'heads: current-native-eligible' ||
+    !lines[5]!.startsWith('expires: ')
+  )
+    throw new DeliveryError('Unsupported approval format, heads policy or conditions.');
+  const raw = lines[2]!.slice(15).split(','),
+    prs = raw.map(Number),
+    expiresAt = lines[5]!.slice(9);
+  if (
+    raw.length > 100 ||
+    raw.some((pr) => !/^[1-9]\d*$/u.test(pr)) ||
+    prs.some((pr) => !Number.isSafeInteger(pr)) ||
+    new Set(prs).size !== prs.length
+  )
+    throw new DeliveryError('Approval requires 1–100 unique positive safe PR numbers.');
+  if (
+    !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/u.test(expiresAt) ||
+    !Number.isFinite(Date.parse(expiresAt)) ||
+    new Date(expiresAt).toISOString().replace('.000Z', 'Z') !== expiresAt
+  )
+    throw new DeliveryError('Approval expiry must be a valid explicit UTC instant with seconds.');
+  return { repository: lines[1]!.slice(12), prs, expiresAt };
+}
+async function approvalComments(context: DeliveryContext, first: QueueEntry, repositoryId: string) {
+  const comments: { id: string; body: string }[] = [],
+    ids = new Set<string>(),
+    cursors = new Set<string>();
+  let cursor: string | null = null,
+    total: number | undefined;
+  for (let page = 0; page < 100; page++) {
+    const result: {
+      repository: {
+        id: string;
+        nameWithOwner: string;
+        pullRequest: {
+          id: string;
+          number: number;
+          comments: {
+            totalCount: number;
+            nodes: { id: string; body: string }[];
+            pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          };
+        };
+      } | null;
+    } = await context.clients.graphql(
+      `query DeliveryQueueApprovalComments($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){id nameWithOwner pullRequest(number:$number){id number comments(first:100,after:$cursor){totalCount nodes{${approvalFields}} pageInfo{hasNextPage endCursor}}}}}`,
+      { ...context.repo, number: first.prNumber, cursor },
+    );
+    const pr = result.repository?.pullRequest,
+      connection = pr?.comments;
+    if (
+      result.repository?.id !== repositoryId ||
+      result.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
+      pr?.id !== first.prId ||
+      pr.number !== first.prNumber ||
+      !connection ||
+      !Number.isSafeInteger(connection.totalCount) ||
+      connection.totalCount < 0 ||
+      (total !== undefined && total !== connection.totalCount) ||
+      !Array.isArray(connection.nodes) ||
+      typeof connection.pageInfo?.hasNextPage !== 'boolean'
+    )
+      throw new DeliveryError('Approval comment pagination or native target identity is incomplete.');
+    total = connection.totalCount;
+    for (const node of connection.nodes) {
+      if (!node || typeof node.id !== 'string' || !node.id || typeof node.body !== 'string' || ids.has(node.id))
+        throw new DeliveryError('Approval comment identity is missing or duplicated.');
+      ids.add(node.id);
+      comments.push(node);
+    }
+    if (!connection.pageInfo.hasNextPage) {
+      if (comments.length !== total) throw new DeliveryError('Approval comment history is incomplete.');
+      return comments;
+    }
+    const next = connection.pageInfo.endCursor;
+    if (!next || cursors.has(next)) throw new DeliveryError('Approval comment pagination did not advance.');
+    cursors.add(next);
+    cursor = next;
+  }
+  throw new DeliveryError('Approval comment history exceeds its bounded readback window.');
+}
+async function chooseApproval(
+  context: DeliveryContext,
+  q: Queue,
+  first: QueueEntry,
+  repositoryId: string,
+): Promise<{ grant?: QueueGrant; reason: string; diagnostics: { id: string; reason: string }[] }> {
+  const diagnostics: { id: string; reason: string }[] = [],
+    candidates: QueueGrant[] = [];
+  const logins = configuredApprovers(context).map((login) => login.toLowerCase());
+  if (!logins.length) return { reason: approvalWait(context), diagnostics };
+  try {
+    const discovered = await approvalComments(context, first, repositoryId);
+    const ids = new Set(discovered.filter((c) => c.body.startsWith('ai-delivery merge approval')).map((c) => c.id));
+    for (const g of q.grants) if (g.members.some((m) => m.entryId === first.id)) ids.add(g.id);
+    for (const id of ids) {
+      try {
+        const result = await context.clients.graphql<{ node: unknown }>(
+          `query DeliveryQueueApprovalNode($id:ID!){node(id:$id){... on IssueComment{${approvalFields}}}}`,
+          { id },
+        );
+        if (result.node === null) throw new DeliveryError('Approval comment is deleted or no longer readable.');
+        const parsed = NativeApproval.safeParse(result.node);
+        if (!parsed.success) throw new DeliveryError('Approval is missing native identity/edit proof.');
+        const c = parsed.data,
+          prior = q.grants.find((g) => g.id === id);
+        if (c.lastEditedAt !== null || c.editor !== null) throw new DeliveryError('Approval was edited after posting.');
+        if (c.isMinimized) throw new DeliveryError('Approval is minimized.');
+        if (
+          c.id !== id ||
+          c.repository.id !== repositoryId ||
+          c.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase()
+        )
+          throw new DeliveryError('Approval native repository/comment identity changed.');
+        if (!logins.includes(c.author.login.toLowerCase()))
+          throw new DeliveryError('Approval author is not a configured approver.');
+        const document = approvalDocument(c.body),
+          expires = Date.parse(document.expiresAt);
+        if (document.repository.toLowerCase() !== context.config.repository.toLowerCase())
+          throw new DeliveryError('Approval names a different repository.');
+        if (Date.parse(c.updatedAt) !== Date.parse(c.createdAt))
+          throw new DeliveryError('Approval was edited after posting.');
+        if (expires <= Date.parse(c.createdAt) || expires <= Date.now())
+          throw new DeliveryError('Approval has expired or does not expire after its creation.');
+        const entries = q.entries.filter(active);
+        if (prior) {
+          if (
+            prior.bodyDigest !== digestValue(c.body) ||
+            prior.authorId !== c.author.id ||
+            prior.authorLogin.toLowerCase() !== c.author.login.toLowerCase() ||
+            prior.anchorId !== c.pullRequest.id ||
+            prior.anchorNumber !== c.pullRequest.number ||
+            prior.consumed >= prior.members.length
+          )
+            throw new DeliveryError('Approval binding changed or was already consumed.');
+          for (const [i, member] of prior.members.entries()) {
+            const entry = q.entries.find((e) => e.id === member.entryId);
+            if (
+              !entry ||
+              entry.prId !== member.prId ||
+              entry.prNumber !== member.prNumber ||
+              entry.grantId !== prior.id ||
+              (i < prior.consumed
+                ? entry.state !== 'merged' || !entry.merge
+                : entries[i - prior.consumed]?.id !== entry.id)
+            )
+              throw new DeliveryError('Approval predecessor was removed, replaced or not merged through this grant.');
+          }
+          candidates.push(prior);
+        } else {
+          if (
+            c.pullRequest.id !== first.prId ||
+            c.pullRequest.number !== first.prNumber ||
+            document.prs.some((number, i) => entries[i]?.prNumber !== number)
+          )
+            throw new DeliveryError('Approval must match the complete ordered FIFO prefix.');
+          candidates.push({
+            id,
+            bodyDigest: digestValue(c.body),
+            authorId: c.author.id,
+            authorLogin: c.author.login,
+            repositoryId,
+            anchorId: c.pullRequest.id,
+            anchorNumber: c.pullRequest.number,
+            expiresAt: document.expiresAt,
+            consumed: 0,
+            members: entries
+              .slice(0, document.prs.length)
+              .map((e) => ({ entryId: e.id, prId: e.prId, prNumber: e.prNumber })),
+          });
+        }
+      } catch (error) {
+        diagnostics.push({ id, reason: approvalFailure(error) });
+      }
+    }
+  } catch (error) {
+    return {
+      reason: `Approval evidence unavailable: ${approvalFailure(error)}`,
+      diagnostics,
+    };
+  }
+  return candidates.length === 1
+    ? { grant: candidates[0]!, reason: '', diagnostics }
+    : {
+        reason: candidates.length
+          ? 'Multiple eligible standing approvals are ambiguous; remove the unwanted grant.'
+          : approvalWait(context),
+        diagnostics,
+      };
+}
 export interface QueueOptions {
   root: string;
   signal?: AbortSignal;
@@ -92,6 +384,7 @@ async function location(context: DeliveryContext, options: QueueOptions) {
     writerRoot: gitRoot(options.root),
     directory,
     path: join(directory, 'queue.json'),
+    repositoryId: repository.node_id,
     baseRef: repository.default_branch,
     binding: digestValue({
       repository: repository.node_id,
@@ -107,11 +400,12 @@ type Location = Awaited<ReturnType<typeof location>>;
 function read(at: Location): Queue {
   if (!existsSync(at.path))
     return {
-      schemaVersion: 'ai-delivery.merge-queue@1',
+      schemaVersion: 'ai-delivery.merge-queue@2',
       binding: at.binding,
       baseRef: at.baseRef,
       writerRoot: at.writerRoot,
       entries: [],
+      grants: [],
       stateId: '',
     };
   const q = Record.parse(JSON.parse(assertPrivateFile(at.path).toString('utf8')));
@@ -155,13 +449,16 @@ export async function enqueuePr(
       const existing = q.entries.find((e) => e.prNumber === pr.number && e.state !== 'removed' && e.state !== 'merged');
       if (existing && (existing.issueNumber !== issueNumber || existing.prId !== pr.node_id))
         throw new DeliveryError('Queued PR identity conflicts.');
-      const entry = existing ?? {
+      const entry: QueueEntry = existing ?? {
         id: randomUUID(),
         prNumber: pr.number,
         issueNumber,
         prId: pr.node_id,
         head: pr.head.sha,
-        state: 'waiting' as const,
+        authorLogin: pr.user.login,
+        sequence: 0,
+        notified: [],
+        state: 'needs-approval',
       };
       if (!existing) {
         const admit = async () => {
@@ -262,12 +559,46 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
     } else if (pending.kind === 'comment') {
       const author = await context.clients.authenticatedAuthor!();
       const matches = (await comments(entry)).filter(
-        (c) => c.body === pending.body && c.user?.login.toLowerCase() === author.actorLogin.toLowerCase(),
+        (c) =>
+          c.body?.includes(pending.body.split('\n')[0]!) &&
+          c.user?.login.toLowerCase() === author.actorLogin.toLowerCase(),
       );
-      if (matches.length !== 1)
-        throw new DeliveryError('Queue diagnostic comment acknowledgement is unknown; no duplicate comment was sent.');
+      if (
+        matches.length !== 1 ||
+        pending.prId !== entry.prId ||
+        author.actorLogin.toLowerCase() !== pending.actor.toLowerCase()
+      )
+        throw new DeliveryError('Queue comment acknowledgement is unknown; no duplicate comment was sent.');
+      const native = (await context.clients.rest.issues.getComment({ ...context.repo, comment_id: matches[0]!.id }))
+        .data;
+      if (
+        native.id !== matches[0]!.id ||
+        native.body !== pending.body ||
+        native.user?.login.toLowerCase() !== pending.actor.toLowerCase() ||
+        new URL(native.issue_url).pathname.toLowerCase() !==
+          `/repos/${context.repo.owner}/${context.repo.repo}/issues/${entry.prNumber}`.toLowerCase() ||
+        native.updated_at !== native.created_at
+      )
+        throw new DeliveryError('Queue authored comment target/body/edit readback changed; no duplicate was sent.');
+      const proof = await context.clients.graphql<{ node: unknown }>(
+        `query DeliveryQueueApprovalNode($id:ID!){node(id:$id){... on IssueComment{${approvalFields}}}}`,
+        { id: native.node_id },
+      );
+      const edit = NativeCommentEdit.safeParse(proof.node);
+      if (
+        !edit.success ||
+        edit.data.id !== native.node_id ||
+        edit.data.lastEditedAt !== null ||
+        edit.data.editor !== null ||
+        edit.data.isMinimized
+      )
+        throw new DeliveryError('Queue authored comment native edit readback changed; no duplicate was sent.');
       await update((current) => {
-        delete current.entries.find((e) => e.id === entry.id)!.comment;
+        const e = current.entries.find((e) => e.id === entry.id)!;
+        if (e.notice?.key !== pending.key || e.notice.body !== pending.body)
+          throw new DeliveryError('Pending queue notice identity changed.');
+        e.notified.push(pending.key);
+        delete e.notice;
         delete current.pending;
       });
     } else {
@@ -299,12 +630,59 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
       }
       await update((current) => {
         const e = current.entries.find((e) => e.id === entry.id)!;
-        e.state = 'merged';
+        const grant = current.grants.find((g) => g.id === pending.grantId);
+        if (
+          !grant ||
+          grant.bodyDigest !== pending.grantDigest ||
+          e.grantId !== grant.id ||
+          grant.members[grant.consumed]?.entryId !== e.id
+        )
+          throw new DeliveryError('Pending merge approval binding disagrees with the consumed queue prefix.');
         e.merge = { sha: commit.sha, tree: commit.tree.sha };
-        delete e.reason;
+        transition(e, 'merged');
+        grant.consumed++;
         delete current.pending;
       });
     }
+  };
+  const flushNotice = async (id: string) => {
+    const entry = read(at).entries.find((e) => e.id === id)!;
+    if (!entry.notice) return;
+    const author = await context.clients.authenticatedAuthor!();
+    const pending = {
+      kind: 'comment' as const,
+      entryId: id,
+      ...entry.notice,
+      actor: author.actorLogin,
+      prId: entry.prId,
+    };
+    const matches = (await comments(entry)).filter(
+      (c) =>
+        c.body?.includes(pending.body.split('\n')[0]!) &&
+        c.user?.login.toLowerCase() === author.actorLogin.toLowerCase(),
+    );
+    await update((q) => {
+      if (q.pending) throw new DeliveryError('Another queue mutation must be reconciled first.');
+      q.pending = pending;
+    });
+    if (!matches.length)
+      await context.clients.rest.issues.createComment({
+        ...context.repo,
+        issue_number: entry.prNumber,
+        body: pending.body,
+      });
+    await reconcile();
+  };
+  const setState = async (id: string, state: QueueEntry['state'], reason?: string) => {
+    await flushNotice(id);
+    await update((q) =>
+      transition(
+        q.entries.find((e) => e.id === id)!,
+        state,
+        reason,
+      ),
+    );
+    await flushNotice(id);
   };
   return withLock(`${at.path}.driver`, {
     timeout: 200,
@@ -459,12 +837,7 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
             await reconcile();
           };
           const remove = async (entry: QueueEntry, reason: string) => {
-            await update((q) => {
-              const e = q.entries.find((e) => e.id === entry.id)!;
-              e.state = 'removed';
-              e.reason = reason;
-              e.comment = `<!-- ai-delivery:merge-queue:${entry.id} -->\nRemoved from the host-local merge queue: ${reason}`;
-            });
+            await setState(entry.id, 'removed', reason);
           };
           let lastProgress = '',
             pollMs = 1000;
@@ -492,25 +865,15 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
               await runner.checkResources();
               await reconcile();
               const q = read(at);
+              for (const e of q.entries) await flushNotice(e.id);
               // Cleanup is itself checkpointed and is completed before another PR can merge.
               for (const e of q.entries.filter((e) => !active(e))) {
                 if (e.published) {
                   await ensureStore();
                   await publish(e, null);
                 }
-                if (e.comment) {
-                  await update((current) => {
-                    current.pending = { kind: 'comment', entryId: e.id, body: e.comment! };
-                  });
-                  await context.clients.rest.issues.createComment({
-                    ...context.repo,
-                    issue_number: e.prNumber,
-                    body: e.comment,
-                  });
-                  await reconcile();
-                }
               }
-              const entries = read(at).entries.filter(active);
+              let entries = read(at).entries.filter(active);
               if (!entries.length) {
                 await cleanup();
                 return queueStatus(context, options);
@@ -519,6 +882,42 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
               const snapshots = new Map<string, Awaited<ReturnType<typeof queuePr>>['pr']>();
               for (const old of entries)
                 snapshots.set(old.id, (await queuePr(context, old.prNumber, old.issueNumber)).pr);
+              const obsolete = entries.find((e) => {
+                const pr = snapshots.get(e.id)!;
+                return pr.state !== 'open' || pr.merged || pr.draft;
+              });
+              if (obsolete) {
+                await remove(obsolete, 'Native PR is no longer open and ready.');
+                continue;
+              }
+              const decision = await chooseApproval(context, read(at), entries[0]!, at.repositoryId);
+              for (const diagnostic of decision.diagnostics) {
+                const id = entries[0]!.id;
+                await flushNotice(id);
+                await update((q) =>
+                  notice(
+                    q.entries.find((e) => e.id === id)!,
+                    `approval-${digestValue(diagnostic).slice(7)}`,
+                    `Approval ${diagnostic.id} ignored: ${diagnostic.reason}`,
+                  ),
+                );
+                await flushNotice(id);
+              }
+              if (!decision.grant) {
+                for (const e of entries) await setState(e.id, 'needs-approval', approvalWait(context, decision.reason));
+                await progress(read(at), decision.reason);
+                await delay(pollMs, undefined, { signal: runner.signal });
+                continue;
+              }
+              const grant = decision.grant;
+              await update((q) => {
+                if (!q.grants.some((g) => g.id === grant.id)) q.grants.push(grant);
+                for (const member of grant.members.slice(grant.consumed))
+                  q.entries.find((e) => e.id === member.entryId)!.grantId = grant.id;
+              });
+              const authorized = grant.members.length - grant.consumed;
+              for (const e of entries.slice(authorized)) await setState(e.id, 'needs-approval', approvalWait(context));
+              entries = entries.slice(0, authorized);
               const rebuildingStore = !existsSync(store);
               const prefixInputs: { id: string; head: string }[] = [];
               const needsObjects = entries.some((entry) => {
@@ -608,9 +1007,8 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                     const e = current.entries.find((e) => e.id === entry.id)!;
                     e.head = pr.head.sha;
                     e.prediction = { base: baseSha, parent, sha, tree, inputs };
-                    e.state = 'verifying';
-                    delete e.reason;
                   });
+                  await setState(entry.id, 'verifying');
                 }
                 const predicted = read(at).entries.find((e) => e.id === entry.id)!;
                 if (predicted.published !== predicted.prediction!.sha) {
@@ -627,11 +1025,13 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                 JSON.stringify(
                   read(at)
                     .entries.filter(active)
+                    .slice(0, entries.length)
                     .map((e) => e.id),
                 ) !== JSON.stringify(entries.map((e) => e.id))
               )
                 continue;
               let waitReason = '';
+              const passed = new Set<string>();
               for (const queued of entries) {
                 const old = read(at).entries.find((e) => e.id === queued.id)!;
                 const prediction = old.prediction!;
@@ -643,16 +1043,15 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                   rebuilt = true;
                   break;
                 }
-                await update((current) => {
-                  const e = current.entries.find((e) => e.id === old.id)!;
-                  e.state = checks.state === 'passed' ? 'ready' : 'verifying';
-                  e.reason = checks.reason;
-                });
+                if (checks.state === 'passed') passed.add(old.id);
+                // A native eligibility wait is not new queue readiness on every poll.
+                if (checks.state !== 'passed' || old.state !== 'waiting')
+                  await setState(old.id, checks.state === 'passed' ? 'ready' : 'verifying', checks.reason);
                 if (checks.state !== 'passed') waitReason ||= checks.reason;
               }
               if (rebuilt) continue;
               const first = read(at).entries.find(active)!;
-              if (first.state === 'ready') {
+              if (first.state === 'ready' || (first.state === 'waiting' && passed.has(first.id))) {
                 const prediction = first.prediction!;
                 try {
                   await mergePr(
@@ -669,8 +1068,22 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                         const checks = await queueChecks(context, at.baseRef, prediction.sha);
                         if (checks.state !== 'passed' || (await remoteRef(first)) !== prediction.sha)
                           throw new DeliveryError('Queue proof changed before merge.');
+                        const approval = await chooseApproval(context, read(at), first, at.repositoryId);
+                        if (approval.grant?.id !== grant.id || approval.grant.bodyDigest !== grant.bodyDigest) {
+                          await setState(
+                            first.id,
+                            'needs-approval',
+                            approvalWait(context, approval.reason || 'Approval binding changed before merge.'),
+                          );
+                          throw new DeliveryError('Standing approval changed before merge.');
+                        }
+                        // Native eligibility has now advanced; notify before the final base read.
+                        if (first.state === 'waiting') await setState(first.id, 'ready', checks.reason);
                       },
                       beforeMutation: async () => {
+                        runner.signal.throwIfAborted();
+                        if (Date.now() >= Date.parse(grant.expiresAt))
+                          throw new DeliveryError('Standing approval expired before merge.');
                         await update((current) => {
                           current.pending = {
                             kind: 'merge',
@@ -678,6 +1091,8 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                             head: first.head,
                             base: prediction.base,
                             tree: prediction.tree,
+                            grantId: grant.id,
+                            grantDigest: grant.bodyDigest,
                           };
                         });
                       },
@@ -687,17 +1102,14 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                   if (read(at).pending) throw error;
                   const reason = error instanceof Error ? error.message : String(error);
                   if (
-                    !/merge eligibility|review eligibility|head\/base changed|base moved|reviewed head differs|proof changed|native blockers/iu.test(
+                    !/merge eligibility|review eligibility|head\/base changed|base moved|reviewed head differs|proof changed|native blockers|standing approval/iu.test(
                       reason,
                     )
                   )
                     throw error;
                   waitReason = reason;
-                  await update((current) => {
-                    const e = current.entries.find((e) => e.id === first.id)!;
-                    e.state = 'waiting';
-                    e.reason = reason;
-                  });
+                  if (read(at).entries.find((e) => e.id === first.id)!.state !== 'needs-approval')
+                    await setState(first.id, 'waiting', reason);
                 }
                 if (read(at).pending) {
                   await reconcile();
