@@ -222,6 +222,8 @@ USER installation. The example target is **0.3.35**, the npm `latest` release
 checked on 2026-10-22. Check `npm view @aviaratech/ai-delivery dist-tags.latest`
 before choosing a newer target; replace both version literals together.
 Using the published CLI through `npx` avoids depending on the old host's CLI.
+Preserving updates are currently qualified for Claude Code **2.1.296** and
+Codex CLI **0.162.1**; the installer refuses other native versions.
 
 ```sh
 # Claude Code
@@ -259,15 +261,23 @@ its `activation.loadedVersion` stays `null`. If the host does not expose its
 loaded version, record it as unverified rather than treating doctor output as
 proof of the running conversation's version.
 
-To roll back a completed update, select its recorded previous version
+To roll back a completed Codex update, select its recorded previous version
 (`0.3.29` after a `0.3.29` → `0.3.35` update):
 
 ```sh
-npx --yes @aviaratech/ai-delivery@0.3.35 plugin rollback --host claude-code --scope user --json
 npx --yes @aviaratech/ai-delivery@0.3.35 plugin rollback --host codex --scope user --json
 ```
 
 Repeat doctor and the host activation/version checks for the previous version.
+
+Claude Code downgrades are not currently qualified. The installer refuses a
+lower-version replacement with `Claude preserving replacement is unqualified`
+before changing the catalog or native selection. Preserve the managed state and
+selected version. Claude's native [marketplace source pins](https://code.claude.com/docs/en/plugins/marketplace-reference#plugin-sources)
+can select git refs or SHAs in a catalog, but they do not retarget this managed
+installation's local catalog. Native `plugin update` selects the version that
+catalog offers. This managed installation has no supported Claude Code downgrade
+procedure.
 
 ## Plugin installation and explicit runtime setup
 
@@ -296,7 +306,8 @@ ai-delivery plugin remove --host codex --scope user --json
 Use `--host claude-code` for Claude Code. Its supported scopes are `user`,
 `project`, and `local`; select the project directory with the global
 `--repo-root` option. Codex currently supports `user`. Install and update require
-a literal version. Rollback selects the recorded previous version. The commands
+a literal version. Codex rollback selects the recorded previous version; Claude
+Code downgrade limits are described in **Upgrade a host** above. The commands
 keep verified version units in a private directory and use the native host's
 marketplace and plugin commands to select that exact local source. Removal keeps
 the managed version units for recovery and uses Claude Code's `--keep-data`.
