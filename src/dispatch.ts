@@ -409,7 +409,10 @@ export async function executeTool(
         ...(input.expectedBaseSha === undefined ? {} : { expectedBaseSha: requireString(input, 'expectedBaseSha') }),
         ...(input.body === undefined ? {} : { body: requireString(input, 'body') }),
         ...(input.title === undefined ? {} : { title: requireString(input, 'title') }),
-        ...(input.headBranch === undefined ? {} : { headBranch: requireString(input, 'headBranch') }),
+        ...(input.head === undefined && input.headBranch === undefined
+          ? {}
+          : { headBranch: requireString(input, input.head === undefined ? 'headBranch' : 'head') }),
+        ...(input.base === undefined ? {} : { baseBranch: requireString(input, 'base') }),
         draft: input.draft !== false,
         dryRun: input.dryRun === true,
       });

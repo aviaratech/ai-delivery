@@ -30,9 +30,30 @@ import {
   type InvestigationPreparation,
 } from './services/worktreeRegistry.js';
 import { parseReviewArtifact, readRequiredReviewState, ReviewSubmissionError, submitReview } from './review.js';
+import { parseIssueBody } from './issueContract.js';
 
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
+
+function hasClosingLink(body: string | null, issueNumber: number) {
+  const line = `Closes #${issueNumber}`;
+  return body === line || body?.startsWith(`${line}\n`) === true || body?.startsWith(`${line}\r\n`) === true;
+}
+function closingBody(issue: { number: number; title: string; body?: string | null }, requested?: string) {
+  const line = `Closes #${issue.number}`;
+  if (requested !== undefined)
+    return requested.startsWith(`${line}\n`) || requested === line ? requested : `${line}\n\n${requested}`;
+  const { outcome, acceptanceCriteria } = parseIssueBody(issue.body ?? '', { title: issue.title }).issue;
+  return [
+    line,
+    ...(outcome ? [`## Outcome\n\n${outcome}`] : []),
+    ...(acceptanceCriteria.length
+      ? [
+          `## Acceptance criteria\n\n${acceptanceCriteria.map((ac) => `- [ ] ${ac.behavior}\n  Verified by: ${ac.verifiedBy}`).join('\n')}`,
+        ]
+      : []),
+  ].join('\n\n');
+}
 
 // Conservative refusals also cover Markdown decoration/escaped references.
 // This is a closure safety check, never authority for an issue association.
@@ -540,6 +561,7 @@ async function verifyPrIssueAssociation(
   onlyIntended = false,
   expectedIssueId?: string,
   expectedRepositoryId?: string,
+  options: { allowMissing?: boolean; missingMessage?: string } = {},
 ): Promise<void> {
   let cursor: string | null = null;
   const cursors = new Set<string>();
@@ -592,8 +614,12 @@ async function verifyPrIssueAssociation(
         throw new DeliveryError('Existing PR has conflicting closing associations; body transition refused.');
     }
     if (!connection.pageInfo.hasNextPage) {
-      if (matches !== 1)
-        throw new DeliveryError('Native GitHub PR closing-issue association does not identify the intended issue.');
+      if (matches !== 1 && !(matches === 0 && options.allowMissing))
+        throw new DeliveryError(
+          matches === 0 && options.missingMessage
+            ? options.missingMessage
+            : 'Native GitHub PR closing-issue association does not identify the intended issue.',
+        );
       return;
     }
     const next = connection.pageInfo.endCursor;
@@ -621,7 +647,7 @@ interface ClosingIssuesQuery {
     } | null;
   } | null;
 }
-async function matchingPrs(context: DeliveryContext, branch: string, base?: string) {
+async function matchingPrs(context: DeliveryContext, branch: string, base?: string, state: 'all' | 'open' = 'all') {
   const matches: Awaited<ReturnType<typeof context.clients.rest.pulls.list>>['data'] = [];
   for (let page = 1; page <= 20; page++) {
     const batch = (
@@ -629,7 +655,7 @@ async function matchingPrs(context: DeliveryContext, branch: string, base?: stri
         ...context.repo,
         head: `${context.repo.owner}:${branch}`,
         ...(base === undefined ? {} : { base }),
-        state: 'all',
+        state,
         page,
         per_page: 100,
       })
@@ -641,10 +667,30 @@ async function matchingPrs(context: DeliveryContext, branch: string, base?: stri
   }
   throw new DeliveryError('GitHub PR match history exceeds the bounded readback window.');
 }
-async function verifyIssuePr(context: DeliveryContext, issueNumber: number, prNumber: number, nonClosing = false) {
+async function verifyIssuePr(
+  context: DeliveryContext,
+  issueNumber: number,
+  prNumber: number,
+  nonClosing = false,
+  explainMissingClosing = false,
+) {
   const pr = await getPr(context, prNumber);
   if (nonClosing) await verifyNonClosingReference(context, issueNumber, pr);
-  else await verifyPrIssueAssociation(context, prNumber, issueNumber);
+  else
+    await verifyPrIssueAssociation(
+      context,
+      prNumber,
+      issueNumber,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      explainMissingClosing && !hasClosingLink(pr.body, issueNumber)
+        ? {
+            missingMessage: `Missing \`Closes #${issueNumber}\` in PR #${prNumber}. Restore it with issue_pr_create(${JSON.stringify({ repo: context.config.repository, issueNumber, head: pr.head.ref })}).`,
+          }
+        : {},
+    );
   if (!pr.merged) {
     const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.head.ref}` })).data;
     if (ref.ref !== `refs/heads/${pr.head.ref}` || ref.object.type !== 'commit' || ref.object.sha !== pr.head.sha)
@@ -1126,24 +1172,22 @@ export async function publishPr(
   validBranch(base);
   if (input.headBranch !== undefined) validBranch(input.headBranch);
   const explicit = input.prNumber === undefined ? undefined : await getPr(context, input.prNumber);
-  const explicitPromotion = input.draft === false && input.headBranch !== undefined;
-  const selectedMatches = explicit
-    ? await matchingPrs(context, explicit.head.ref, base)
-    : explicitPromotion
-      ? await matchingPrs(context, input.headBranch!, base)
-      : undefined;
+  const explicitPromotion = nonClosing && input.draft === false && input.headBranch !== undefined;
+  const selectedMatches = explicitPromotion ? await matchingPrs(context, input.headBranch!, base) : undefined;
   const branch = explicit
     ? explicit.head.ref
-    : explicitPromotion && selectedMatches!.length > 0
-      ? input.headBranch!
-      : await issueBranch(context, input.issueNumber, input.headBranch);
+    : nonClosing
+      ? explicitPromotion && selectedMatches!.length > 0
+        ? input.headBranch!
+        : await issueBranch(context, input.issueNumber, input.headBranch)
+      : (input.headBranch ?? (await issueBranch(context, input.issueNumber)));
   if (input.headBranch !== undefined && branch !== input.headBranch)
     throw new DeliveryError('Explicit PR and head selectors disagree.');
   validBranch(branch);
   const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${branch}` })).data;
   if (ref.ref !== `refs/heads/${branch}` || ref.object.type !== 'commit' || !validSha(ref.object.sha))
     throw new DeliveryError('Remote issue branch head/ref readback is invalid.');
-  const matches = selectedMatches ?? (await matchingPrs(context, branch, base));
+  const matches = selectedMatches ?? (await matchingPrs(context, branch, base, nonClosing ? 'all' : 'open'));
   if (matches.length > 1 || (explicit && (matches.length !== 1 || matches[0]!.number !== explicit.number)))
     throw new DeliveryError('Remote issue branch has conflicting PR matches.');
   let pr = explicit ?? (matches[0] === undefined ? undefined : await getPr(context, matches[0].number));
@@ -1158,16 +1202,13 @@ export async function publishPr(
   if (reconcileReference && ref.object.sha !== input.expectedHeadSha)
     throw new DeliveryError('Reference reconciliation expected head differs from the exact remote linked head.');
   const requestedBody =
-    input.body ??
-    (nonClosing ? (pr?.body ?? referenceLine(context, input.issueNumber)) : `Closes #${input.issueNumber}`);
-  if (!requestedBody.trim()) throw new DeliveryError('PR body must contain text.');
+    input.body ?? pr?.body ?? (nonClosing ? referenceLine(context, input.issueNumber) : closingBody(issue));
+  if ((nonClosing || input.body !== undefined) && !requestedBody.trim())
+    throw new DeliveryError('PR body must contain text.');
   const body = nonClosing
     ? nonClosingBody(context, input.issueNumber, requestedBody)
-    : new RegExp(`(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\\s+#${input.issueNumber}(?![0-9])`, 'iu').test(
-          requestedBody,
-        )
-      ? requestedBody
-      : `${requestedBody}\n\nCloses #${input.issueNumber}`;
+    : closingBody(issue, requestedBody);
+  const closingRepair = !nonClosing && pr !== undefined && !hasClosingLink(pr.body, input.issueNumber);
   const transition = nonClosing && pr !== undefined && pr.body !== body;
   if (reconcileReference && transition)
     throw new DeliveryError('Reference reconciliation refuses body transition; retain exact original intent.');
@@ -1180,7 +1221,7 @@ export async function publishPr(
       pr.base.ref !== base ||
       pr.state !== 'open' ||
       pr.merged ||
-      (!transition && input.body !== undefined && pr.body !== body) ||
+      (!transition && input.body !== undefined && pr.body !== input.body && pr.body !== body) ||
       (input.title !== undefined && pr.title !== input.title))
   )
     throw new DeliveryError('Existing remote PR conflicts with the requested branch, intent or state.');
@@ -1194,6 +1235,7 @@ export async function publishPr(
   let publicationBaseSha: string | undefined;
   const existing = pr;
   let pendingTransition = transition;
+  let pendingClosingRepair = closingRepair;
   let expectedBody = pr?.body;
   const transitionDraft = pr?.draft;
   let promotionApplied = false;
@@ -1240,9 +1282,10 @@ export async function publishPr(
     }
   };
   const readExisting = async () => {
-    const current = reconcileReference
-      ? await getPr(context, existing!.number)
-      : await verifyIssuePr(context, input.issueNumber, existing!.number, nonClosing && !pendingTransition);
+    const current =
+      reconcileReference || pendingClosingRepair
+        ? await getPr(context, existing!.number)
+        : await verifyIssuePr(context, input.issueNumber, existing!.number, nonClosing && !pendingTransition);
     if (
       current.state !== 'open' ||
       current.merged ||
@@ -1252,12 +1295,28 @@ export async function publishPr(
       current.base.ref !== base ||
       current.base.sha !== existing!.base.sha ||
       current.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase() ||
-      (transition && !promotionApplied && current.draft !== transitionDraft) ||
+      ((transition || closingRepair) && !promotionApplied && current.draft !== transitionDraft) ||
       current.body !== expectedBody ||
       current.title !== existing!.title
     )
       throw new DeliveryError('Existing PR publication head, identity, intent or author readback drifted.');
     if (reconcileReference) await readReconciliation(current);
+    if (pendingClosingRepair) {
+      await verifyPrIssueAssociation(
+        context,
+        current.number,
+        input.issueNumber,
+        current.node_id,
+        true,
+        issue.node_id,
+        repository.node_id,
+        { allowMissing: true },
+      );
+      const currentRef = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${branch}` })).data;
+      if (currentRef.ref !== ref.ref || currentRef.object.type !== 'commit' || currentRef.object.sha !== ref.object.sha)
+        throw new DeliveryError('Closing-link repair remote head drifted; reconcile read-only.');
+      sameReferencePr(current, await getPr(context, current.number));
+    }
     if (pendingTransition) {
       await verifyPrIssueAssociation(
         context,
@@ -1323,10 +1382,24 @@ export async function publishPr(
       headBranch: branch,
       baseBranch: base,
       reviewRoute,
+      ...(closingRepair ? { closingLinkAdded: false, body } : {}),
       ...(reconcileReference ? { referenceRemoval: 'pending', nonClosingVerified: false } : {}),
     };
   let created = false;
   if (pr) {
+    if (pendingClosingRepair) {
+      pr = await readExisting();
+      try {
+        await context.clients.rest.pulls.update({ ...context.repo, pull_number: pr.number, body });
+      } catch (error) {
+        throw new DeliveryError(
+          `PR #${pr.number} closing-link repair acknowledgement is uncertain; reconcile this PR read-only before retrying. ${error instanceof Error ? error.message : 'Unknown failure'}`,
+        );
+      }
+      pendingClosingRepair = false;
+      expectedBody = body;
+      pr = await readExisting();
+    }
     if (pendingTransition) {
       pr = await readExisting();
       await context.clients.rest.pulls.update({ ...context.repo, pull_number: pr.number, body });
@@ -1443,8 +1516,8 @@ export async function publishPr(
     prNumber: pr.number,
     url: pr.html_url,
     headSha: pr.head.sha,
-    draft: pr.draft,
-    reviewRoute,
+    state: pr.draft ? 'draft' : pr.state,
+    ...(closingRepair ? { closingLinkAdded: true } : {}),
     ...(nonClosing ? { nonClosing: true, nonClosingVerified: true } : {}),
     ...(reconcileReference ? { referenceRemoval: removalState } : {}),
   };
@@ -1455,7 +1528,7 @@ export async function submitFormalReview(
   input: { artifact: string; issueNumber: number; prNumber: number; dryRun?: boolean; nonClosing?: boolean },
 ) {
   const nonClosing = nonClosingMode(input.nonClosing);
-  const pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing);
+  const pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing, true);
   const issue = nonClosing ? await openReferenceIssue(context, input.issueNumber) : undefined;
   const result = await submitReview({
     context,

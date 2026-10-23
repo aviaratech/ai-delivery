@@ -300,7 +300,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_pr_create',
     commandName: 'pr:create',
-    description: 'Create or reuse a PR from its GitHub-linked issue branch',
+    description:
+      'Create or reuse an issue-closing PR from any directory using repo, issueNumber and a pushed head. Restore a missing closing link on reuse.',
     inputSchema: z
       .strictObject({
         repo: Repo,
@@ -321,7 +322,13 @@ export const AI_DELIVERY_MCP_TOOLS = [
         dryRun: z.boolean().optional(),
         title: z.string().min(1).optional(),
         headBranch: z.string().min(1).optional(),
+        head: z.string().min(1).optional(),
+        base: z.string().min(1).optional(),
       })
+      .refine(
+        (input) => input.head === undefined || input.headBranch === undefined || input.head === input.headBranch,
+        'head and headBranch must identify the same branch.',
+      )
       .refine(
         (input) =>
           input.reconcileNonClosingReference === true

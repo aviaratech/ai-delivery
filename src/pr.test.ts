@@ -182,7 +182,7 @@ function fixture(
       list: async () => ({ data: [] }),
       listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
       create: async (input: Record<string, unknown>) => {
-        assert.equal(input.body, 'Plain explanation\n\nCloses #17');
+        assert.equal(input.body, 'Closes #17\n\nPlain explanation');
         assert.equal(typeof input.title, 'string');
         assert.equal(typeof input.draft, 'boolean');
         publicationBody = input.body as string;
