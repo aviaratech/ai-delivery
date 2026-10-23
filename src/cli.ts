@@ -513,7 +513,7 @@ program
   });
 program
   .command('pr:create')
-  .description('Create a PR from a linked issue branch, or promote an existing associated PR with --head and --ready.')
+  .description('Create or reuse an issue-closing PR from a pushed --head, from any directory.')
   .requiredOption('--issue <number>')
   .option('--pr <number>', 'Exact existing PR selector; never creates a replacement')
   .option('--non-closing', 'Retain the issue OPEN using native non-closing reference proof')
@@ -525,7 +525,8 @@ program
   .option('--expected-base <sha>', 'Exact default-base SHA for the explicit reference action')
   .option('--title <title>')
   .option('--body-file <path>')
-  .option('--head <branch>', 'Explicit remote head; existing PR promotion verifies its native issue association')
+  .option('--head <branch>', 'Pushed remote head; no ai-delivery branch or worktree setup required')
+  .option('--base <branch>', 'Repository default branch (inferred when omitted)')
   .option('--ready', 'Publish ready, or promote the author-owned PR selected by --head')
   .option('--dry-run')
   .action(
@@ -539,6 +540,7 @@ program
       title?: string;
       bodyFile?: string;
       head?: string;
+      base?: string;
       ready?: boolean;
       dryRun?: boolean;
     }) =>
@@ -552,6 +554,7 @@ program
         title: o.title,
         body: body(undefined, o.bodyFile),
         headBranch: o.head,
+        base: o.base,
         draft: o.ready !== true,
         dryRun: o.dryRun === true,
       }),

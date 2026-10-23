@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import * as settings from './config/deliveryConfig.js';
@@ -184,7 +184,7 @@ function fixture(published = true, nonClosing = false) {
       update: async (input: { body: string }) => {
         state.updates++;
         state.body = input.body;
-        state.nonClosing = true;
+        state.nonClosing = input.body.startsWith('References ');
         if (state.failUpdateAck) throw new Error('Transport lost after body update');
         return { data: pr() };
       },
@@ -410,6 +410,144 @@ function fixture(published = true, nonClosing = false) {
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+describe('remote closing PR creation', () => {
+  it('replays a plain-git head from a temporary non-git directory through the public tool', async () => {
+    const { context, state } = fixture(false);
+    state.remoteHead = head;
+    state.issueBody =
+      '## Outcome\n\nWidgets improve.\n\n## Acceptance criteria\n\n- [ ] Reject invalid widgets.\n  Verified by: A synthetic widget test.';
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-pr-open-')));
+    vi.spyOn(settings, 'loadDeliverySettings').mockResolvedValue(
+      context.config as unknown as Awaited<ReturnType<typeof settings.loadDeliverySettings>>,
+    );
+    vi.spyOn(issues, 'loadDeliveryContext').mockImplementation(async (input) => {
+      assert.equal(input.repository, repo);
+      assert.equal(input.repoRoot, root);
+      return { ...context, root };
+    });
+    const branchLinks = vi
+      .spyOn(issues, 'linkedIssueBranches')
+      .mockRejectedValue(new Error('No ai-delivery branch lifecycle'));
+    try {
+      const result = await executeTool(
+        'issue_pr_create',
+        { repo, issueNumber: 17, head: 'issue/17', base: 'main' },
+        { repoRoot: root },
+      );
+      assert.equal(state.creations, 1);
+      assert.equal(branchLinks.mock.calls.length, 0);
+      assert.equal(
+        state.body,
+        'Closes #17\n\n## Outcome\n\nWidgets improve.\n\n## Acceptance criteria\n\n- [ ] Reject invalid widgets.\n  Verified by: A synthetic widget test.',
+      );
+      assert.deepEqual(result, {
+        prNumber: 23,
+        url: 'https://github.com/example/widget/pull/23',
+        headSha: head,
+        state: 'draft',
+      });
+      expect(JSON.stringify(result)).toMatchInlineSnapshot(
+        '"{"prNumber":23,"url":"https://github.com/example/widget/pull/23","headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"draft"}"',
+      );
+      assert.ok(JSON.stringify(result).length < 1000);
+    } finally {
+      rmSync(root, { recursive: true });
+    }
+  });
+
+  it('reuses an open PR for an unlinked remote head without changing its body', async () => {
+    const { context, state } = fixture();
+    state.body = 'Closes #17\n\nRetain the author explanation.';
+    const result = await publishPr(context, { issueNumber: 17, headBranch: 'issue/17' });
+    assert.equal(result.prNumber, 23);
+    assert.equal(state.creations + state.updates, 0);
+    assert.equal(state.body, 'Closes #17\n\nRetain the author explanation.');
+  });
+
+  it('restores a lost closing link once and reports the repair without replacing user content', async () => {
+    const { context, state } = fixture();
+    state.body = 'Retain the author explanation.';
+    state.nonClosing = true;
+    const input = { issueNumber: 17, headBranch: 'issue/17' };
+    assert.deepEqual(await publishPr(context, input), {
+      prNumber: 23,
+      url: 'https://github.com/example/widget/pull/23',
+      headSha: head,
+      state: 'draft',
+      closingLinkAdded: true,
+    });
+    assert.equal(state.body, 'Closes #17\n\nRetain the author explanation.');
+    await publishPr(context, input);
+    assert.equal(state.creations, 0);
+    assert.equal(state.updates, 1);
+  });
+
+  it('previews a closing-link repair without a mutation', async () => {
+    const { context, state } = fixture();
+    state.body = 'Retain explanation';
+    state.nonClosing = true;
+    await publishPr(context, { issueNumber: 17, headBranch: 'issue/17', dryRun: true });
+    assert.equal(state.updates + state.creations, 0);
+  });
+
+  it('refuses a conflicting association without rewriting the existing body', async () => {
+    const { context, state } = fixture();
+    state.body = 'Closes #18';
+    state.issueNumber = 18;
+    await assert.rejects(publishPr(context, { issueNumber: 17, headBranch: 'issue/17' }), /conflicting/u);
+    assert.equal(state.updates + state.creations, 0);
+  });
+
+  it('refuses body drift during the final association read before repair', async () => {
+    const { context, state } = fixture();
+    state.body = 'Retain explanation';
+    state.nonClosing = true;
+    const graphql = context.clients.graphql;
+    let associationReads = 0;
+    vi.spyOn(context.clients, 'graphql').mockImplementation(async (query, variables) => {
+      const result = await graphql(query, variables);
+      if (String(query).includes('DeliveryClosingIssues') && ++associationReads === 2)
+        state.body = 'Concurrent author edit';
+      return result;
+    });
+    await assert.rejects(publishPr(context, { issueNumber: 17, headBranch: 'issue/17' }), /drifted/u);
+    assert.equal(state.updates, 0);
+    assert.equal(state.body, 'Concurrent author edit');
+  });
+
+  it('reconciles a lost repair acknowledgement without repeating the applied update', async () => {
+    const { context, state } = fixture();
+    state.body = 'Retain explanation';
+    state.nonClosing = true;
+    state.failUpdateAck = true;
+    const input = { issueNumber: 17, headBranch: 'issue/17' };
+    await assert.rejects(publishPr(context, input), /repair acknowledgement is uncertain/u);
+    state.failUpdateAck = false;
+    await publishPr(context, input);
+    assert.equal(state.creations, 0);
+    assert.equal(state.updates, 1);
+  });
+
+  it('names the missing closing line and exact repair call before independent review', async () => {
+    const { reviewerContext, state, artifact } = fixture();
+    state.body = 'Lost closing link';
+    state.nonClosing = true;
+    await assert.rejects(
+      submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /Missing `Closes #17`/u);
+        assert.ok(
+          error.message.includes('issue_pr_create({"repo":"example/widget","issueNumber":17,"head":"issue/17"})'),
+        );
+        assert.doesNotMatch(error.message, /association does not identify/u);
+        return true;
+      },
+    );
+    assert.equal(state.submissions + state.updates, 0);
+  });
+});
 
 function rulesetOnlyFixture(published = true) {
   const current = fixture(published, true);
@@ -892,12 +1030,14 @@ describe('authoritative existing PR promotion', () => {
     await submitFormalReview(reviewerContext, { issueNumber: 17, prNumber: 23, artifact });
     const preview = await publishPr(context, { ...input, dryRun: true });
     assert.equal(preview.prNumber, 23);
+    assert.ok('dryRun' in preview);
     assert.equal(preview.draft, true);
     assert.equal(state.promotions, 0);
     const promoted = await publishPr(context, input);
     const reused = await publishPr(context, input);
     assert.equal(promoted.prNumber, 23);
-    assert.equal(promoted.draft, false);
+    assert.ok('state' in promoted);
+    assert.equal(promoted.state, 'open');
     assert.deepEqual(reused, promoted);
     assert.equal(state.promotions, 1);
     assert.equal(state.creations, 0);
@@ -996,25 +1136,23 @@ describe('authoritative existing PR promotion', () => {
     }
   });
 
-  it('requires explicit head and ready intent rather than guessing a post-publication branch', async () => {
+  it('requires an explicit head after branch links disappear and preserves draft on reuse', async () => {
     const { context, state } = fixture();
     await assert.rejects(publishPr(context, { issueNumber: 17, draft: false }), /linked/u);
-    await assert.rejects(publishPr(context, { ...input, draft: true }), /linked/u);
+    await publishPr(context, { ...input, draft: true });
     assert.equal(state.promotions, 0);
   });
 
-  it('keeps new ready-PR creation behind native linked-branch authority', async () => {
+  it('creates a ready PR directly from a pushed remote head without native branch setup', async () => {
     const { context, state } = fixture(false);
-    await assert.rejects(publishPr(context, input), /linked/u);
-    assert.equal(state.creations, 0);
-    const started = await startIssueBranch(context, 17);
-    assert.equal(started.headSha, base);
     state.remoteHead = head;
     state.expectedCreationDraft = false;
     const created = await publishPr(context, input);
-    assert.equal(created.draft, false);
+    assert.ok('state' in created);
+    assert.equal(created.state, 'open');
     assert.equal(state.creations, 1);
     assert.equal(state.promotions, 0);
+    assert.equal(state.events.includes('native-start'), false);
   });
 
   it('keeps incomplete native branch readback behind the unchanged start gate', async () => {
@@ -1127,8 +1265,9 @@ describe('directory-independent exact-PR contract', () => {
         env: { HOME: root, PATH: process.env.PATH },
         encoding: 'utf8',
       }).replace(/\s+/gu, ' ');
-      assert.match(creationHelp, /promote an existing associated PR with --head and --ready/u);
-      assert.match(creationHelp, /Explicit remote head/u);
+      assert.match(creationHelp, /Create or reuse an issue-closing PR from a pushed --head, from any directory/u);
+      assert.match(creationHelp, /--base <branch>/u);
+      assert.match(creationHelp, /Pushed remote head/u);
       assert.match(creationHelp, /--pr <number>/u);
       assert.match(creationHelp, /--reconcile-non-closing-reference/u);
       assert.match(creationHelp, /--expected-head <sha>/u);

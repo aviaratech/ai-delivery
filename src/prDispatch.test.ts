@@ -26,6 +26,23 @@ function routes() {
 }
 
 describe('validated PR mode dispatch', () => {
+  it('accepts head/base with the legacy headBranch alias and rejects disagreement before credentials', async () => {
+    const calls = routes();
+    await executeTool('issue_pr_create', { issueNumber: 17, head: 'topic', base: 'main' }, execution);
+    assert.deepEqual(calls.create.mock.calls[0]![1], {
+      issueNumber: 17,
+      headBranch: 'topic',
+      baseBranch: 'main',
+      draft: true,
+      dryRun: false,
+    });
+    const previousLoads = calls.load.mock.calls.length;
+    await assert.rejects(
+      executeTool('issue_pr_create', { issueNumber: 17, head: 'topic', headBranch: 'other' }, execution),
+      /same branch/u,
+    );
+    assert.equal(calls.load.mock.calls.length, previousLoads);
+  });
   const action = {
     ...ids,
     nonClosing: true,

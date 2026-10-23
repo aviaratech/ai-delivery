@@ -119,7 +119,7 @@ const routes: Route[] = [
     verify: (_v, f) => {
       assert.equal(f.state.published, true);
       const input = f.calls.find((c) => c.name === 'pulls.create')!.input as { body: string; draft: boolean };
-      assert.equal(input.body, 'Plain explanation\n\nCloses #17');
+      assert.equal(input.body, 'Closes #17\n\nPlain explanation');
       assert.equal(input.draft, true);
     },
   },
