@@ -68,7 +68,7 @@ function inspect(identity, terminate = false) {
     try { process.kill(identity.pid, 0); }
     catch (error) {
       if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
-        return { ...identity, state: 'absent', observerMethod: 'node-signal-zero-ESRCH' };
+        return { pid: identity.pid, birth: identity.birth, state: 'absent', observerMethod: 'node-signal-zero-ESRCH' };
       }
     }
   }
