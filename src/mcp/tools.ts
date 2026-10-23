@@ -3,7 +3,7 @@ import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
 import { DeliveryHealthInput } from '../services/deliveryHealthService.js';
 import { BoardReconcileInput } from '../services/boardReconcileService.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
-import { JournalInputSchema } from '../issueJournal.js';
+import { JournalInputSchema, JOURNAL_SCHEMA_METADATA } from '../issueJournal.js';
 import {
   IssueFields,
   IssueWriteFields,
@@ -189,7 +189,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
         if (!parsed.success)
           for (const issue of parsed.error.issues)
             ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });
-      }),
+      })
+      .meta(JOURNAL_SCHEMA_METADATA),
   },
   {
     name: 'runtime_stage',
@@ -243,6 +244,15 @@ export const AI_DELIVERY_MCP_TOOLS = [
         ...NativeIssueDateFields,
         ...IssueWriteFields,
         title: IssueFields.shape.title,
+        opId: z
+          .string()
+          .trim()
+          .min(1)
+          .max(256)
+          .optional()
+          .describe(
+            'Stable retry identity: repeat the same original arguments to complete a partial create without another issue.',
+          ),
         status: CreateIssueStatus.optional(),
       }),
     ),

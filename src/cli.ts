@@ -244,6 +244,8 @@ program
   .command('create')
   .requiredOption('--title <title>')
   .option('--fields-file <path>', 'UTF-8 JSON typed fields; explicit CLI fields take precedence')
+  .option('--epic', 'Create an active unsized parent issue')
+  .option('--op-id <id>', 'Stable identity for retrying the same create')
   .option('--draft', 'Explicitly write an incomplete parked draft')
   .option('--body <markdown>')
   .option('--body-file <path>')
@@ -256,11 +258,13 @@ program
   .option('--override-reason <reason>', 'Required explanation when adding a blocker to active work')
   .option('--milestone <number>')
   .option('--parent <number>')
-  .action(async (o: Record<string, string> & { draft?: boolean }) =>
+  .action(async (o: Record<string, string> & { draft?: boolean; epic?: boolean }) =>
     run(
       'issue_create',
       fields(o.fieldsFile, {
         title: o.title,
+        epic: o.epic,
+        opId: o.opId,
         body: body(o.body, o.bodyFile),
         issueType: o.type,
         points: int(o.points),

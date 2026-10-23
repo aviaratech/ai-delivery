@@ -9,6 +9,10 @@ const START_FOOTER =
 export function issueStartFooter(body: string): string {
   return START_FOOTER.exec(body)?.[0] ?? '';
 }
+const CREATE_FOOTER = /\n\n<!-- ai-delivery-create: sha256:[a-f0-9]{64} intent: sha256:[a-f0-9]{64} -->$/u;
+export function issueTrackingFooter(body: string): string {
+  return CREATE_FOOTER.exec(body)?.[0] ?? issueStartFooter(body);
+}
 const Text = z.string();
 const Strings = z.array(Text);
 const AcceptanceCriterion = z.strictObject({ behavior: Text, verifiedBy: Text });
@@ -33,6 +37,7 @@ export const IssueFields = z.strictObject({
   title: Text,
   issueType: Text.optional(),
   points: z.number().int().optional(),
+  epic: z.literal(true).optional(),
   problem: Text.default(''),
   outcome: Text.default(''),
   acceptanceCriteria: z.array(AcceptanceCriterion).default([]),
@@ -125,7 +130,7 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
   const add = (code: string, field: (string | number)[], fixHint: string): void =>
     ctx.addIssue({ code: 'custom', path: field, message: fixHint, params: { issueCode: code } });
   if (value.draft) add('draft', ['draft'], 'Resolve the draft fields and set draft to false before starting work.');
-  if (value.points === undefined || value.points < 1 || value.points > 8)
+  if (!value.epic && (value.points === undefined || value.points < 1 || value.points > 8))
     add('points', ['points'], 'Choose Points from 1 through 8; split a 13-point issue into sub-issues.');
   if (
     value.title.trim().length < 10 ||
@@ -179,7 +184,7 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
 
 export const ReadyIssue = IssueFields.extend({
   title: Text.min(10).max(80),
-  points: z.number().int().min(1).max(8),
+  points: z.number().int().min(1).max(8).optional(),
   problem: Text.min(1),
   outcome: Text.min(1),
   acceptanceCriteria: z.array(AcceptanceCriterion).min(1),
@@ -188,7 +193,8 @@ export const ReadyIssue = IssueFields.extend({
   draft: z.literal(false).default(false),
 })
   .superRefine(secretRule)
-  .superRefine(readyRules);
+  .superRefine(readyRules)
+  .meta({ anyOf: [{ properties: { epic: { const: true } }, required: ['epic'] }, { required: ['points'] }] });
 export type ReadyIssueData = z.output<typeof ReadyIssue>;
 const ReadySemantics = IssueFields.superRefine(secretRule).superRefine(readyRules);
 /** Portable structural schemas; semantic refinements are enforced by the write/readiness boundary. */
@@ -203,6 +209,7 @@ export const IssueWriteFields = {
   title: IssueFields.shape.title.optional(),
   issueType: IssueFields.shape.issueType,
   points: IssueFields.shape.points,
+  epic: IssueFields.shape.epic,
   problem: IssueFields.shape.problem.removeDefault().optional(),
   outcome: IssueFields.shape.outcome.removeDefault().optional(),
   acceptanceCriteria: IssueFields.shape.acceptanceCriteria.removeDefault().optional(),
@@ -409,7 +416,7 @@ export function parseIssueBody(
           hint('body.canonical', 'status', 'Status state must agree with the typed draft field.'),
         ]);
     }
-    const footer = issueStartFooter(body);
+    const footer = issueTrackingFooter(body);
     const canonical = footer ? body.slice(0, -footer.length) : body;
     const legacyFormatting = renderIssueBody(result.issue, status) !== canonical;
     if (

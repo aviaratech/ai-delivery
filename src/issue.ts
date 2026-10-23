@@ -61,7 +61,7 @@ import {
   renderIssueBody,
   issueWarnings,
   issueBodyDiff,
-  issueStartFooter,
+  issueTrackingFooter,
   validateIssue,
   IssueValidationError,
   type IssueFieldsInput,
@@ -301,6 +301,8 @@ async function labels(context: DeliveryContext, input: readonly string[] | undef
 
 export interface CreateIssueInput extends Partial<IssueFieldsInput>, NativeIssueDatePatch {
   status?: { nextMilestone?: string };
+  /** Stable retry identity scoped to this repository and authenticated author. */
+  opId?: string;
   blockedBy?: number[];
   /** Add this issue as a blocker of these dependents without replacing their other blockers. */
   blocks?: number[];
@@ -447,7 +449,7 @@ function prepareIssueWrite(
           : base;
   const body =
     renderIssueBody(issue, status, forIntent ? false : legacyFormatting) +
-    (source === undefined || parsed.legacy ? '' : issueStartFooter(source));
+    (source === undefined || parsed.legacy ? '' : issueTrackingFooter(source));
   return {
     issue,
     body,
@@ -475,9 +477,12 @@ export class CreatedTrackingIssueError extends DeliveryError {
   constructor(
     readonly created: { number: number; title: string; url: string },
     cause: unknown,
+    readonly failedStep?: string,
+    readonly remainingSteps?: readonly string[],
+    readonly opId?: string,
   ) {
     super(
-      `Issue #${created.number} was created but native tracking did not complete: ${String(cause)}. Resume this known issue; do not create another.`,
+      `Issue #${created.number} was created but native tracking did not complete: ${String(cause)}. ${failedStep === undefined ? '' : `Failed step: ${failedStep}. Remaining steps: ${remainingSteps?.join(', ')}. `}${opId === undefined ? 'Resume this known issue; do not create another.' : 'Repeat issue_create with the same opId and original arguments to finish this known issue.'}`,
     );
   }
 }
@@ -492,7 +497,13 @@ export async function createIssue(
   warnings: IssueDiagnostic[];
 }> {
   if (context.clients.role !== 'author') throw new DeliveryError('Issue writes require the configured author role.');
+  const canonicalBody = canonicalIssueBody(input);
   const prepared = prepareIssueWrite(input);
+  const originalIntent = digestValue(
+    Object.fromEntries(
+      Object.entries({ ...input, opId: undefined, body: canonicalBody }).filter(([, value]) => value !== undefined),
+    ),
+  );
   const dateChanges = await prepareIssueDates(context, input);
   input = {
     ...input,
@@ -527,16 +538,63 @@ export async function createIssue(
           input.blockedBy ?? [],
         )
       : async () => {};
-  const created = await clients.rest.issues.create({
-    body: input.body ?? '',
-    labels: await labels(context, input.labels),
-    ...(input.milestone === undefined ? {} : { milestone: input.milestone }),
-    owner: repo.owner,
-    repo: repo.repo,
-    title: input.title,
-    ...(input.issueType === undefined ? {} : { type: input.issueType }),
-  });
+  let prior: Awaited<ReturnType<typeof clients.rest.issues.listForRepo>>['data'][number] | undefined;
+  if (input.opId !== undefined) {
+    const opId = z.string().trim().min(1).max(256).parse(input.opId);
+    const actor = (await clients.authenticatedAuthor?.())?.actorLogin;
+    if (!actor) throw new DeliveryError('Create retry requires authenticated author identity.');
+    const key = digestValue({ repository: config.repository.toLowerCase(), actor: actor.toLowerCase(), opId });
+    const marker = `<!-- ai-delivery-create: ${key} intent: ${originalIntent} -->`;
+    const matches: (typeof prior)[] = [];
+    for (let page = 1; page <= Math.min(20, context.readPageLimit ?? 20); page++) {
+      const batch = (await clients.rest.issues.listForRepo({ ...repo, state: 'all', page, per_page: 100 })).data;
+      matches.push(
+        ...batch.filter(
+          (row) => !('pull_request' in row) && row.body?.includes(`<!-- ai-delivery-create: ${key} intent:`),
+        ),
+      );
+      if (batch.length < 100) break;
+      if (page === Math.min(20, context.readPageLimit ?? 20))
+        throw new DeliveryError('Create retry search exceeds the bounded readback window; reconcile the known issue.');
+    }
+    if (matches.length > 1) throw new DeliveryError('Conflicting issues claim the same create opId.');
+    prior = matches[0];
+    if (prior) {
+      const footer = issueTrackingFooter(prior.body ?? '');
+      if (
+        prior.user?.login.toLowerCase() !== actor.toLowerCase() ||
+        prior.state !== 'open' ||
+        prior.title !== input.title ||
+        footer !== `\n\n${marker}` ||
+        canonicalIssueBody({ title: prior.title, body: (prior.body ?? '').slice(0, -footer.length) }) !== canonicalBody
+      )
+        throw new DeliveryError('Prior create opId conflicts with its author, original intent or current issue state.');
+      input.body = prior.body ?? '';
+    } else input.body = `${input.body}\n\n${marker}`;
+  }
+  const created = prior
+    ? { data: prior }
+    : await clients.rest.issues.create({
+        body: input.body ?? '',
+        labels: await labels(context, input.labels),
+        ...(input.milestone === undefined ? {} : { milestone: input.milestone }),
+        owner: repo.owner,
+        repo: repo.repo,
+        title: input.title,
+        ...(input.issueType === undefined ? {} : { type: input.issueType }),
+      });
   const issueNumber = created.data.number;
+  const steps = [
+    'created-readback',
+    ...(input.points !== undefined || input.priority !== undefined ? ['metadata'] : []),
+    ...(dateChanges.length ? ['dates'] : []),
+    'project',
+    ...(input.parentIssueNumber !== undefined ? ['parent', 'parent-points'] : []),
+    ...((input.blockedBy?.length ?? 0) > 0 ? ['blockers'] : []),
+    ...((input.blocks?.length ?? 0) > 0 ? ['dependents'] : []),
+    'readback',
+  ];
+  let step = steps[0]!;
   try {
     if (
       created.data.title !== input.title ||
@@ -549,7 +607,29 @@ export async function createIssue(
       throw new DeliveryError(
         'Created issue content or repository identity readback disagrees; reconcile this existing issue before retrying.',
       );
-    if (input.points !== undefined || input.priority !== undefined)
+    const existing = prior === undefined ? undefined : await issueInfo(context, issueNumber);
+    const existingRelationships =
+      prior === undefined
+        ? undefined
+        : await getNativeBlockerRelationships({ graphql: clients.graphql, issueNumber, repo });
+    if (
+      existing &&
+      (existing.projectStatus === 'In Progress' ||
+        existing.projectStatus === 'Done' ||
+        (input.points !== undefined && existing.points !== undefined && existing.points !== input.points) ||
+        (input.priority !== undefined && existing.priority !== undefined && existing.priority !== input.priority) ||
+        dateChanges.some(
+          (change) => existing.fields[change.name] != null && existing.fields[change.name] !== change.value,
+        ) ||
+        (existing.parentIssueNumber !== null && existing.parentIssueNumber !== (input.parentIssueNumber ?? null)) ||
+        existingRelationships!.blockers.some((blocker) => !(input.blockedBy ?? []).includes(blocker.number)))
+    )
+      throw new DeliveryError('Prior create opId conflicts with later native tracking changes.');
+    step = 'metadata';
+    if (
+      (input.points !== undefined && existing?.points !== input.points) ||
+      (input.priority !== undefined && existing?.priority !== input.priority)
+    )
       await setConfiguredNativeIssueMetadata({
         issueNumber,
         metadata: {
@@ -562,7 +642,26 @@ export async function createIssue(
         rest: clients.rest,
         settings: nativeIssueSettingsFromDeliveryConfig(config),
       });
-    await applyNativeIssueDates({ changes: dateChanges, issueNumber, ...repo, rest: clients.rest });
+    step = 'dates';
+    await applyNativeIssueDates({
+      changes: dateChanges.filter(
+        (change) => existing === undefined || (existing.fields[change.name] ?? null) !== change.value,
+      ),
+      issueNumber,
+      ...repo,
+      rest: clients.rest,
+    });
+    step = 'project';
+    if (existing?.projectStatus !== (targets.unresolvedBlockers.length > 0 ? 'Blocked' : 'Todo'))
+      await syncIssueProjectStatus({
+        graphql: clients.graphql,
+        issueNodeId: created.data.node_id,
+        org: config.native.organization,
+        ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+        settings: projectSettingsFromDeliveryConfig(config),
+        status: targets.unresolvedBlockers.length > 0 ? 'Blocked' : 'Todo',
+      });
+    step = 'parent';
     if (input.parentIssueNumber !== undefined)
       await replaceParentIssue({
         graphql: clients.graphql,
@@ -571,6 +670,7 @@ export async function createIssue(
         repo,
         rest: clients.rest,
       });
+    step = 'parent-points';
     if (input.parentIssueNumber !== undefined)
       await clearConfiguredNativeIssuePoints({
         issueNumber: input.parentIssueNumber,
@@ -580,14 +680,7 @@ export async function createIssue(
         rest: clients.rest,
         settings: nativeIssueSettingsFromDeliveryConfig(config),
       });
-    await syncIssueProjectStatus({
-      graphql: clients.graphql,
-      issueNodeId: created.data.node_id,
-      org: config.native.organization,
-      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-      settings: projectSettingsFromDeliveryConfig(config),
-      status: targets.unresolvedBlockers.length > 0 ? 'Blocked' : 'Todo',
-    });
+    step = 'blockers';
     if ((input.blockedBy?.length ?? 0) > 0)
       await replaceBlockedBy({
         beforeAdd,
@@ -597,6 +690,7 @@ export async function createIssue(
         repo,
         rest: clients.rest,
       });
+    step = 'dependents';
     for (const dependent of new Set(input.blocks ?? []))
       await linkBlockedBy({
         beforeAdd,
@@ -606,6 +700,7 @@ export async function createIssue(
         repo,
         rest: clients.rest,
       });
+    step = 'readback';
     const readback = await issueInfo(context, issueNumber);
     if (
       readback.title !== input.title ||
@@ -618,6 +713,9 @@ export async function createIssue(
     throw new CreatedTrackingIssueError(
       { number: issueNumber, title: created.data.title, url: created.data.html_url },
       error,
+      step,
+      steps.slice(steps.indexOf(step)),
+      input.opId,
     );
   }
   return {
@@ -1266,9 +1364,32 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   )
     throw new DeliveryError('A superseding issue must be a different positive issue number.');
   const { clients, config, repo } = context;
+  const preserveArchived = Object.keys(input).every((key) =>
+    ['issueNumber', 'title', 'state', 'closeReason', 'supersededBy', 'preserveHistory'].includes(key),
+  );
   const dateChanges = await prepareIssueDates(context, input);
   const currentContent = await issueInfo(context, input.issueNumber);
-  const prepared = prepareIssueWrite(input, currentContent);
+  const archivedItemId = preserveArchived
+    ? await assertIssueProjectWritable({
+        preserveArchived: true,
+        graphql: clients.graphql,
+        issueNodeId: (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data.node_id,
+        org: config.native.organization,
+        ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+        settings: projectSettingsFromDeliveryConfig(config),
+      })
+    : null;
+  const legacyNativeEdit =
+    archivedItemId !== null && !currentContent.body.trimStart().startsWith('<!-- ai-delivery:issue@1 -->');
+  const prepared: ReturnType<typeof prepareIssueWrite> = legacyNativeEdit
+    ? {
+        issue: IssueFields.parse({ title: input.title ?? currentContent.title, draft: true }),
+        body: currentContent.body,
+        statusOnly: true,
+        preserveHistory: input.preserveHistory ?? false,
+        warnings: [],
+      }
+    : prepareIssueWrite(input, currentContent);
   input = {
     ...input,
     body: prepared.body,
@@ -1401,6 +1522,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   )
     throw new DeliveryError('History target is not the requested issue.');
   await assertIssueProjectWritable({
+    preserveArchived,
     graphql: clients.graphql,
     issueNodeId: target.node_id,
     org: config.native.organization,
@@ -1416,6 +1538,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     supersedingIssueId,
     assertClosure,
     currentContent,
+    preserveArchived,
     nativeTarget: { nodeId: target.node_id, url: target.html_url },
     dateChanges,
     priorContent,
@@ -1570,17 +1693,37 @@ async function applyIssueUpdate(
       'pull_request' in target
     )
       throw new DeliveryError('Native closure readback returned a foreign issue identity.');
-    await syncIssueProjectStatus({
-      graphql: clients.graphql,
-      issueNodeId: target.node_id,
-      org: config.native.organization,
-      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-      settings: projectSettingsFromDeliveryConfig(config),
-      status,
-    });
-    readback = await issueInfo(context, input.issueNumber);
-    if (readback.projectStatus !== status)
-      throw new DeliveryError('Project Status readback disagrees with the requested outcome.');
+    const archivedItemId = plan.preserveArchived
+      ? await assertIssueProjectWritable({
+          preserveArchived: true,
+          graphql: clients.graphql,
+          issueNodeId: target.node_id,
+          org: config.native.organization,
+          ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+          settings: projectSettingsFromDeliveryConfig(config),
+        })
+      : null;
+    if (archivedItemId !== null) {
+      readback = info;
+      prepared.warnings.push({
+        code: 'project.archived',
+        field: 'project',
+        message: `Archived Project item ${archivedItemId} was preserved.`,
+        fixHint: `Archived Project item ${archivedItemId} was preserved.`,
+      });
+    } else {
+      await syncIssueProjectStatus({
+        graphql: clients.graphql,
+        issueNodeId: target.node_id,
+        org: config.native.organization,
+        ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+        settings: projectSettingsFromDeliveryConfig(config),
+        status,
+      });
+      readback = await issueInfo(context, input.issueNumber);
+      if (readback.projectStatus !== status)
+        throw new DeliveryError('Project Status readback disagrees with the requested outcome.');
+    }
   } catch (error) {
     const observedRate = clients.rateLimitObservation?.();
     const limit = getRateLimitDiagnostics(error) ?? (observedRate !== priorRateObservation ? observedRate : undefined);
