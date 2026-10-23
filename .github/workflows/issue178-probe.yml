@@ -47,8 +47,6 @@ jobs:
     timeout-minutes: 15
     env:
       PROBE_INPUT_DIGEST: ${{ needs.stage.outputs.input_digest }}
-      PROBE_INPUT: ${{ runner.temp }}/issue178-input
-      PROBE_RESULTS: ${{ runner.temp }}/issue178-results
     steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -60,6 +58,9 @@ jobs:
           path: ${{ runner.temp }}/issue178-input
       - name: Native stock PowerShell experiment without a checkout
         shell: powershell
+        env:
+          PROBE_INPUT: ${{ runner.temp }}/issue178-input
+          PROBE_RESULTS: ${{ runner.temp }}/issue178-results
         run: node "$env:PROBE_INPUT/probe.mjs" run "$env:PROBE_RESULTS"
       - name: Retain partial or final native evidence
         if: always()

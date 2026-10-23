@@ -6,19 +6,38 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { release } from 'node:os';
 
+/** @typedef {import('node:child_process').ChildProcess} Child */
+/** @typedef {{pid:number,birth?:string}} Identity */
+/** @typedef {Identity & {state:string,sameIdentity?:boolean}} Observation */
+/** @typedef {{phase:string,identity:Identity,root?:Identity,jobZero?:boolean,pendingReadsSettled?:boolean,reason?:string}} Status */
+/** @typedef {{action:string,event:string,value:Status,request:unknown,code:number|null,signal:NodeJS.Signals|null,statuses:Status[],bytes:number,protocolBytes:number,nonProtocolLines:number,output:string}} Message */
+/** @typedef {{error:boolean,closed:boolean,code?:number|null,signal?:NodeJS.Signals|null,done:Promise<void>}} ChildOutcome */
+/** @typedef {{schema:string,sourceSha:string,sourceTree:string,platform:string,arch:string,node:string,files:Record<string,string>}} Manifest */
+/** @typedef {{mode:string,startedAt:string,identities:Identity[],passed:boolean,requestSent?:boolean,actionSent?:boolean,statuses?:Status[],final?:Status|null,transport?:object,boundary?:string,supervisorAbsence?:Observation,jobZero?:string,literalArgumentsExact?:boolean,selectedRsaResponseExact?:boolean,sourceValidation?:string,nativeAbsence?:Observation[],peerPreserved?:boolean,completedAt?:string,driverRssBytes?:number}} Case */
+/** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean}} Cleanup */
+/** @typedef {{state?:string,directOwnedHandleExited?:boolean,launchFailed?:boolean}} PeerCleanup */
+/** @typedef {{schema:string,source:Manifest,manifestSha256:string,platform:string,arch:string,osRelease:string,node:string,powershell:string,startedAt:string,complete:boolean,productAcceptance:boolean,liveCredentialAccess:boolean,cases:Case[],cleanup:Cleanup[],errors:{category:string,reason:string}[],unexecuted:string[],limits:object,peer?:Observation,peerCleanup?:PeerCleanup,cleanupConfirmed?:boolean,cleanupContract?:string,completedAt?:string}} Report */
+
 const here = dirname(fileURLToPath(import.meta.url));
 const script = join(here, 'supervisor.ps1');
+/** @param {import('node:crypto').BinaryLike} bytes */
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const literal = ['', 'with spaces', 'snowman-\u2603', 'embedded"quote', 'trailing\\', ';$env:USERPROFILE|&%PATH%'];
 const safe = () => Object.fromEntries(
   ['SystemRoot', 'TEMP', 'TMP', 'USERPROFILE'].filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]),
 );
+/** @param {string} message @returns {never} */
 const fail = (message) => { throw new Error(message); };
-const check = (condition, message) => { if (!condition) fail(message); };
+/** @param {unknown} condition @param {string} message @returns {asserts condition} */
+function check(condition, message) { if (!condition) fail(message); }
+/** @param {number} ms */
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+/** @type {WeakMap<Child, ChildOutcome>} */
 const childOutcomes = new WeakMap();
+/** @template {Child} T @param {T} child @returns {T} */
 function tracked(child) {
-  const outcome = { error: false, closed: false };
+  /** @type {ChildOutcome} */
+  const outcome = { error: false, closed: false, done: Promise.resolve() };
   outcome.done = new Promise((done) => {
     child.once('error', () => { outcome.error = true; });
     child.once('close', (code, signal) => {
@@ -28,6 +47,7 @@ function tracked(child) {
   childOutcomes.set(child, outcome);
   return child;
 }
+/** @param {string} path @param {unknown} value */
 function atomic(path, value) {
   writeFileSync(path + '.partial', JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
   renameSync(path + '.partial', path);
@@ -40,6 +60,7 @@ function powershell() {
   check(existsSync(executable), 'Stock PowerShell5.1 unavailable; no fallback');
   return executable;
 }
+/** @param {Identity} identity @param {boolean} terminate @returns {Observation} */
 function inspect(identity, terminate = false) {
   const args = ['-NoProfile', '-NonInteractive', '-File', script, '-Mode', 'Inspect', '-TargetPid', String(identity.pid)];
   if (identity.birth) args.push('-ExpectedBirth', identity.birth);
@@ -49,8 +70,9 @@ function inspect(identity, terminate = false) {
   }
   const observed = spawnSync(powershell(), args, { shell: false, env: safe(), encoding: 'utf8', maxBuffer: 16384 });
   check(observed.status === 0, 'Identity observer failed: ' + observed.stderr.slice(0, 2048));
-  try { return JSON.parse(observed.stdout); } catch { fail('Identity observer returned no structured proof'); }
+  try { return /** @type {Observation} */ (JSON.parse(observed.stdout)); } catch { fail('Identity observer returned no structured proof'); }
 }
+/** @param {Identity} identity */
 async function absent(identity) {
   const first = inspect(identity);
   if (first.state === 'absent') return { identity, absent: true, terminationNeeded: false };
@@ -59,11 +81,13 @@ async function absent(identity) {
   check(stopped.state === 'absent' && stopped.sameIdentity, 'Owned diagnostic cleanup unverified');
   return { identity, absent: true, terminationNeeded: true };
 }
+/** @param {Child} child */
 async function exited(child) {
   const outcome = childOutcomes.get(child);
   check(outcome, 'Child outcome was not retained before launch');
   return outcome.done;
 }
+/** @param {string} mode */
 async function helper(mode) {
   if (mode === 'peer' || mode === 'hold') {
     setInterval(() => {}, 1000);
@@ -94,33 +118,38 @@ async function helper(mode) {
   else setInterval(() => {}, 1000);
 }
 async function controller() {
+  /** @type {import('node:child_process').ChildProcessWithoutNullStreams|undefined} */
   let child;
+  /** @type {Buffer[]} */
   let output = [];
   let bytes = 0;
   let protocolBytes = 0;
   let pending = '';
+  /** @type {Status[]} */
   let statuses = [];
   let nonProtocolLines = 0;
-  const endInput = () => { try { child?.stdin.end(); } catch { try { child?.kill(); } catch {} } };
+  const endInput = () => { try { child?.stdin.end(); } catch { try { child?.kill(); } catch { /* Retained close outcome owns cleanup. */ } } };
+  /** @param {object} value @param {()=>void} [done] */
   function emit(value, done) {
     if (!process.connected) { endInput(); done?.(); return; }
     try { process.send(value, (error) => { if (error) endInput(); done?.(); }); }
     catch { endInput(); done?.(); }
   }
   process.once('disconnect', endInput);
-  process.on('message', (message) => {
+  process.on('message', (raw) => {
+    const message = /** @type {Message} */ (raw);
     try {
     if (message.action === 'launch') {
       child = tracked(spawn(powershell(), ['-NoProfile', '-NonInteractive', '-File', script], {
         shell: false, env: safe(), stdio: ['pipe', 'pipe', 'pipe'],
       }));
       child.stdin.on('error', () => {});
-      child.stdout.on('data', (chunk) => {
+      child.stdout.on('data', (/** @type {Buffer} */ chunk) => {
         bytes += chunk.length;
         if (bytes <= 65536) output.push(chunk);
         else { output = []; child.kill(); }
       });
-      child.stderr.on('data', (chunk) => {
+      child.stderr.on('data', (/** @type {Buffer} */ chunk) => {
         protocolBytes += chunk.length;
         if (protocolBytes > 65536) { child.kill(); return; }
         pending += chunk.toString('utf8');
@@ -129,7 +158,7 @@ async function controller() {
           if (index < 0) break;
           const line = pending.slice(0, index); pending = pending.slice(index + 1);
           try {
-            const value = JSON.parse(line);
+            const value = /** @type {Status} */ (JSON.parse(line));
             statuses.push(value);
             emit({ event: 'status', value });
           } catch { nonProtocolLines++; }
@@ -150,10 +179,12 @@ async function controller() {
     }
   });
 }
+/** @param {string} destination */
 function stage(destination) {
   check(process.platform === 'linux', 'Staging proof requires native Linux');
   check(!existsSync(destination), 'Fresh staging directory required');
   mkdirSync(destination, { recursive: true });
+  /** @type {Record<string,string>} */
   const files = {};
   for (const name of ['probe.mjs', 'supervisor.ps1']) {
     const source = join(here, name);
@@ -161,6 +192,7 @@ function stage(destination) {
     copyFileSync(source, join(destination, name));
     files[name] = sha256(readFileSync(source));
   }
+  /** @param {string[]} args */
   const git = (args) => {
     const result = spawnSync('git', args, { encoding: 'utf8', maxBuffer: 4096 });
     check(result.status === 0, 'Source identity unavailable');
@@ -176,14 +208,16 @@ function stage(destination) {
   console.log(JSON.stringify({ stage: 'linux-input-complete', sourceSha: head, files,
     manifestSha256: digest }));
 }
+/** @param {string} destination */
 async function run(destination) {
   check(process.platform === 'win32' && process.arch === 'x64' && process.version === 'v24.21.0', 'Native pinned Windows controller required');
   check(!existsSync(destination), 'Fresh result directory required');
   mkdirSync(destination, { recursive: true });
-  const manifest = JSON.parse(readFileSync(join(here, 'manifest.json'), 'utf8'));
+  const manifest = /** @type {Manifest} */ (JSON.parse(readFileSync(join(here, 'manifest.json'), 'utf8')));
   check(sha256(readFileSync(join(here, 'manifest.json'))) === process.env.PROBE_INPUT_DIGEST, 'Linux artifact digest mismatch');
   check(manifest.platform === 'linux' && manifest.sourceSha === process.env.PROBE_SOURCE_SHA, 'Linux/source provenance mismatch');
   for (const [name, digest] of Object.entries(manifest.files)) check(sha256(readFileSync(join(here, name))) === digest, 'Detached fixture bytes changed');
+  /** @type {Report} */
   const report = { schema: 'issue178-windows-feasibility@1', source: manifest,
     manifestSha256: sha256(readFileSync(join(here, 'manifest.json'))), platform: process.platform, arch: process.arch,
     osRelease: release(), node: process.version, powershell: powershell(), startedAt: new Date().toISOString(),
@@ -202,6 +236,7 @@ async function run(destination) {
   const key = generateKeyPairSync('rsa', { modulusLength: 2048,
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } }).privateKey;
   const peer = tracked(spawn(process.execPath, [fileURLToPath(import.meta.url), 'helper', 'peer'], { shell: false, stdio: 'ignore', env: safe() }));
+  /** @type {Observation} */
   let peerIdentity;
   try {
     check(Number.isInteger(peer.pid), 'Peer launch failed before PID assignment');
@@ -215,12 +250,15 @@ async function run(destination) {
     report.completedAt = new Date().toISOString(); checkpoint(); process.exitCode = 1; return;
   }
   report.peer = peerIdentity;
+  /** @type {Set<Child>} */
   const controllers = new Set();
+  /** @type {Map<string,Identity>} */
   const owned = new Map();
   const cases = ['pem', 'base64', 'denied', 'malformed', 'missing', 'descendant-exit', 'immediate-exit',
     'cancel', 'eof', 'timeout', 'overflow', 'stderr-overflow', 'initialization-loss', 'controller-loss', 'supervisor-loss'];
   try {
     for (const mode of cases) {
+      /** @type {Case} */
       const record = { mode, startedAt: new Date().toISOString(), identities: [], passed: false };
       report.cases.push(record); checkpoint();
       console.log(JSON.stringify({ stage: 'native-case', unit: mode, completed: report.cases.length - 1, remaining: cases.length - report.cases.length + 1 }));
@@ -228,12 +266,18 @@ async function run(destination) {
       controllers.add(child);
       let requestSent = false;
       let actionSent = false;
+      /** @type {Identity|undefined} */
       let supervisor;
+      /** @type {Message|undefined} */
       let completion;
       let controllerClosed = false;
+      /** @type {number|undefined} */
       let rootPid;
+      /** @type {string|undefined} */
       let eventFailure;
+      /** @type {Status[]} */
       const statuses = [];
+      /** @param {object} message */
       const send = (message) => {
         try {
           if (!child.connected) { eventFailure = 'Controller IPC disconnected'; return; }
@@ -246,7 +290,8 @@ async function run(destination) {
         environment: { ...safe(), ISSUE178_SYNTHETIC_KEY: key }, cwd: destination,
         deadline: new Date(Date.now() + 30000).toISOString(),
       };
-      child.on('message', (message) => {
+      child.on('message', (raw) => {
+        const message = /** @type {Message} */ (raw);
         try {
         if (message.event === 'status') {
           const value = message.value; statuses.push(value);
@@ -280,7 +325,7 @@ async function run(destination) {
       await exited(child); controllers.delete(child);
       record.requestSent = requestSent; record.actionSent = actionSent;
       record.statuses = statuses;
-      const final = completion?.statuses.findLast((value) => value.phase === 'complete');
+      const final = completion ? [...completion.statuses].reverse().find((value) => value.phase === 'complete') : undefined;
       record.final = final ?? null;
       record.transport = completion ? { code: completion.code, signal: completion.signal, bytes: completion.bytes,
         protocolBytes: completion.protocolBytes, nonProtocolLines: completion.nonProtocolLines } : { controllerLost: true };
@@ -324,7 +369,7 @@ async function run(destination) {
     report.errors.push({ category: 'probe-failure', reason: error instanceof Error ? error.message : 'Unknown probe failure' });
   } finally {
     for (const child of controllers) {
-      try { if (child.connected) child.send({ action: 'stop' }, () => {}); } catch {}
+      try { if (child.connected) child.send({ action: 'stop' }, () => {}); } catch { /* Kill and retained close outcome follow. */ }
       await delay(100);
       if (child.exitCode === null && child.signalCode === null) child.kill();
       await exited(child);
