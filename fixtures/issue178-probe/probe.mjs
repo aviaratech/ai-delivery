@@ -15,7 +15,7 @@ import { release } from 'node:os';
 /** @typedef {{error:boolean,closed:boolean,code?:number|null,signal?:NodeJS.Signals|null,done:Promise<void>}} ChildOutcome */
 /** @typedef {{schema:string,sourceSha:string,sourceTree:string,platform:string,arch:string,node:string,files:Record<string,string>}} Manifest */
 /** @typedef {{mode:string,startedAt:string,identities:Identity[],passed:boolean,requestSent?:boolean,actionSent?:boolean,statuses?:Status[],final?:Status|null,transport?:object,boundary?:string,supervisorStop?:(StopReceipt & {observedAt:string}),supervisorAbsence?:Observation,jobZero?:string,literalArgumentsExact?:boolean,selectedRsaResponseExact?:boolean,sourceValidation?:string,nativeAbsence?:Observation[],peerPreserved?:boolean,completedAt?:string,driverRssBytes?:number}} Case */
-/** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean,observation?:Observation}} Cleanup */
+/** @typedef {{identity:Identity,absent:boolean|'unknown',terminationNeeded?:boolean,replacementPreserved?:boolean,observation?:Observation}} Cleanup */
 /** @typedef {{state?:string,directOwnedHandleExited?:boolean,launchFailed?:boolean}} PeerCleanup */
 /** @typedef {{schema:string,source:Manifest,manifestSha256:string,platform:string,arch:string,osRelease:string,node:string,powershell:string,startedAt:string,complete:boolean,productAcceptance:boolean,liveCredentialAccess:boolean,cases:Case[],cleanup:Cleanup[],errors:{category:string,reason:string}[],unexecuted:string[],limits:object,peer?:Observation,peerAfterCases?:Observation,peerCleanup?:PeerCleanup,cleanupConfirmed?:boolean,cleanupContract?:string,completedAt?:string}} Report */
 
@@ -91,6 +91,10 @@ function inspect(identity, terminate = false) {
 async function absent(identity) {
   const first = inspect(identity);
   if (first.state === 'absent') return { identity, absent: true, terminationNeeded: false };
+  if (first.state === 'alive' && first.sameIdentity === false && first.pid === identity.pid &&
+      /^[0-9]+$/u.test(identity.birth ?? '') && /^[0-9]+$/u.test(first.birth ?? '') && first.birth !== identity.birth) {
+    return { identity, absent: true, terminationNeeded: false, replacementPreserved: true, observation: first };
+  }
   if (first.state !== 'alive' || !first.sameIdentity) return { identity, absent: 'unknown', observation: first };
   const stopped = inspect(identity, true);
   return { identity, absent: stopped.state === 'absent' && stopped.sameIdentity ? true : 'unknown',
@@ -292,7 +296,7 @@ async function run(destination) {
   try {
     for (const mode of cases) {
       /** @type {Case} */
-      const record = { mode, startedAt: new Date().toISOString(), identities: [], passed: false };
+      const record = { mode, startedAt: new Date().toISOString(), identities: [], passed: false, requestSent: false, actionSent: false };
       report.cases.push(record); checkpoint();
       console.log(JSON.stringify({ stage: 'native-case', unit: mode, completed: report.cases.length - 1, remaining: cases.length - report.cases.length + 1 }));
       const child = tracked(fork(fileURLToPath(import.meta.url), ['controller'], { execArgv: [], env: safe(), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }));
@@ -310,6 +314,7 @@ async function run(destination) {
       let eventFailure;
       /** @type {Status[]} */
       const statuses = [];
+      record.statuses = statuses;
       /** @param {object} message */
       const send = (message) => {
         try {
@@ -329,12 +334,12 @@ async function run(destination) {
         if (message.event === 'status') {
           const value = message.value; statuses.push(value);
           if (value.phase === 'bootstrap') {
-            supervisor = value.identity; owned.set(String(supervisor.pid), supervisor);
+            supervisor = value.identity; owned.set(String(supervisor.pid) + ':' + supervisor.birth, supervisor);
             if (mode === 'initialization-loss') { actionSent = true; child.kill(); }
             else { requestSent = true; send({ action: 'request', request }); }
           }
-          if (value.root) { rootPid = value.root.pid; owned.set(String(value.root.pid), value.root); record.identities.push(value.root); }
-          if (value.phase === 'member') { owned.set(String(value.identity.pid), value.identity); record.identities.push(value.identity); }
+          if (value.root) { rootPid = value.root.pid; owned.set(String(value.root.pid) + ':' + value.root.birth, value.root); record.identities.push(value.root); }
+          if (value.phase === 'member') { owned.set(String(value.identity.pid) + ':' + value.identity.birth, value.identity); record.identities.push(value.identity); }
           if (!actionSent && value.phase === 'member' && value.identity.pid !== rootPid) {
             if (mode === 'cancel') { actionSent = true; send({ action: 'cancel' }); }
             if (mode === 'eof') { actionSent = true; send({ action: 'eof' }); }
@@ -343,10 +348,17 @@ async function run(destination) {
           }
         } else if (message.event === 'supervisor-stop-result' && message.stop.id === 'supervisor-loss') {
           record.supervisorStop = { ...message.stop, observedAt: new Date().toISOString() };
-        } else if (message.event === 'finished') completion = message;
+        } else if (message.event === 'finished') {
+          completion = message;
+          record.final = message.statuses.slice().reverse().find((value) => value.phase === 'complete') ?? null;
+          record.transport = { code: message.code, signal: message.signal, bytes: message.bytes,
+            protocolBytes: message.protocolBytes, nonProtocolLines: message.nonProtocolLines,
+            trailingProtocolBytes: message.trailingProtocolBytes };
+        }
         else if (message.event === 'spawn-error') eventFailure = 'Supervisor launch failed';
         else if (message.event === 'controller-error') eventFailure = 'Supervisor controller operation failed';
         } catch { eventFailure = 'Controller message observation failed'; }
+        record.requestSent = requestSent; record.actionSent = actionSent;
       });
       child.once('error', () => { eventFailure = 'Controller launch failed'; });
       child.once('close', () => { controllerClosed = true; });
@@ -358,13 +370,8 @@ async function run(destination) {
       if (eventFailure) fail(eventFailure);
       if (!completion && !controllerClosed) { send({ action: 'stop', stopId: 'protocol-stall' }); fail('Supervisor protocol stalled after response and cleanup windows'); }
       await exited(child); controllers.delete(child);
-      record.requestSent = requestSent; record.actionSent = actionSent;
-      record.statuses = statuses;
-      const final = completion ? [...completion.statuses].reverse().find((value) => value.phase === 'complete') : undefined;
-      record.final = final ?? null;
-      record.transport = completion ? { code: completion.code, signal: completion.signal, bytes: completion.bytes,
-        protocolBytes: completion.protocolBytes, nonProtocolLines: completion.nonProtocolLines,
-        trailingProtocolBytes: completion.trailingProtocolBytes } : { controllerLost: true };
+      const final = record.final;
+      if (!completion) record.transport = { controllerLost: true };
       if (['initialization-loss', 'controller-loss', 'supervisor-loss'].includes(mode)) {
         if (mode === 'initialization-loss') record.boundary = 'awaiting-first-request-before-Reflection.Emit-or-native-allocation';
         check(actionSent && supervisor, 'Loss boundary was not reached');
