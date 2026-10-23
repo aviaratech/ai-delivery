@@ -225,6 +225,62 @@ ai-delivery --repo example/widget --identity author merge queue run
 
 MCP uses `issue_pr_merge({repo, prNumber, issueNumber?, queue:true})`, `issue_pr_merge_queue_status({repo})` and `issue_pr_merge_queue_run({repo})`. When omitted, the issue is derived from one complete same-repository native closing association. Queue requests reject direct-merge options (`nonClosing`, `reviewedHeadSha`, `strategy`, `dryRun`); omitted or false `queue` preserves direct merge. Enqueue conveys no approval. The configured author owns ref/comment/merge writes. There is no daemon: process loss stops progress until an explicit compatible `run` resumes.
 
+Queue merges require a standing approval. Add the human approver logins to the existing **operator-owned** user configuration, scoped to the repository:
+
+```json
+{ "mergeQueueApprovers": { "example/widget": ["maintainer"] } }
+```
+
+This optional field does not grant authority through repository files, author/reviewer roles or GitHub organization membership. Missing configuration or an empty list grants no standing approval. Repository names and human login comparisons are case-insensitive; duplicate entries refuse. Running commands retain their captured configuration binding. Configuration changes require a new compatible invocation; delete the approval comment to revoke a running grant.
+
+An approver posts the following **whole comment on the batch's first PR** after every listed PR is queued, in exactly this format:
+
+```text
+ai-delivery merge approval v1
+repository: example/widget
+pull-requests: 23,24,25
+conditions: current-native-eligibility,current-queue-checks,predecessors-merged
+heads: current-native-eligible
+expires: 2026-10-24T00:00:00Z
+```
+
+Use a future explicit UTC expiry (`YYYY-MM-DDTHH:mm:ssZ`), strictly after the comment's creation. No expiry is implied. The list contains 1–100 unique positive PR numbers and must match the complete contiguous FIFO prefix. Only CRLF line endings and one optional final newline are normalized; extra prose, fields, expressions, duplicate PRs, unsupported conditions or another heads policy refuse. The three mandatory conditions mean current native GitHub merge/check/review/blocker eligibility, successful complete required checks for the exact queue SHA and producer, and verified earlier merges through the same grant. Native zero-review policy keeps its existing meaning; standing approval never supplies an App review or bypasses protection.
+
+**The approval names PR identities, including later code edits as well as rebases.** Each changed head still requires fresh native eligibility, repository-required review/check proof and a newly valid exact queue-SHA prediction. No additional human grant is needed while those conditions and the expiry hold. This is broader than approving exact commit SHAs.
+
+The queue uses authenticated GitHub comment/author/repository/PR identities and explicit native edit evidence. Non-approvers, expired or edited comments are ignored with a reason on the PR; restoring an edited body does not restore authority. Missing or unreadable proof refuses. An uncovered entry stays `needs-approval` with one comment naming the configured approvers. The queue publishes predictions only for an approved prefix and never skips an uncovered earlier entry. Multiple eligible grants refuse as ambiguous; delete the unwanted one rather than relying on newest/oldest precedence.
+
+Deletion, editing, minimization or expiry prevents later merges. Removed or externally merged predecessors invalidate the remaining grant; post a new unedited approval on the remaining FIFO prefix's first PR. Re-enqueue cannot reuse a comment already bound to old queue entries. Compatible resumes retain the original comment anchor and verified consumed prefix after its first PR merges. Every real `verifying`, `ready`, `merged as <sha>` or `removed: <reason>` transition gets one authored PR comment mentioning the native PR author; repeated polls do not add comments. Rebuilt suffix predictions can produce another genuine verifying/ready cycle. Lost acknowledgements are reconciled by exact authored target/body/operation identity. An absent, duplicate or conflicting uncertain outcome halts without another POST or merge.
+
+The queue record is `ai-delivery.merge-queue@2`. Old schema, runtime or configuration bindings refuse without migration or reset. Resolve an old runtime's queue and retain uncertain-write evidence before changing its binding; deleting its state is not a recovery procedure. Reconciliation/cleanup and notification of an already established merge remain distinct from permission to send a new merge.
+
+GitHub cannot atomically validate a comment or expiry and merge a PR. A revocation or expiry can race the last check and server request, alongside the base race described below. The driver checks again before each new merge and halts on unexpected outcomes. A GitHub standing grant never overrides host-platform admission or a refusal.
+
+For host permissions, the following are **documentation examples only**. Replace the repository and `author` with your configured values through your host's normal policy process. One exact Claude Code allow entry is:
+
+```json
+{ "permissions": { "allow": ["Bash(ai-delivery --repo example/widget --identity author merge queue run)"] } }
+```
+
+One Codex rule for the same queue-run command family is:
+
+```python
+prefix_rule(
+    pattern = ["ai-delivery", "--repo", "example/widget", "--identity", "author", "merge", "queue", "run"],
+    decision = "allow",
+    match = ["ai-delivery --repo example/widget --identity author merge queue run"],
+    not_match = [
+        "ai-delivery --repo example/widget --identity author merge queue add 23",
+        "ai-delivery --repo example/widget --identity author merge queue status",
+        "ai-delivery --repo example/widget --identity author pr:merge --issue 17 --pr 23",
+        "ai-delivery --repo example/widget --identity author pr:review --issue 17 --pr 23 --artifact review.json",
+        "ai-delivery plugin update --host codex --version 0.3.35",
+    ],
+)
+```
+
+Claude's no-wildcard rule matches the full command. Codex matches an argv **prefix**, so trailing options can match; its `match`/`not_match` entries are tests, not additional restrictions. This rule cannot enforce an exact argument count. Neither example allows another ai-delivery subcommand, installs itself, supplies standing merge authority or overrides stricter denials. See [Claude permissions](https://code.claude.com/docs/en/permissions) and [Codex rules](https://learn.chatgpt.com/docs/agent-configuration/rules).
+
 For a long MCP `run`, clients should request standard progress notifications and reset their stall timeout on progress, without a total request deadline. Notifications report actual queue observations and completed/remaining entries; unchanged waits do not claim additional completed work. Host request limits still apply. The CLI driver emits the same bounded observations to stderr and supports cancellation throughout.
 
 The driver predicts ordered squash trees in an owned inert bare object store and publishes exact SHAs at `ai-delivery/queue/<pr>`. Consumers must arrange their required CI checks on those refs. No hosted queue-SHA qualification is bundled here. Required check discovery, complete current-attempt check/status observations, required App source and exact SHA must all agree. Missing, partial, unknown or non-success proof cannot pass. Git hooks, target configuration, filters, signing, custom merge drivers, policy modules and consumer scripts are never executed by prediction. Expected-object Git ref leases protect creation, replacement and deletion. Conflicts and failed checks remove the entry with PR diagnostics; the remaining suffix is rebuilt. Every actual squash changes the base identity, so suffix predictions need new SHA checks even when their trees match.
