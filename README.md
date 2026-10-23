@@ -213,7 +213,36 @@ Formal review requires a validated independent artifact and the configured revie
 
 An App submission does not prove that GitHub counted it. `pr:checks` exposes GitHub’s live review decision, merge state, configured required check names and head check observations. Required names come from applicable native rules and classic branch protection, so checks that have never reported remain visible. Partial requirement discovery is labelled explicitly; head observations do not override GitHub’s eligibility decision. Merge uses GitHub’s eligibility for the exact PR head and current base, including active rulesets, required checks, required reviews and configured up-to-date requirements. A repository requiring zero reviews does not acquire an extra App approval requirement. CLEAN and HAS_HOOKS are eligible; UNSTABLE follows GitHub’s mergeable decision with non-passing commit status; GitHub decides which check results and requirements apply. BLOCKED, BEHIND, DIRTY, unknown or incomplete eligibility and moved head/base refuse with native state and required-check diagnostics. No unresolved native issue blockers may remain. The server merge mutation includes the expected head SHA. Finish confirms the intended PR merged before closing its issue, and retries from remote readback without local receipts.
 
+The optional host-local squash queue uses one configured canonical clone per repository. Linked worktrees share its Git common-directory queue; multiple independent configured clones refuse. Add returns a durable position, status only observes, and an explicit foreground driver advances the queue:
+
+Status includes the recorded process `leaseRoot`. Keep that worktree available while entries or cleanup remain pending; runs from another linked worktree retain the same recovery lease. Once fully drained, a new admission can bind the current configured worktree.
+
+```sh
+ai-delivery --repo example/widget --identity author merge queue add 23 --issue 17
+ai-delivery --repo example/widget merge queue status
+ai-delivery --repo example/widget --identity author merge queue run
+```
+
+MCP uses `issue_pr_merge({repo, prNumber, issueNumber?, queue:true})`, `issue_pr_merge_queue_status({repo})` and `issue_pr_merge_queue_run({repo})`. When omitted, the issue is derived from one complete same-repository native closing association. Queue requests reject direct-merge options (`nonClosing`, `reviewedHeadSha`, `strategy`, `dryRun`); omitted or false `queue` preserves direct merge. Enqueue conveys no approval. The configured author owns ref/comment/merge writes. There is no daemon: process loss stops progress until an explicit compatible `run` resumes.
+
+For a long MCP `run`, clients should request standard progress notifications and reset their stall timeout on progress, without a total request deadline. Notifications report actual queue observations and completed/remaining entries; unchanged waits do not claim additional completed work. Host request limits still apply. The CLI driver emits the same bounded observations to stderr and supports cancellation throughout.
+
+The driver predicts ordered squash trees in an owned inert bare object store and publishes exact SHAs at `ai-delivery/queue/<pr>`. Consumers must arrange their required CI checks on those refs. No hosted queue-SHA qualification is bundled here. Required check discovery, complete current-attempt check/status observations, required App source and exact SHA must all agree. Missing, partial, unknown or non-success proof cannot pass. Git hooks, target configuration, filters, signing, custom merge drivers, policy modules and consumer scripts are never executed by prediction. Expected-object Git ref leases protect creation, replacement and deletion. Conflicts and failed checks remove the entry with PR diagnostics; the remaining suffix is rebuilt. Every actual squash changes the base identity, so suffix predictions need new SHA checks even when their trees match.
+
+Native PR protections remain an additional gate. Strict up-to-date rules can leave a later PR `BEHIND`; its owner must refresh its head and obtain current native checks/review. The queue never rewrites PR heads or transfers check/review authority. An observed native null review decision retains the existing zero-review semantics; unavailable or malformed decisions cannot establish eligibility.
+
+GitHub's merge endpoint pins the PR head, **not the expected base**. The driver rereads the base immediately before sending a merge and then verifies the actual squash's single parent, tree and current main. A concurrent outside writer can still cause an irreversible unexpected merge; this residual race is accepted by Option A. Unexpected parent/tree/main halts the queue without rollback or advancing another PR. Pending write intents survive lost acknowledgements and are reconciled read-only before another mutation; an unestablished outcome halts instead of blindly retrying. Compatible resumes skip completed merges and cleanup. Corrupt state or changed repository/host/configuration/runtime binding refuses reuse. Status exposes pending/halted state. Owned process identity, bounded resources and quiescent cleanup use the existing runtime writer; unresolved mutations retain their queue refs/object evidence for reconciliation.
+
 The removed `develop`, `verify`, `pr:checkout`, worktree creation/cleanup and local velocity record commands are no longer public CLI/MCP workflows. Preserve existing consumer checks, controller admissions and historical custody records. Their original schemas, digest identities, writer locks and operational closure rules remain separate. The legacy transition commands remain exposed, but this runtime cannot reproduce their historical repository-policy configuration binding: CLI/MCP inspection and apply refuse without executing policy or converting records. Complete those transitions with the original controller. Explicit runtime stage/admit remain supported.
+
+For `issue_create` / `create`, supply a stable `opId` / `--op-id` when a write
+must be recoverable. Repeat the same original arguments after a partial failure;
+the authored issue marker identifies the existing issue and remaining tracking
+steps complete without creating another issue. A conflicting intent, author,
+closed issue or later tracking change refuses recovery. Keep the same author
+and original issue body; the bounded search refuses when its complete window
+cannot be read. `epic: true` / `--epic` permits a Ready parent without Points.
+State and title edits preserve archived Project items and warn with the item ID.
 
 ## Upgrade a host
 
@@ -246,20 +275,30 @@ or rollback is selected; preserve the installer state and native cache.
 Compare each observed registration `version` with the published target from
 the npm command above.
 
-Confirm the **loaded host**, too. In Claude Code, run `/reload-plugins`, check
-the `ai-delivery` version on `/plugin`'s Installed tab, and resolve any reload
-error. In Codex desktop, fully quit and reopen the app after the update, select
-the installed `ai-delivery` plugin from `ai-delivery-user` in the Plugins
-Directory, and start a new chat. For Codex CLI, exit and start a new session.
-These activation steps follow the
-[Claude Code update guidance](https://code.claude.com/docs/en/discover-plugins#keep-plugins-updated)
-and [OpenAI local-plugin guidance](https://developers.openai.com/plugins/build/plugins#install-a-local-plugin-manually).
-From the new host session, call the native `issue_info` with
-`repo: "aviaratech/ai-delivery"` and `issueNumber: 163`, then record the loaded
-plugin/MCP version shown by that host. The doctor launches a separate process:
-its `activation.loadedVersion` stays `null`. If the host does not expose its
-loaded version, record it as unverified rather than treating doctor output as
-proof of the running conversation's version.
+Confirm the **running conversation** separately. In Claude Code, `/plugin`'s
+Installed tab shows installed metadata. In an interactive terminal,
+`/reload-plugins` applies pending plugin changes without restarting the session;
+resolve any reload error. In desktop/noninteractive sessions, that reload does
+not connect or disconnect plugin MCP servers. See the
+[Claude Code reload reference](https://code.claude.com/docs/en/plugins/cli-reference#sessions-without-an-interactive-terminal)
+for the surface-specific behavior.
+
+The [OpenAI local-plugin guidance](https://developers.openai.com/plugins/build/plugins#install-a-local-plugin-manually)
+describes restarting the desktop app to load changed local plugin files.
+Preserve active jobs and their core sessions: wait until the affected jobs are
+clear and an operator window is agreed before a full desktop/core CLI restart.
+During that window, follow the host's activation guidance; for Codex CLI, exit
+and start a new session. A new chat, refreshed skills or other newer server
+processes do not by themselves prove which MCP version serves this conversation.
+
+From the host conversation being checked, call the native `issue_info` with
+`repo: "aviaratech/ai-delivery"` and `issueNumber: 163`. Record native-read success
+separately from any supported current loaded plugin and MCP version readouts,
+including the source of each readout. If a version is not exposed, record
+`not exposed/unverified`. A successful read or installed metadata does not attest
+the running MCP version. The doctor launches a separate process: its
+`activation.loadedVersion` stays `null`, so startup results also do not prove the
+running conversation's version.
 
 To roll back a completed Codex update, select its recorded previous version
 (`0.3.29` after a `0.3.29` → `0.3.35` update):
@@ -465,7 +504,9 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 | Record a typed journal | `issue_comment` | See the [typed journal contract](#typed-issue-journals); the MCP call returns the authored comment identity and readback |
 | Close with a reason | `issue_update` | `update --issue N --state closed --close-reason not_planned --superseded-by S` |
 
-Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
+Typed JSON contains the issue contract fields, including Issue Type, Points, problem, outcome, acceptance and non-goals. CLI repository, parent and priority selectors use their documented flags. Issue and PR tools return compact JSON by default: identities, native fields and relationships, warnings, and history-comment links. MCP `verbose: true` restores the complete prior payload, including bodies, conversion diffs and routing; CLI `--json --verbose` does the same. Recovery arguments, refusals and diagnostic fix hints remain available in compact output.
+
+Inspect each result: rewrites return the preserved history comment; creation and reparenting return native readback. Reasoned closure returns `closure` evidence, supersession and the authored comment from `issue_update`; `issue_info` supplies state and Project status without the closure-reason evidence. A successful readiness check does not start an issue.
 
 `issue_create` and `issue_update` also accept optional native `startDate` and
 `targetDate` values, including in CLI `--fields-file` JSON. They resolve the

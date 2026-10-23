@@ -1,9 +1,12 @@
 import { getMachineRequestDiagnostics } from './errors.js';
 import { getIncompleteIssueUpdate } from './issue.js';
+import { projectToolOutput } from './toolOutput.js';
 
 /** Keep a recoverable start failure machine-readable while signalling shell failure. */
-export function printCommandResult(command: string, value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, command === 'board_reconcile' ? undefined : 2)}\n`);
+export function printCommandResult(command: string, value: unknown, verbose = false): void {
+  process.stdout.write(
+    `${JSON.stringify(projectToolOutput(command, value, verbose), null, command === 'board_reconcile' ? undefined : 2)}\n`,
+  );
   if (command === 'board_reconcile' && typeof value === 'object' && value !== null) {
     if ('scopeComplete' in value && value.scopeComplete === false) process.exitCode = 1;
     if (
@@ -45,10 +48,10 @@ export function printCommandResult(command: string, value: unknown): void {
   }
 }
 
-export function printCommandError(error: unknown): void {
+export function printCommandError(error: unknown, verbose = false): void {
   const incomplete = getIncompleteIssueUpdate(error);
   if (incomplete !== undefined) {
-    process.stdout.write(`${JSON.stringify(incomplete, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(projectToolOutput('issue_update', incomplete, verbose), null, 2)}\n`);
     process.exitCode = 1;
     return;
   }

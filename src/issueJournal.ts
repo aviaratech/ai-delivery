@@ -53,6 +53,29 @@ const JournalVariants = z.discriminatedUnion('kind', [
   }),
 ]);
 export type JournalInput = z.infer<typeof JournalVariants>;
+/** Publish the same kind requirements enforced by the canonical variant schemas. */
+export const JOURNAL_SCHEMA_METADATA = {
+  required: [
+    ...Object.entries(Common)
+      .filter(([, schema]) => !schema.isOptional())
+      .map(([key]) => key),
+    'kind',
+  ],
+  anyOf: JournalVariants.options.map((variant) => ({
+    properties: { kind: { const: variant.shape.kind.value } },
+    required: Object.entries(variant.shape as Record<string, z.ZodType>)
+      .filter(([key, schema]) => !(key in Common) && key !== 'kind' && !schema.isOptional())
+      .map(([key]) => key),
+  })),
+};
+export function missingJournalFields(input: Record<string, unknown>): string[] {
+  const variant = JournalVariants.options.find((option) => option.shape.kind.value === input.kind);
+  const shape = variant?.shape ?? { ...Common, kind: z.string() };
+  return Object.entries(shape as Record<string, z.ZodType>)
+    .filter(([key, schema]) => !schema.isOptional() && input[key] === undefined)
+    .map(([key]) => key);
+}
+
 // MCP requires an object schema; the same variant validator enforces kind-specific fields.
 export const JournalInputSchema = z
   .strictObject({

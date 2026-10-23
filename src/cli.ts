@@ -34,6 +34,8 @@ program
   .version(PACKAGE_VERSION)
   .option('--identity <name>', 'Configured author or reviewer identity')
   .option('--personal-auth', 'Explicit legacy personal-token author override')
+  .option('--json', 'Print JSON output')
+  .option('--verbose', 'Include full bodies, diffs and routing with --json')
   .option('--repo <owner/name>', 'GitHub repository owner/name; works from any directory')
   .option('--repo-root <path>', 'Launch directory or explicit clone for local operations', process.cwd());
 
@@ -91,7 +93,10 @@ function fields(file: string | undefined, overrides: Record<string, unknown>): R
   };
 }
 function run(name: AiDeliveryMcpToolName, input: Record<string, unknown>): Promise<void> {
-  return executeTool(name, input, execution()).then((value) => printCommandResult(name, value));
+  const options = program.opts<{ json?: boolean; verbose?: boolean }>();
+  return executeTool(name, input, execution()).then((value) =>
+    printCommandResult(name, value, options.json === true && options.verbose === true),
+  );
 }
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -239,6 +244,8 @@ program
   .command('create')
   .requiredOption('--title <title>')
   .option('--fields-file <path>', 'UTF-8 JSON typed fields; explicit CLI fields take precedence')
+  .option('--epic', 'Create an active unsized parent issue')
+  .option('--op-id <id>', 'Stable identity for retrying the same create')
   .option('--draft', 'Explicitly write an incomplete parked draft')
   .option('--body <markdown>')
   .option('--body-file <path>')
@@ -251,11 +258,13 @@ program
   .option('--override-reason <reason>', 'Required explanation when adding a blocker to active work')
   .option('--milestone <number>')
   .option('--parent <number>')
-  .action(async (o: Record<string, string> & { draft?: boolean }) =>
+  .action(async (o: Record<string, string> & { draft?: boolean; epic?: boolean }) =>
     run(
       'issue_create',
       fields(o.fieldsFile, {
         title: o.title,
+        epic: o.epic,
+        opId: o.opId,
         body: body(o.body, o.bodyFile),
         issueType: o.type,
         points: int(o.points),
@@ -513,7 +522,7 @@ program
   });
 program
   .command('pr:create')
-  .description('Create a PR from a linked issue branch, or promote an existing associated PR with --head and --ready.')
+  .description('Create or reuse an issue-closing PR from a pushed --head, from any directory.')
   .requiredOption('--issue <number>')
   .option('--pr <number>', 'Exact existing PR selector; never creates a replacement')
   .option('--non-closing', 'Retain the issue OPEN using native non-closing reference proof')
@@ -525,7 +534,8 @@ program
   .option('--expected-base <sha>', 'Exact default-base SHA for the explicit reference action')
   .option('--title <title>')
   .option('--body-file <path>')
-  .option('--head <branch>', 'Explicit remote head; existing PR promotion verifies its native issue association')
+  .option('--head <branch>', 'Pushed remote head; no ai-delivery branch or worktree setup required')
+  .option('--base <branch>', 'Repository default branch (inferred when omitted)')
   .option('--ready', 'Publish ready, or promote the author-owned PR selected by --head')
   .option('--dry-run')
   .action(
@@ -539,6 +549,7 @@ program
       title?: string;
       bodyFile?: string;
       head?: string;
+      base?: string;
       ready?: boolean;
       dryRun?: boolean;
     }) =>
@@ -552,6 +563,7 @@ program
         title: o.title,
         body: body(undefined, o.bodyFile),
         headBranch: o.head,
+        base: o.base,
         draft: o.ready !== true,
         dryRun: o.dryRun === true,
       }),
@@ -698,6 +710,20 @@ program
       process.exitCode = 1;
     }
   });
+const mergeQueue = program.command('merge').command('queue').description('Host-local canonical repository merge queue');
+mergeQueue
+  .command('add <pr>')
+  .option('--issue <number>')
+  .action((pr: string, o: { issue?: string }) =>
+    run('issue_pr_merge', {
+      prNumber: int(pr),
+      ...(o.issue === undefined ? {} : { issueNumber: int(o.issue) }),
+      queue: true,
+    }),
+  );
+mergeQueue.command('status').action(() => run('issue_pr_merge_queue_status', {}));
+mergeQueue.command('run').action(() => run('issue_pr_merge_queue_run', {}));
+
 for (const [command, tool] of [
   ['pr:merge', 'issue_pr_merge'],
   ['finish', 'issue_finish'],
@@ -815,4 +841,7 @@ program
   });
 program.command('mcp:serve').action(async () => serveAiDeliveryMcp(execution()));
 
-program.parseAsync(process.argv).catch(printCommandError);
+program.parseAsync(process.argv).catch((error: unknown) => {
+  const options = program.opts<{ json?: boolean; verbose?: boolean }>();
+  printCommandError(error, options.json === true && options.verbose === true);
+});

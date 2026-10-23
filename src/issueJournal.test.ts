@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { z } from 'zod';
 import { test, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -35,6 +36,17 @@ test('decision journal list fields start below their label and preserve nested s
     result,
     'A decision was made.\n\n**Kind:** decision. **Status:** Ready\n\n**Decision:**\n- First\n  - Nested\n- Second\n\n**Rationale:** The existing owner is sufficient.\n\n**Key numbers:** None reported.\n\n**Next:** Run checks (date not scheduled).\n\n**Evidence:** None yet.',
   );
+});
+
+test('published comment schema lists required fields for every journal kind', () => {
+  const schema = z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema);
+  assert.deepEqual(schema.anyOf, [
+    { properties: { kind: { const: 'start' } }, required: ['outcome'] },
+    { properties: { kind: { const: 'progress' } }, required: ['done', 'decisionNeeded'] },
+    { properties: { kind: { const: 'decision' } }, required: ['decision', 'rationale'] },
+    { properties: { kind: { const: 'blocker' } }, required: ['blocker', 'resolution'] },
+    { properties: { kind: { const: 'closeout' } }, required: ['acceptance', 'followUps'] },
+  ]);
 });
 
 test('journal tool validates all five typed templates before dispatch', () => {
@@ -391,6 +403,25 @@ test('registered journal tool returns actionable decision refusals before native
     const text = JSON.stringify(refused);
     assert.doesNotMatch(text, /-32602|Input validation error/u, 'a normal contract refusal must reach the handler');
     assert.match(text, /rationale/u);
+    const missingBoth = await client.callTool({ name: 'issue_comment', arguments: { ...common, kind: 'progress' } });
+    assert.equal(missingBoth.isError, true);
+    assert.match(JSON.stringify(missingBoth), /Missing required fields: done, decisionNeeded/u);
+    const missingCommon = await client.callTool({
+      name: 'issue_comment',
+      arguments: { repo: 'example/widget', issueNumber: 17, kind: 'decision' },
+    });
+    assert.equal(missingCommon.isError, true);
+    assert.match(
+      JSON.stringify(missingCommon),
+      /Missing required fields: summary, status, nextStep, nextDate, keyNumbers, evidence, decision, rationale/u,
+    );
+    assert.doesNotMatch(JSON.stringify(missingCommon), /-32602|Input validation error/u);
+
+    const published = (await client.listTools()).tools.find((t) => t.name === 'issue_comment');
+    assert.deepEqual(
+      published?.inputSchema.anyOf,
+      z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema).anyOf,
+    );
     assert.match(text, /[Pp]rovide/u, 'the refusal explains the correction');
     const listed = (await client.listTools()).tools.find((tool) => tool.name === 'issue_comment');
     assert.ok(listed);
@@ -435,7 +466,7 @@ test('registered journal tool returns actionable decision refusals before native
       /^Parser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
     );
     assert.match(renderedDecision, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
-    const retry = await client.callTool({ name: 'issue_comment', arguments: decision });
+    const retry = await client.callTool({ name: 'issue_comment', arguments: { ...decision, verbose: true } });
     assert.notEqual(retry.isError, true);
     const retried = JSON.parse((retry.content as { text: string }[])[0]!.text) as {
       body: string;
@@ -468,7 +499,7 @@ test('registered journal tool returns actionable decision refusals before native
         '**Follow-ups:** None.',
       ],
     ] as const) {
-      const accepted = await client.callTool({ name: 'issue_comment', arguments: variant });
+      const accepted = await client.callTool({ name: 'issue_comment', arguments: { ...variant, verbose: true } });
       assert.notEqual(accepted.isError, true, JSON.stringify(accepted));
       const value = JSON.parse((accepted.content as { text: string }[])[0]!.text) as { body: string; reused: boolean };
       assert.equal(value.reused, false);

@@ -5,7 +5,9 @@ import { z } from 'zod';
 import { executeTool, type ExecutionContext } from '../dispatch.js';
 import { setLogsSuppressed } from '../logger.js';
 import { PACKAGE_VERSION } from '../version.js';
+import { JOURNAL_SCHEMA_METADATA, missingJournalFields } from '../issueJournal.js';
 import { getIncompleteIssueUpdate } from '../issue.js';
+import { projectToolOutput } from '../toolOutput.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
@@ -36,19 +38,23 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
         // property names stay private through a schema-local error message.
         inputSchema:
           tool.name === 'issue_comment'
-            ? z.strictObject(tool.inputSchema.shape, {
-                error: 'Invalid journal object. Provide only the advertised fields.',
-              })
+            ? z
+                .strictObject(tool.inputSchema.shape, {
+                  error: 'Invalid journal object. Provide only the advertised fields.',
+                })
+                .partial()
+                .meta(JOURNAL_SCHEMA_METADATA)
             : tool.inputSchema,
       },
       async (args, extra) => {
         const parsed = tool.inputSchema.safeParse(args);
         if (!parsed.success) {
+          const missing = tool.name === 'issue_comment' ? missingJournalFields(args) : [];
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `Invalid arguments for ${tool.name}.${tool.name === 'issue_comment' ? ` ${tool.description}` : ''}`,
+                text: `Invalid arguments for ${tool.name}.${missing.length ? ` Missing required fields: ${missing.join(', ')}. Provide every missing field.` : tool.name === 'issue_comment' ? ` ${tool.description}` : ''}`,
               },
             ],
             isError: true,
@@ -56,9 +62,25 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
         }
         try {
           const signal = context.signal === undefined ? extra.signal : AbortSignal.any([context.signal, extra.signal]);
-          const pending = executeTool(tool.name as AiDeliveryMcpToolName, parsed.data, {
+          const { verbose, ...input } = parsed.data;
+          const progressToken = extra._meta?.progressToken;
+          let observations = 0;
+          const queueProgress: ExecutionContext['queueProgress'] =
+            tool.name !== 'issue_pr_merge_queue_run' || progressToken === undefined
+              ? undefined
+              : async (progress) =>
+                  extra.sendNotification({
+                    method: 'notifications/progress',
+                    params: {
+                      progressToken,
+                      progress: ++observations,
+                      message: `Observation ${observations}: ${progress.completed} entries complete, ${progress.remaining} remaining. ${progress.reason}`,
+                    },
+                  });
+          const pending = executeTool(tool.name as AiDeliveryMcpToolName, input, {
             ...context,
             signal,
+            ...(queueProgress === undefined ? {} : { queueProgress }),
           });
           activeCalls?.add(pending);
           let value: unknown;
@@ -67,11 +89,25 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
           } finally {
             activeCalls?.delete(pending);
           }
-          return { content: [{ type: 'text' as const, text: JSON.stringify(value) }] };
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(projectToolOutput(tool.name, value, verbose === true)) },
+            ],
+          };
         } catch (error) {
           const incomplete = getIncompleteIssueUpdate(error);
           if (incomplete !== undefined)
-            return { content: [{ type: 'text' as const, text: JSON.stringify(incomplete) }], isError: true };
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    projectToolOutput(tool.name, incomplete, 'verbose' in args && args.verbose === true),
+                  ),
+                },
+              ],
+              isError: true,
+            };
           const message = error instanceof Error ? error.message : String(error);
           return { content: [{ type: 'text' as const, text: message }], isError: true };
         }

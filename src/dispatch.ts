@@ -49,6 +49,7 @@ import {
 import { stageRuntime, admitRuntime, type StageRuntimeInput, type AdmitRuntimeInput } from './setup.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 import { IssueValidationError } from './issueContract.js';
+import { enqueuePr, queueStatus, runQueue, type QueueOptions } from './mergeQueue.js';
 
 export interface ExecutionContext {
   settings?: LoadedDeliverySettings;
@@ -59,6 +60,7 @@ export interface ExecutionContext {
   repoRoot: string;
   runtimeEntryPath?: string;
   signal?: AbortSignal;
+  queueProgress?: QueueOptions['onProgress'];
 }
 function requiredNumber(input: Record<string, unknown>, key: string): number {
   const value = input[key];
@@ -326,7 +328,7 @@ export async function executeTool(
       ...(execution.signal === undefined ? {} : { signal: execution.signal }),
     });
   }
-  const { repo: selected, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
+  const { repo: selected, verbose: _verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
   if (name === 'issue_finish' && input.nonClosing === true)
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
@@ -371,6 +373,35 @@ export async function executeTool(
     name === 'issue_pr_review' ? 'reviewer' : 'author',
   );
   if (local) context.root = root;
+  if (
+    (name === 'issue_pr_merge' && input.queue === true) ||
+    name === 'issue_pr_merge_queue_status' ||
+    name === 'issue_pr_merge_queue_run'
+  ) {
+    const settings = execution.settings ?? (await loadDeliverySettings());
+    const options = {
+      root: resolveCheckout({
+        repository: context.config.repository,
+        launchDirectory: execution.repoRoot,
+        checkoutRoots: settings.checkoutRoots,
+        canonical: true,
+      }),
+      ...(execution.signal === undefined ? {} : { signal: execution.signal }),
+      ...(execution.queueProgress === undefined ? {} : { onProgress: execution.queueProgress }),
+    };
+    return name === 'issue_pr_merge_queue_status'
+      ? queueStatus(context, options)
+      : name === 'issue_pr_merge_queue_run'
+        ? runQueue(context, options)
+        : enqueuePr(
+            context,
+            {
+              prNumber: requiredNumber(input, 'prNumber'),
+              ...(input.issueNumber === undefined ? {} : { issueNumber: requiredNumber(input, 'issueNumber') }),
+            },
+            options,
+          );
+  }
   switch (name) {
     case 'delivery_health':
       return deliveryHealth(context, { ...input, repo: repo! } as DeliveryHealthRequest);
@@ -409,7 +440,10 @@ export async function executeTool(
         ...(input.expectedBaseSha === undefined ? {} : { expectedBaseSha: requireString(input, 'expectedBaseSha') }),
         ...(input.body === undefined ? {} : { body: requireString(input, 'body') }),
         ...(input.title === undefined ? {} : { title: requireString(input, 'title') }),
-        ...(input.headBranch === undefined ? {} : { headBranch: requireString(input, 'headBranch') }),
+        ...(input.head === undefined && input.headBranch === undefined
+          ? {}
+          : { headBranch: requireString(input, input.head === undefined ? 'headBranch' : 'head') }),
+        ...(input.base === undefined ? {} : { baseBranch: requireString(input, 'base') }),
         draft: input.draft !== false,
         dryRun: input.dryRun === true,
       });

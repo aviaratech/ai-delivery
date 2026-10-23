@@ -1,5 +1,7 @@
 # Recorded public GitHub fragments
 
+Issue #188's queue tests reuse the observed `reviewDecision: null` value below. Its non-draft eligibility, queue-SHA checks, ordered squashes, owner refresh/`BEHIND` transitions, head/base drift, conflict, failed check, cancellation and lost acknowledgements are explicitly synthetic. `queueScenario` uses real owned Git objects and the actual bounded process runner, substituting only remote transport, GitHub HTTP and selected-author credentials. These cases neither qualify a hosted queue-SHA workflow nor establish a production outside-writer race.
+
 These fixtures support issue #167's approved four-file design. On October 21,
 2026, the operator explicitly accepted recorded public fragments plus labeled
 synthetic transitions. They characterize the existing native GitHub eligibility
