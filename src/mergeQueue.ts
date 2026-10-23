@@ -143,7 +143,10 @@ const NativeCommentEdit = z.object({
 });
 const NativeApproval = NativeCommentEdit.extend({
   body: z.string(),
-  author: z.object({ __typename: z.literal('User'), id: z.string().min(1), login: z.string().min(1) }),
+  author: z.discriminatedUnion('__typename', [
+    z.object({ __typename: z.literal('User'), id: z.string().min(1), login: z.string().min(1) }),
+    z.object({ __typename: z.enum(['Bot', 'Organization', 'Mannequin']), login: z.string().min(1) }),
+  ]),
   repository: z.object({ id: z.string().min(1), nameWithOwner: z.string() }),
   pullRequest: z.object({ id: z.string().min(1), number: z.number().int().positive() }),
   createdAt: z.iso.datetime({ offset: true }),
@@ -257,25 +260,36 @@ async function chooseApproval(
     const ids = new Set(discovered.filter((c) => c.body.startsWith('ai-delivery merge approval')).map((c) => c.id));
     for (const g of q.grants) if (g.members.some((m) => m.entryId === first.id)) ids.add(g.id);
     for (const id of ids) {
+      // A failed read cannot establish that a competing grant is ineligible.
+      const result = await context.clients.graphql<{ node: unknown }>(
+        `query DeliveryQueueApprovalNode($id:ID!){node(id:$id){... on IssueComment{${approvalFields}}}}`,
+        { id },
+      );
+      if (result.node === null) {
+        diagnostics.push({ id, reason: 'Approval comment is deleted or no longer readable.' });
+        continue;
+      }
+      const parsed = NativeApproval.safeParse(result.node),
+        prior = q.grants.find((g) => g.id === id);
+      if (
+        !parsed.success ||
+        parsed.data.id !== id ||
+        parsed.data.repository.id !== repositoryId ||
+        parsed.data.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
+        parsed.data.pullRequest.id !== (prior?.anchorId ?? first.prId) ||
+        parsed.data.pullRequest.number !== (prior?.anchorNumber ?? first.prNumber)
+      ) {
+        const reason = parsed.success
+          ? 'Approval native repository/comment/target identity changed.'
+          : 'Approval is missing native identity/edit proof.';
+        diagnostics.push({ id, reason });
+        return { reason: `Approval evidence unavailable: ${reason}`, diagnostics };
+      }
+      const c = parsed.data;
       try {
-        const result = await context.clients.graphql<{ node: unknown }>(
-          `query DeliveryQueueApprovalNode($id:ID!){node(id:$id){... on IssueComment{${approvalFields}}}}`,
-          { id },
-        );
-        if (result.node === null) throw new DeliveryError('Approval comment is deleted or no longer readable.');
-        const parsed = NativeApproval.safeParse(result.node);
-        if (!parsed.success) throw new DeliveryError('Approval is missing native identity/edit proof.');
-        const c = parsed.data,
-          prior = q.grants.find((g) => g.id === id);
         if (c.lastEditedAt !== null || c.editor !== null) throw new DeliveryError('Approval was edited after posting.');
         if (c.isMinimized) throw new DeliveryError('Approval is minimized.');
-        if (
-          c.id !== id ||
-          c.repository.id !== repositoryId ||
-          c.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase()
-        )
-          throw new DeliveryError('Approval native repository/comment identity changed.');
-        if (!logins.includes(c.author.login.toLowerCase()))
+        if (c.author.__typename !== 'User' || !logins.includes(c.author.login.toLowerCase()))
           throw new DeliveryError('Approval author is not a configured approver.');
         const document = approvalDocument(c.body),
           expires = Date.parse(document.expiresAt);
@@ -291,8 +305,6 @@ async function chooseApproval(
             prior.bodyDigest !== digestValue(c.body) ||
             prior.authorId !== c.author.id ||
             prior.authorLogin.toLowerCase() !== c.author.login.toLowerCase() ||
-            prior.anchorId !== c.pullRequest.id ||
-            prior.anchorNumber !== c.pullRequest.number ||
             prior.consumed >= prior.members.length
           )
             throw new DeliveryError('Approval binding changed or was already consumed.');
@@ -1003,12 +1015,14 @@ export async function runQueue(context: DeliveryContext, options: QueueOptions) 
                       `ai-delivery queue ${inputs}`,
                     ]),
                   );
+                  await flushNotice(entry.id);
                   await update((current) => {
                     const e = current.entries.find((e) => e.id === entry.id)!;
                     e.head = pr.head.sha;
                     e.prediction = { base: baseSha, parent, sha, tree, inputs };
+                    transition(e, 'verifying');
                   });
-                  await setState(entry.id, 'verifying');
+                  await flushNotice(entry.id);
                 }
                 const predicted = read(at).entries.find((e) => e.id === entry.id)!;
                 if (predicted.published !== predicted.prediction!.sha) {

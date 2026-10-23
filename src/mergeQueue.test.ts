@@ -116,6 +116,62 @@ for (const mode of ['pagination', 'wrong-target', 'ambiguous', 'no-config', 'rea
   });
 }
 
+for (const phase of ['discovery', 'final-merge-gate', 'missing-metadata'] as const) {
+  test(`unreadable competing approval refuses authority at ${phase}`, { timeout: 0 }, async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    const addUnavailable = () => {
+      const competing = s.approve();
+      if (phase === 'missing-metadata') Reflect.deleteProperty(competing, 'lastEditedAt');
+      else s.controls.unreadableApprovalIds.add(competing.node_id);
+    };
+    if (phase !== 'final-merge-gate') addUnavailable();
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    const stop = new AbortController();
+    let armed = phase !== 'final-merge-gate';
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        if (!armed) {
+          addUnavailable();
+          armed = true;
+        } else stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    const status = await queueStatus(context, { root: f.root });
+    assert.equal(status.entries[0]!.state, 'needs-approval');
+    assert.match(status.entries[0]!.reason!, /unavailable/u);
+    assert.equal(s.prs[0]!.merged, false);
+    if (phase !== 'final-merge-gate') assert.equal(s.events.includes('git.push'), false);
+    f.assertInert();
+  });
+}
+
+for (const kind of ['non-approver', 'bot'] as const) {
+  test(
+    `a conclusively invalid ${kind} approval does not suppress a valid grant`,
+    { timeout: 0 },
+    async ({ signal }) => {
+      const f = inertTarget(signal),
+        s = queueScenario(f, 1),
+        invalid = s.approve();
+      if (kind === 'non-approver') invalid.user.login = 'outsider';
+      else invalid.user.type = 'Bot';
+      const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+      await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+      await runQueue(context, { root: f.root, signal: f.signal });
+      assert.equal(s.prs[0]!.merged, true);
+      assert.equal(s.events.filter((event) => event === 'native.merge:23').length, 1);
+      assert.ok(f.comments.some((comment) => comment.body.includes('ignored:')));
+      f.assertInert();
+    },
+  );
+}
+
 for (const outcome of ['present', 'absent', 'duplicate', 'spoofed', 'edited', 'same-second-restored'] as const) {
   test(
     `queue reconciles comment loss without duplicate POST, outcome=${outcome}`,
@@ -669,6 +725,99 @@ test(
     assert.notEqual(result.response.isError, true, result.text);
     assert.equal(s.prs[0]!.merged, true);
     assert.equal(s.prs[1]!.merged, true);
+    f.assertInert();
+  },
+);
+
+test(
+  'refreshed prediction checkpoint resumes with the uninterrupted transition notices',
+  { timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 2);
+    s.controls.reviewDecision = 'REVIEW_REQUIRED';
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    for (const pr of s.prs) await enqueuePr(context, { prNumber: pr.number }, { root: f.root });
+    const runUntilReady = async (head: string) => {
+      const stop = new AbortController();
+      await runQueue(context, {
+        root: f.root,
+        signal: AbortSignal.any([f.signal, stop.signal]),
+        onProgress: async () => {
+          const entries = (await queueStatus(context, { root: f.root })).entries;
+          if (entries[0]!.state === 'waiting' && entries[1]!.state === 'ready' && entries[1]!.head === head)
+            stop.abort();
+        },
+      }).catch((error: unknown) => {
+        if (!stop.signal.aborted) throw error;
+      });
+    };
+    await runUntilReady(s.prs[1]!.head);
+    const path = join(f.root, '.git', 'ai-delivery', 'merge-queue', 'queue.json'),
+      store = join(f.root, '.git', 'ai-delivery', 'merge-queue', 'objects.git'),
+      original = readFileSync(path),
+      originalEntries = (await queueStatus(context, { root: f.root })).entries,
+      originalComments = structuredClone(f.comments);
+    s.refresh(24, true);
+    const refreshedHead = s.prs[1]!.head,
+      outcomes: { notices: string[]; sha: string; tree: string }[] = [];
+    for (const interrupted of [false, true]) {
+      if (interrupted) {
+        // Fork the same completed fictional checkpoint and Git inputs; this is not a runtime reset path.
+        assert.equal(existsSync(store), false);
+        writeFileSync(path, original, { mode: 0o600 });
+        f.comments.splice(0, f.comments.length, ...structuredClone(originalComments));
+        for (const entry of originalEntries) {
+          const ref = `refs/heads/ai-delivery/queue/${entry.prNumber}`,
+            current = fixtureGit(s.remote, 'rev-parse', ref);
+          fixtureGit(s.remote, 'update-ref', ref, entry.published!, current);
+        }
+        const atomic = await import('./utils/atomicJson.js');
+        const write = atomic.writePrivateJsonFileAtomically;
+        let stopped = false;
+        const fault = vi.spyOn(atomic, 'writePrivateJsonFileAtomically').mockImplementation((target, value) => {
+          if (target === path && stopped) throw new Error('Synthetic controller loss at prediction checkpoint');
+          write(target, value);
+          const entries = (value as { entries?: { prNumber: number; head: string }[] }).entries;
+          if (target === path && entries?.some((entry) => entry.prNumber === 24 && entry.head === refreshedHead)) {
+            stopped = true;
+            throw new Error('Synthetic controller loss at prediction checkpoint');
+          }
+        });
+        try {
+          await assert.rejects(
+            runQueue(context, { root: f.root, signal: f.signal }),
+            /Synthetic controller loss at prediction checkpoint/u,
+          );
+        } finally {
+          fault.mockRestore();
+        }
+        assert.equal(stopped, true);
+        const checkpoint = await queueStatus(context, { root: f.root });
+        assert.equal(checkpoint.entries[1]!.head, refreshedHead);
+        assert.equal(checkpoint.entries[1]!.state, 'verifying');
+        assert.match(checkpoint.entries[1]!.notice!.body, /PR #24 verifying/u);
+        assert.equal(checkpoint.pending, undefined);
+        assert.equal(existsSync(store), true);
+      }
+      await runUntilReady(refreshedHead);
+      assert.equal(existsSync(store), false);
+      const entry = (await queueStatus(context, { root: f.root })).entries[1]!;
+      const notices = f.comments
+        .filter((comment) => comment.user.login === 'operator' && comment.issue_url.endsWith('/issues/24'))
+        .map((comment) => comment.body);
+      assert.deepEqual(
+        notices.map((body) => /PR #24 (verifying|ready)\./u.exec(body)?.[1]),
+        ['verifying', 'ready', 'verifying', 'ready'],
+      );
+      assert.equal(
+        s.events.some((event) => event.startsWith('native.merge')),
+        false,
+      );
+      assert.equal(s.object(entry.prediction!.sha).tree.sha, entry.prediction!.tree);
+      outcomes.push({ notices, sha: entry.prediction!.sha, tree: entry.prediction!.tree });
+    }
+    assert.deepEqual(outcomes[1], outcomes[0]);
     f.assertInert();
   },
 );

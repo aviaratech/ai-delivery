@@ -878,6 +878,7 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
     pendingChecks: false,
     loseCommentAck: false,
     approvalFault: '' as '' | 'pagination' | 'wrong-target' | 'read-error',
+    unreadableApprovalIds: new Set<string>(),
     pendingFor: new Set<number>(),
     reviewDecision: 'APPROVED' as string | null,
   };
@@ -1073,6 +1074,7 @@ export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
       };
     };
     if (query.includes('DeliveryQueueApprovalNode')) {
+      if (controls.unreadableApprovalIds.has(String(variables.id))) throw new Error('Synthetic selective read failure');
       const c = f.comments.find((c) => c.node_id === variables.id);
       return { node: c ? nativeComment(c) : null };
     }
