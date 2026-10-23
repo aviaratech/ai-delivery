@@ -1,0 +1,308 @@
+// Temporary issue178 experiment. No live credentials, package imports or host changes.
+import { spawn, spawnSync, fork } from 'node:child_process';
+import { createHash, generateKeyPairSync, createPrivateKey } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, lstatSync, existsSync, copyFileSync, appendFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { release } from 'node:os';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const script = join(here, 'supervisor.ps1');
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const literal = ['', 'with spaces', 'snowman-\u2603', 'embedded"quote', 'trailing\\', ';$env:USERPROFILE|&%PATH%'];
+const safe = () => Object.fromEntries(
+  ['SystemRoot', 'TEMP', 'TMP', 'USERPROFILE'].filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]),
+);
+const fail = (message) => { throw new Error(message); };
+const check = (condition, message) => { if (!condition) fail(message); };
+const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+function atomic(path, value) {
+  writeFileSync(path + '.partial', JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+  renameSync(path + '.partial', path);
+}
+function powershell() {
+  check(process.platform === 'win32' && process.arch === 'x64', 'Native Windows x64 required');
+  const root = process.env.SystemRoot;
+  check(root && /^[A-Za-z]:\\/u.test(root), 'Missing fully qualified SystemRoot');
+  const executable = join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  check(existsSync(executable), 'Stock PowerShell5.1 unavailable; no fallback');
+  return executable;
+}
+function inspect(identity, terminate = false) {
+  const args = ['-NoProfile', '-NonInteractive', '-File', script, '-Mode', 'Inspect', '-TargetPid', String(identity.pid)];
+  if (identity.birth) args.push('-ExpectedBirth', identity.birth);
+  if (terminate) {
+    check(/^[0-9]+$/u.test(identity.birth ?? ''), 'Cleanup requires retained creation identity');
+    args.push('-TerminateOwned');
+  }
+  const observed = spawnSync(powershell(), args, { shell: false, env: safe(), encoding: 'utf8', maxBuffer: 16384 });
+  check(observed.status === 0, 'Identity observer failed: ' + observed.stderr.slice(0, 2048));
+  try { return JSON.parse(observed.stdout); } catch { fail('Identity observer returned no structured proof'); }
+}
+async function absent(identity) {
+  const first = inspect(identity);
+  if (first.state === 'absent') return { identity, absent: true, terminationNeeded: false };
+  check(first.state === 'alive' && first.sameIdentity, 'Owned identity is unknown or changed');
+  const stopped = inspect(identity, true);
+  check(stopped.state === 'absent' && stopped.sameIdentity, 'Owned diagnostic cleanup unverified');
+  return { identity, absent: true, terminationNeeded: true };
+}
+async function exited(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((done) => child.once('exit', done));
+}
+async function helper(mode) {
+  if (mode === 'peer' || mode === 'hold') {
+    setInterval(() => {}, 1000);
+    return;
+  }
+  if (mode === 'pem' || mode === 'base64') {
+    check(JSON.stringify(process.argv.slice(4)) === JSON.stringify(literal), 'Literal argv changed');
+    const key = process.env.ISSUE178_SYNTHETIC_KEY;
+    check(key?.startsWith('-----BEGIN PRIVATE KEY-----'), 'Synthetic key absent');
+    process.stdout.write(mode === 'base64' ? Buffer.from(key).toString('base64') : key);
+    return;
+  }
+  if (mode === 'denied') { process.stderr.write('SYNTHETIC_PRIVATE_ERROR'); process.exitCode = 7; return; }
+  if (mode === 'malformed') { process.stdout.write('SYNTHETIC_MALFORMED_KEY'); return; }
+  if (mode === 'overflow' || mode === 'stderr-overflow') {
+    (mode === 'overflow' ? process.stdout : process.stderr).write('x'.repeat(70 * 1024));
+    setInterval(() => {}, 1000);
+    return;
+  }
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'helper', 'hold'], {
+    detached: true, stdio: 'ignore', shell: false, env: safe(),
+  });
+  child.unref();
+  process.stderr.write('synthetic-child-' + String(child.pid) + '\n');
+  if (mode === 'immediate-exit') process.exit(0);
+  else if (mode === 'descendant-exit') setTimeout(() => process.exit(0), 500);
+  else setInterval(() => {}, 1000);
+}
+async function controller() {
+  let child;
+  let output = [];
+  let bytes = 0;
+  let protocolBytes = 0;
+  let pending = '';
+  let statuses = [];
+  let nonProtocolLines = 0;
+  process.on('message', (message) => {
+    if (message.action === 'launch') {
+      child = spawn(powershell(), ['-NoProfile', '-NonInteractive', '-File', script], {
+        shell: false, env: safe(), stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      child.stdin.on('error', () => {});
+      child.stdout.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes <= 65536) output.push(chunk);
+        else { output = []; child.kill(); }
+      });
+      child.stderr.on('data', (chunk) => {
+        protocolBytes += chunk.length;
+        if (protocolBytes > 65536) { child.kill(); return; }
+        pending += chunk.toString('utf8');
+        for (;;) {
+          const index = pending.indexOf('\n');
+          if (index < 0) break;
+          const line = pending.slice(0, index); pending = pending.slice(index + 1);
+          try {
+            const value = JSON.parse(line);
+            statuses.push(value);
+            process.send({ event: 'status', value });
+          } catch { nonProtocolLines++; }
+        }
+      });
+      child.once('error', () => process.send({ event: 'spawn-error' }));
+      child.once('close', (code, signal) => {
+        process.send({ event: 'finished', code, signal, statuses, bytes, protocolBytes, nonProtocolLines,
+          output: Buffer.concat(output).toString('base64') }, () => process.exit(0));
+      });
+    } else if (message.action === 'request') child.stdin.write(JSON.stringify(message.request) + '\n');
+    else if (message.action === 'cancel') child.stdin.write('cancel\n');
+    else if (message.action === 'eof') child.stdin.end();
+    else if (message.action === 'stop') child?.kill();
+  });
+}
+function stage(destination) {
+  check(process.platform === 'linux', 'Staging proof requires native Linux');
+  check(!existsSync(destination), 'Fresh staging directory required');
+  mkdirSync(destination, { recursive: true });
+  const files = {};
+  for (const name of ['probe.mjs', 'supervisor.ps1']) {
+    const source = join(here, name);
+    check(lstatSync(source).isFile() && !lstatSync(source).isSymbolicLink(), 'Regular fixture file required');
+    copyFileSync(source, join(destination, name));
+    files[name] = sha256(readFileSync(source));
+  }
+  const git = (args) => {
+    const result = spawnSync('git', args, { encoding: 'utf8', maxBuffer: 4096 });
+    check(result.status === 0, 'Source identity unavailable');
+    return result.stdout.trim();
+  };
+  const head = git(['rev-parse', 'HEAD']);
+  check(head === process.env.PROBE_SOURCE_SHA && /^[a-f0-9]{40}$/u.test(head), 'Staged source mismatch');
+  const manifest = { schema: 'issue178-probe-input@1', sourceSha: head, sourceTree: git(['rev-parse', 'HEAD^{tree}']),
+    platform: process.platform, arch: process.arch, node: process.version, files };
+  atomic(join(destination, 'manifest.json'), manifest);
+  const digest = sha256(readFileSync(join(destination, 'manifest.json')));
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, 'input_digest=' + digest + '\n');
+  console.log(JSON.stringify({ stage: 'linux-input-complete', sourceSha: head, files,
+    manifestSha256: digest }));
+}
+async function run(destination) {
+  check(process.platform === 'win32' && process.arch === 'x64' && process.version === 'v24.21.0', 'Native pinned Windows controller required');
+  check(!existsSync(destination), 'Fresh result directory required');
+  mkdirSync(destination, { recursive: true });
+  const manifest = JSON.parse(readFileSync(join(here, 'manifest.json'), 'utf8'));
+  check(sha256(readFileSync(join(here, 'manifest.json'))) === process.env.PROBE_INPUT_DIGEST, 'Linux artifact digest mismatch');
+  check(manifest.platform === 'linux' && manifest.sourceSha === process.env.PROBE_SOURCE_SHA, 'Linux/source provenance mismatch');
+  for (const [name, digest] of Object.entries(manifest.files)) check(sha256(readFileSync(join(here, name))) === digest, 'Detached fixture bytes changed');
+  const report = { schema: 'issue178-windows-feasibility@1', source: manifest,
+    manifestSha256: sha256(readFileSync(join(here, 'manifest.json'))), platform: process.platform, arch: process.arch,
+    osRelease: release(), node: process.version, powershell: powershell(), startedAt: new Date().toISOString(),
+    complete: false, productAcceptance: false, liveCredentialAccess: false, cases: [], cleanup: [], errors: [],
+    limits: { helperResponseMs: 30000, combinedHelperOutputBytes: 65536, supervisorProtocolBytes: 65536,
+      nativeCleanupObservationMs: 3000, externalJobLimitMinutes: 15 } };
+  const checkpoint = () => {
+    const path = join(destination, 'result.json');
+    writeFileSync(path + '.partial', JSON.stringify(report, null, 2) + '\n');
+    renameSync(path + '.partial', path);
+  };
+  checkpoint();
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } }).privateKey;
+  const peer = spawn(process.execPath, [fileURLToPath(import.meta.url), 'helper', 'peer'], { shell: false, stdio: 'ignore', env: safe() });
+  let peerIdentity;
+  try {
+    peerIdentity = inspect({ pid: peer.pid });
+    check(peerIdentity.state === 'alive' && peerIdentity.birth, 'Peer creation identity missing');
+  } catch (error) {
+    peer.kill(); await exited(peer);
+    report.errors.push({ category: 'observer-admission', reason: error instanceof Error ? error.message : 'Observer unavailable' });
+    report.peerCleanup = { directOwnedHandleExited: peer.exitCode !== null || peer.signalCode !== null };
+    report.cleanupConfirmed = report.peerCleanup.directOwnedHandleExited;
+    report.completedAt = new Date().toISOString(); checkpoint(); process.exitCode = 1; return;
+  }
+  report.peer = peerIdentity;
+  const controllers = new Set();
+  const owned = new Map();
+  const cases = ['pem', 'base64', 'denied', 'malformed', 'missing', 'descendant-exit', 'immediate-exit',
+    'cancel', 'eof', 'timeout', 'overflow', 'stderr-overflow', 'initialization-loss', 'controller-loss', 'supervisor-loss'];
+  try {
+    for (const mode of cases) {
+      const record = { mode, startedAt: new Date().toISOString(), identities: [], passed: false };
+      report.cases.push(record); checkpoint();
+      console.log(JSON.stringify({ stage: 'native-case', unit: mode, completed: report.cases.length - 1, remaining: cases.length - report.cases.length + 1 }));
+      const child = fork(fileURLToPath(import.meta.url), ['controller'], { execArgv: [], env: safe(), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+      controllers.add(child);
+      let requestSent = false;
+      let actionSent = false;
+      let supervisor;
+      let completion;
+      let controllerClosed = false;
+      let rootPid;
+      const statuses = [];
+      const request = {
+        argv: [mode === 'missing' ? join(destination, 'missing.exe') : process.execPath, fileURLToPath(import.meta.url), 'helper',
+          ['cancel', 'eof', 'timeout', 'controller-loss', 'supervisor-loss'].includes(mode) ? 'hold-tree' : mode, ...literal],
+        environment: { ...safe(), ISSUE178_SYNTHETIC_KEY: key }, cwd: destination,
+        deadline: new Date(Date.now() + 30000).toISOString(),
+      };
+      child.on('message', (message) => {
+        if (message.event === 'status') {
+          const value = message.value; statuses.push(value);
+          if (value.phase === 'bootstrap') {
+            supervisor = value.identity; owned.set(String(supervisor.pid), supervisor);
+            if (mode === 'initialization-loss') { actionSent = true; child.kill(); }
+            else { requestSent = true; child.send({ action: 'request', request }); }
+          }
+          if (value.root) { rootPid = value.root.pid; owned.set(String(value.root.pid), value.root); record.identities.push(value.root); }
+          if (value.phase === 'member') { owned.set(String(value.identity.pid), value.identity); record.identities.push(value.identity); }
+          if (!actionSent && value.phase === 'member' && value.identity.pid !== rootPid) {
+            if (mode === 'cancel') { actionSent = true; child.send({ action: 'cancel' }); }
+            if (mode === 'eof') { actionSent = true; child.send({ action: 'eof' }); }
+            if (mode === 'controller-loss') { actionSent = true; child.kill(); }
+            if (mode === 'supervisor-loss') { actionSent = true; inspect(supervisor, true); }
+          }
+        } else if (message.event === 'finished') completion = message;
+      });
+      child.once('close', () => { controllerClosed = true; });
+      child.send({ action: 'launch' });
+      // This is the real 30s credential response window, followed by existing cleanup observation.
+      // A 10s protocol stall after that window is diagnostic failure, never an extended helper allowance.
+      const observationDeadline = Date.now() + 43000;
+      while (!completion && !controllerClosed && Date.now() < observationDeadline) await delay(25);
+      if (!completion && !controllerClosed) { child.send({ action: 'stop' }); fail('Supervisor protocol stalled after response and cleanup windows'); }
+      await exited(child); controllers.delete(child);
+      record.requestSent = requestSent; record.actionSent = actionSent;
+      record.statuses = statuses;
+      const final = completion?.statuses.findLast((value) => value.phase === 'complete');
+      record.final = final ?? null;
+      record.transport = completion ? { code: completion.code, signal: completion.signal, bytes: completion.bytes,
+        protocolBytes: completion.protocolBytes, nonProtocolLines: completion.nonProtocolLines } : { controllerLost: true };
+      if (['initialization-loss', 'controller-loss', 'supervisor-loss'].includes(mode)) {
+        check(actionSent && supervisor, 'Loss boundary was not reached');
+        await delay(1000);
+        const observed = inspect(supervisor);
+        record.supervisorAbsence = observed;
+        check(observed.state === 'absent', 'Supervisor survived the loss boundary');
+        record.jobZero = 'unobserved-after-loss';
+      } else {
+        check(final && final.jobZero && final.pendingReadsSettled, 'Native job-zero/I/O settlement proof missing');
+        const expected = { missing: 'admission-failure', denied: 'helper-exit', cancel: 'cancel', eof: 'parent-eof',
+          timeout: 'timeout', overflow: 'overflow', 'stderr-overflow': 'overflow' }[mode] ?? 'success';
+        check(final.reason === expected, 'Unexpected native terminal reason');
+        check(completion.nonProtocolLines === 0, 'Unstructured supervisor diagnostics');
+        check(completion.bytes <= 65536, 'Private output bound exceeded');
+        if (mode === 'pem' || mode === 'base64') {
+          let pem = Buffer.from(completion.output, 'base64').toString('utf8');
+          if (mode === 'base64') pem = Buffer.from(pem, 'base64').toString('utf8');
+          check(pem === key && createPrivateKey(pem).asymmetricKeyType === 'rsa', 'Selected synthetic RSA response mismatch');
+          record.literalArgumentsExact = true; record.selectedRsaResponseExact = true;
+        }
+        if (mode === 'malformed') {
+          check(Buffer.from(completion.output, 'base64').toString() === 'SYNTHETIC_MALFORMED_KEY', 'Malformed capture mismatch');
+          record.sourceValidation = 'outside-this-supervision-probe';
+        }
+      }
+      const identities = [...new Map(record.identities.map((identity) => [String(identity.pid), identity])).values()];
+      record.nativeAbsence = identities.map((identity) => inspect(identity));
+      check(record.nativeAbsence.every((value) => value.state === 'absent'), 'An owned helper identity survived');
+      const peerAfter = inspect(peerIdentity);
+      check(peerAfter.state === 'alive' && peerAfter.sameIdentity, 'Unrelated peer was changed');
+      record.peerPreserved = true; record.passed = true; record.completedAt = new Date().toISOString();
+      record.driverRssBytes = process.memoryUsage().rss;
+      checkpoint();
+    }
+    report.complete = true;
+  } catch (error) {
+    report.errors.push({ category: 'probe-failure', reason: error instanceof Error ? error.message : 'Unknown probe failure' });
+  } finally {
+    for (const child of controllers) {
+      try { child.send({ action: 'stop' }); } catch {}
+      await delay(100);
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await exited(child);
+    }
+    for (const identity of owned.values()) {
+      try { report.cleanup.push(await absent(identity)); }
+      catch { report.cleanup.push({ identity, absent: 'unknown' }); }
+    }
+    if (peer.exitCode === null && peer.signalCode === null) peer.kill();
+    await exited(peer);
+    report.peerCleanup = inspect(peerIdentity);
+    report.cleanupConfirmed = report.cleanup.every((value) => value.absent === true) && report.peerCleanup.state === 'absent';
+    report.completedAt = new Date().toISOString();
+    checkpoint();
+  }
+  console.log(JSON.stringify({ stage: 'native-complete', passed: report.cases.filter((value) => value.passed).length,
+    total: cases.length, complete: report.complete, cleanupConfirmed: report.cleanupConfirmed, evidence: join(destination, 'result.json') }));
+  if (!report.complete || !report.cleanupConfirmed) process.exitCode = 1;
+}
+const [mode, argument] = process.argv.slice(2);
+if (mode === 'helper') await helper(argument);
+else if (mode === 'controller') await controller();
+else if (mode === 'stage') stage(resolve(argument));
+else if (mode === 'run') await run(resolve(argument));
+else fail('Use only the approved stage/run/fixture modes');
