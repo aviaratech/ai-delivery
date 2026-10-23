@@ -90,6 +90,7 @@ Bind 'WaitForSingleObject' $u32 @($ptr, $u32)
 Bind 'GetExitCodeProcess' $bool @($ptr, $u32.MakeByRefType())
 Bind 'GetProcessTimes' $bool @($ptr, $ptr, $ptr, $ptr, $ptr)
 Bind 'OpenProcess' $ptr @($u32, $bool, $u32)
+Bind 'IsProcessInJob' $bool @($ptr, $ptr, $bool.MakeByRefType())
 Bind 'TerminateProcess' $bool @($ptr, $u32)
 Bind 'CloseHandle' $bool @($ptr)
 $native = $builder.CreateType()
@@ -285,7 +286,16 @@ try {
                 if (-not $observed.ContainsKey($memberPid)) {
                     $h = N 'OpenProcess' @([uint32]0x101000, $false, [uint32]$memberPid)
                     if ($h -ne [IntPtr]::Zero) {
-                        try { $identity = @{ pid = $memberPid; birth = (Birth $h) }; $observed[$memberPid] = $identity; Status @{ phase = 'member'; identity = $identity } }
+                        try {
+                            # Enumeration is not ownership: the PID may have been reused before OpenProcess.
+                            $membership = [object[]]@($h, $job, $false)
+                            if (-not (N 'IsProcessInJob' $membership)) { throw 'job-membership-observation' }
+                            if ($membership[2]) {
+                                $identity = @{ pid = $memberPid; birth = (Birth $h) }
+                                $observed[$memberPid] = $identity
+                                Status @{ phase = 'member'; identity = $identity; membershipVerified = $true }
+                            }
+                        }
                         finally { [void](N 'CloseHandle' @($h)) }
                     }
                 }

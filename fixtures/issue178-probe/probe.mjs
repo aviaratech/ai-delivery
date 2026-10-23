@@ -16,6 +16,18 @@ const safe = () => Object.fromEntries(
 const fail = (message) => { throw new Error(message); };
 const check = (condition, message) => { if (!condition) fail(message); };
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+const childOutcomes = new WeakMap();
+function tracked(child) {
+  const outcome = { error: false, closed: false };
+  outcome.done = new Promise((done) => {
+    child.once('error', () => { outcome.error = true; });
+    child.once('close', (code, signal) => {
+      outcome.closed = true; outcome.code = code; outcome.signal = signal; done(outcome);
+    });
+  });
+  childOutcomes.set(child, outcome);
+  return child;
+}
 function atomic(path, value) {
   writeFileSync(path + '.partial', JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
   renameSync(path + '.partial', path);
@@ -48,8 +60,9 @@ async function absent(identity) {
   return { identity, absent: true, terminationNeeded: true };
 }
 async function exited(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise((done) => child.once('exit', done));
+  const outcome = childOutcomes.get(child);
+  check(outcome, 'Child outcome was not retained before launch');
+  return outcome.done;
 }
 async function helper(mode) {
   if (mode === 'peer' || mode === 'hold') {
@@ -73,6 +86,7 @@ async function helper(mode) {
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'helper', 'hold'], {
     detached: true, stdio: 'ignore', shell: false, env: safe(),
   });
+  child.once('error', () => process.exit(3));
   child.unref();
   process.stderr.write('synthetic-child-' + String(child.pid) + '\n');
   if (mode === 'immediate-exit') process.exit(0);
@@ -87,11 +101,19 @@ async function controller() {
   let pending = '';
   let statuses = [];
   let nonProtocolLines = 0;
+  const endInput = () => { try { child?.stdin.end(); } catch { try { child?.kill(); } catch {} } };
+  function emit(value, done) {
+    if (!process.connected) { endInput(); done?.(); return; }
+    try { process.send(value, (error) => { if (error) endInput(); done?.(); }); }
+    catch { endInput(); done?.(); }
+  }
+  process.once('disconnect', endInput);
   process.on('message', (message) => {
+    try {
     if (message.action === 'launch') {
-      child = spawn(powershell(), ['-NoProfile', '-NonInteractive', '-File', script], {
+      child = tracked(spawn(powershell(), ['-NoProfile', '-NonInteractive', '-File', script], {
         shell: false, env: safe(), stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      }));
       child.stdin.on('error', () => {});
       child.stdout.on('data', (chunk) => {
         bytes += chunk.length;
@@ -109,19 +131,23 @@ async function controller() {
           try {
             const value = JSON.parse(line);
             statuses.push(value);
-            process.send({ event: 'status', value });
+            emit({ event: 'status', value });
           } catch { nonProtocolLines++; }
         }
       });
-      child.once('error', () => process.send({ event: 'spawn-error' }));
+      child.once('error', () => emit({ event: 'spawn-error' }));
       child.once('close', (code, signal) => {
-        process.send({ event: 'finished', code, signal, statuses, bytes, protocolBytes, nonProtocolLines,
+        emit({ event: 'finished', code, signal, statuses, bytes, protocolBytes, nonProtocolLines,
           output: Buffer.concat(output).toString('base64') }, () => process.exit(0));
       });
     } else if (message.action === 'request') child.stdin.write(JSON.stringify(message.request) + '\n');
     else if (message.action === 'cancel') child.stdin.write('cancel\n');
-    else if (message.action === 'eof') child.stdin.end();
+    else if (message.action === 'eof') endInput();
     else if (message.action === 'stop') child?.kill();
+    } catch {
+      endInput();
+      emit({ event: 'controller-error' }, () => { if (!child) process.exit(2); });
+    }
   });
 }
 function stage(destination) {
@@ -162,8 +188,11 @@ async function run(destination) {
     manifestSha256: sha256(readFileSync(join(here, 'manifest.json'))), platform: process.platform, arch: process.arch,
     osRelease: release(), node: process.version, powershell: powershell(), startedAt: new Date().toISOString(),
     complete: false, productAcceptance: false, liveCredentialAccess: false, cases: [], cleanup: [], errors: [],
+    unexecuted: ['interruption after job/pipe/attribute allocation', 'full issue178 doctor/CredRead/configuration acceptance',
+      'production Linux-built plugin qualification', 'other Windows architectures and host policies'],
     limits: { helperResponseMs: 30000, combinedHelperOutputBytes: 65536, supervisorProtocolBytes: 65536,
-      nativeCleanupObservationMs: 3000, externalJobLimitMinutes: 15 } };
+      nativeCleanupObservationMs: 3000, externalJobLimitMinutes: 15,
+      identityObserver: 'synchronous; bounded 16KiB capture; external job backstop only' } };
   const checkpoint = () => {
     const path = join(destination, 'result.json');
     writeFileSync(path + '.partial', JSON.stringify(report, null, 2) + '\n');
@@ -172,15 +201,16 @@ async function run(destination) {
   checkpoint();
   const key = generateKeyPairSync('rsa', { modulusLength: 2048,
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } }).privateKey;
-  const peer = spawn(process.execPath, [fileURLToPath(import.meta.url), 'helper', 'peer'], { shell: false, stdio: 'ignore', env: safe() });
+  const peer = tracked(spawn(process.execPath, [fileURLToPath(import.meta.url), 'helper', 'peer'], { shell: false, stdio: 'ignore', env: safe() }));
   let peerIdentity;
   try {
+    check(Number.isInteger(peer.pid), 'Peer launch failed before PID assignment');
     peerIdentity = inspect({ pid: peer.pid });
     check(peerIdentity.state === 'alive' && peerIdentity.birth, 'Peer creation identity missing');
   } catch (error) {
     peer.kill(); await exited(peer);
     report.errors.push({ category: 'observer-admission', reason: error instanceof Error ? error.message : 'Observer unavailable' });
-    report.peerCleanup = { directOwnedHandleExited: peer.exitCode !== null || peer.signalCode !== null };
+    report.peerCleanup = { directOwnedHandleExited: childOutcomes.get(peer).closed, launchFailed: peer.pid === undefined };
     report.cleanupConfirmed = report.peerCleanup.directOwnedHandleExited;
     report.completedAt = new Date().toISOString(); checkpoint(); process.exitCode = 1; return;
   }
@@ -194,7 +224,7 @@ async function run(destination) {
       const record = { mode, startedAt: new Date().toISOString(), identities: [], passed: false };
       report.cases.push(record); checkpoint();
       console.log(JSON.stringify({ stage: 'native-case', unit: mode, completed: report.cases.length - 1, remaining: cases.length - report.cases.length + 1 }));
-      const child = fork(fileURLToPath(import.meta.url), ['controller'], { execArgv: [], env: safe(), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+      const child = tracked(fork(fileURLToPath(import.meta.url), ['controller'], { execArgv: [], env: safe(), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }));
       controllers.add(child);
       let requestSent = false;
       let actionSent = false;
@@ -202,7 +232,14 @@ async function run(destination) {
       let completion;
       let controllerClosed = false;
       let rootPid;
+      let eventFailure;
       const statuses = [];
+      const send = (message) => {
+        try {
+          if (!child.connected) { eventFailure = 'Controller IPC disconnected'; return; }
+          child.send(message, (error) => { if (error) eventFailure = 'Controller IPC send failed'; });
+        } catch { eventFailure = 'Controller IPC send failed'; }
+      };
       const request = {
         argv: [mode === 'missing' ? join(destination, 'missing.exe') : process.execPath, fileURLToPath(import.meta.url), 'helper',
           ['cancel', 'eof', 'timeout', 'controller-loss', 'supervisor-loss'].includes(mode) ? 'hold-tree' : mode, ...literal],
@@ -210,30 +247,36 @@ async function run(destination) {
         deadline: new Date(Date.now() + 30000).toISOString(),
       };
       child.on('message', (message) => {
+        try {
         if (message.event === 'status') {
           const value = message.value; statuses.push(value);
           if (value.phase === 'bootstrap') {
             supervisor = value.identity; owned.set(String(supervisor.pid), supervisor);
             if (mode === 'initialization-loss') { actionSent = true; child.kill(); }
-            else { requestSent = true; child.send({ action: 'request', request }); }
+            else { requestSent = true; send({ action: 'request', request }); }
           }
           if (value.root) { rootPid = value.root.pid; owned.set(String(value.root.pid), value.root); record.identities.push(value.root); }
           if (value.phase === 'member') { owned.set(String(value.identity.pid), value.identity); record.identities.push(value.identity); }
           if (!actionSent && value.phase === 'member' && value.identity.pid !== rootPid) {
-            if (mode === 'cancel') { actionSent = true; child.send({ action: 'cancel' }); }
-            if (mode === 'eof') { actionSent = true; child.send({ action: 'eof' }); }
+            if (mode === 'cancel') { actionSent = true; send({ action: 'cancel' }); }
+            if (mode === 'eof') { actionSent = true; send({ action: 'eof' }); }
             if (mode === 'controller-loss') { actionSent = true; child.kill(); }
             if (mode === 'supervisor-loss') { actionSent = true; inspect(supervisor, true); }
           }
         } else if (message.event === 'finished') completion = message;
+        else if (message.event === 'spawn-error') eventFailure = 'Supervisor launch failed';
+        else if (message.event === 'controller-error') eventFailure = 'Supervisor controller operation failed';
+        } catch { eventFailure = 'Controller message observation failed'; }
       });
+      child.once('error', () => { eventFailure = 'Controller launch failed'; });
       child.once('close', () => { controllerClosed = true; });
-      child.send({ action: 'launch' });
+      send({ action: 'launch' });
       // This is the real 30s credential response window, followed by existing cleanup observation.
       // A 10s protocol stall after that window is diagnostic failure, never an extended helper allowance.
       const observationDeadline = Date.now() + 43000;
-      while (!completion && !controllerClosed && Date.now() < observationDeadline) await delay(25);
-      if (!completion && !controllerClosed) { child.send({ action: 'stop' }); fail('Supervisor protocol stalled after response and cleanup windows'); }
+      while (!completion && !controllerClosed && !eventFailure && Date.now() < observationDeadline) await delay(25);
+      if (eventFailure) fail(eventFailure);
+      if (!completion && !controllerClosed) { send({ action: 'stop' }); fail('Supervisor protocol stalled after response and cleanup windows'); }
       await exited(child); controllers.delete(child);
       record.requestSent = requestSent; record.actionSent = actionSent;
       record.statuses = statuses;
@@ -242,6 +285,7 @@ async function run(destination) {
       record.transport = completion ? { code: completion.code, signal: completion.signal, bytes: completion.bytes,
         protocolBytes: completion.protocolBytes, nonProtocolLines: completion.nonProtocolLines } : { controllerLost: true };
       if (['initialization-loss', 'controller-loss', 'supervisor-loss'].includes(mode)) {
+        if (mode === 'initialization-loss') record.boundary = 'awaiting-first-request-before-Reflection.Emit-or-native-allocation';
         check(actionSent && supervisor, 'Loss boundary was not reached');
         await delay(1000);
         const observed = inspect(supervisor);
@@ -280,7 +324,7 @@ async function run(destination) {
     report.errors.push({ category: 'probe-failure', reason: error instanceof Error ? error.message : 'Unknown probe failure' });
   } finally {
     for (const child of controllers) {
-      try { child.send({ action: 'stop' }); } catch {}
+      try { if (child.connected) child.send({ action: 'stop' }, () => {}); } catch {}
       await delay(100);
       if (child.exitCode === null && child.signalCode === null) child.kill();
       await exited(child);
@@ -293,6 +337,7 @@ async function run(destination) {
     await exited(peer);
     report.peerCleanup = inspect(peerIdentity);
     report.cleanupConfirmed = report.cleanup.every((value) => value.absent === true) && report.peerCleanup.state === 'absent';
+    report.cleanupContract = 'Observed owned PID/creation identities absent; loss cases retain unobserved job-zero status separately';
     report.completedAt = new Date().toISOString();
     checkpoint();
   }
