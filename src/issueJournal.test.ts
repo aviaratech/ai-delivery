@@ -435,7 +435,7 @@ test('registered journal tool returns actionable decision refusals before native
       /^Parser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
     );
     assert.match(renderedDecision, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
-    const retry = await client.callTool({ name: 'issue_comment', arguments: decision });
+    const retry = await client.callTool({ name: 'issue_comment', arguments: { ...decision, verbose: true } });
     assert.notEqual(retry.isError, true);
     const retried = JSON.parse((retry.content as { text: string }[])[0]!.text) as {
       body: string;
@@ -468,7 +468,7 @@ test('registered journal tool returns actionable decision refusals before native
         '**Follow-ups:** None.',
       ],
     ] as const) {
-      const accepted = await client.callTool({ name: 'issue_comment', arguments: variant });
+      const accepted = await client.callTool({ name: 'issue_comment', arguments: { ...variant, verbose: true } });
       assert.notEqual(accepted.isError, true, JSON.stringify(accepted));
       const value = JSON.parse((accepted.content as { text: string }[])[0]!.text) as { body: string; reused: boolean };
       assert.equal(value.reused, false);

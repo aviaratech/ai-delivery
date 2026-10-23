@@ -1,0 +1,30 @@
+{
+  "issueNumber": 17,
+  "url": "https://github.com/example/widget/issues/17",
+  "title": "Synthetic delivery change",
+  "state": "open",
+  "projectStatus": "Todo",
+  "issueType": "Feature",
+  "points": 3,
+  "priority": "P1",
+  "fields": {
+    "startDate": null
+  },
+  "blockedBy": [
+    12
+  ],
+  "parentIssueNumber": 1,
+  "warnings": [
+    {
+      "code": "body.length",
+      "field": "body",
+      "message": "Consider a smaller body.",
+      "fixHint": "Shorten the body."
+    }
+  ],
+  "historyComment": {
+    "commentId": 30,
+    "url": "https://github.com/example/widget/issues/17#issuecomment-30",
+    "reused": false
+  }
+}

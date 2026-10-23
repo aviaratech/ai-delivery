@@ -261,7 +261,7 @@ globalThis.fetch=async(url,init)=>{
             reused: boolean;
           };
         for (const [index, journal] of journals.entries()) {
-          const response = await client.callTool({ name: 'issue_comment', arguments: journal });
+          const response = await client.callTool({ name: 'issue_comment', arguments: { ...journal, verbose: true } });
           assert.equal(response.isError, undefined, JSON.stringify(response));
           const readback = decoded(response);
           assert.equal(readback.commentId, 91 + index);

@@ -1,0 +1,109 @@
+{
+  "issue_create": {
+    "issueNumber": 17,
+    "url": "https://github.com/example/widget/issues/17",
+    "title": "Synthetic delivery change",
+    "state": "open",
+    "projectStatus": "Todo",
+    "issueType": "Feature",
+    "points": 3,
+    "priority": "P1",
+    "fields": {
+      "startDate": null
+    },
+    "blockedBy": [
+      12
+    ],
+    "parentIssueNumber": 1,
+    "warnings": [
+      {
+        "code": "body.length",
+        "field": "body",
+        "message": "Consider a smaller body.",
+        "fixHint": "Shorten the body."
+      }
+    ]
+  },
+  "issue_update": {
+    "issueNumber": 17,
+    "url": "https://github.com/example/widget/issues/17",
+    "title": "Synthetic delivery change",
+    "state": "open",
+    "projectStatus": "Todo",
+    "issueType": "Feature",
+    "points": 3,
+    "priority": "P1",
+    "fields": {
+      "startDate": null
+    },
+    "blockedBy": [
+      12
+    ],
+    "parentIssueNumber": 1,
+    "warnings": [
+      {
+        "code": "body.length",
+        "field": "body",
+        "message": "Consider a smaller body.",
+        "fixHint": "Shorten the body."
+      }
+    ],
+    "historyComment": {
+      "commentId": 30,
+      "url": "https://github.com/example/widget/issues/17#issuecomment-30",
+      "reused": false
+    }
+  },
+  "issue_info": {
+    "issueNumber": 17,
+    "url": "https://github.com/example/widget/issues/17",
+    "title": "Synthetic delivery change",
+    "state": "open",
+    "projectStatus": "Todo",
+    "issueType": "Feature",
+    "points": 3,
+    "priority": "P1",
+    "fields": {
+      "startDate": null
+    },
+    "blockedBy": [
+      12
+    ],
+    "parentIssueNumber": 1
+  },
+  "issue_comment": {
+    "commentId": 31,
+    "url": "https://github.com/example/widget/issues/17#issuecomment-31",
+    "reused": false
+  },
+  "issue_pr_create": {
+    "prNumber": 23,
+    "url": "https://github.com/example/widget/pull/23",
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "draft": true,
+    "reviewRoute": {
+      "author": {
+        "actorLogin": "synthetic-author"
+      },
+      "reviewer": {
+        "actorLogin": "synthetic-reviewer[bot]"
+      },
+      "rules": {
+        "observedRequiredApprovals": 1,
+        "visibility": "complete"
+      },
+      "approvalEligibility": "unknown",
+      "nextAction": "Confirm counted approval after exact-head submission."
+    }
+  },
+  "issue_pr_info": {
+    "prNumber": 23,
+    "url": "https://github.com/example/widget/pull/23",
+    "state": "open",
+    "draft": true,
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headBranch": "issue/17",
+    "baseBranch": "main",
+    "merged": false
+  }
+}

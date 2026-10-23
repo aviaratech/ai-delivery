@@ -450,6 +450,7 @@ test('composes shipped tracking through one non-Git MCP session with persisted r
       issueNumber: 17,
       title: 'Replacement tracking issue',
       preserveHistory: true,
+      verbose: true,
     });
     const expectedHistory =
       '<details>\n<summary>Previous issue title and body</summary>\n\nTitle:\n<pre>  Legacy &lt;tracking&gt; &amp; title\r\n</pre>\n\nBody:\n<pre>\nLegacy &amp; backlog &lt;tag&gt;\t \r\n</pre>\n\n</details>';
@@ -493,6 +494,7 @@ test('composes shipped tracking through one non-Git MCP session with persisted r
     for (const number of [10, 20])
       assert.equal((await call<IssueInfo>('issue_info', { issueNumber: number })).points, undefined);
     const journal = await call<{ commentId: number; body: string; url: string }>('issue_comment', {
+      verbose: true,
       issueNumber: 31,
       kind: 'progress',
       summary: 'Tracking replay is verified.',
