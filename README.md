@@ -215,6 +215,60 @@ An App submission does not prove that GitHub counted it. `pr:checks` exposes Git
 
 The removed `develop`, `verify`, `pr:checkout`, worktree creation/cleanup and local velocity record commands are no longer public CLI/MCP workflows. Preserve existing consumer checks, controller admissions and historical custody records. Their original schemas, digest identities, writer locks and operational closure rules remain separate. The legacy transition commands remain exposed, but this runtime cannot reproduce their historical repository-policy configuration binding: CLI/MCP inspection and apply refuse without executing policy or converting records. Complete those transitions with the original controller. Explicit runtime stage/admit remain supported.
 
+## Upgrade a host
+
+The operator runs these commands for an existing managed `ai-delivery-user`
+USER installation. The example target is **0.3.35**, the npm `latest` release
+checked on 2026-10-22. Check `npm view @aviaratech/ai-delivery dist-tags.latest`
+before choosing a newer target; replace both version literals together.
+Using the published CLI through `npx` avoids depending on the old host's CLI.
+
+```sh
+# Claude Code
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin update --host claude-code --scope user --version 0.3.35 --json
+# Codex marketplace plugin
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin update --host codex --scope user --version 0.3.35 --json
+```
+
+Confirm the selected installation and its separate startup check:
+
+```sh
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin doctor --host claude-code --scope user --json
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin doctor --host codex --scope user --json
+```
+
+Require `installed: true`, `enabled: true`, `sourceIntegrity: true`,
+`version: "0.3.35"`, and `activation.startupVersion: "0.3.35"`.
+A `recoveryRequired` result needs the reported recovery before another version
+or rollback is selected; preserve the installer state and native cache.
+Compare each observed registration `version` with the published target from
+the npm command above.
+
+Confirm the **loaded host**, too. In Claude Code, run `/reload-plugins`, check
+the `ai-delivery` version on `/plugin`'s Installed tab, and resolve any reload
+error. In Codex desktop, fully quit and reopen the app after the update, select
+the installed `ai-delivery` plugin from `ai-delivery-user` in the Plugins
+Directory, and start a new chat. For Codex CLI, exit and start a new session.
+These activation steps follow the
+[Claude Code update guidance](https://code.claude.com/docs/en/discover-plugins#keep-plugins-updated)
+and [OpenAI local-plugin guidance](https://developers.openai.com/plugins/build/plugins#install-a-local-plugin-manually).
+From the new host session, call the native `issue_info` with
+`repo: "aviaratech/ai-delivery"` and `issueNumber: 163`, then record the loaded
+plugin/MCP version shown by that host. The doctor launches a separate process:
+its `activation.loadedVersion` stays `null`. If the host does not expose its
+loaded version, record it as unverified rather than treating doctor output as
+proof of the running conversation's version.
+
+To roll back a completed update, select its recorded previous version
+(`0.3.29` after a `0.3.29` → `0.3.35` update):
+
+```sh
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin rollback --host claude-code --scope user --json
+npx --yes @aviaratech/ai-delivery@0.3.35 plugin rollback --host codex --scope user --json
+```
+
+Repeat doctor and the host activation/version checks for the previous version.
+
 ## Plugin installation and explicit runtime setup
 
 The complete plugin is the canonical public installation for Codex and Claude
@@ -262,6 +316,11 @@ Doctor can also observe native-marketplace plugins when managed state is absent.
 That observation does not establish ownership or permit startup of unknown
 bytes. It reports bounded registration candidates and incomplete scope evidence;
 the verified managed selection retains its separate integrity checks. Doctor
+compares observed registration versions with npm's `latest` tag in
+`diagnostics.latestPublishedVersion`; each registration's `behind` flags an older
+version. Unknown installed versions or an unavailable lookup leave the comparison
+`null`, with an explicit finding on lookup failure. Preview and dry-run make no
+registry request. Doctor
 reports managed installation and source integrity, skills, and a direct
 credential-free stdio startup check of the selected bundled MCP server. Startup
 means that the server initialized and listed its tools; it does not validate

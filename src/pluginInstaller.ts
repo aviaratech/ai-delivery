@@ -130,6 +130,7 @@ export interface PluginResult {
   authProbe?: PluginAuthProbe;
   diagnostics?: {
     completeness: 'incomplete';
+    latestPublishedVersion: string | null;
     registrations: RegistrationObservation[];
     nativeInventory: 'not_checked' | 'observed' | 'unavailable';
     findings: string[];
@@ -145,12 +146,14 @@ interface RegistrationObservation {
   ownership: 'managed' | 'external' | 'unknown';
   source: 'managed_archive' | 'unknown';
   version: string | null;
+  behind: boolean | null;
   enabled: boolean | null;
 }
 
 function sourceDiagnostics(input: Input, target: Target): NonNullable<PluginResult['diagnostics']> {
   const report: NonNullable<PluginResult['diagnostics']> = {
     completeness: 'incomplete',
+    latestPublishedVersion: null,
     registrations: [],
     nativeInventory: 'not_checked',
     plannedChanges: [],
@@ -221,6 +224,7 @@ function sourceDiagnostics(input: Input, target: Target): NonNullable<PluginResu
         ownership: 'unknown',
         source: 'unknown',
         version: null,
+        behind: null,
         enabled: null,
       });
   };
@@ -299,9 +303,75 @@ function observeNativePlugins(
       ownership: managed ? 'managed' : 'external',
       source: managed ? 'managed_archive' : 'unknown',
       version: version.success ? version.data : null,
+      behind: null,
       enabled: typeof entry.enabled === 'boolean' ? entry.enabled : null,
     });
   }
+}
+
+function versionBehind(installed: string, latest: string): boolean {
+  const [installedCore, ...installedSuffix] = installed.split('+')[0]!.split('-');
+  const [latestCore, ...latestSuffix] = latest.split('+')[0]!.split('-');
+  for (let index = 0; index < 3; index++) {
+    const left = BigInt(installedCore!.split('.')[index]!);
+    const right = BigInt(latestCore!.split('.')[index]!);
+    if (left !== right) return left < right;
+  }
+  if (installedSuffix.length === 0 || latestSuffix.length === 0)
+    return installedSuffix.length > 0 && latestSuffix.length === 0;
+  const left = installedSuffix.join('-').split('.');
+  const right = latestSuffix.join('-').split('.');
+  for (let index = 0; index < Math.max(left.length, right.length); index++) {
+    const a = left[index],
+      b = right[index];
+    if (a === b) continue;
+    if (a === undefined) return true;
+    if (b === undefined) return false;
+    const numericA = /^\d+$/u.test(a),
+      numericB = /^\d+$/u.test(b);
+    if (numericA && numericB) return BigInt(a) < BigInt(b);
+    if (numericA !== numericB) return numericA;
+    return a < b;
+  }
+  return false;
+}
+
+async function publishedVersionDiagnostics(result: PluginResult): Promise<PluginResult> {
+  const report = result.diagnostics!;
+  if (report.registrations.length === 0) return result;
+  try {
+    const response = await fetch('https://registry.npmjs.org/-/package/@aviaratech%2fai-delivery/dist-tags', {
+      signal: AbortSignal.timeout(5_000),
+      redirect: 'error',
+      headers: { accept: 'application/json' },
+    });
+    if (!response.ok || !response.body) {
+      await response.body?.cancel();
+      throw new Error('Published version unavailable.');
+    }
+    const reader = response.body.getReader(),
+      chunks: Uint8Array[] = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        if (!(chunk.value instanceof Uint8Array)) throw new Error('Invalid published version response.');
+        bytes += chunk.value.byteLength;
+        if (bytes > 8192) throw new Error('Published version response exceeded its limit.');
+        chunks.push(chunk.value);
+      }
+    } finally {
+      await reader.cancel();
+    }
+    const { latest } = z.object({ latest: Version }).parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    report.latestPublishedVersion = latest;
+    for (const entry of report.registrations)
+      entry.behind = entry.version === null ? null : versionBehind(entry.version, latest);
+  } catch {
+    report.findings.push('latest_published_version_unavailable');
+  }
+  return result;
 }
 
 export interface PluginAuthProbe {
@@ -1186,7 +1256,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         result.diagnostics.nativeInventory = 'unavailable';
         result.diagnostics.findings.push('native_inventory_unavailable');
       }
-      return result;
+      return publishedVersionDiagnostics(result);
     }
     try {
       verifiedUnit(target, state.currentVersion);
@@ -1215,7 +1285,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
         result.diagnostics.nativeInventory = 'unavailable';
         result.diagnostics.findings.push('native_inventory_unavailable');
       }
-      return result;
+      return publishedVersionDiagnostics(result);
     }
     result.activation.installedVersion = state.currentVersion;
     try {
@@ -1258,7 +1328,7 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       delete result.authProbe.reason;
       await checkAuthentication(input, result.nativePluginRoot!, result.authProbe);
     }
-    return result;
+    return publishedVersionDiagnostics(result);
   }
   if (!state && input.action === 'remove') return result;
   if (!state && existsSync(target.directory) && readdirSync(target.directory).length > 0)
