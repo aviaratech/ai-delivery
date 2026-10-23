@@ -254,6 +254,45 @@ it('loads optional repository-scoped WIP limits without treating them as routing
   }
 });
 
+it('loads explicit repository queue approvers without routing or role fallback', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'delivery-queue-config-'));
+  try {
+    const path = join(root, 'settings.json');
+    const configured = parseDeliveryConfig(syntheticConfig({ owner: 'example', repo: 'widget', projectNumber: 1 }));
+    userConfig(path, configured);
+    const base = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    const before = await loadDeliveryConfig(root, {
+      repository: 'example/widget',
+      clients: syntheticDiscoveryClients(configured),
+    });
+    assert.equal(Reflect.get(await loadDeliverySettings(), 'mergeQueueApprovers'), undefined);
+    const approvers = { 'example/widget': ['Maintainer'], 'example/other': [] };
+    writeFileSync(path, JSON.stringify({ ...base, mergeQueueApprovers: approvers }));
+    const settings = await loadDeliverySettings();
+    assert.deepEqual(Reflect.get(settings, 'mergeQueueApprovers'), approvers);
+    assert.equal(Reflect.has(settings.overrides, 'mergeQueueApprovers'), false);
+    const loaded = await loadDeliveryConfig(root, {
+      repository: 'example/widget',
+      clients: syntheticDiscoveryClients(configured),
+    });
+    assert.deepEqual(Reflect.get(loaded.config, 'mergeQueueApprovers'), approvers);
+    assert.notEqual(loaded.configDigest, before.configDigest);
+    for (const bad of [
+      { 'not-a-repository': ['maintainer'] },
+      { 'example/widget': ['maintainer', 'MAINTAINER'] },
+      { 'example/widget': ['invalid[bot]'] },
+      { 'example/widget': ['-invalid'] },
+      { 'example/widget': ['maintainer'], 'EXAMPLE/widget': ['other'] },
+      { 'example/widget': 'maintainer' },
+    ]) {
+      writeFileSync(path, JSON.stringify({ ...base, mergeQueueApprovers: bad }));
+      await assert.rejects(loadDeliverySettings(), /mergeQueueApprovers/u);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 describe('portable delivery configuration', () => {
   it('selects a configured personal author token without ambient fallback and keeps the reviewer App role', async () => {
     const base = syntheticConfig({ owner: 'sample', projectNumber: 7, repo: 'widget' });
