@@ -164,6 +164,17 @@ const RuntimeController = {
 
 export const AI_DELIVERY_MCP_TOOLS = [
   {
+    name: 'delivery_board',
+    commandName: 'board',
+    description:
+      'Read human attention, native PR readiness, stale In Progress issues, this-host merge queues and seven-day delivery marker fractions for explicit repositories. Partial observations are data, never merge authority.',
+    inputSchema: z.strictObject({
+      repos: z.array(Repo.unwrap()).min(1),
+      decisionLabels: z.array(z.string().min(1)).optional(),
+      verbose: Verbose,
+    }),
+  },
+  {
     name: 'board_reconcile',
     commandName: 'board:reconcile',
     description:

@@ -35,6 +35,7 @@ export const boardReplayRepos = ['example/alpha', 'example/beta'];
 export const boardReplayAsOf = '2026-10-23T12:00:00.000Z';
 export interface BoardReplayOptions {
   selectedIssues?: number;
+  longLinks?: boolean;
   asOf?: string;
   abortAfterRepository?: AbortController;
   unreadableRepository?: string;
@@ -69,9 +70,12 @@ export interface BoardReplayOptions {
 
 /** Fictional native projections. Only external client/context ports and forbidden writers are replaced. */
 export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
+  const repos = options.longLinks
+    ? boardReplayRepos.map((repository) => `${repository}-${'x'.repeat(90)}`)
+    : boardReplayRepos;
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-board-replay-')));
   const ownership = lstatSync(base);
-  const roots = boardReplayRepos.map((_, i) => join(base, `repo-${i}`));
+  const roots = repos.map((_, i) => join(base, `repo-${i}`));
   const trap = join(base, 'target-code-executions.txt');
   const calls = {
     operations: {} as Record<string, number>,
@@ -134,7 +138,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
   const day = 24 * 60 * 60 * 1000;
   const baseSha = 'c'.repeat(40);
   const sha = (number: number) => number.toString(16).padStart(40, '0');
-  const index = (repository: string) => boardReplayRepos.indexOf(repository.toLowerCase());
+  const index = (repository: string) => repos.indexOf(repository.toLowerCase());
   const repoId = (repository: string) => `REPO-${index(repository)}`;
   const issueId = (repository: string, number: number) => `ISSUE-${index(repository)}-${number}`;
   const prId = (repository: string, number: number) => `PR-${index(repository)}-${number}`;
@@ -166,7 +170,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     schemaVersion: 'ai-delivery.github@1',
     roles: settings.roles,
   });
-  const configs = new Map(boardReplayRepos.map((repository) => [repository, config(repository)]));
+  const configs = new Map(repos.map((repository) => [repository, config(repository)]));
   const selected = options.selectedIssues ?? 50;
   const selectedCount = (repository: string) => Math.max(0, Math.min(25, selected - index(repository) * 25));
   const observedIssue = (repository: string, number: number) => ({
@@ -280,7 +284,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     fieldValueByName: { name: string; optionId: string } | null;
   };
   const projectItems: ProjectReplayItem[] = Array.from({ length: 580 }, (_, i) => {
-    const repository = i < 25 ? boardReplayRepos[0]! : i < 50 ? boardReplayRepos[1]! : 'example/unselected';
+    const repository = i < 25 ? repos[0]! : i < 50 ? repos[1]! : 'example/unselected';
     const number = i < 50 ? (i % 25) + 1 : i + 1;
     const active = number >= 6 && number <= 10 && i < 50;
     return {
@@ -327,7 +331,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
       get: async (input: Record<string, unknown>) => {
         const repository = coordinates(input);
         count(`Repo:${repository}`);
-        if (repository === boardReplayRepos[0]) options.abortAfterRepository?.abort();
+        if (repository === repos[0]) options.abortAfterRepository?.abort();
         if (repository === options.unreadableRepository || index(repository) < 0) throw { status: 404 };
         return {
           status: 200,
@@ -389,7 +393,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
               app: { id: 7 },
               status: 'completed',
               conclusion:
-                options.prChecksFailed && coordinates(input) === boardReplayRepos[0] && input.ref === sha(101)
+                options.prChecksFailed && coordinates(input) === repos[0] && input.ref === sha(101)
                   ? 'failure'
                   : 'success',
             },
@@ -407,7 +411,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
             ref: 'refs/heads/main',
             object: {
               type: 'commit',
-              sha: options.movedBase && coordinates(input) === boardReplayRepos[0] ? 'd'.repeat(40) : baseSha,
+              sha: options.movedBase && coordinates(input) === repos[0] ? 'd'.repeat(40) : baseSha,
             },
           },
         };
@@ -437,7 +441,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     count(operation);
     const repository = `${String(variables.owner)}/${String(variables.repo ?? variables.name)}`.toLowerCase();
     if (operation === 'ProjectDeliveryConfiguration') {
-      const data = await syntheticDiscoveryClients(native(boardReplayRepos[0]!)).graphql<{
+      const data = await syntheticDiscoveryClients(native(repos[0]!)).graphql<{
         organization: { projectV2: { viewerCanUpdate: boolean } };
       }>(query, variables);
       if (options.readOnlyProject) data.organization.projectV2.viewerCanUpdate = false;
@@ -560,7 +564,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
       assert.ok(from <= asOf - 7 * day && from > asOf - 7 * day - 1000, 'query lower bound encloses the exact window');
       assert.ok(to >= asOf && to < asOf + 1000, 'query upper bound preserves the final partial second');
 
-      if (options.lateMetricFailure && selectedRepo === boardReplayRepos[1] && merged) throw { status: 503 };
+      if (options.lateMetricFailure && selectedRepo === repos[1] && merged) throw { status: 503 };
       const marker = '<!-- ai-delivery:pr@1 -->';
       const nodes = options.emptyMetrics
         ? []
@@ -572,17 +576,17 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
             repository: { id: repoId(selectedRepo), nameWithOwner: selectedRepo },
             createdAt: merged
               ? iso(-30 * day)
-              : options.windowEdges && selectedRepo === boardReplayRepos[0]
+              : options.windowEdges && selectedRepo === repos[0]
                 ? iso(i === 0 ? -7 * day : i === 1 ? 0 : -7 * day - 1)
                 : iso(-day),
             mergedAt: merged
-              ? options.windowEdges && selectedRepo === boardReplayRepos[0]
+              ? options.windowEdges && selectedRepo === repos[0]
                 ? iso(i === 0 ? -7 * day : i === 1 ? 0 : -1)
                 : iso(-day)
               : null,
             body: i < 2 ? `Synthetic proof.\n\n${marker}` : 'Unmarked body.',
             mergeCommit: merged
-              ? options.unknownMergeCommit && selectedRepo === boardReplayRepos[0] && i === 0
+              ? options.unknownMergeCommit && selectedRepo === repos[0] && i === 0
                 ? null
                 : {
                     oid: sha(401 + i),
@@ -591,17 +595,16 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
                   }
               : null,
           }));
-      if (options.duplicateSearchIds && selectedRepo === boardReplayRepos[0] && !merged) nodes[1] = { ...nodes[0]! };
-      if (options.retainedLimit && selectedRepo === boardReplayRepos[0] && !merged && nodes[0])
+      if (options.duplicateSearchIds && selectedRepo === repos[0] && !merged) nodes[1] = { ...nodes[0]! };
+      if (options.retainedLimit && selectedRepo === repos[0] && !merged && nodes[0])
         nodes[0].id = 'x'.repeat(16 * 1024 * 1024);
       return {
         search: {
-          issueCount: options.searchCap && selectedRepo === boardReplayRepos[0] && !merged ? 1001 : nodes.length,
+          issueCount: options.searchCap && selectedRepo === repos[0] && !merged ? 1001 : nodes.length,
           nodes,
           pageInfo: {
-            hasNextPage: Boolean(options.searchCursorRepeats && selectedRepo === boardReplayRepos[0] && !merged),
-            endCursor:
-              options.searchCursorRepeats && selectedRepo === boardReplayRepos[0] && !merged ? 'repeated' : null,
+            hasNextPage: Boolean(options.searchCursorRepeats && selectedRepo === repos[0] && !merged),
+            endCursor: options.searchCursorRepeats && selectedRepo === repos[0] && !merged ? 'repeated' : null,
           },
         },
       };
@@ -658,7 +661,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
   for (const [i, root] of roots.entries()) {
     mkdirSync(root, { recursive: true });
     fixtureGit(root, 'init', '-b', 'main');
-    fixtureGit(root, 'config', 'remote.origin.url', `https://github.com/${boardReplayRepos[i]}.git`);
+    fixtureGit(root, 'config', 'remote.origin.url', `https://github.com/${repos[i]}.git`);
     writeFileSync(
       join(root, 'consumer-trap.cjs'),
       `require('node:fs').appendFileSync(${JSON.stringify(trap)}, 'executed\\n');process.exit(91);\n`,
@@ -674,7 +677,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const path = join(directory, 'queue.json');
     if (options.queue !== 'missing') {
-      const repository = boardReplayRepos[i]!;
+      const repository = repos[i]!;
       const entries = Array.from({ length: 5 }, (_, j) => ({
         id: randomUUID(),
         issueNumber: 11 + j,
@@ -793,5 +796,5 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     for (const [root, original] of configHashes)
       assert.deepEqual(snapshot(join(root, '.git', 'config')), original, 'checkout configuration remains unchanged');
   };
-  return { base, roots, calls, settings, execution, assertReadOnly, dispose };
+  return { base, roots, repos, calls, settings, execution, assertReadOnly, dispose };
 }

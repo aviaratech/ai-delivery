@@ -53,6 +53,13 @@ const journal = {
 };
 const routes: Route[] = [
   {
+    name: 'delivery_board',
+    input: () => ({ repos: ['example/widget'], verbose: true }),
+    cli: () => ['board', '--repos', 'example/widget', '--json'],
+    witness: 'issues.listForRepo',
+    verify: (value) => assert.equal(value.schemaVersion, 'ai-delivery.board@1'),
+  },
+  {
     name: 'board_reconcile',
     input: (f) => ({
       repositories: ['example/widget'],
@@ -331,7 +338,7 @@ for (const route of routes) {
         await route.before?.(f);
         // A schema/authentication failure must never masquerade as owner coverage.
         AI_DELIVERY_MCP_TOOLS.find((tool) => tool.name === route.name)!.inputSchema.parse({
-          repo: 'example/widget',
+          ...(route.name === 'delivery_board' ? {} : { repo: 'example/widget' }),
           ...route.input(f),
         });
         if (surface === 'MCP') {

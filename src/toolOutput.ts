@@ -1,5 +1,8 @@
+import { renderDeliveryBoard, type DeliveryBoardResult } from './deliveryBoard.js';
+
 /** Project transport output only; stored content and internal readbacks stay complete. */
 export function projectToolOutput(command: string, value: unknown, verbose = false): unknown {
+  if (command === 'delivery_board' && !verbose) return renderDeliveryBoard(value as DeliveryBoardResult);
   if (verbose || !command.startsWith('issue_')) return value;
   return compact(value);
 }

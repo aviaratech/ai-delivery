@@ -31,7 +31,6 @@ export interface BoardRow {
   reasons: string[];
   state?: string;
   updatedAt?: string;
-  sourceUrl?: string;
   headSha?: string;
   issueNumber?: number;
 }
@@ -72,6 +71,111 @@ export interface DeliveryBoardResult {
   collection: { startedAt: string; completedAt: string; asOf: string };
   complete: boolean;
   repositories: BoardRepository[];
+}
+
+const boardSections: ReadonlyArray<readonly [BoardSection, string]> = [
+  ['humanAttention', 'Human attention'],
+  ['readyPrs', 'Ready PRs'],
+  ['blockedPrs', 'Blocked PRs'],
+  ['staleIssues', 'Stale In Progress issues (72h)'],
+  ['mergeQueue', 'Merge queue (this-host)'],
+];
+
+function singleLine(value: string): string {
+  return value.replace(/[\p{Cc}\s]+/gu, ' ').replace(/[\\`*_[\]<>]/gu, '\\$&');
+}
+function metricText(value: BoardMetric): string {
+  const fraction = `${value.marked}/${value.total}`;
+  return value.complete
+    ? `${fraction} (${value.percentage === null ? 'n/a' : `${Math.round(value.percentage)}%`})`
+    : `${fraction} observed; unknown ${value.unknown}; incomplete`;
+}
+
+/** Bound the actual CLI newline and MCP JSON-string transports without changing facts. */
+export function renderDeliveryBoard(result: DeliveryBoardResult): string {
+  const groups = boardSections.map(([section, heading]) => ({
+    section,
+    heading,
+    repositories: result.repositories.map((repo) => ({
+      repo,
+      rows: [...repo[section]]
+        .sort((a, b) => a.number - b.number)
+        .map((row) => {
+          const url = row.url.replace(/[\\<>()[\]\s]/gu, (character) => encodeURIComponent(character));
+          const reason = row.reasons.length
+            ? ` ${row.reasons[0]}${row.reasons.length > 1 ? ` +${row.reasons.length - 1}` : ''}`
+            : '';
+          return {
+            link: `[#${row.number}](${url})${reason}`,
+            title: singleLine(row.title).slice(0, 80),
+          };
+        }),
+    })),
+  }));
+  const count = groups.reduce(
+    (total, group) => total + group.repositories.reduce((n, repo) => n + repo.rows.length, 0),
+    0,
+  );
+  const heading = `Delivery board @ ${result.collection.asOf} (${result.complete ? 'complete' : 'partial'})`;
+  const metadata = result.repositories.map((repo) => {
+    const gaps = boardSections.flatMap(([section]) => {
+      const scope = repo.coverage[section];
+      return scope.status === 'complete'
+        ? []
+        : [
+            `${section}:${scope.status}, unknown ${scope.unknownRows.length}${scope.reasons[0] ? `, ${scope.reasons[0]}` : ''}`,
+          ];
+    });
+    return `${repo.repository}: ${repo.access}; 7d opened ${metricText(repo.metrics.opened)}, merged ${metricText(repo.metrics.merged)}; queue this-host${repo.queueScope.baseRef ? `/${singleLine(repo.queueScope.baseRef)}` : ''}${gaps.length ? `; ${gaps.join('; ')}` : '; coverage complete'}`;
+  });
+  function render(titles: boolean, visible: number): string {
+    let remaining = visible;
+    return [
+      heading,
+      ...metadata,
+      ...groups.map((group) => {
+        const lines = group.repositories.flatMap(({ repo, rows }) => {
+          if (!rows.length) return [];
+          const shown = rows.slice(0, remaining);
+          remaining -= shown.length;
+          return [
+            `${repo.repository}:`,
+            ...shown.map((row) => `${row.link}${titles && row.title ? ` ${row.title}` : ''}`),
+            ...(shown.length < rows.length ? [`${rows.length - shown.length} rows omitted`] : []),
+          ];
+        });
+        return `${group.heading}\n${lines.length ? lines.join('\n') : 'None observed'}`;
+      }),
+    ].join('\n');
+  }
+  function fits(value: string): boolean {
+    return Math.max(value.length + 1, JSON.stringify(value).length) <= 3999;
+  }
+  const titled = render(true, count);
+  if (fits(titled)) return titled;
+  const links = render(false, count);
+  if (fits(links)) return links;
+  if (fits(render(false, 0))) {
+    let lower = 0,
+      upper = count;
+    while (lower < upper) {
+      const middle = Math.ceil((lower + upper) / 2);
+      if (fits(render(false, middle))) lower = middle;
+      else upper = middle - 1;
+    }
+    return render(false, lower);
+  }
+  // Even repository metadata can exceed the transport budget. Preserve explicit
+  // aggregate access/coverage and omissions; full JSON retains every detail.
+  return [
+    heading,
+    `${result.repositories.length} repository details omitted; readable ${result.repositories.filter((repo) => repo.access === 'readable').length}, unreadable ${result.repositories.filter((repo) => repo.access === 'unreadable').length}, unknown ${result.repositories.filter((repo) => repo.access === 'unknown').length}. Per-repository metrics/reasons remain in full JSON.`,
+    ...groups.map((group) => {
+      const rows = group.repositories.reduce((n, repo) => n + repo.rows.length, 0);
+      const scopes = result.repositories.map((repo) => repo.coverage[group.section]);
+      return `${group.heading}\n${rows ? `${rows} rows omitted` : 'None observed'}; coverage unavailable ${scopes.filter((scope) => scope.status === 'unavailable').length}, partial ${scopes.filter((scope) => scope.status === 'partial').length}; unknown rows ${scopes.reduce((n, scope) => n + scope.unknownRows.length, 0)}`;
+    }),
+  ].join('\n');
 }
 
 const repositoryPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;

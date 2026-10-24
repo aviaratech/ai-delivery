@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
-import { test } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { Command } from 'commander';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createAiDeliveryMcpServer } from './mcp/index.js';
+import { test, vi } from 'vitest';
 import * as board from './deliveryBoard.js';
 import type { DeliveryBoardRequest, DeliveryBoardResult } from './deliveryBoard.js';
 import type { ExecutionContext } from './dispatch.js';
@@ -444,4 +451,284 @@ test('selector conflicts and cancellation stop before dependent native work', as
   assert.equal(g.calls.operations['Prs:example/alpha'], undefined);
   assert.equal(g.calls.operations['Repo:example/beta'], undefined);
   g.assertReadOnly();
+});
+
+function rendered(result: DeliveryBoardResult): string {
+  const render = Reflect.get(board, 'renderDeliveryBoard') as ((value: DeliveryBoardResult) => string) | undefined;
+  assert.equal(typeof render, 'function', 'compact board renderer is available');
+  return render!(result);
+}
+
+function boardText(response: unknown): string {
+  const value = response as { content: Array<{ type: string; text?: string }> };
+  const block = value.content.find((item) => item.type === 'text');
+  assert.ok(block && typeof block.text === 'string');
+  return block.text;
+}
+
+async function nativeBoardMcp(f: ReturnType<typeof deliveryBoardReplay>, args: Record<string, unknown>) {
+  const server = createAiDeliveryMcpServer(f.execution);
+  const client = new Client({ name: 'delivery-board-replay', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const advertised = (await client.listTools()).tools.find((tool) => tool.name === 'delivery_board');
+    assert.ok(advertised, 'real MCP server advertises the board tool');
+    assert.ok(advertised.inputSchema.properties?.repos);
+    assert.ok(advertised.inputSchema.properties?.decisionLabels);
+    assert.ok(advertised.inputSchema.properties?.verbose);
+    assert.ok(advertised.inputSchema.required?.includes('repos'));
+    return await client.callTool({ name: 'delivery_board', arguments: args });
+  } finally {
+    try {
+      await client.close();
+    } finally {
+      await server.close();
+    }
+  }
+}
+
+async function nativeBoardCli(args: string[]) {
+  const previousArgv = process.argv,
+    previousExit = process.exitCode;
+  let stdout = '',
+    stderr = '';
+  const parse = vi.spyOn(Command.prototype, 'parseAsync');
+  const out = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+    stdout += String(chunk);
+    return true;
+  });
+  const err = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+    stderr += String(chunk);
+    return true;
+  });
+  const exit = vi.spyOn(process, 'exit').mockImplementation((status) => {
+    throw new Error(`CLI requested exit ${status}`);
+  });
+  try {
+    process.exitCode = undefined;
+    const cli = pathToFileURL(join(process.cwd(), 'dist/cli.js')).href;
+    process.argv = [process.execPath, cli, '--identity', 'fixture-author', ...args];
+    await import(`${cli}?boardReplay=${randomUUID()}`);
+    const command = parse.mock.results[0];
+    assert.ok(command?.type === 'return', 'the actual Commander parser was invoked');
+    // The default spy calls the original parser. Settle its action and entry-point
+    // catch before releasing globals, mocks, transports or owned checkout roots.
+    await command.value.catch(() => undefined);
+    await Promise.resolve();
+    return { stdout, stderr, status: Number(process.exitCode ?? 0) };
+  } finally {
+    process.argv = previousArgv;
+    process.exitCode = previousExit;
+    parse.mockRestore();
+    out.mockRestore();
+    err.mockRestore();
+    exit.mockRestore();
+  }
+}
+
+function compactBoardAssertions(value: string): void {
+  for (const heading of [/Human attention/u, /Ready PRs/u, /Blocked PRs/u, /Stale/u, /merge queue/iu])
+    assert.match(value, heading);
+  for (const repository of boardReplayRepos) assert.ok(value.includes(repository));
+  assert.ok(value.includes('2/3') && value.includes('1/3'));
+  assert.match(value, /this.host/iu);
+  assert.equal(
+    (value.match(/https:\/\/github\.com\/example\/(?:alpha|beta)\/(?:issues|pull)\/\d+/gu) ?? []).length,
+    50,
+  );
+}
+
+test('actual MCP board route retains real dispatch, collector and six-page zero-write replay', async () => {
+  const f = deliveryBoardReplay();
+  const response = await nativeBoardMcp(f, request());
+  assert.notEqual(response.isError, true);
+  const serialized = boardText(response),
+    compact = JSON.parse(serialized) as string;
+  compactBoardAssertions(compact);
+  assert.ok(serialized.length < 4000, 'actual MCP JSON-string text fits the compact budget');
+  assert.equal(f.calls.operations.ProjectDeliveryItems, 6);
+  f.assertReadOnly();
+});
+
+test('actual compiled CLI board route uses the same native replay and compact newline budget', async () => {
+  const f = deliveryBoardReplay();
+  const response = await nativeBoardCli([
+    'board',
+    '--repos',
+    boardReplayRepos.join(','),
+    '--decision-labels',
+    'needs-decision',
+  ]);
+  assert.equal(response.status, 0, response.stderr);
+  compactBoardAssertions(response.stdout);
+  assert.ok(response.stdout.endsWith('\n') && response.stdout.length < 4000);
+  assert.equal(f.calls.operations.ProjectDeliveryItems, 6);
+  f.assertReadOnly();
+});
+
+test('CLI JSON without verbose and MCP verbose expose identical complete board facts', async () => {
+  const f = deliveryBoardReplay();
+  const cli = await nativeBoardCli([
+    'board',
+    '--repos',
+    boardReplayRepos.join(','),
+    '--decision-labels',
+    'needs-decision',
+    '--json',
+  ]);
+  assert.equal(cli.status, 0, cli.stderr);
+  const json = JSON.parse(cli.stdout) as DeliveryBoardResult;
+  assert.equal(json.schemaVersion, 'ai-delivery.board@1');
+  assert.equal(f.calls.operations.ProjectDeliveryItems, 6);
+  f.assertReadOnly();
+  f.dispose();
+  const g = deliveryBoardReplay();
+  const mcp = await nativeBoardMcp(g, { ...request(), verbose: true });
+  assert.notEqual(mcp.isError, true);
+  assert.deepEqual(JSON.parse(boardText(mcp)), json);
+  assert.equal(g.calls.operations.ProjectDeliveryItems, 6);
+  g.assertReadOnly();
+});
+
+test('partial boards remain successful data through both real routes', async () => {
+  for (const options of [{ projectDenied: true }, { unreadableRepository: boardReplayRepos[1]! }]) {
+    const f = deliveryBoardReplay(options);
+    const cli = await nativeBoardCli([
+      'board',
+      '--repos',
+      boardReplayRepos.join(','),
+      '--decision-labels',
+      'needs-decision',
+      '--json',
+    ]);
+    assert.equal(cli.status, 0, cli.stderr);
+    const json = JSON.parse(cli.stdout) as DeliveryBoardResult;
+    assert.equal(json.complete, false);
+    assert.equal(json.repositories[0]!.readyPrs.length, 5);
+    f.assertReadOnly();
+    f.dispose();
+    const g = deliveryBoardReplay(options);
+    const mcp = await nativeBoardMcp(g, { ...request(), verbose: true });
+    assert.notEqual(mcp.isError, true);
+    assert.deepEqual(JSON.parse(boardText(mcp)), json);
+    g.assertReadOnly();
+    g.dispose();
+  }
+});
+
+test('real route invalid selectors are rejected before credential access', async () => {
+  const f = deliveryBoardReplay();
+  const mcp = await nativeBoardMcp(f, { repos: [] });
+  assert.equal(mcp.isError, true);
+  assert.equal(f.calls.clientFactory, 0);
+  f.assertReadOnly();
+  f.dispose();
+  const g = deliveryBoardReplay();
+  const cli = await nativeBoardCli(['--repo', boardReplayRepos[0]!, 'board', '--repos', boardReplayRepos.join(',')]);
+  assert.equal(cli.status, 1);
+  assert.equal(g.calls.clientFactory, 0);
+  g.assertReadOnly();
+});
+
+test('compact rendering drops titles then records omissions without mutating full unknown coverage', async () => {
+  const f = deliveryBoardReplay({ unreadableRepository: boardReplayRepos[1]! });
+  const result = await collector()(request(), f.execution);
+  for (const repository of result.repositories) {
+    for (const rows of [
+      repository.humanAttention,
+      repository.readyPrs,
+      repository.blockedPrs,
+      repository.staleIssues,
+      repository.mergeQueue,
+    ])
+      for (const row of rows) {
+        row.title = 'long title '.repeat(1000);
+        row.url += `?proof=${'x'.repeat(500)}`;
+      }
+  }
+  const original = structuredClone(result),
+    compact = rendered(result);
+  assert.ok(compact.length + 1 < 4000 && JSON.stringify(compact).length < 4000);
+  assert.match(compact, /omitt/iu);
+  assert.match(compact, /example\/beta/u);
+  assert.match(compact, /unreadable|unavailable|unknown/iu);
+  assert.deepEqual(result, original);
+  const oversizedMetadata = structuredClone(result);
+  oversizedMetadata.repositories[0]!.queueScope.baseRef = 'branch'.repeat(1000);
+  const aggregate = rendered(oversizedMetadata);
+  assert.ok(aggregate.length + 1 < 4000 && JSON.stringify(aggregate).length < 4000);
+  assert.match(aggregate, /repository details omitted/iu);
+  assert.match(aggregate, /unreadable 1/iu);
+  assert.match(aggregate, /coverage unavailable/iu);
+  const knownRows = oversizedMetadata.repositories.reduce(
+    (sum, repo) =>
+      sum + [repo.humanAttention, repo.readyPrs, repo.blockedPrs, repo.staleIssues, repo.mergeQueue].flat().length,
+    0,
+  );
+  assert.equal(
+    [...aggregate.matchAll(/(\d+) rows omitted/gu)].reduce((sum, match) => sum + Number(match[1]), 0),
+    knownRows,
+  );
+  f.assertReadOnly();
+});
+
+test('real compact omissions preserve their identities and unknown coverage in both full routes', async () => {
+  // Fixture implementation is Task4 preparation: long repo names must be used
+  // consistently by all existing native seams, never by replacing route results.
+  const options = { longLinks: true, projectDenied: true };
+  const f = deliveryBoardReplay(options);
+  const cliCompact = await nativeBoardCli([
+    'board',
+    '--repos',
+    f.repos.join(','),
+    '--decision-labels',
+    'needs-decision',
+  ]);
+  assert.equal(cliCompact.status, 0, cliCompact.stderr);
+  assert.ok(cliCompact.stdout.length < 4000);
+  assert.match(cliCompact.stdout, /\d+\s+(?:rows?\s+)?omitted/iu);
+  f.assertReadOnly();
+  f.dispose();
+  const g = deliveryBoardReplay(options);
+  const cliFull = await nativeBoardCli([
+    'board',
+    '--repos',
+    g.repos.join(','),
+    '--decision-labels',
+    'needs-decision',
+    '--json',
+  ]);
+  assert.equal(cliFull.status, 0, cliFull.stderr);
+  const full = JSON.parse(cliFull.stdout) as DeliveryBoardResult;
+  const rows = full.repositories.flatMap((repo) =>
+    [repo.humanAttention, repo.readyPrs, repo.blockedPrs, repo.staleIssues, repo.mergeQueue].flat(),
+  );
+  const omitted = rows.filter((row) => !cliCompact.stdout.includes(row.url));
+  assert.ok(omitted.length > 0);
+  const count = [...cliCompact.stdout.matchAll(/(\d+)\s+(?:rows?\s+)?omitted/giu)].reduce(
+    (sum, match) => sum + Number(match[1]),
+    0,
+  );
+  assert.equal(count, omitted.length, 'each omitted displayed row is explicitly counted once');
+  for (const row of omitted) assert.ok(cliFull.stdout.includes(row.url));
+  for (const repo of full.repositories) {
+    assert.equal(repo.coverage.staleIssues.status, 'unavailable');
+    assert.equal(repo.coverage.staleIssues.unknownRows.length, 25);
+  }
+  g.assertReadOnly();
+  g.dispose();
+  const h = deliveryBoardReplay(options);
+  const mcpCompact = await nativeBoardMcp(h, { repos: h.repos, decisionLabels: ['needs-decision'] });
+  assert.notEqual(mcpCompact.isError, true);
+  assert.ok(boardText(mcpCompact).length < 4000);
+  assert.equal(JSON.parse(boardText(mcpCompact)), cliCompact.stdout.trimEnd());
+  h.assertReadOnly();
+  h.dispose();
+  const i = deliveryBoardReplay(options);
+  const mcpFull = await nativeBoardMcp(i, { repos: i.repos, decisionLabels: ['needs-decision'], verbose: true });
+  assert.notEqual(mcpFull.isError, true);
+  assert.deepEqual(JSON.parse(boardText(mcpFull)), full);
+  i.assertReadOnly();
 });

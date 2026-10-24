@@ -26,6 +26,7 @@ import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch } from './issueC
 import { NativeIssueDateFields } from './github/nativeIssueMetadata.js';
 import { DeliveryError } from './errors.js';
 import { parseBoardReconcileRequest } from './services/boardReconcileService.js';
+import { renderDeliveryBoard, type DeliveryBoardResult } from './deliveryBoard.js';
 
 const program = new Command();
 program
@@ -426,6 +427,23 @@ program
         }),
       ),
   );
+
+program
+  .command('board')
+  .description('Read delivery attention and readiness for explicit repositories')
+  .requiredOption('--repos <owner/repo,...>', 'Explicit GitHub repositories, separated by commas')
+  .option('--decision-labels <label,...>', 'Additional labels that signal human attention')
+  .option('--json', 'Print the complete board as JSON')
+  .action(async (options: { repos: string; decisionLabels?: string; json?: boolean }) => {
+    // Preserve empty selectors and control characters for the common validator.
+    const result = (await executeTool(
+      'delivery_board',
+      { repos: options.repos.split(','), decisionLabels: options.decisionLabels?.split(',') },
+      execution(),
+    )) as DeliveryBoardResult;
+    if (options.json || program.opts<{ json?: boolean }>().json) print(result);
+    else process.stdout.write(`${renderDeliveryBoard(result)}\n`);
+  });
 
 program
   .command('board:reconcile')
