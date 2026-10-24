@@ -78,7 +78,8 @@ function ints(value: string | undefined): number[] | undefined {
   return list(value)?.map(Number);
 }
 function body(value: string | undefined, file: string | undefined): string | undefined {
-  if (value !== undefined && file !== undefined) throw new Error('Pass either --body or --body-file.');
+  if (value !== undefined && file !== undefined)
+    throw new Error('Both --body and --body-file were supplied.\nFix: Pass only one of --body or --body-file.');
   return file === undefined ? value : readFileSync(file, 'utf8');
 }
 function fields(file: string | undefined, overrides: Record<string, unknown>): Record<string, unknown> {
@@ -106,7 +107,9 @@ function reconciliationFile(path: string): unknown {
   const limit = 16 * 1024 * 1024;
   const stat = statSync(path);
   if (!stat.isFile() || stat.size > limit)
-    throw new DeliveryError('Reconciliation files must be regular UTF-8 JSON files of at most 16 MiB.');
+    throw new DeliveryError(
+      'The reconciliation input is not a regular file of at most 16 MiB.\nFix: Pass a regular UTF-8 JSON file no larger than 16 MiB.',
+    );
   const bytes = readFileSync(path);
   if (bytes.byteLength > limit) throw new DeliveryError('Reconciliation files exceed 16 MiB.');
   return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown;
@@ -463,7 +466,10 @@ program
       planFile?: string;
       priorResultFile?: string;
     }) => {
-      if (options.dryRun && options.apply) throw new DeliveryError('Choose either --dry-run or --apply.');
+      if (options.dryRun && options.apply)
+        throw new DeliveryError(
+          'Project reconciliation cannot use --dry-run and --apply together.\nFix: Pass only --dry-run or --apply.',
+        );
       const request = parseBoardReconcileRequest({
         repositories: options.repositories,
         ...(execution().repo === undefined ? {} : { repo: execution().repo }),
@@ -599,7 +605,8 @@ program
   .command('pr:list')
   .option('--state <state>', 'open, closed or all', 'open')
   .action(async (o: { state: string }) => {
-    if (!['open', 'closed', 'all'].includes(o.state)) throw new Error('Invalid PR state.');
+    if (!['open', 'closed', 'all'].includes(o.state))
+      throw new Error('The PR state is invalid.\nFix: Set --state to open, closed or all.');
     const context = await contextFor(execution(), 'pr:list');
     print(await listPrs(context, o.state as 'open' | 'closed' | 'all'));
   });
@@ -635,15 +642,20 @@ program
   .option('--identity <name>', 'Required configured reviewer profile')
   .option('--verdict <path>', 'Required for submit: UTF-8 JSON verdict, at most 64 KiB')
   .action(async (action: string, o: { pr?: string; head?: string; identity?: string; verdict?: string }) => {
-    if (!['submit', 'doctor'].includes(action)) throw new DeliveryError('review action must be submit or doctor.');
+    if (!['submit', 'doctor'].includes(action))
+      throw new DeliveryError('The review action is invalid.\nFix: Use review submit or review doctor.');
     const identity = o.identity ?? execution().identity ?? '';
     const settings = await loadDeliverySettings(undefined, { reviewerIdentity: identity, prepareEnvironment: true });
     const profile = settings.roles.reviewer;
     if (!('appId' in profile))
-      throw new DeliveryError('identity: Select a reviewer profile with explicit App/provider binding.');
+      throw new DeliveryError(
+        'The selected reviewer profile is not bound to a reviewer App.\nFix: Select a configured reviewer profile with an explicit App and provider binding.',
+      );
     if (action === 'doctor') {
       if (o.pr !== undefined || o.head !== undefined || o.verdict !== undefined)
-        throw new DeliveryError('review doctor does not accept submission inputs.');
+        throw new DeliveryError(
+          'Review doctor received submission options.\nFix: Remove --pr, --head and --verdict when using review doctor.',
+        );
       const clients = await createDeliveryGitHubClients({
         config: settings,
         identity,
@@ -663,7 +675,9 @@ program
       return;
     }
     if (o.pr === undefined || o.head === undefined || o.verdict === undefined)
-      throw new DeliveryError('review submit requires --pr, --head and --verdict.');
+      throw new DeliveryError(
+        'Review submission is missing required options.\nFix: Pass --pr, --head and --verdict to review submit.',
+      );
     const fd = openSync(o.verdict, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     let raw: string;
     let verdictFileSha256: string;
@@ -676,10 +690,16 @@ program
         if (count === 0) break;
         size += count;
       }
-      if (size > 64 * 1024) throw new DeliveryError('verdict: File exceeds 64 KiB.');
+      if (size > 64 * 1024)
+        throw new DeliveryError(
+          'The review verdict file exceeds 64 KiB.\nFix: Pass a verdict JSON file no larger than 64 KiB.',
+        );
       const content = bytes.subarray(0, size);
       raw = content.toString('utf8');
-      if (!Buffer.from(raw, 'utf8').equals(content)) throw new DeliveryError('verdict: Expected valid UTF-8.');
+      if (!Buffer.from(raw, 'utf8').equals(content))
+        throw new DeliveryError(
+          'The review verdict file is not valid UTF-8.\nFix: Pass a verdict JSON file encoded as UTF-8.',
+        );
       verdictFileSha256 = `sha256:${createHash('sha256').update(content).digest('hex')}`;
     } finally {
       closeSync(fd);

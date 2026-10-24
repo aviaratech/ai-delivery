@@ -1,0 +1,43 @@
+C1 body sources
+ai-delivery: Both --body and --body-file were supplied.
+Fix: Pass only one of --body or --body-file.
+
+C2 reconciliation file
+ai-delivery: The reconciliation input is not a regular file of at most 16 MiB.
+Fix: Pass a regular UTF-8 JSON file no larger than 16 MiB.
+
+C2 reconciliation size
+ai-delivery: The reconciliation input is not a regular file of at most 16 MiB.
+Fix: Pass a regular UTF-8 JSON file no larger than 16 MiB.
+
+C3 reconciliation modes
+ai-delivery: Project reconciliation cannot use --dry-run and --apply together.
+Fix: Pass only --dry-run or --apply.
+
+C4 PR state
+ai-delivery: The PR state is invalid.
+Fix: Set --state to open, closed or all.
+
+C5 review action
+ai-delivery: The review action is invalid.
+Fix: Use review submit or review doctor.
+
+C6 reviewer binding
+ai-delivery: The selected reviewer profile is not bound to a reviewer App.
+Fix: Select a configured reviewer profile with an explicit App and provider binding.
+
+C7 doctor inputs
+ai-delivery: Review doctor received submission options.
+Fix: Remove --pr, --head and --verdict when using review doctor.
+
+C8 submit inputs
+ai-delivery: Review submission is missing required options.
+Fix: Pass --pr, --head and --verdict to review submit.
+
+C9 verdict size
+ai-delivery: The review verdict file exceeds 64 KiB.
+Fix: Pass a verdict JSON file no larger than 64 KiB.
+
+C10 verdict encoding
+ai-delivery: The review verdict file is not valid UTF-8.
+Fix: Pass a verdict JSON file encoded as UTF-8.

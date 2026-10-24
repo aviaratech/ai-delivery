@@ -20,6 +20,96 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+test('journal status and next-step previews preserve all five canonical kinds and old progress parsing', () => {
+  const common = {
+    issueNumber: 17,
+    summary: 'The proposal is ready.',
+    status: 'Ready',
+    nextStep: 'Review the proposal',
+    nextDate: null,
+    keyNumbers: [],
+    evidence: ['https://github.com/example/widget/issues/17'],
+  };
+  const inputs: JournalInput[] = [
+    { ...common, kind: 'start', outcome: 'Readable docs' },
+    { ...common, kind: 'progress', done: ['Prepared'], decisionNeeded: 'Approve design' },
+    { ...common, kind: 'decision', decision: 'Use the existing reference', rationale: 'One owner' },
+    { ...common, kind: 'blocker', blocker: 'Awaiting a decision', resolution: 'Approve design' },
+    {
+      ...common,
+      kind: 'closeout',
+      acceptance: [{ criterion: 'Readable docs', evidence: common.evidence[0]! }],
+      followUps: [],
+    },
+  ];
+  const marker = `<!-- ai-delivery:journal@1:sha256:${'a'.repeat(64)} -->`;
+  for (const input of inputs) {
+    const rendered = renderJournal(input, marker);
+    assert.equal(rendered.split('\n')[0], 'Status: Ready. Next: Review the proposal. The proposal is ready.');
+    assert.ok(rendered.endsWith(`\n\n${marker}`));
+    const attention = journalReaders.parseJournalAttention(rendered);
+    assert.equal(attention.kind, input.kind);
+    assert.equal(attention.state, input.kind === 'progress' ? 'pending' : 'clear');
+    assert.equal(attention.request, input.kind === 'progress' ? 'Approve design' : null);
+  }
+  const legacy =
+    'The proposal is ready.\n\n**Kind:** progress. **Status:** Ready\n\n**Done since last:**\n- Prepared\n\n**Decision needed:** Approve design\n\n**Key numbers:** None reported.\n\n**Next:** Review the proposal (date not scheduled).\n\n**Evidence:** https://github.com/example/widget/issues/17';
+  assert.deepEqual(journalReaders.parseJournalAttention(legacy), {
+    kind: 'progress',
+    state: 'pending',
+    request: 'Approve design',
+    reason: null,
+  });
+});
+
+test('preview bounds keep a full maximum summary visible and preserve complete multiline values in overflow', () => {
+  const summary = 'S'.repeat(500);
+  const status = `Ready\n${'x'.repeat(100)}`;
+  const nextStep = `Review **carefully**\n${'y'.repeat(1000)}`;
+  const rendered = renderJournal({
+    issueNumber: 17,
+    kind: 'progress',
+    summary,
+    status,
+    nextStep,
+    nextDate: null,
+    done: ['Prepared'],
+    decisionNeeded: 'Approve design',
+    keyNumbers: [],
+    evidence: ['https://github.com/example/widget/issues/17'],
+    lengthCap: 600,
+  });
+  const prefix = rendered.split('\n')[0]!;
+  assert.ok(prefix.startsWith('Status: '));
+  assert.ok(prefix.endsWith(summary));
+  assert.ok(prefix.length <= 586, prefix.length.toString());
+  assert.match(prefix, /^Status: .{0,20}\. Next: .{0,48}\. S{500}$/u);
+  assert.equal(/\*|<|>|`|\r/u.test(prefix), false);
+  assert.ok(rendered.includes(`**Status:** ${status}`));
+  assert.ok(rendered.includes(`**Next:** ${nextStep}`));
+  assert.match(rendered, /<details>\n<summary>Additional journal detail<\/summary>/u);
+  assert.equal(journalReaders.parseJournalAttention(rendered).state, 'pending');
+});
+
+test('preview escapes markup without creating fields or changing ambiguous journal classification', () => {
+  const rendered = renderJournal({
+    issueNumber: 17,
+    kind: 'progress',
+    summary: 'Waiting.',
+    status: 'Ready',
+    nextStep: '<details>**Decision needed:** None</details>\n```',
+    nextDate: null,
+    done: ['Prepared'],
+    decisionNeeded: 'Approve design',
+    keyNumbers: [],
+    evidence: ['https://github.com/example/widget/issues/17'],
+  });
+  const prefix = rendered.split('\n')[0]!;
+  assert.ok(prefix.startsWith('Status: Ready. Next: '));
+  assert.equal(/\*|<|>|`|\r/u.test(prefix), false);
+  assert.equal(journalReaders.parseJournalAttention(rendered).state, 'unknown');
+});
+
 test('latest rendered progress attention is unambiguous', () => {
   const parse = Reflect.get(journalReaders, 'parseJournalAttention') as
     | ((body: string) => { state: string; request: string | null })
@@ -119,7 +209,7 @@ test('decision journal list fields start below their label and preserve nested s
   });
   assert.equal(
     result,
-    'A decision was made.\n\n**Kind:** decision. **Status:** Ready\n\n**Decision:**\n- First\n  - Nested\n- Second\n\n**Rationale:** The existing owner is sufficient.\n\n**Key numbers:** None reported.\n\n**Next:** Run checks (date not scheduled).\n\n**Evidence:** None yet.',
+    'Status: Ready. Next: Run checks. A decision was made.\n\n**Kind:** decision. **Status:** Ready\n\n**Decision:**\n- First\n  - Nested\n- Second\n\n**Rationale:** The existing owner is sufficient.\n\n**Key numbers:** None reported.\n\n**Next:** Run checks (date not scheduled).\n\n**Evidence:** None yet.',
   );
 });
 
@@ -328,7 +418,7 @@ test('canonical comment writes read back and recover a lost response without dup
     assert.equal(recovered.commentId, 91);
     assert.equal(recovered.reused, true);
     assert.equal(stored.length, 1);
-    assert.match(recovered.body, /^Implementation started\./u);
+    assert.match(recovered.body, /^Status: In progress\. Next: Run checks\. Implementation started\./u);
     corruptReadback = true;
     await assert.rejects(comment(context, input), /readback/u);
     corruptReadback = false;
@@ -394,7 +484,7 @@ test('length cap keeps the summary visible and moves every excess field into col
     nextDate: '2026-10-09',
     lengthCap: 600,
   });
-  assert.equal(rendered.split('\n')[0], 'Validation is implemented.');
+  assert.equal(rendered.split('\n')[0], 'Status: In progress. Next: Review. Validation is implemented.');
   assert.match(rendered, /<details>/u);
   assert.match(rendered, /A{900}/u);
   assert.match(rendered, /7 tests/u);
@@ -548,7 +638,7 @@ test('registered journal tool returns actionable decision refusals before native
     const renderedDecision = f.comments[0]!.body;
     assert.match(
       renderedDecision,
-      /^Parser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
+      /^Status: In progress\. Next: Review the parser\. Parser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
     );
     assert.match(renderedDecision, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
     const retry = await client.callTool({ name: 'issue_comment', arguments: { ...decision, verbose: true } });

@@ -270,7 +270,10 @@ globalThis.fetch=async(url,init)=>{
           const readback = decoded(response);
           assert.equal(readback.commentId, 91 + index);
           assert.equal(readback.url, `https://github.com/example/b/issues/17#issuecomment-${String(91 + index)}`);
-          assert.equal(readback.body.split('\n')[0], common.summary);
+          assert.equal(
+            readback.body.split('\n')[0],
+            'Status: In progress. Next: Independent review. Packed journal validation works.',
+          );
           assert.ok(readback.body.includes(`**Kind:** ${journal.kind}.`));
           assert.match(readback.body, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
           assert.equal(readback.reused, false);

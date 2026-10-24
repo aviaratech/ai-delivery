@@ -1,22 +1,16 @@
 ---
-name: "ai-delivery:worktree-lifecycle"
-description: Start a GitHub-linked issue branch, prepare a host-owned worktree and verify its change through repository contributor checks.
+name: 'ai-delivery:worktree-lifecycle'
+description: Use when starting a GitHub-linked issue branch and developing its change in a host-owned worktree.
 ---
 
 # Host-owned worktree lifecycle
 
-Read user configuration and inspect `ai-delivery --repo <owner/name> config:resolve`. Confirm configured author and independent reviewer actors and repository access. Unknown GitHub rule visibility remains unknown.
+**Required:** Read [credentials/readiness](../../README.md#credentials-and-readiness), [issue contracts](../../README.md#issue-contracts) and [authority/recovery](../../README.md#authority-and-recovery). Before legacy controller/transition work, read the complete [retained compatibility contract](../../README.md#retained-controller-and-compatibility-commands).
 
-Use `issue_info` and `issue_ready_check` with an explicit `repo`, then `issue_start` with the existing issue number to create or reuse its GitHub-linked branch. Prepare the local worktree using the host's supported worktree tools. Follow the target repository's contributor policy. When it specifies fast local checks plus focused tests and a CI merge gate, run that fast path with an explicit test selection for changed contracts and only the necessary build; do not implicitly run the full suite, install dependencies or qualify an archive. For this repository, use `npm run checks:fast -- --test-file dist/path.test.js`; other repositories retain their own commands. Record the selected tests, omitted proof and results honestly: fast/focused success does not prove a full suite or release package. Preserve older full-local failures as diagnostic history without inventing an extra merge prerequisite. Commit and push through the normal workflow. The ai-delivery runtime never executes repository policy modules or checks, or creates local worktrees. Continue to pull request handoff at the unchanged remote head.
+Inspect `ai-delivery --repo <owner/name> config:resolve`; confirm configured author, distinct reviewer and actual repository access. Unknown rules/counting eligibility remain unknown. Do not change host settings, credentials or actors to repair a refusal without authority.
 
-```sh
-ai-delivery --repo <owner/name> ready:check --issue <number>
-ai-delivery --repo <owner/name> start --issue <number>
-# Prepare a host-owned worktree, implement, run contributor checks, commit and push.
-```
+Read `issue_info` and `issue_ready_check` with explicit repo, then `issue_start` for the existing issue. Prepare one host-supported isolated worktree. ai-delivery does not create local worktrees or execute consumer policy/checks.
 
-Parking an issue with `issue_update({repo, issueNumber, park: true})` retains its remote tracking presentation. Worktree cleanup remains with the host owner.
+Implement and follow repository contributor policy. This repository requires `checks:fast` with explicit focused compiled tests and only the needed plugin build; record omitted full-suite/package proof. Do not implicitly install dependencies or qualify an archive. Required current CI remains the merge gate. Commit/push through the normal host workflow, then use the PR handoff skill at the unchanged head.
 
-Legacy `issue_worktree_transition_inspect` and `issue_worktree_transition_apply` preserve their separate custody contract. Preserve original bytes and accounting; unsupported configuration or closure bindings fail closed. Apply only an exact independently accepted plan with native personal-operator relinquishment, distinct reviewer-App acceptance, complete immutable inventory, runtime admission and quiescent writer proof. This skill grants no private adoption, hold release, launcher change, shared admission or protocol retirement authority.
-
-This runtime's CLI/MCP cannot reconstruct the historical repository-policy binding, so those transition commands refuse. Use the original controller for their successful execution; retained engine tests do not imply compatibility of the new public entrypoint.
+Parking preserves remote tracking; the host retains cleanup ownership. Legacy transitions require exact original custody, operator relinquishment, independent App acceptance, immutable inventory, admission and quiescent writers. Current public entrypoints cannot reconstruct historical policy bindings and refuse. Retained engine tests grant no private adoption, hold release, shared admission, launcher change or protocol retirement authority.
