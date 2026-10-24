@@ -136,7 +136,8 @@ jobs:
           QUALIFICATION_OUTCOME: ${{ steps.qualification.outcome }}
         run: |
           node --input-type=module <<'JS'
-          import { appendFileSync, constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, writeFileSync } from 'node:fs';
+          import { appendFileSync, constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
           import { basename, dirname, join, resolve } from 'node:path';
           import { fileURLToPath } from 'node:url';
           import { RELEASE_CASES } from './scripts/checks.mjs';
@@ -265,6 +266,89 @@ jobs:
           });
           const commands = Array.isArray(producer?.commands) ? producer.commands : [];
           const releaseCommands = Array.isArray(release?.commands) ? release.commands : [];
+          // Only these reviewed credential-free CI test outputs may cross the raw-log boundary.
+          // The JSON projection above still accepts no original bytes or free-form strings.
+          const logs = { status: 'unavailable', files: [], bytes: 0 };
+          const same = (a, b) => ['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeMs', 'ctimeMs'].every(key => a[key] === b[key]);
+          const readLog = (parts, room) => {
+            let fd;
+            let observedFile = false;
+            const parents = [];
+            try {
+              let path = root;
+              for (const part of ['', ...parts.slice(0, -1)]) {
+                if (part) path = join(path, part);
+                const stat = lstatSync(path);
+                parents.push({ path, stat });
+                if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path) throw 'unsafe';
+              }
+              path = join(root, ...parts);
+              const stat = lstatSync(path);
+              observedFile = true;
+              if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || realpathSync(path) !== path) throw 'unsafe';
+              if (stat.size > room) throw 'oversized';
+              fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+              if (!same(stat, fstatSync(fd))) throw 'changed';
+              const buffer = Buffer.alloc(stat.size + 1);
+              const length = readSync(fd, buffer, 0, buffer.length, 0);
+              if (length !== stat.size || !same(stat, fstatSync(fd)) || !same(stat, lstatSync(path)) || realpathSync(path) !== path || parents.some(parent => !same(parent.stat, lstatSync(parent.path)) || realpathSync(parent.path) !== parent.path)) throw 'changed';
+              return buffer.subarray(0, length);
+            } catch (error) {
+              if (error?.code === 'ENOENT') {
+                if (!observedFile) {
+                  try { if (parents.every(parent => same(parent.stat, lstatSync(parent.path)) && realpathSync(parent.path) === parent.path)) return null; }
+                  catch { /* An observed parent disappeared, so this is changed input. */ }
+                }
+                throw 'changed';
+              }
+              throw ['unsafe', 'oversized', 'changed'].includes(error) ? error : 'unsafe';
+            } finally { if (fd !== undefined) closeSync(fd); }
+          };
+          let staged;
+          let stagedIdentity;
+          try {
+            const contents = [];
+            for (const [stage, directory] of [['producer', 'producer'], ['release', releaseDirectory]]) {
+              let commandBytes = 0;
+              for (const stream of ['stdout', 'stderr']) {
+                const entry = { name: `${stage}.${stream}.txt`, status: directory ? 'missing' : 'unavailable' };
+                logs.files.push(entry);
+                if (!directory) continue;
+                try {
+                  const bytes = readLog([directory, 'tests', `${stream}.txt`], 32 * 1024 * 1024 - commandBytes);
+                  if (bytes === null) continue;
+                  entry.status = 'read';
+                  commandBytes += bytes.length;
+                  logs.bytes += bytes.length;
+                  if (logs.bytes > 64 * 1024 * 1024) throw 'oversized';
+                  contents.push({ name: entry.name, bytes });
+                } catch (error) { entry.status = error; throw error; }
+              }
+            }
+            if (contents.length) {
+              staged = mkdtempSync(join(temporary, 'release-qualification-logs-'));
+              stagedIdentity = lstatSync(staged);
+              const files = contents.map(({ name, bytes }) => {
+                writeFileSync(join(staged, name), bytes, { flag: 'wx', mode: 0o600 });
+                return { name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+              });
+              const manifest = { observationOnly: true, qualified: false, promotionEligible: false, source: /^[a-f0-9]{40}$/.test(env.REVIEWED_SOURCE_SHA ?? '') ? env.REVIEWED_SOURCE_SHA : null, runId: number(Number(env.GITHUB_RUN_ID), 1), runAttempt: number(Number(env.GITHUB_RUN_ATTEMPT), 1), files };
+              writeFileSync(join(staged, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+              appendFileSync(env.GITHUB_OUTPUT, `logs_directory=${staged}\n`);
+              logs.status = 'staged';
+            }
+          } catch {
+            logs.status = 'refused';
+            if (staged) {
+              logs.cleanupConfirmed = false;
+              try {
+                if (realpathSync(staged) === staged && lstatSync(staged).dev === stagedIdentity.dev && lstatSync(staged).ino === stagedIdentity.ino) {
+                  rmSync(staged, { recursive: true });
+                  logs.cleanupConfirmed = true;
+                }
+              } catch { /* Keep the safe projection even if private staging cleanup is uncertain. */ }
+            }
+          }
           const diagnostic = {
             observationOnly: true, qualified: false, promotionEligible: false,
             qualificationOutcome: choice(env.QUALIFICATION_OUTCOME, ['failure', 'cancelled']),
@@ -275,6 +359,7 @@ jobs:
             pack: command(overall?.pack),
             release: { status: status(release?.status), command: command(releaseCommands.length === 1 ? releaseCommands[0] : null), cleanup: cleanup(release?.release?.temporary), counts: { total: number(vitest?.numTotalTests), passed: number(vitest?.numPassedTests), failed: number(vitest?.numFailedTests) }, cases },
             consumer: { status: status(consumer?.status), command: command(consumerDirectory ? consumerAttempt?.command : null), cleanup: cleanup(consumer?.cleanup) },
+            logs,
           };
           const bytes = JSON.stringify(diagnostic, null, 2) + '\n';
           if (Buffer.byteLength(bytes) > 64 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
@@ -288,6 +373,182 @@ jobs:
         with:
           name: npm-qualification-diagnostics-${{ github.run_attempt }}
           path: ${{ steps.diagnostics.outputs.file }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Scan failed qualification logs
+        id: failure_log_scan
+        if: ${{ always() && inputs.qualification_only && steps.diagnostics.outcome == 'success' && steps.diagnostics.outputs.logs_directory != '' }}
+        env:
+          LOGS_DIRECTORY: ${{ steps.diagnostics.outputs.logs_directory }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync, constants, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, realpathSync, writeFileSync } from 'node:fs';
+          import { createHash, randomUUID } from 'node:crypto';
+          import { basename, dirname, join, resolve } from 'node:path';
+          import { executeCommand } from './scripts/checks.mjs';
+          const env = process.env;
+          const temporary = realpathSync(env.RUNNER_TEMP);
+          const privateRoot = mkdtempSync(join(temporary, 'release-log-scan-'));
+          const receiptPath = join(privateRoot, 'result.json');
+          const receipt = { observationOnly: true, qualified: false, promotionEligible: false, status: 'running', commands: [], cleanupConfirmed: false };
+          const cancellation = new AbortController();
+          const cancel = () => cancellation.abort();
+          process.on('SIGINT', cancel);
+          process.on('SIGTERM', cancel);
+          const custody = randomUUID();
+          const name = `ai-delivery-failure-logs-${env.GITHUB_RUN_ID}-${env.GITHUB_RUN_ATTEMPT}-${custody}`;
+          const imageReference = 'ghcr.io/trufflesecurity/trufflehog:3.97.5';
+          const directory = resolve(env.LOGS_DIRECTORY);
+          let imageId;
+          let containerId;
+          let passed = false;
+          const persist = () => writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
+          const call = async (args, cleanup = false, required = true) => {
+            const record = await executeCommand(['docker', ...args], {
+              cwd: env.GITHUB_WORKSPACE,
+              env: { PATH: env.PATH, DOCKER_CONFIG: join(privateRoot, 'docker'), LANG: 'C' },
+              directory: join(privateRoot, `command-${receipt.commands.length}`),
+              signal: cleanup ? undefined : cancellation.signal,
+              timeoutMs: ['start', 'pull'].includes(args[0]) ? 0 : 30_000,
+              maxOutputBytes: 32 * 1024 * 1024, maxRssBytes: 3 * 1024 ** 3,
+            });
+            receipt.commands.push(record);
+            persist();
+            if (record.cleanupConfirmed !== true || (required && record.status !== 'passed')) throw new Error('Docker command refused.');
+            return record;
+          };
+          const text = record => {
+            if (lstatSync(record.stdoutPath).size > 1024 * 1024) throw new Error('Docker metadata exceeds its bound.');
+            return readFileSync(record.stdoutPath, 'utf8').trim();
+          };
+          const inspect = async (selector, cleanup = false) => {
+            const record = await call(['container', 'inspect', '--format', '{{json .}}', selector], cleanup, false);
+            return record.status === 'passed' ? JSON.parse(text(record)) : null;
+          };
+          const owned = value => value && /^[a-f0-9]{64}$/.test(value.Id) && value.Name === '/' + name && value.Image === imageId && value.Config?.Labels?.['ai-delivery.failure-log-owner'] === custody && value.Config?.Labels?.['ai-delivery.run'] === env.GITHUB_RUN_ID && value.Config?.Labels?.['ai-delivery.attempt'] === env.GITHUB_RUN_ATTEMPT && value.Mounts?.length === 1 && value.Mounts[0].Type === 'bind' && value.Mounts[0].Source === directory && value.Mounts[0].Destination === '/logs' && value.Mounts[0].RW === false;
+          const same = (a, b) => ['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeMs', 'ctimeMs'].every(key => a[key] === b[key]);
+          let identity;
+          const read = (file, bound) => {
+            if (realpathSync(directory) !== directory || !same(identity, lstatSync(directory))) throw new Error('Staged root changed.');
+            const path = join(directory, file);
+            const stat = lstatSync(path);
+            if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== identity.uid || stat.gid !== identity.gid || (stat.mode & 0o777) !== 0o600 || stat.size > bound || realpathSync(path) !== path) throw new Error('Unsafe staged file.');
+            const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+            try {
+              if (!same(stat, fstatSync(fd))) throw new Error('Staged identity changed.');
+              const buffer = Buffer.alloc(stat.size + 1);
+              const size = readSync(fd, buffer, 0, buffer.length, 0);
+              if (size !== stat.size || !same(stat, fstatSync(fd)) || !same(stat, lstatSync(path)) || !same(identity, lstatSync(directory)) || realpathSync(directory) !== directory || realpathSync(path) !== path) throw new Error('Staged bytes changed.');
+              return buffer.subarray(0, size);
+            } finally { closeSync(fd); }
+          };
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          let manifestHash;
+          const validate = () => {
+            const bytes = read('manifest.json', 64 * 1024);
+            if (manifestHash && hash(bytes) !== manifestHash) throw new Error('Manifest changed.');
+            const manifest = JSON.parse(bytes.toString('utf8'));
+            if (JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(['observationOnly', 'qualified', 'promotionEligible', 'source', 'runId', 'runAttempt', 'files'].sort())) throw new Error('Unreviewed manifest fields.');
+            if (manifest.observationOnly !== true || manifest.qualified !== false || manifest.promotionEligible !== false || manifest.source !== env.REVIEWED_SOURCE_SHA || manifest.runId !== Number(env.GITHUB_RUN_ID) || manifest.runAttempt !== Number(env.GITHUB_RUN_ATTEMPT) || !Array.isArray(manifest.files) || !manifest.files.length || manifest.files.length > 4) throw new Error('Invalid log manifest.');
+            const names = new Set();
+            const counts = { producer: 0, release: 0 };
+            for (const file of manifest.files) {
+              if (!file || JSON.stringify(Object.keys(file).sort()) !== JSON.stringify(['name', 'bytes', 'sha256'].sort())) throw new Error('Unreviewed log fields.');
+              if (typeof file.name !== 'string' || !/^(producer|release)\.(stdout|stderr)\.txt$/.test(file.name) || names.has(file.name) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || !/^[a-f0-9]{64}$/.test(file.sha256)) throw new Error('Invalid fixed log entry.');
+              names.add(file.name);
+              const stage = file.name.split('.')[0];
+              const content = read(file.name, 32 * 1024 * 1024 - counts[stage]);
+              if (content.length !== file.bytes || hash(content) !== file.sha256) throw new Error('Log digest changed.');
+              counts[stage] += content.length;
+            }
+            if (JSON.stringify(readdirSync(directory).sort()) !== JSON.stringify([...names, 'manifest.json'].sort())) throw new Error('Unexpected staged input.');
+            manifestHash = hash(bytes);
+            return ['manifest.json', ...names];
+          };
+          try {
+            if (!/^[1-9]\d*$/.test(env.GITHUB_RUN_ID ?? '') || !Number.isSafeInteger(Number(env.GITHUB_RUN_ID)) || !/^[1-9]\d*$/.test(env.GITHUB_RUN_ATTEMPT ?? '') || !Number.isSafeInteger(Number(env.GITHUB_RUN_ATTEMPT)) || !/^[a-f0-9]{40}$/.test(env.REVIEWED_SOURCE_SHA ?? '') || dirname(directory) !== temporary || !/^release-qualification-logs-[A-Za-z0-9]{6}$/.test(basename(directory)) || directory.includes(',')) throw new Error('Invalid scan binding.');
+            identity = lstatSync(directory);
+            if (!identity.isDirectory() || identity.isSymbolicLink() || (identity.mode & 0o777) !== 0o700 || !Number.isSafeInteger(identity.uid) || identity.uid < 0 || !Number.isSafeInteger(identity.gid) || identity.gid < 0) throw new Error('Unsafe staged root.');
+            const files = validate();
+            const user = `${identity.uid}:${identity.gid}`;
+            const scanArgs = ['filesystem', ...files.map(file => join('/logs', file)), '--no-verification', '--fail', '--fail-on-scan-errors', '--no-update', '--json'];
+            mkdirSync(join(privateRoot, 'docker'), { mode: 0o700 });
+            writeFileSync(join(privateRoot, 'docker', 'config.json'), '{"auths":{}}\n', { flag: 'wx', mode: 0o600 });
+            let image = await call(['image', 'inspect', '--format', '{{json .}}', imageReference], false, false);
+            if (image.status !== 'passed') {
+              await call(['pull', imageReference]);
+              image = await call(['image', 'inspect', '--format', '{{json .}}', imageReference]);
+            }
+            const metadata = JSON.parse(text(image));
+            imageId = metadata.Id;
+            if (!/^sha256:[a-f0-9]{64}$/.test(imageId) || Object.keys(metadata.Config?.Volumes ?? {}).length) throw new Error('Scanner image identity or implicit volumes refused.');
+            receipt.imageId = imageId;
+            receipt.containerName = name;
+            receipt.custody = custody;
+            const created = await call(['create', '--name', name, '--label', `ai-delivery.failure-log-owner=${custody}`, '--label', `ai-delivery.run=${env.GITHUB_RUN_ID}`, '--label', `ai-delivery.attempt=${env.GITHUB_RUN_ATTEMPT}`, '--user', user, '--memory', '3221225472', '--memory-swap', '3221225472', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '128', '--log-driver', 'none', '--mount', `type=bind,source=${directory},target=/logs,readonly`, imageId, ...scanArgs]);
+            const acknowledgement = text(created);
+            if (!/^[a-f0-9]{64}$/.test(acknowledgement)) throw new Error('Unknown create acknowledgement.');
+            containerId = acknowledgement;
+            const before = await inspect(containerId);
+            if (!owned(before) || before.Config?.User !== user || JSON.stringify(before.Config?.Cmd) !== JSON.stringify(scanArgs) || before.HostConfig?.Memory !== 3221225472 || before.HostConfig?.MemorySwap !== 3221225472 || before.HostConfig?.NetworkMode !== 'none' || before.HostConfig?.ReadonlyRootfs !== true || !before.HostConfig?.CapDrop?.includes('ALL') || !before.HostConfig?.SecurityOpt?.includes('no-new-privileges') || before.HostConfig?.LogConfig?.Type !== 'none' || before.HostConfig?.PidsLimit !== 128) throw new Error('Scanner resource containment or exact command refused.');
+            receipt.containerId = containerId;
+            receipt.memoryLimitBytes = before.HostConfig.Memory;
+            receipt.memorySwapLimitBytes = before.HostConfig.MemorySwap;
+            await call(['start', '--attach', containerId]);
+            const after = await inspect(containerId);
+            if (!owned(after) || after.State?.Running !== false || after.State?.OOMKilled !== false || after.State?.ExitCode !== 0) throw new Error('Scanner exit or ownership refused.');
+            receipt.containerExit = { running: after.State.Running, oomKilled: after.State.OOMKilled, exitCode: after.State.ExitCode };
+            validate();
+            passed = true;
+          } catch { receipt.status = 'refused'; }
+          finally {
+            if (imageId) {
+              try {
+                // Reconcile a lost create acknowledgement by exact name and custody; never create again.
+                const observed = await inspect(containerId ?? name, true);
+                if (observed) {
+                  if (!owned(observed) || (containerId && observed.Id !== containerId)) throw new Error('Container custody changed.');
+                  containerId = observed.Id;
+                  const current = await inspect(containerId, true);
+                  if (!owned(current) || current.Id !== containerId) throw new Error('Container changed before removal.');
+                  await call(['container', 'rm', '--force', containerId], true);
+                }
+                const remaining = text(await call(['container', 'ls', '--all', '--no-trunc', '--format', '{{.ID}}'], true)).split('\n').filter(Boolean);
+                if (remaining.some(id => !/^[a-f0-9]{64}$/.test(id)) || (containerId && remaining.includes(containerId))) throw new Error('Container absence unconfirmed.');
+                if (!containerId) {
+                  const matches = text(await call(['container', 'ls', '--all', '--no-trunc', '--filter', `label=ai-delivery.failure-log-owner=${custody}`, '--format', '{{.ID}}'], true));
+                  if (matches) throw new Error('Unresolved create acknowledgement.');
+                }
+                receipt.cleanupConfirmed = true;
+              } catch { receipt.cleanupConfirmed = false; }
+            } else receipt.cleanupConfirmed = true; // No create command was admitted.
+            process.off('SIGINT', cancel);
+            process.off('SIGTERM', cancel);
+          }
+          try {
+            if (!passed || !receipt.cleanupConfirmed || cancellation.signal.aborted) throw new Error('Scan or cleanup did not complete.');
+            validate();
+            appendFileSync(env.GITHUB_OUTPUT, 'scanned=true\n');
+            receipt.status = 'passed';
+          } catch {
+            receipt.status = 'refused';
+            process.exitCode = 1;
+            process.stderr.write('Failure-log upload withheld: scan, input or cleanup was not verified.\n');
+          }
+          persist();
+          appendFileSync(env.GITHUB_OUTPUT, `receipt=${receiptPath}\n`);
+          JS
+      - name: Upload scanned failure logs
+        if: ${{ always() && inputs.qualification_only && steps.failure_log_scan.outcome == 'success' && steps.failure_log_scan.outputs.scanned == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-qualification-failure-logs-${{ github.run_attempt }}
+          path: |
+            ${{ steps.diagnostics.outputs.logs_directory }}/manifest.json
+            ${{ steps.diagnostics.outputs.logs_directory }}/producer.stdout.txt
+            ${{ steps.diagnostics.outputs.logs_directory }}/producer.stderr.txt
+            ${{ steps.diagnostics.outputs.logs_directory }}/release.stdout.txt
+            ${{ steps.diagnostics.outputs.logs_directory }}/release.stderr.txt
           if-no-files-found: error
           retention-days: 1
       - name: Scan source history
