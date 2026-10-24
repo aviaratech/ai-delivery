@@ -187,6 +187,35 @@ export function hasDeliveryMergeTrailer(message: string): boolean {
   return active?.length === 1 && active[0] === trailer.index + 2;
 }
 
+function publicationBody(body: string, previous: string | null | undefined): string {
+  function marked(value: string): boolean {
+    const active = activeMarkerPositions(value, /<!--\s*ai-delivery:pr@[^\n]*?(?:-->|$)/gmu);
+    if (active === null || (active.length > 0 && !hasDeliveryPrMarker(value)))
+      throw new DeliveryError('PR marker footer is malformed, misplaced or ambiguous; reconcile without repair.');
+    return active.length === 1;
+  }
+  const previousMarked = typeof previous === 'string' && marked(previous);
+  const requestedMarked = marked(body);
+  if (previous !== undefined && !previousMarked) {
+    if (requestedMarked) throw new DeliveryError('Historical unmarked PRs cannot receive a marker footer backfill.');
+    return body;
+  }
+  if (requestedMarked) return body;
+  const decorated = body + DeliveryPrFooter;
+  if (!hasDeliveryPrMarker(decorated))
+    throw new DeliveryError('PR marker footer would be ambiguous; retain the original body without repair.');
+  return decorated;
+}
+
+function deliverySquashMessage(body: string): string {
+  const substantive = hasDeliveryPrMarker(body) ? body.slice(0, -DeliveryPrFooter.length) : body;
+  if (hasDeliveryMergeTrailer(substantive)) return substantive;
+  const message = `${substantive}\n\nDelivered-by: ai-delivery`;
+  if (!hasDeliveryMergeTrailer(message))
+    throw new DeliveryError('Squash delivery trailer would be ambiguous; reconcile the message without repair.');
+  return message;
+}
+
 function hasClosingLink(body: string | null, issueNumber: number) {
   const line = `Closes #${issueNumber}`;
   return body === line || body?.startsWith(`${line}\n`) === true || body?.startsWith(`${line}\r\n`) === true;
@@ -1789,9 +1818,10 @@ export async function publishPr(
     input.body ?? pr?.body ?? (nonClosing ? referenceLine(context, input.issueNumber) : closingBody(issue));
   if ((nonClosing || input.body !== undefined) && !requestedBody.trim())
     throw new DeliveryError('PR body must contain text.');
-  const body = nonClosing
-    ? nonClosingBody(context, input.issueNumber, requestedBody)
-    : closingBody(issue, requestedBody);
+  const body = publicationBody(
+    nonClosing ? nonClosingBody(context, input.issueNumber, requestedBody) : closingBody(issue, requestedBody),
+    pr?.body,
+  );
   const closingRepair = !nonClosing && pr !== undefined && !hasClosingLink(pr.body, input.issueNumber);
   const transition = nonClosing && pr !== undefined && pr.body !== body;
   if (reconcileReference && transition)
@@ -1953,6 +1983,7 @@ export async function publishPr(
   if (input.dryRun)
     return {
       dryRun: true,
+      ...(pr === undefined ? { body } : {}),
       ...(pr === undefined ? {} : { prNumber: pr.number, draft: pr.draft }),
       ...(nonClosing
         ? {
@@ -2177,16 +2208,6 @@ export async function mergePr(
   let pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing);
   const initialPr = pr;
   const issue = nonClosing ? await openReferenceIssue(context, input.issueNumber) : undefined;
-  const squash = nonClosing
-    ? {
-        commit_title: pr.title,
-        commit_message: `${referenceLine(context, input.issueNumber)}\n\nDelivered by PR #${pr.number}.`,
-      }
-    : undefined;
-  if (squash) {
-    refuseClosingDirective(squash.commit_title);
-    refuseClosingDirective(squash.commit_message);
-  }
   if (input.reviewedHeadSha !== undefined && input.reviewedHeadSha !== pr.head.sha)
     throw new DeliveryError('Requested reviewed head differs from the GitHub PR.');
   if (pr.merged && pr.state === 'closed' && validSha(pr.merge_commit_sha))
@@ -2194,6 +2215,21 @@ export async function mergePr(
   if (pr.state !== 'open' || pr.draft) throw new DeliveryError('GitHub PR must be open and ready for merge.');
   if (pr.user.login.toLowerCase() !== author.actorLogin.toLowerCase())
     throw new DeliveryError('Merge requires the configured PR author.');
+  const squash =
+    (input.strategy ?? 'squash') === 'squash'
+      ? {
+          commit_title: pr.title,
+          commit_message: deliverySquashMessage(
+            nonClosing
+              ? `${referenceLine(context, input.issueNumber)}\n\nDelivered by PR #${pr.number}.`
+              : pr.body || `Closes #${input.issueNumber}`,
+          ),
+        }
+      : undefined;
+  if (nonClosing) {
+    refuseClosingDirective(squash!.commit_title);
+    refuseClosingDirective(squash!.commit_message);
+  }
   const reviewedHead = pr.head.sha;
   const blockers = await getNativeBlockerRelationships({
     graphql: context.clients.graphql,
@@ -2215,6 +2251,8 @@ export async function mergePr(
     sameReferencePr(initialPr, pr);
     sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
   }
+  if (squash && (pr.title !== initialPr.title || pr.body !== initialPr.body))
+    throw new DeliveryError('GitHub PR message changed; refresh squash delivery before merge.');
   if (pr.head.sha !== reviewedHead || pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha)
     throw new DeliveryError('GitHub head/base changed; refresh native merge eligibility.');
   if (
@@ -2239,7 +2277,8 @@ export async function mergePr(
       dryRun: true,
       headSha: reviewedHead,
       prNumber: pr.number,
-      ...(squash === undefined ? {} : { nonClosing: true, ...squash }),
+      ...(nonClosing ? { nonClosing: true } : {}),
+      ...squash,
     };
   if (queue) {
     await queue.checkProof();

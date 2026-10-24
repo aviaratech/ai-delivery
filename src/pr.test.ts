@@ -635,6 +635,8 @@ function fixture(
     baseMoved?: boolean;
     nonClosing?: boolean;
     commitMessage?: string;
+    prBody?: string;
+    messageChangedAfterDecision?: 'title' | 'body';
     retainedIssueDrift?: boolean;
     mergeAckLost?: boolean;
     headMoved?: boolean;
@@ -701,8 +703,14 @@ function fixture(
     number: 23,
     node_id: 'PR23',
     changed_files: 1,
-    title: publicationTitle ?? 'Improve widget',
-    body: publicationBody ?? (option.nonClosing ? 'References example/widget#17\n\nImprove widget.' : 'Closes #17'),
+    title:
+      decisionRead && option.messageChangedAfterDecision === 'title'
+        ? 'Edited title'
+        : (publicationTitle ?? 'Improve widget'),
+    body:
+      publicationBody ??
+      (decisionRead && option.messageChangedAfterDecision === 'body' ? 'Closes #17\n\nEdited body.' : option.prBody) ??
+      (option.nonClosing ? 'References example/widget#17\n\nImprove widget.' : 'Closes #17'),
     html_url: 'https://github.com/example/widget/pull/23',
     state: merged ? 'closed' : 'open',
     draft: publicationDraft ?? false,
@@ -796,7 +804,7 @@ function fixture(
       list: async () => ({ data: [] }),
       listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
       create: async (input: Record<string, unknown>) => {
-        assert.equal(input.body, 'Closes #17\n\nPlain explanation');
+        assert.equal(input.body, 'Closes #17\n\nPlain explanation\n\n<!-- ai-delivery:pr@1 -->');
         assert.equal(typeof input.title, 'string');
         assert.equal(typeof input.draft, 'boolean');
         publicationBody = input.body as string;
@@ -1271,6 +1279,99 @@ describe('remote GitHub lifecycle', () => {
   });
 });
 
+describe('managed squash usage trailer', () => {
+  const footer = '\n\n<!-- ai-delivery:pr@1 -->';
+  const trailer = '\n\nDelivered-by: ai-delivery';
+  const content = 'Closes #17\n\nOriginal body.  \r\n\n```md\n<!-- ai-delivery:pr@1 -->\n```';
+  for (const marked of [false, true]) {
+    for (const queued of [false, true]) {
+      it(`sends one closing squash trailer with exact substantive bytes (${marked}, queue=${queued})`, async () => {
+        const { context, merges } = fixture('clean', { prBody: content + (marked ? footer : '') });
+        const input = { issueNumber: 17, prNumber: 23, reviewedHeadSha: head };
+        const preview = await mergePr(context, { ...input, dryRun: true });
+        assert.equal(Reflect.get(preview, 'commit_title'), 'Improve widget');
+        assert.equal(Reflect.get(preview, 'commit_message'), content + trailer);
+        assert.notEqual(Reflect.get(preview, 'nonClosing'), true);
+        assert.equal(merges.length, 0);
+        const stages: string[] = [];
+        await mergePr(
+          context,
+          input,
+          queued
+            ? {
+                expectedBase: 'c'.repeat(40),
+                checkProof: async () => {
+                  stages.push('proof');
+                },
+                beforeMutation: async () => {
+                  stages.push('intent');
+                },
+              }
+            : undefined,
+        );
+        assert.deepEqual(stages, queued ? ['proof', 'intent'] : []);
+        assert.deepEqual(merges[0], {
+          owner: 'example',
+          repo: 'widget',
+          pull_number: 23,
+          sha: head,
+          merge_method: 'squash',
+          commit_title: 'Improve widget',
+          commit_message: content + trailer,
+        });
+        assert.equal((await mergePr(context, input)).reused, true);
+        assert.equal(merges.length, 1);
+      });
+    }
+  }
+  for (const strategy of ['merge', 'rebase'] as const) {
+    it(`preserves native ${strategy} messages without a squash trailer`, async () => {
+      const { context, merges } = fixture('clean', { prBody: content + footer, messageChangedAfterDecision: 'body' });
+      await mergePr(context, { issueNumber: 17, prNumber: 23, strategy });
+      assert.deepEqual(merges[0], {
+        owner: 'example',
+        repo: 'widget',
+        pull_number: 23,
+        sha: head,
+        merge_method: strategy,
+      });
+    });
+  }
+  for (const field of ['title', 'body'] as const) {
+    for (const mode of ['direct', 'queued', 'dry-run'] as const) {
+      it(`refuses closing squash ${field} drift after the review read (${mode})`, async () => {
+        const { context, merges } = fixture('clean', { messageChangedAfterDecision: field });
+        const stages: string[] = [];
+        await assert.rejects(
+          mergePr(
+            context,
+            { issueNumber: 17, prNumber: 23, dryRun: mode === 'dry-run' },
+            mode === 'queued'
+              ? {
+                  expectedBase: 'c'.repeat(40),
+                  checkProof: async () => {
+                    stages.push('proof');
+                  },
+                  beforeMutation: async () => {
+                    stages.push('intent');
+                  },
+                }
+              : undefined,
+          ),
+          /message.*changed|message.*drift/iu,
+        );
+        assert.equal(merges.length, 0);
+        assert.deepEqual(stages, []);
+      });
+    }
+  }
+  it('does not duplicate a canonical final trailer already present in substantive content', async () => {
+    const { context, merges } = fixture('clean', { prBody: content + trailer + footer });
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges[0]!.commit_message, content + trailer);
+  });
+});
+
 describe('retained issue guarded squash delivery', () => {
   const input = { issueNumber: 17, prNumber: 23, reviewedHeadSha: head, nonClosing: true };
   it('sends explicit safe squash messages at the approved SHA and reuses merged readback without closing', async () => {
@@ -1278,7 +1379,10 @@ describe('retained issue guarded squash delivery', () => {
     const preview = await mergePr(context, { ...input, dryRun: true });
     assert.ok('commit_title' in preview && 'commit_message' in preview);
     assert.equal(preview.commit_title, 'Improve widget');
-    assert.equal(preview.commit_message, 'References example/widget#17\n\nDelivered by PR #23.');
+    assert.equal(
+      preview.commit_message,
+      'References example/widget#17\n\nDelivered by PR #23.\n\nDelivered-by: ai-delivery',
+    );
     assert.equal(merges.length, 0);
     const result = await mergePr(context, input);
     assert.equal(result.mergeSha, merge);
@@ -1410,6 +1514,8 @@ function recordedFlow(
       pull_number: 23,
       sha: headSha,
       merge_method: 'squash',
+      commit_title: 'Improve widget',
+      commit_message: 'Closes #17\n\nDelivered-by: ai-delivery',
     });
     return merge(...args);
   }) as typeof merge;
