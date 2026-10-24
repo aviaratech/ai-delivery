@@ -227,7 +227,8 @@ test('ordinary full and focused checks exclude release cases without claiming ar
 
 test('PR reports exclude release identities while scoped release reports require all mandatory outcomes', () => {
   assert.ok(Array.isArray(checks.RELEASE_CASES));
-  assert.equal(checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length, 23);
+  const mandatory = checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory');
+  assert.equal(new Set(mandatory.map(({ file, title }) => JSON.stringify([file, title]))).size, mandatory.length);
   const f = fixture();
   const files = [...new Set(checks.RELEASE_CASES.map((test) => test.file))];
   const report = (release: boolean): TestReport => {
@@ -259,12 +260,12 @@ test('PR reports exclude release identities while scoped release reports require
       { AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/explicit-historical-input' },
       'pr',
     );
-    assert.equal(pr.passed, 4);
-    assert.equal(pr.total, 4);
+    assert.equal(pr.passed, files.length);
+    assert.equal(pr.total, files.length);
     assert.deepEqual(pr.skips, []);
-    assert.equal(pr.laneExcluded.length, 24);
+    assert.equal(pr.laneExcluded.length, checks.RELEASE_CASES.length);
     const release = checks.analyzeTests(report(true), files, f.cwd, '', {}, 'release');
-    assert.equal(release.passed, 23);
+    assert.equal(release.passed, checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length);
     assert.equal(release.skips.length, 1);
     for (const failure of ['missing', 'duplicate', 'unexpected', 'failed', 'pr-executed', 'historical-input']) {
       const data = report(failure !== 'pr-executed');
@@ -310,10 +311,7 @@ test('runtime-expanded tags match every reviewed mandatory identity without exec
       [
         join(repository, 'node_modules/vitest/vitest.mjs'),
         'list',
-        'dist/setup.test.js',
-        'dist/lifecycle.test.js',
-        'dist/targetPolicyLocal.test.js',
-        'dist/pluginPackaging.test.js',
+        ...new Set(checks.RELEASE_CASES.map((test) => test.file)),
         '--tags-filter=release',
         '--no-staticParse',
         '--maxWorkers=1',
@@ -336,7 +334,7 @@ test('runtime-expanded tags match every reviewed mandatory identity without exec
       file,
       title,
     }));
-    assert.equal(actual.length, 23);
+    assert.equal(actual.length, expected.length);
     const compare = (a: CaseIdentity, b: CaseIdentity) => JSON.stringify(a).localeCompare(JSON.stringify(b));
     assert.deepEqual(actual.sort(compare), expected.sort(compare));
   } finally {
@@ -1344,9 +1342,9 @@ function qualificationFixture() {
         selectedTestFiles: [...new Set(checks.RELEASE_CASES.map((test) => test.file))],
         tests: {
           lane: 'release',
-          files: 4,
-          total: 24,
-          passed: 23,
+          files: new Set(checks.RELEASE_CASES.map((test) => test.file)).size,
+          total: checks.RELEASE_CASES.length,
+          passed: checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length,
           skips: [historical],
           selectedCases: checks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
           laneExcluded: [],

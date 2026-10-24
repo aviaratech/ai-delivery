@@ -1059,7 +1059,7 @@ function fixture() {
     omitted: [],
     tree: identity.fingerprint,
     commands: gates.map((stage) => ({ stage, ...command })),
-    selectedTestFiles: ['dist/fictional.test.js'],
+    selectedTestFiles: ['src/fictional.test.ts'],
     tests: { files: 1, passed: 1, total: 1, skips: [] },
     toolchain: {
       controller: { executable: contract.node24, version: 'v24.21.0' },
@@ -1146,9 +1146,9 @@ function fixture() {
     selectedTestFiles: [...new Set(laneChecks.RELEASE_CASES.map((test) => test.file))],
     tests: {
       lane: 'release',
-      files: 4,
-      total: 24,
-      passed: 23,
+      files: new Set(laneChecks.RELEASE_CASES.map((test) => test.file)).size,
+      total: laneChecks.RELEASE_CASES.length,
+      passed: laneChecks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length,
       skips: laneChecks.RELEASE_CASES.filter((test) => test.kind === 'external-historical-qualification'),
       selectedCases: laneChecks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
       laneExcluded: [],
@@ -1304,12 +1304,7 @@ test('release scope runs only the exact mandatory inventory without another buil
   const f = fixture();
   try {
     const context = qualification.validateReleaseEntry(join(f.results, 'contract.json'), f.source);
-    const files = [
-      'dist/setup.test.js',
-      'dist/lifecycle.test.js',
-      'dist/targetPolicyLocal.test.js',
-      'dist/pluginPackaging.test.js',
-    ];
+    const files = [...new Set(laneChecks.RELEASE_CASES.map((test) => test.file))];
     let launched = 0;
     let driftDuringTest = false;
     let commandStatus = 'passed';
@@ -1340,8 +1335,8 @@ test('release scope runs only the exact mandatory inventory without another buil
         output,
         JSON.stringify({
           success: true,
-          numTotalTests: 24,
-          numPassedTests: 23,
+          numTotalTests: laneChecks.RELEASE_CASES.length,
+          numPassedTests: laneChecks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length,
           testResults: files.map((file) => ({
             name: join(f.source, file),
             status: 'passed',
@@ -1378,7 +1373,7 @@ test('release scope runs only the exact mandatory inventory without another buil
     assert.equal(report.scope, 'release');
     assert.equal(report.fullSuccess, false);
     assert.equal(report.artifactQualified, false);
-    assert.equal(report.tests?.passed, 23);
+    assert.equal(report.tests?.passed, laneChecks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length);
     assert.deepEqual(
       report.commands.map((command) => command.stage),
       ['tests'],
