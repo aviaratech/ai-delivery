@@ -75,6 +75,25 @@ the exact archive, resolved production closure, installed byte/mode checks, CLI,
 exports, packaged stdio MCP schemas, skills, actual Node26 library use, and owned
 quiescent removal. Its `qualified: true` and exit 0 are full package qualification
 proof, distinct from ordinary local fast/focused evidence.
+Failed qualification diagnostics remain observation-only and cannot establish
+qualification or promotion. Their JSON retains the 64 KiB limit. The
+`release.caseEncoding` discriminator is `ai-delivery.release-case-tuples@1`:
+each `release.cases` row is `[caseOrdinal, status, failureFramesOrNull]`. A failure
+is `[frameStatus, truncated, frames]`, and each frame is
+`[publicFileOrdinal, line, column, messageOrdinal]`. Descriptive statuses, repeated
+frames, message order and explicit unknown/truncated observations are preserved.
+
+Decode against the independently expected reviewed source, never mutable main.
+Verify `source`, the encoding, and `release.inventory`: its SHA256 covers UTF-8
+`JSON.stringify(RELEASE_CASES.map(({file,title,kind}) => ({file,title,kind})))` in
+that exact order, with exact case and public-file counts. Public-file ordinals
+index the first-seen unique compiled/source test paths from that inventory,
+adding each `dist/*.test.js` before its corresponding `src/*.test.ts`. Every
+case ordinal must appear once in inventory order. Missing, duplicate, reordered,
+unknown or malformed rows refuse decoding; a failed frame's coordinates must
+match that source's allowlisted file bounds. The workflow also requires matching
+`GITHUB_SHA` and `REVIEWED_SOURCE_SHA`. Full qualification reports retain complete
+file/title identities; this compact observation format never replaces them.
 Source names, compiled names and actual Vitest selection must agree;
 deleted/renamed tests cannot survive in stale `dist`. Actual artifact qualification
 requires a clean committed source including untracked files. Results must be

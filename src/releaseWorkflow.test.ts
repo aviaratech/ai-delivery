@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -142,6 +143,111 @@ function diagnosticStep(name: string) {
   return step;
 }
 
+// Test-only reader of the fixed observation format; qualification never consumes it.
+function decodeDiagnostic(wire: Json, source: string, sourceRoot: string, inventory = laneChecks.RELEASE_CASES): Json {
+  assert.match(source, /^[a-f0-9]{40}$/u);
+  assert.equal(wire['source'], source, 'Diagnostic source differs.');
+  assert.deepEqual(Object.keys(wire).sort(), [
+    'consumer',
+    'inputs',
+    'observationOnly',
+    'overall',
+    'pack',
+    'producer',
+    'promotionEligible',
+    'qualificationOutcome',
+    'qualified',
+    'release',
+    'runAttempt',
+    'runId',
+    'source',
+  ]);
+  assert.equal(wire['observationOnly'], true);
+  assert.equal(wire['qualified'], false);
+  assert.equal(wire['promotionEligible'], false);
+  const release = wire['release'] as Json;
+  assert.deepEqual(Object.keys(release).sort(), [
+    'caseEncoding',
+    'cases',
+    'cleanup',
+    'command',
+    'counts',
+    'inventory',
+    'status',
+  ]);
+  assert.equal(release['caseEncoding'], 'ai-delivery.release-case-tuples@1');
+  const identities = inventory.map(({ file, title, kind }) => ({ file, title, kind }));
+  assert.equal(new Set(identities.map(({ file, title }) => JSON.stringify([file, title]))).size, identities.length);
+  const files = [
+    ...new Set(identities.flatMap(({ file }) => [file, file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts')])),
+  ];
+  assert.deepEqual(release['inventory'], {
+    sha256: createHash('sha256').update(JSON.stringify(identities)).digest('hex'),
+    caseCount: identities.length,
+    publicFileCount: files.length,
+  });
+  const cases = release['cases'];
+  assert.ok(Array.isArray(cases));
+  assert.equal(cases.length, identities.length);
+  const code = new Map<string, string[]>();
+  const decoded = cases.map((row: unknown, ordinal: number) => {
+    assert.ok(Array.isArray(row));
+    assert.equal(row.length, 3);
+    assert.equal(row[0], ordinal, 'Diagnostic case ordinal differs.');
+    const state: unknown = row[1];
+    assert.equal(typeof state, 'string');
+    assert.ok(
+      ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled', 'ambiguous', 'unknown'].includes(state as string),
+    );
+    const identity = identities[ordinal]!;
+    if (state !== 'failed') {
+      assert.equal(row[2], null);
+      return { file: identity.file, title: identity.title, status: state };
+    }
+    const failure: unknown = row[2];
+    assert.ok(Array.isArray(failure));
+    assert.equal(failure.length, 3);
+    const frameStatus: unknown = failure[0];
+    const truncated: unknown = failure[1];
+    assert.ok(typeof frameStatus === 'string' && ['matched', 'no-match', 'unknown'].includes(frameStatus));
+    assert.equal(typeof truncated, 'boolean');
+    assert.ok(Array.isArray(failure[2]) && failure[2].length <= 4);
+    let priorMessage = 1;
+    const frames = failure[2].map((frame: unknown) => {
+      assert.ok(Array.isArray(frame));
+      assert.equal(frame.length, 4);
+      const [file, line, column, message] = frame as unknown[];
+      assert.ok(Number.isSafeInteger(file) && Number(file) >= 0 && Number(file) < files.length);
+      assert.ok(Number.isSafeInteger(line) && Number(line) > 0);
+      assert.ok(Number.isSafeInteger(column) && Number(column) > 0);
+      assert.ok((message === 1 || message === 2) && message >= priorMessage);
+      priorMessage = message;
+      const path = files[Number(file)]!;
+      if (!code.has(path)) {
+        const absolute = join(sourceRoot, path);
+        const stat = lstatSync(absolute);
+        assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 4 * 1024 * 1024);
+        assert.equal(realpathSync(absolute), absolute);
+        const bytes = readFileSync(absolute);
+        assert.equal(bytes.length, stat.size);
+        code.set(path, bytes.toString('utf8').split(/\r?\n/u));
+      }
+      const lines = code.get(path)!;
+      assert.ok(Number(line) <= lines.length && Number(column) <= lines[Number(line) - 1]!.length + 1);
+      return { file: path, line, column, message };
+    });
+    if (frameStatus === 'matched') assert.ok(frames.length > 0);
+    if (frameStatus === 'no-match') assert.ok(frames.length === 0 && truncated === false);
+    return {
+      file: identity.file,
+      title: identity.title,
+      status: state,
+      failureFrames: { status: frameStatus, truncated, frames },
+    };
+  });
+  return { ...wire, release: { ...release, cases: decoded } };
+}
+
 function diagnosticFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-diagnostic-')));
   const sourceRoot = join(root, 'public source');
@@ -238,7 +344,11 @@ function diagnosticFixture() {
   });
   save(`release-tests-${runId}/temporary/.npmrc`, sensitive);
   save('producer/command/stderr.txt', sensitive);
-  const execute = (outcome = 'failure') => {
+  const raw = (
+    outcome = 'failure',
+    env: Record<string, string | undefined> = {},
+    inventory = laneChecks.RELEASE_CASES,
+  ) => {
     const step = diagnosticStep('Prepare failed qualification diagnostics');
     const script = /node --input-type=module <<'JS'\n([\s\S]*?)\n\s+JS/u.exec(step)?.[1];
     assert.ok(script);
@@ -247,6 +357,7 @@ function diagnosticFixture() {
     writeFileSync(output, '');
     new Script(program).runInNewContext({
       constants,
+      createHash,
       closeSync,
       fstatSync,
       lstatSync,
@@ -268,7 +379,7 @@ function diagnosticFixture() {
       fileURLToPath,
       URL,
       Buffer,
-      RELEASE_CASES: laneChecks.RELEASE_CASES,
+      RELEASE_CASES: inventory,
       process: {
         env: {
           RUNNER_TEMP: root,
@@ -277,8 +388,10 @@ function diagnosticFixture() {
           GITHUB_RUN_ID: '101',
           GITHUB_RUN_ATTEMPT: '1',
           REVIEWED_SOURCE_SHA: 'a'.repeat(40),
+          GITHUB_SHA: 'a'.repeat(40),
           QUALIFICATION_OUTCOME: outcome,
           SECRET_VALUE: sensitive,
+          ...env,
         },
       },
     });
@@ -291,6 +404,7 @@ function diagnosticFixture() {
     assert.ok(!bytes.includes(root), 'runtime paths must not cross the public projection');
     return JSON.parse(bytes) as Json;
   };
+  const execute = (outcome = 'failure') => decodeDiagnostic(raw(outcome), 'a'.repeat(40), sourceRoot);
   const failures = (failureMessages: unknown, status = 'failed') =>
     save(`release-tests-${runId}/vitest.json`, {
       testResults: [
@@ -304,7 +418,19 @@ function diagnosticFixture() {
     const cases = (execute()['release'] as Json)['cases'] as Json[];
     return cases[0]!['failureFrames'];
   };
-  return { root, sourceRoot, qualificationRoot, releaseDirectory, runId, save, execute, sensitive, failures, frames };
+  return {
+    root,
+    sourceRoot,
+    qualificationRoot,
+    releaseDirectory,
+    runId,
+    save,
+    raw,
+    execute,
+    sensitive,
+    failures,
+    frames,
+  };
 }
 
 test.each([1110, 1114, 1122])('diagnostic frames preserve the public closure helper and caller at %s', (caller) => {
@@ -349,28 +475,266 @@ test('diagnostic frames preserve message order, repeats, file URLs and distinct 
   }
 });
 
-test('diagnostics retain the complete release inventory with four failure frames per case', () => {
+test.each([
+  { GITHUB_SHA: undefined },
+  { GITHUB_SHA: 'b'.repeat(40) },
+  { GITHUB_SHA: 'invalid' },
+  { REVIEWED_SOURCE_SHA: undefined },
+  { REVIEWED_SOURCE_SHA: 'invalid' },
+])('diagnostic writer refuses an unbound source before creating observations: %j', (env) => {
   const f = diagnosticFixture();
   try {
+    assert.throws(() => f.raw('failure', env), /Diagnostic source/u);
+    assert.equal(readFileSync(join(f.root, 'output'), 'utf8'), '');
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostic writer and reader refuse duplicate or differently ordered source inventories', () => {
+  const f = diagnosticFixture();
+  try {
+    const inventory = laneChecks.RELEASE_CASES;
+    assert.throws(() => f.raw('failure', {}, [...inventory, inventory[0]!]), /Diagnostic inventory/u);
+    const wire = f.raw();
+    assert.throws(() => decodeDiagnostic(wire, 'b'.repeat(40), f.sourceRoot), /Diagnostic source/u);
+    assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot, inventory.toReversed()));
+    assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot, [...inventory, inventory[0]!]));
+    assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot, inventory.slice(1)));
+    assert.throws(() =>
+      decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot, [
+        { ...inventory[0]!, kind: 'parent-launched-helper' },
+        ...inventory.slice(1),
+      ]),
+    );
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  'encoding',
+  'extra-top',
+  'extra-release',
+  'extra-inventory',
+  'hash',
+  'count',
+  'file-count',
+  'source',
+  'duplicate',
+  'missing',
+  'order',
+  'negative',
+  'fractional',
+  'outside',
+  'extra-row',
+  'missing-row',
+  'case-status',
+  'frame-status',
+  'truncation',
+  'nonfailed-frames',
+  'file-negative',
+  'file-outside',
+  'file-fractional',
+  'line-zero',
+  'line-outside',
+  'column-zero',
+  'column-outside',
+  'message-zero',
+  'message-outside',
+  'extra-frame',
+  'missing-frame',
+  'too-many-frames',
+  'matched-empty',
+  'no-match-frames',
+  'message-order',
+])('diagnostic reader refuses malformed %s observations without guessing identities', (failure) => {
+  const f = diagnosticFixture();
+  try {
+    f.failures([`    at caller (${f.sourceRoot}/src/setup.test.ts:1110:3)`]);
+    const wire = f.raw();
+    const release = wire['release'] as Json;
+    const inventory = release['inventory'] as Json;
+    const rows = release['cases'] as unknown[][];
+    const frames = rows[0]![2] as unknown[];
+    const coordinates = frames[2] as unknown[][];
+    if (failure === 'encoding') release['caseEncoding'] = 'ai-delivery.release-case-tuples@2';
+    if (failure === 'extra-top') wire['extra'] = true;
+    if (failure === 'extra-release') release['extra'] = true;
+    if (failure === 'extra-inventory') inventory['extra'] = true;
+    if (failure === 'hash') inventory['sha256'] = 'b'.repeat(64);
+    if (failure === 'count') inventory['caseCount'] = rows.length - 1;
+    if (failure === 'file-count') inventory['publicFileCount'] = 0;
+    if (failure === 'source') delete wire['source'];
+    if (failure === 'duplicate') rows[1] = rows[0]!;
+    if (failure === 'missing') rows.pop();
+    if (failure === 'order') rows.reverse();
+    if (failure === 'negative') rows[0]![0] = -1;
+    if (failure === 'fractional') rows[0]![0] = 0.5;
+    if (failure === 'outside') rows[0]![0] = rows.length;
+    if (failure === 'extra-row') rows[0]!.push(null);
+    if (failure === 'missing-row') rows[0]!.pop();
+    if (failure === 'case-status') rows[0]![1] = 'invented';
+    if (failure === 'frame-status') frames[0] = 'invented';
+    if (failure === 'truncation') frames[1] = 'false';
+    if (failure === 'nonfailed-frames') rows[0]![1] = 'passed';
+    if (failure === 'file-negative') coordinates[0]![0] = -1;
+    if (failure === 'file-outside') coordinates[0]![0] = 32;
+    if (failure === 'file-fractional') coordinates[0]![0] = 0.5;
+    if (failure === 'line-zero') coordinates[0]![1] = 0;
+    if (failure === 'line-outside') coordinates[0]![1] = 1202;
+    if (failure === 'column-zero') coordinates[0]![2] = 0;
+    if (failure === 'column-outside') coordinates[0]![2] = 999;
+    if (failure === 'message-zero') coordinates[0]![3] = 0;
+    if (failure === 'message-outside') coordinates[0]![3] = 3;
+    if (failure === 'extra-frame') coordinates[0]!.push(null);
+    if (failure === 'missing-frame') coordinates[0]!.pop();
+    if (failure === 'too-many-frames') frames[2] = Array.from({ length: 5 }, () => coordinates[0]);
+    if (failure === 'matched-empty') frames[2] = [];
+    if (failure === 'no-match-frames') frames[0] = 'no-match';
+    if (failure === 'message-order')
+      frames[2] = [
+        [...coordinates[0]!.slice(0, 3), 2],
+        [...coordinates[0]!.slice(0, 3), 1],
+      ];
+    assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot));
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test.each(['link', 'changed-coordinates'])('diagnostic reader refuses %s public source after projection', (failure) => {
+  const f = diagnosticFixture();
+  try {
+    const path = join(f.sourceRoot, 'src/setup.test.ts');
+    f.failures([`    at caller (${path}:1110:3)`]);
+    const wire = f.raw();
+    if (failure === 'link') {
+      rmSync(path);
+      symlinkSync(join(f.sourceRoot, 'dist/setup.test.js'), path);
+    } else writeFileSync(path, '// changed\n');
+    assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot));
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostic tuples round-trip every identity and descriptive case status', () => {
+  const f = diagnosticFixture();
+  try {
+    const states = ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled', 'ambiguous', 'unknown'];
     f.save(`release-tests-${f.runId}/vitest.json`, {
+      testResults: [...new Set(laneChecks.RELEASE_CASES.map((entry) => entry.file))].map((file) => ({
+        name: join(f.sourceRoot, file),
+        assertionResults: laneChecks.RELEASE_CASES.flatMap((entry, index) => {
+          if (entry.file !== file || index >= states.length || states[index] === 'unknown') return [];
+          const value = { fullName: entry.title, status: states[index], failureMessages: ['no public frames'] };
+          return states[index] === 'ambiguous' ? [value, value] : [value];
+        }),
+      })),
+    });
+    const wire = f.raw();
+    const decoded = decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot);
+    const observed = (decoded['release'] as Json)['cases'] as Json[];
+    assert.deepEqual(
+      observed.slice(0, states.length).map((entry) => entry['status']),
+      states,
+    );
+    assert.deepEqual(
+      observed.map(({ file, title }) => ({ file, title })),
+      laneChecks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
+    );
+    assert.deepEqual(observed[1]!['failureFrames'], { status: 'no-match', truncated: false, frames: [] });
+    assert.throws(() => JSON.parse(JSON.stringify(wire).slice(0, -5)));
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostics retain the complete release inventory with four seven-digit frames per case under64KiB', () => {
+  const f = diagnosticFixture();
+  try {
+    const publicFiles = [
+      ...new Set(
+        laneChecks.RELEASE_CASES.flatMap(({ file }) => [
+          file,
+          file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts'),
+        ]),
+      ),
+    ];
+    const publicFile = publicFiles.at(-1)!;
+    // These coordinates are simultaneously valid in a 2,000,000-byte public file.
+    writeFileSync(join(f.sourceRoot, publicFile), '\n'.repeat(1_000_000) + 'x'.repeat(1_000_000));
+    const command = {
+      status: 'incomplete',
+      exitCode: -255,
+      signal: 'SIGTERM',
+      cleanupConfirmed: false,
+      outputBytes: Number.MAX_SAFE_INTEGER,
+      peakRssBytes: Number.MAX_SAFE_INTEGER,
+    };
+    f.save('result.json', {
+      schemaVersion: 'ai-delivery.current-qualification@1',
+      runId: f.runId,
+      status: 'incomplete',
+      pack: command,
+    });
+    f.save('producer/result.json', {
+      status: 'incomplete',
+      fullSuccess: false,
+      commands: gates.map((stage) => ({ stage, ...command })),
+    });
+    f.save(`release-tests-${f.runId}/result.json`, {
+      status: 'incomplete',
+      commands: [command],
+      release: { temporary: { removed: false, quiescent: false } },
+    });
+    const consumerDirectory = join(f.qualificationRoot, `consumer-${f.runId}`);
+    f.save('consumer-attempt.json', {
+      runId: f.runId,
+      directory: consumerDirectory,
+      consumerPath: join(consumerDirectory, 'result.json'),
+      command,
+    });
+    f.save(`consumer-${f.runId}/result.json`, { status: 'incomplete', cleanup: { removed: false, quiescent: false } });
+    f.save(`release-tests-${f.runId}/vitest.json`, {
+      numTotalTests: Number.MAX_SAFE_INTEGER,
+      numPassedTests: Number.MAX_SAFE_INTEGER,
+      numFailedTests: Number.MAX_SAFE_INTEGER,
       testResults: [...new Set(laneChecks.RELEASE_CASES.map((entry) => entry.file))].map((file) => ({
         name: join(f.sourceRoot, file),
         assertionResults: laneChecks.RELEASE_CASES.filter((entry) => entry.file === file).map(({ title }) => ({
           fullName: title,
           status: 'failed',
           failureMessages: [
-            Array.from({ length: 4 }, () => `    at caller (${join(f.sourceRoot, file)}:1110:3)`).join('\n'),
+            null,
+            Array.from({ length: 4 }, () => `    at caller (${join(f.sourceRoot, publicFile)}:1000001:1000001)`).join(
+              '\n',
+            ),
           ],
         })),
       })),
     });
-    const observed = (f.execute()['release'] as Json)['cases'] as Json[];
+    const wire = f.raw('cancelled', {
+      GITHUB_RUN_ID: String(Number.MAX_SAFE_INTEGER),
+      GITHUB_RUN_ATTEMPT: String(Number.MAX_SAFE_INTEGER),
+    });
+    const bytes = Buffer.byteLength(JSON.stringify(wire) + '\n');
+    assert.ok(bytes <= 64 * 1024);
+    process.stdout.write(
+      `DIAGNOSTIC_FIXED_BOUND ${JSON.stringify({ cases: laneChecks.RELEASE_CASES.length, frames: laneChecks.RELEASE_CASES.length * 4, bytes, bound: 64 * 1024 })}\n`,
+    );
+    const observed = (decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot)['release'] as Json)['cases'] as Json[];
     assert.equal(observed.length, laneChecks.RELEASE_CASES.length);
     for (const entry of observed) {
       assert.equal(entry['status'], 'failed');
       const frames = entry['failureFrames'] as Json;
-      assert.equal(frames['status'], 'matched');
-      assert.equal((frames['frames'] as Json[]).length, 4);
+      assert.equal(frames['status'], 'unknown');
+      assert.equal(frames['truncated'], false);
+      assert.deepEqual(
+        frames['frames'],
+        Array.from({ length: 4 }, () => ({ file: publicFile, line: 1_000_001, column: 1_000_001, message: 2 })),
+      );
     }
   } finally {
     rmSync(f.root, { recursive: true, force: true });
@@ -1606,6 +1970,7 @@ test.each([
 
 test('portable verification refuses missing or incomplete release proof even with consistent hashes', () => {
   const f = fixture();
+  const diagnostic = diagnosticFixture();
   try {
     const bundle = api.selectReleaseArtifact(f.results, f.output, f.inputs, f.source);
     const original = bundle.records['releaseTests'];
@@ -1618,15 +1983,22 @@ test('portable verification refuses missing or incomplete release proof even wit
     bundle.records['releaseTests'] = original;
     const report = JSON.parse(original.contents) as Json;
     report['scope'] = 'full';
-    const contents = JSON.stringify(report);
-    bundle.records['releaseTests'] = { contents, sha256: canonical.sha256(contents) };
-    const overall = JSON.parse(bundle.records['overall']!.contents) as Json;
-    (overall['releaseTests'] as Json)['sha256'] = canonical.sha256(contents);
-    const overallContents = JSON.stringify(overall);
-    bundle.records['overall'] = { contents: overallContents, sha256: canonical.sha256(overallContents) };
-    f.save(path, bundle);
-    assert.throws(() => api.verifyReleaseArtifact(f.output, f.inputs));
+    const observations = diagnostic.raw('failure', {
+      REVIEWED_SOURCE_SHA: f.inputs.source,
+      GITHUB_SHA: f.inputs.source,
+    });
+    for (const invalid of [report, observations]) {
+      const contents = JSON.stringify(invalid);
+      bundle.records['releaseTests'] = { contents, sha256: canonical.sha256(contents) };
+      const overall = JSON.parse(bundle.records['overall']!.contents) as Json;
+      (overall['releaseTests'] as Json)['sha256'] = canonical.sha256(contents);
+      const overallContents = JSON.stringify(overall);
+      bundle.records['overall'] = { contents: overallContents, sha256: canonical.sha256(overallContents) };
+      f.save(path, bundle);
+      assert.throws(() => api.verifyReleaseArtifact(f.output, f.inputs));
+    }
   } finally {
+    rmSync(diagnostic.root, { recursive: true, force: true });
     f.cleanup();
   }
 });
