@@ -393,10 +393,7 @@ export const RELEASE_CASES = [
         'external consumer join never installs twice and rejects unconfirmed owned removal',
         'interrupted release retry preserves prior evidence and skips completed producer and pack',
         'lost consumer completion retains a reservation, blocks duplicate launch and reconciles without producer or pack replay',
-        'qualification checkpoints one producer and pack, resumes without replay, and retains immutable digests',
-        'qualification joins producer pack release tests and consumer in order',
         'reservation before launch survives an uncertain spawn and refuses automatic retry',
-        'resume reuses compatible completed release proof',
         'two competing resumes release at most one checkpoint-owned test child',
       ],
     },
@@ -661,6 +658,37 @@ export const RELEASE_CASES = [
       kind: 'parent-launched-helper',
     },
   ].map((entry) => ({ ...entry, kind: /** @type {const} */ ('parent-launched-helper') })),
+  ...[
+    {
+      file: 'dist/contributorChecks.test.js',
+      titles: [
+        'Vitest source and compiled inputs are unique and use isolated core-aware fork workers',
+        'runtime-expanded tags match every reviewed mandatory identity without executing cases',
+        'direct-focus npm interception reaches the pinned worker before real-case selection',
+        'historical archive input cannot override direct-focus PR exclusion',
+        'direct release focus rejects invalid contracts before any npm launch',
+        'qualification CLI finishes module loading before its owned graph reuses the validator',
+        'real failed and explicitly timed-out commands preserve logs and prove owned cleanup',
+        'cancellation reaps observed detached descendants and preserves an unrelated peer',
+        'cancellation discovers children born from a detached owner after the root exits and preserves a peer',
+      ],
+    },
+    {
+      file: 'dist/build.test.js',
+      titles: [
+        'JavaScript emit preserves nested ESM imports, source maps, executable CLI and prepared declarations',
+        'explicit clean emit removes stale outputs without retaining deleted test files',
+        'plugin emit retains standalone CLI identity and full bundled package license text',
+      ],
+    },
+    {
+      file: 'dist/currentConsumer.test.js',
+      titles: [
+        'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=false',
+        'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=true',
+      ],
+    },
+  ].flatMap(({ file, titles }) => titles.map((title) => ({ file, title, kind: /** @type {const} */ ('mandatory') }))),
 ];
 
 export const SKIP_ALLOWLIST = [

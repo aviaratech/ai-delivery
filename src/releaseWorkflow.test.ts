@@ -579,7 +579,7 @@ test.each([
     if (failure === 'truncation') frames[1] = 'false';
     if (failure === 'nonfailed-frames') rows[0]![1] = 'passed';
     if (failure === 'file-negative') coordinates[0]![0] = -1;
-    if (failure === 'file-outside') coordinates[0]![0] = 32;
+    if (failure === 'file-outside') coordinates[0]![0] = inventory['publicFileCount'];
     if (failure === 'file-fractional') coordinates[0]![0] = 0.5;
     if (failure === 'line-zero') coordinates[0]![1] = 0;
     if (failure === 'line-outside') coordinates[0]![1] = 1202;

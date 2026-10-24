@@ -124,47 +124,51 @@ type Checks = {
 const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as Checks;
 const repository = fileURLToPath(new URL('../', import.meta.url));
 
-test('Vitest source and compiled inputs are unique and use isolated core-aware fork workers', async () => {
-  const f = fixture();
-  try {
-    const { default: configure } = (await import(pathToFileURL(join(repository, 'vitest.config.ts')).href)) as {
-      default: (env: { mode: string }) => {
-        test: { testTimeout: number; pool: string; maxWorkers: number; fileParallelism: boolean };
+test(
+  'Vitest source and compiled inputs are unique and use isolated core-aware fork workers',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    try {
+      const { default: configure } = (await import(pathToFileURL(join(repository, 'vitest.config.ts')).href)) as {
+        default: (env: { mode: string }) => {
+          test: { testTimeout: number; pool: string; maxWorkers: number; fileParallelism: boolean };
+        };
       };
-    };
-    assert.equal(typeof configure, 'function');
-    for (const mode of ['source', 'compiled']) {
-      const config = configure({ mode }).test;
-      assert.ok(Number.isFinite(config.testTimeout) && config.testTimeout > 0);
-      assert.equal(config.pool, 'forks');
-      assert.equal(config.maxWorkers, availableParallelism());
-      assert.equal(config.fileParallelism, true);
-      const output = join(f.base, `projects-${mode}.json`);
-      execFileSync(
-        process.execPath,
-        [
-          join(repository, 'node_modules/vitest/vitest.mjs'),
-          'list',
-          `--mode=${mode}`,
-          '--filesOnly',
-          `--json=${output}`,
-        ],
-        {
-          cwd: repository,
-          env: checks.safeEnvironment({ PATH: process.env.PATH ?? '' }),
-          encoding: 'utf8',
-          maxBuffer: 1024 ** 2,
-        },
-      );
-      const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string }[];
-      const selected = rows.map((row) => relative(repository, row.file).replaceAll('\\', '/'));
-      assert.deepEqual([...selected].sort(), checks.expectedTests(repository, mode));
-      assert.equal(new Set(selected).size, selected.length, 'No file may execute more than once');
+      assert.equal(typeof configure, 'function');
+      for (const mode of ['source', 'compiled']) {
+        const config = configure({ mode }).test;
+        assert.ok(Number.isFinite(config.testTimeout) && config.testTimeout > 0);
+        assert.equal(config.pool, 'forks');
+        assert.equal(config.maxWorkers, availableParallelism());
+        assert.equal(config.fileParallelism, true);
+        const output = join(f.base, `projects-${mode}.json`);
+        execFileSync(
+          process.execPath,
+          [
+            join(repository, 'node_modules/vitest/vitest.mjs'),
+            'list',
+            `--mode=${mode}`,
+            '--filesOnly',
+            `--json=${output}`,
+          ],
+          {
+            cwd: repository,
+            env: checks.safeEnvironment({ PATH: process.env.PATH ?? '' }),
+            encoding: 'utf8',
+            maxBuffer: 1024 ** 2,
+          },
+        );
+        const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string }[];
+        const selected = rows.map((row) => relative(repository, row.file).replaceAll('\\', '/'));
+        assert.deepEqual([...selected].sort(), checks.expectedTests(repository, mode));
+        assert.equal(new Set(selected).size, selected.length, 'No file may execute more than once');
+      }
+    } finally {
+      f.cleanup();
     }
-  } finally {
-    f.cleanup();
-  }
-});
+  },
+);
 
 test('ordinary full and focused checks exclude release cases without claiming archive proof', async () => {
   for (const focused of [false, true]) {
@@ -286,51 +290,55 @@ test('PR reports exclude release identities while scoped release reports require
   }
 });
 
-test('runtime-expanded tags match every reviewed mandatory identity without executing cases', () => {
-  const f = fixture();
-  try {
-    const config = join(f.base, 'collection-only.config.mjs');
-    const base = pathToFileURL(join(repository, 'vitest.config.ts')).href;
-    writeFileSync(
-      config,
-      `if(!process.argv.includes('list'))throw new Error('Collection only');const base=(await import(${JSON.stringify(base)})).default({mode:'compiled'});export default {...base,test:{...base.test,tags:base.test.tags.map(tag=>tag.name==='release'?{...tag,skip:false}:tag)}};`,
-    );
-    const output = join(f.base, 'inventory.json');
-    execFileSync(
-      process.execPath,
-      [
-        join(repository, 'node_modules/vitest/vitest.mjs'),
-        'list',
-        ...new Set(checks.RELEASE_CASES.map((test) => test.file)),
-        '--tags-filter=release',
-        '--no-staticParse',
-        '--maxWorkers=1',
-        `--config=${config}`,
-        `--json=${output}`,
-      ],
-      {
-        cwd: repository,
-        env: { ...checks.safeEnvironment({ PATH: process.env.PATH ?? '' }), AI_DELIVERY_TEST_LANE: 'pr' },
-        encoding: 'utf8',
-        maxBuffer: 1024 ** 2,
-      },
-    );
-    const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; name: string }[];
-    const actual = rows.map((row) => ({
-      file: relative(repository, row.file).replaceAll('\\', '/'),
-      title: row.name.replaceAll(' > ', ' '),
-    }));
-    const expected = checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').map(({ file, title }) => ({
-      file,
-      title,
-    }));
-    assert.equal(actual.length, expected.length);
-    const compare = (a: CaseIdentity, b: CaseIdentity) => JSON.stringify(a).localeCompare(JSON.stringify(b));
-    assert.deepEqual(actual.sort(compare), expected.sort(compare));
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'runtime-expanded tags match every reviewed mandatory identity without executing cases',
+  { tags: ['release'] },
+  () => {
+    const f = fixture();
+    try {
+      const config = join(f.base, 'collection-only.config.mjs');
+      const base = pathToFileURL(join(repository, 'vitest.config.ts')).href;
+      writeFileSync(
+        config,
+        `if(!process.argv.includes('list'))throw new Error('Collection only');const base=(await import(${JSON.stringify(base)})).default({mode:'compiled'});export default {...base,test:{...base.test,tags:base.test.tags.map(tag=>tag.name==='release'?{...tag,skip:false}:tag)}};`,
+      );
+      const output = join(f.base, 'inventory.json');
+      execFileSync(
+        process.execPath,
+        [
+          join(repository, 'node_modules/vitest/vitest.mjs'),
+          'list',
+          ...new Set(checks.RELEASE_CASES.map((test) => test.file)),
+          '--tags-filter=release',
+          '--no-staticParse',
+          '--maxWorkers=1',
+          `--config=${config}`,
+          `--json=${output}`,
+        ],
+        {
+          cwd: repository,
+          env: { ...checks.safeEnvironment({ PATH: process.env.PATH ?? '' }), AI_DELIVERY_TEST_LANE: 'pr' },
+          encoding: 'utf8',
+          maxBuffer: 1024 ** 2,
+        },
+      );
+      const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; name: string }[];
+      const actual = rows.map((row) => ({
+        file: relative(repository, row.file).replaceAll('\\', '/'),
+        title: row.name.replaceAll(' > ', ' '),
+      }));
+      const expected = checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').map(({ file, title }) => ({
+        file,
+        title,
+      }));
+      assert.equal(actual.length, expected.length);
+      const compare = (a: CaseIdentity, b: CaseIdentity) => JSON.stringify(a).localeCompare(JSON.stringify(b));
+      assert.deepEqual(actual.sort(compare), expected.sort(compare));
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test('unknown lane and mismatched release context fail before child launch', async () => {
   const f = fixture();
@@ -440,17 +448,21 @@ function directFocus(f: ReturnType<typeof fixture>, title: string, env: Record<s
   return { result, reportPath, loaded };
 }
 
-test('direct-focus npm interception reaches the pinned worker before real-case selection', () => {
-  const f = fixture();
-  try {
-    const run = directFocus(f, 'controlled nonexistent selection', {}, 'worker-probe');
-    assert.equal(run.result.status, 0);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'direct-focus npm interception reaches the pinned worker before real-case selection',
+  { tags: ['release'] },
+  () => {
+    const f = fixture();
+    try {
+      const run = directFocus(f, 'controlled nonexistent selection', {}, 'worker-probe');
+      assert.equal(run.result.status, 0);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('historical archive input cannot override direct-focus PR exclusion', () => {
+test('historical archive input cannot override direct-focus PR exclusion', { tags: ['release'] }, () => {
   const f = fixture();
   const title =
     'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer';
@@ -482,7 +494,7 @@ test('historical archive input cannot override direct-focus PR exclusion', () =>
   }
 });
 
-test('direct release focus rejects invalid contracts before any npm launch', () => {
+test('direct release focus rejects invalid contracts before any npm launch', { tags: ['release'] }, () => {
   const f = fixture();
   try {
     for (const kind of ['absent', 'missing', 'malformed']) {
@@ -508,70 +520,74 @@ test('direct release focus rejects invalid contracts before any npm launch', () 
   }
 });
 
-test('qualification CLI finishes module loading before its owned graph reuses the validator', () => {
-  const f = fixture();
-  try {
-    const scripts = join(f.cwd, 'scripts');
-    mkdirSync(scripts);
-    const entry = join(scripts, 'current-qualification.mjs');
-    writeFileSync(entry, readFileSync(join(repository, 'scripts/current-qualification.mjs')));
-    const marker = join(f.base, 'module-ready');
-    writeFileSync(
-      join(scripts, 'checks.mjs'),
-      `export {RELEASE_CASES,confirmCommandQuiescence,errorMessage,executeCommand,safeEnvironment,treeIdentity} from ${JSON.stringify(pathToFileURL(join(repository, 'scripts/checks.mjs')).href)};import {writeFileSync} from 'node:fs';export async function runChecks(){await import('./current-qualification.mjs');writeFileSync(${JSON.stringify(marker)},'ready');throw new Error('Controlled stop before pack');}`,
-    );
-    writeFileSync(
-      join(scripts, 'current-consumer.mjs'),
-      `export {inspectCandidate,sha256,verifyProducerJoin} from ${JSON.stringify(pathToFileURL(join(repository, 'scripts/current-consumer.mjs')).href)};`,
-    );
-    writeFileSync(
-      join(f.cwd, 'package.json'),
-      JSON.stringify({ type: 'module', name: '@example/entry-fixture', version: '0.0.0' }),
-    );
-    writeFileSync(join(f.cwd, 'package-lock.json'), '{}\n');
-    execFileSync('git', ['add', '.'], { cwd: f.cwd });
-    execFileSync(
-      'git',
-      [
-        '-c',
-        'user.name=Fictional Fixture',
-        '-c',
-        'user.email=fixture@example.invalid',
-        '-c',
-        'commit.gpgsign=false',
-        'commit',
-        '-qm',
-        'controlled entry source',
-      ],
-      { cwd: f.cwd },
-    );
-    const output = join(f.base, 'entry-result');
-    const result = spawnSync(process.execPath, [entry, '--results-dir', output], {
-      cwd: f.cwd,
-      env: checks.safeEnvironment(process.env as Record<string, string>),
-      encoding: 'utf8',
-      maxBuffer: 1024 ** 2,
-    });
-    assert.equal(
-      existsSync(marker),
-      true,
-      'The entry module must finish evaluating before its graph awaits its validation exports.',
-    );
-    assert.equal(result.status, 1);
-    const report = JSON.parse(readFileSync(join(output, 'result.json'), 'utf8')) as {
-      status: string;
-      error: string;
-      pack?: unknown;
-      consumer?: unknown;
-    };
-    assert.equal(report.status, 'failed');
-    assert.match(report.error, /Controlled stop before pack/u);
-    assert.equal(report.pack, undefined);
-    assert.equal(report.consumer, undefined);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'qualification CLI finishes module loading before its owned graph reuses the validator',
+  { tags: ['release'] },
+  () => {
+    const f = fixture();
+    try {
+      const scripts = join(f.cwd, 'scripts');
+      mkdirSync(scripts);
+      const entry = join(scripts, 'current-qualification.mjs');
+      writeFileSync(entry, readFileSync(join(repository, 'scripts/current-qualification.mjs')));
+      const marker = join(f.base, 'module-ready');
+      writeFileSync(
+        join(scripts, 'checks.mjs'),
+        `export {RELEASE_CASES,confirmCommandQuiescence,errorMessage,executeCommand,safeEnvironment,treeIdentity} from ${JSON.stringify(pathToFileURL(join(repository, 'scripts/checks.mjs')).href)};import {writeFileSync} from 'node:fs';export async function runChecks(){await import('./current-qualification.mjs');writeFileSync(${JSON.stringify(marker)},'ready');throw new Error('Controlled stop before pack');}`,
+      );
+      writeFileSync(
+        join(scripts, 'current-consumer.mjs'),
+        `export {inspectCandidate,sha256,verifyProducerJoin} from ${JSON.stringify(pathToFileURL(join(repository, 'scripts/current-consumer.mjs')).href)};`,
+      );
+      writeFileSync(
+        join(f.cwd, 'package.json'),
+        JSON.stringify({ type: 'module', name: '@example/entry-fixture', version: '0.0.0' }),
+      );
+      writeFileSync(join(f.cwd, 'package-lock.json'), '{}\n');
+      execFileSync('git', ['add', '.'], { cwd: f.cwd });
+      execFileSync(
+        'git',
+        [
+          '-c',
+          'user.name=Fictional Fixture',
+          '-c',
+          'user.email=fixture@example.invalid',
+          '-c',
+          'commit.gpgsign=false',
+          'commit',
+          '-qm',
+          'controlled entry source',
+        ],
+        { cwd: f.cwd },
+      );
+      const output = join(f.base, 'entry-result');
+      const result = spawnSync(process.execPath, [entry, '--results-dir', output], {
+        cwd: f.cwd,
+        env: checks.safeEnvironment(process.env as Record<string, string>),
+        encoding: 'utf8',
+        maxBuffer: 1024 ** 2,
+      });
+      assert.equal(
+        existsSync(marker),
+        true,
+        'The entry module must finish evaluating before its graph awaits its validation exports.',
+      );
+      assert.equal(result.status, 1);
+      const report = JSON.parse(readFileSync(join(output, 'result.json'), 'utf8')) as {
+        status: string;
+        error: string;
+        pack?: unknown;
+        consumer?: unknown;
+      };
+      assert.equal(report.status, 'failed');
+      assert.match(report.error, /Controlled stop before pack/u);
+      assert.equal(report.pack, undefined);
+      assert.equal(report.consumer, undefined);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 function fixture() {
   const base = mkdtempSync(join(tmpdir(), 'contributor-check-fixture-'));
@@ -957,69 +973,77 @@ test('release helper skips require every mapped parent, native receipt and exact
   );
 });
 
-test('real failed and explicitly timed-out commands preserve logs and prove owned cleanup', async () => {
-  const f = fixture();
-  try {
-    const env = checks.safeEnvironment(process.env as Record<string, string>);
-    const failed = await checks.executeCommand(
-      [process.execPath, '-e', "console.log('partial failure evidence');process.exit(7)"],
-      { cwd: f.cwd, env, directory: join(f.base, 'failure') },
-    );
-    assert.equal(failed.status, 'failed');
-    assert.equal(failed.exitCode, 7);
-    assert.match(readFileSync(failed.stdoutPath, 'utf8'), /partial failure evidence/u);
-    const timed = await checks.executeCommand(
-      [process.execPath, '-e', "console.log('started');setInterval(()=>{},1000)"],
-      { cwd: f.cwd, env, directory: join(f.base, 'timeout'), timeoutMs: 200 },
-    );
-    assert.equal(timed.status, 'command-timeout');
-    assert.equal(timed.cleanupConfirmed, true);
-    assert.ok(timed.observedProcesses!.length > 0);
-    assert.ok(timed.observedProcesses!.every((row) => row.birth.length > 0));
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'real failed and explicitly timed-out commands preserve logs and prove owned cleanup',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    try {
+      const env = checks.safeEnvironment(process.env as Record<string, string>);
+      const failed = await checks.executeCommand(
+        [process.execPath, '-e', "console.log('partial failure evidence');process.exit(7)"],
+        { cwd: f.cwd, env, directory: join(f.base, 'failure') },
+      );
+      assert.equal(failed.status, 'failed');
+      assert.equal(failed.exitCode, 7);
+      assert.match(readFileSync(failed.stdoutPath, 'utf8'), /partial failure evidence/u);
+      const timed = await checks.executeCommand(
+        [process.execPath, '-e', "console.log('started');setInterval(()=>{},1000)"],
+        { cwd: f.cwd, env, directory: join(f.base, 'timeout'), timeoutMs: 200 },
+      );
+      assert.equal(timed.status, 'command-timeout');
+      assert.equal(timed.cleanupConfirmed, true);
+      assert.ok(timed.observedProcesses!.length > 0);
+      assert.ok(timed.observedProcesses!.every((row) => row.birth.length > 0));
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('cancellation reaps observed detached descendants and preserves an unrelated peer', async () => {
-  const f = fixture();
-  const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
-  try {
-    const controller = new AbortController();
-    const marker = join(f.base, 'owned-child');
-    const script = `const cp=require('node:child_process'),fs=require('node:fs');const c=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(c.pid));setInterval(()=>{},1000);`;
-    const timer = setInterval(() => {
-      if (existsSync(marker)) {
-        clearInterval(timer);
-        setTimeout(() => controller.abort(), 250);
-      }
-    }, 20);
-    const result = await checks.executeCommand([process.execPath, '-e', script], {
-      cwd: f.cwd,
-      env: checks.safeEnvironment(process.env as Record<string, string>),
-      directory: join(f.base, 'cancelled'),
-      signal: controller.signal,
-    });
-    clearInterval(timer);
-    assert.equal(result.status, 'cancelled');
-    assert.equal(result.cleanupConfirmed, true);
-    const ownedPid = readFileSync(marker, 'utf8');
-    const state = execFileSync('/bin/ps', ['-p', ownedPid, '-o', 'stat='], { encoding: 'utf8' }).trim();
-    assert.ok(state.startsWith('Z'));
-    process.kill(peer.pid!, 0);
-  } catch (error) {
-    // ps exits1 for an absent child, which is also confirmed cleanup.
-    if (!(error instanceof Error && 'status' in error && error.status === 1)) throw error;
-    process.kill(peer.pid!, 0);
-  } finally {
-    peer.kill('SIGKILL');
-    await new Promise<void>((done) => {
-      if (peer.exitCode !== null || peer.signalCode !== null) done();
-      else peer.once('close', () => done());
-    });
-    f.cleanup();
-  }
-});
+test(
+  'cancellation reaps observed detached descendants and preserves an unrelated peer',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    try {
+      const controller = new AbortController();
+      const marker = join(f.base, 'owned-child');
+      const script = `const cp=require('node:child_process'),fs=require('node:fs');const c=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(c.pid));setInterval(()=>{},1000);`;
+      const timer = setInterval(() => {
+        if (existsSync(marker)) {
+          clearInterval(timer);
+          setTimeout(() => controller.abort(), 250);
+        }
+      }, 20);
+      const result = await checks.executeCommand([process.execPath, '-e', script], {
+        cwd: f.cwd,
+        env: checks.safeEnvironment(process.env as Record<string, string>),
+        directory: join(f.base, 'cancelled'),
+        signal: controller.signal,
+      });
+      clearInterval(timer);
+      assert.equal(result.status, 'cancelled');
+      assert.equal(result.cleanupConfirmed, true);
+      const ownedPid = readFileSync(marker, 'utf8');
+      const state = execFileSync('/bin/ps', ['-p', ownedPid, '-o', 'stat='], { encoding: 'utf8' }).trim();
+      assert.ok(state.startsWith('Z'));
+      process.kill(peer.pid!, 0);
+    } catch (error) {
+      // ps exits1 for an absent child, which is also confirmed cleanup.
+      if (!(error instanceof Error && 'status' in error && error.status === 1)) throw error;
+      process.kill(peer.pid!, 0);
+    } finally {
+      peer.kill('SIGKILL');
+      await new Promise<void>((done) => {
+        if (peer.exitCode !== null || peer.signalCode !== null) done();
+        else peer.once('close', () => done());
+      });
+      f.cleanup();
+    }
+  },
+);
 
 test('existing temporary aliases resolve to the same physical directory without creating a new destination', () => {
   const f = fixture();
@@ -1055,20 +1079,23 @@ test('source identity preserves leading filename whitespace and refuses dangling
   }
 });
 
-test('cancellation discovers children born from a detached owner after the root exits and preserves a peer', async () => {
-  const f = fixture();
-  const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
-  const marker = join(f.base, 'late-children.json');
-  const controller = new AbortController();
-  const identity = (pid: number) => {
-    const result = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'stat=,lstart='], { encoding: 'utf8' });
-    assert.ok(!result.error, result.error?.message);
-    assert.ok(result.status === 0 || result.status === 1, result.stderr);
-    return result.status === 1 ? undefined : result.stdout.trim();
-  };
-  let timer: ReturnType<typeof setInterval> | undefined;
-  try {
-    const descendant = `const cp=require('node:child_process'),fs=require('node:fs');
+test(
+  'cancellation discovers children born from a detached owner after the root exits and preserves a peer',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    const marker = join(f.base, 'late-children.json');
+    const controller = new AbortController();
+    const identity = (pid: number) => {
+      const result = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'stat=,lstart='], { encoding: 'utf8' });
+      assert.ok(!result.error, result.error?.message);
+      assert.ok(result.status === 0 || result.status === 1, result.stderr);
+      return result.status === 1 ? undefined : result.stdout.trim();
+    };
+    let timer: ReturnType<typeof setInterval> | undefined;
+    try {
+      const descendant = `const cp=require('node:child_process'),fs=require('node:fs');
 const id=(pid)=>cp.execFileSync('/bin/ps',['-p',String(pid),'-o','stat=,lstart='],{encoding:'utf8'}).trim().split(/\\s+/).slice(1).join(' ');
 const record={a:process.pid,aBirth:id(process.pid)};fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify(record));
 process.once('SIGTERM',()=>setTimeout(()=>{
@@ -1077,63 +1104,64 @@ record.rootExited=root.status===1||root.stdout.trim().startsWith('Z');
 const b=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
 record.b=b.pid;record.bBirth=id(b.pid);fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify(record));
 },200));setInterval(()=>{},1000);`;
-    // The root exits on TERM. Its detached child ignores TERM and births B later.
-    const script = `const cp=require('node:child_process');cp.spawn(process.execPath,['-e',${JSON.stringify(descendant)},String(process.pid)],{detached:true,stdio:'ignore'});setInterval(()=>{},1000);`;
-    timer = setInterval(() => {
-      if (existsSync(marker)) {
-        clearInterval(timer);
-        setTimeout(() => controller.abort(), 250);
-      }
-    }, 20);
-    const result = await checks.executeCommand([process.execPath, '-e', script], {
-      cwd: f.cwd,
-      env: checks.safeEnvironment(process.env as Record<string, string>),
-      directory: join(f.base, 'late-cancellation'),
-      signal: controller.signal,
-    });
-    const children = JSON.parse(readFileSync(marker, 'utf8')) as {
-      a: number;
-      aBirth: string;
-      b: number;
-      bBirth: string;
-      rootExited: boolean;
-    };
-    assert.ok(children.b, 'The TERM-resistant owner must create a late descendant.');
-    assert.equal(children.rootExited, true, 'The late descendant must be born after the root exits.');
-    assert.equal(result.status, 'cancelled');
-    assert.equal(result.cleanupConfirmed, true);
-    assert.ok(result.observedProcesses?.some((row) => row.pid === children.b && row.birth === children.bBirth));
-    for (const pid of [children.a, children.b]) assert.ok(identity(pid)?.startsWith('Z') ?? true);
-    process.kill(peer.pid!, 0);
-  } finally {
-    clearInterval(timer);
-    // On a failing assertion, signal only the synthetic identities this fixture recorded.
-    if (existsSync(marker)) {
+      // The root exits on TERM. Its detached child ignores TERM and births B later.
+      const script = `const cp=require('node:child_process');cp.spawn(process.execPath,['-e',${JSON.stringify(descendant)},String(process.pid)],{detached:true,stdio:'ignore'});setInterval(()=>{},1000);`;
+      timer = setInterval(() => {
+        if (existsSync(marker)) {
+          clearInterval(timer);
+          setTimeout(() => controller.abort(), 250);
+        }
+      }, 20);
+      const result = await checks.executeCommand([process.execPath, '-e', script], {
+        cwd: f.cwd,
+        env: checks.safeEnvironment(process.env as Record<string, string>),
+        directory: join(f.base, 'late-cancellation'),
+        signal: controller.signal,
+      });
       const children = JSON.parse(readFileSync(marker, 'utf8')) as {
         a: number;
         aBirth: string;
-        b?: number;
-        bBirth?: string;
+        b: number;
+        bBirth: string;
+        rootExited: boolean;
       };
-      for (const [pid, birth] of [
-        [children.a, children.aBirth],
-        [children.b, children.bBirth],
-      ] as const) {
-        if (pid && birth) {
-          const state = identity(pid);
-          if (state && !state.startsWith('Z') && state.split(/\s+/u).slice(1).join(' ') === birth)
-            process.kill(pid, 'SIGKILL');
+      assert.ok(children.b, 'The TERM-resistant owner must create a late descendant.');
+      assert.equal(children.rootExited, true, 'The late descendant must be born after the root exits.');
+      assert.equal(result.status, 'cancelled');
+      assert.equal(result.cleanupConfirmed, true);
+      assert.ok(result.observedProcesses?.some((row) => row.pid === children.b && row.birth === children.bBirth));
+      for (const pid of [children.a, children.b]) assert.ok(identity(pid)?.startsWith('Z') ?? true);
+      process.kill(peer.pid!, 0);
+    } finally {
+      clearInterval(timer);
+      // On a failing assertion, signal only the synthetic identities this fixture recorded.
+      if (existsSync(marker)) {
+        const children = JSON.parse(readFileSync(marker, 'utf8')) as {
+          a: number;
+          aBirth: string;
+          b?: number;
+          bBirth?: string;
+        };
+        for (const [pid, birth] of [
+          [children.a, children.aBirth],
+          [children.b, children.bBirth],
+        ] as const) {
+          if (pid && birth) {
+            const state = identity(pid);
+            if (state && !state.startsWith('Z') && state.split(/\s+/u).slice(1).join(' ') === birth)
+              process.kill(pid, 'SIGKILL');
+          }
         }
       }
+      peer.kill('SIGKILL');
+      await new Promise<void>((done) => {
+        if (peer.exitCode !== null || peer.signalCode !== null) done();
+        else peer.once('close', () => done());
+      });
+      f.cleanup();
     }
-    peer.kill('SIGKILL');
-    await new Promise<void>((done) => {
-      if (peer.exitCode !== null || peer.signalCode !== null) done();
-      else peer.once('close', () => done());
-    });
-    f.cleanup();
-  }
-});
+  },
+);
 
 test('coverage labels unobserved contributor scripts without synthesizing measured ranges or floors', () => {
   const f = fixture();
@@ -1300,7 +1328,6 @@ function qualificationFixture() {
       order.push('release');
       mkdirSync(resultsDir);
       const observed = await releaseHook({ resultsDir, ...(signal ? { signal } : {}) });
-      const historical = checks.RELEASE_CASES.find((test) => test.kind === 'external-historical-qualification')!;
       const cancelled = signal?.aborted === true;
       const report = {
         schemaVersion: 'contributor-checks@1',
@@ -1337,7 +1364,7 @@ function qualificationFixture() {
           files: new Set(checks.RELEASE_CASES.map((test) => test.file)).size,
           total: checks.RELEASE_CASES.length,
           passed: checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length,
-          skips: [historical],
+          skips: checks.RELEASE_CASES.filter((test) => test.kind !== 'mandatory'),
           selectedCases: checks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
           laneExcluded: [],
         },
@@ -1495,39 +1522,35 @@ function qualificationFixture() {
   };
 }
 
-test(
-  'qualification checkpoints one producer and pack, resumes without replay, and retains immutable digests',
-  { tags: ['release'] },
-  async () => {
-    const f = qualificationFixture();
-    try {
-      const report = await qualification.runQualification({ ...f.options, producerOnly: true });
-      assert.equal(report.status, 'incomplete');
-      assert.equal(report.qualified, false);
-      assert.equal(report.exitCode, 2);
-      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
-      const checkpoint = join(f.options.resultsDir, 'checkpoint.json');
-      const producer = readFileSync(join(f.options.resultsDir, 'producer/result.json'));
-      const resumed = await qualification.runQualification({
-        ...f.options,
-        resume: checkpoint,
-        resultsDir: join(f.base, 'resumed'),
-      });
-      assert.equal(resumed.qualified, true);
-      assert.equal(resumed.exitCode, 0);
-      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
-      assert.deepEqual(readFileSync(join(f.options.resultsDir, 'producer/result.json')), producer);
-      await assert.rejects(
-        qualification.runQualification({ ...f.options, resume: checkpoint, resultsDir: join(f.base, 'resumed') }),
-        /Existing overall result/u,
-      );
-    } finally {
-      f.cleanup();
-    }
-  },
-);
+test('qualification checkpoints one producer and pack, resumes without replay, and retains immutable digests', async () => {
+  const f = qualificationFixture();
+  try {
+    const report = await qualification.runQualification({ ...f.options, producerOnly: true });
+    assert.equal(report.status, 'incomplete');
+    assert.equal(report.qualified, false);
+    assert.equal(report.exitCode, 2);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    const checkpoint = join(f.options.resultsDir, 'checkpoint.json');
+    const producer = readFileSync(join(f.options.resultsDir, 'producer/result.json'));
+    const resumed = await qualification.runQualification({
+      ...f.options,
+      resume: checkpoint,
+      resultsDir: join(f.base, 'resumed'),
+    });
+    assert.equal(resumed.qualified, true);
+    assert.equal(resumed.exitCode, 0);
+    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+    assert.deepEqual(readFileSync(join(f.options.resultsDir, 'producer/result.json')), producer);
+    await assert.rejects(
+      qualification.runQualification({ ...f.options, resume: checkpoint, resultsDir: join(f.base, 'resumed') }),
+      /Existing overall result/u,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
 
-test('qualification joins producer pack release tests and consumer in order', { tags: ['release'] }, async () => {
+test('qualification joins producer pack release tests and consumer in order', async () => {
   const f = qualificationFixture();
   try {
     const report = await qualification.runQualification(f.options);
@@ -1553,7 +1576,7 @@ test('producer-only omits release and consumer proof', async () => {
   }
 });
 
-test('resume reuses compatible completed release proof', { tags: ['release'] }, async () => {
+test('resume reuses compatible completed release proof', async () => {
   const f = qualificationFixture();
   try {
     const first = await qualification.runQualification(f.options);

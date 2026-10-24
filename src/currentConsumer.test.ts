@@ -112,6 +112,7 @@ const failure =
 
 test.each([false, true])(
   'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=%s',
+  { tags: ['release'] },
   (frozen) => {
     const f = fixture();
     let confirmedQuiescence = false;

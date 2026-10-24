@@ -50,28 +50,32 @@ function build(root: string, ...flags: string[]) {
   assert.equal(result.status, 0, result.stderr || result.error?.message);
 }
 
-test('JavaScript emit preserves nested ESM imports, source maps, executable CLI and prepared declarations', () => {
-  const f = fixture();
-  try {
-    f.write('dist/nested/value.d.ts', 'export declare const answer: number;\n');
-    build(f.root);
-    const output = spawnSync(process.execPath, [join(f.root, 'dist/cli.js')], { encoding: 'utf8' });
-    assert.equal(output.status, 0, output.stderr);
-    assert.equal(output.stdout, '42');
-    assert.ok(statSync(join(f.root, 'dist/cli.js')).mode & 0o111);
-    assert.ok(readFileSync(join(f.root, 'dist/cli.js'), 'utf8').startsWith('#!/usr/bin/env node\n'));
-    assert.equal(
-      readFileSync(join(f.root, 'dist/nested/value.d.ts'), 'utf8'),
-      'export declare const answer: number;\n',
-    );
-    const map = JSON.parse(readFileSync(join(f.root, 'dist/nested/value.js.map'), 'utf8')) as { sources: string[] };
-    assert.deepEqual(map.sources, ['../../src/nested/value.ts']);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'JavaScript emit preserves nested ESM imports, source maps, executable CLI and prepared declarations',
+  { tags: ['release'] },
+  () => {
+    const f = fixture();
+    try {
+      f.write('dist/nested/value.d.ts', 'export declare const answer: number;\n');
+      build(f.root);
+      const output = spawnSync(process.execPath, [join(f.root, 'dist/cli.js')], { encoding: 'utf8' });
+      assert.equal(output.status, 0, output.stderr);
+      assert.equal(output.stdout, '42');
+      assert.ok(statSync(join(f.root, 'dist/cli.js')).mode & 0o111);
+      assert.ok(readFileSync(join(f.root, 'dist/cli.js'), 'utf8').startsWith('#!/usr/bin/env node\n'));
+      assert.equal(
+        readFileSync(join(f.root, 'dist/nested/value.d.ts'), 'utf8'),
+        'export declare const answer: number;\n',
+      );
+      const map = JSON.parse(readFileSync(join(f.root, 'dist/nested/value.js.map'), 'utf8')) as { sources: string[] };
+      assert.deepEqual(map.sources, ['../../src/nested/value.ts']);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('explicit clean emit removes stale outputs without retaining deleted test files', () => {
+test('explicit clean emit removes stale outputs without retaining deleted test files', { tags: ['release'] }, () => {
   const f = fixture();
   try {
     f.write('dist/deleted.test.js', 'throw new Error("stale");\n');
@@ -83,7 +87,7 @@ test('explicit clean emit removes stale outputs without retaining deleted test f
   }
 });
 
-test('plugin emit retains standalone CLI identity and full bundled package license text', () => {
+test('plugin emit retains standalone CLI identity and full bundled package license text', { tags: ['release'] }, () => {
   const f = fixture();
   try {
     f.write(
