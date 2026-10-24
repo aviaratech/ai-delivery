@@ -35,6 +35,150 @@ import { parseIssueBody } from './issueContract.js';
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
 
+const DeliveryPrFooter = '\n\n<!-- ai-delivery:pr@1 -->';
+function activeMarkerPositions(text: string, pattern: RegExp): number[] | null {
+  // A bounded context reader, not a Markdown renderer. Resolve blocks before inline
+  // quoting; unsupported container/HTML interactions cannot prove a usage marker.
+  const ignored: Array<[number, number]> = [];
+  const uncertain: Array<[number, number]> = [];
+  const inline: Array<[number, number]> = [];
+  let paragraph: number | null = null;
+  let fence: string | null = null;
+  let comment = false;
+  let htmlEnd: 'blank' | RegExp | null = null;
+  let container = false;
+  let quoted = false;
+  let blank = true;
+  const flush = (end: number) => {
+    if (paragraph !== null) inline.push([paragraph, end]);
+    paragraph = null;
+  };
+  for (const line of text.matchAll(/[^\n]*(?:\n|$)/gu)) {
+    if (!line[0]) continue;
+    const start = line.index;
+    const end = start + line[0].length;
+    const content = line[0].replace(/\r?\n$/u, '');
+    if (comment) {
+      const closing = content.indexOf('-->');
+      ignored.push([start, closing < 0 ? end : start + closing + 3]);
+      if (closing >= 0) comment = false;
+      continue;
+    }
+    if (htmlEnd !== null) {
+      if (htmlEnd === 'blank' && !content.trim()) htmlEnd = null;
+      else {
+        uncertain.push([start, end]);
+        if (htmlEnd !== 'blank' && htmlEnd.test(content)) htmlEnd = null;
+        continue;
+      }
+    }
+    const edge = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(content);
+    if (fence !== null) {
+      ignored.push([start, end]);
+      if (edge && edge[1]![0] === fence[0] && edge[1]!.length >= fence.length && !edge[2]!.trim()) fence = null;
+      continue;
+    }
+    if (!content.trim()) {
+      flush(start);
+      quoted = false;
+      blank = true;
+      continue;
+    }
+    if (/^ {0,3}>/u.test(content)) {
+      flush(start);
+      ignored.push([start, end]);
+      quoted = true;
+      blank = false;
+      continue;
+    }
+    if (blank && /^\S/u.test(content) && !/^[-+*\d]/u.test(content)) container = false;
+    const indented = /^(?: {4}| {0,3}\t)/u.test(content);
+    if (indented && paragraph === null) {
+      (container || quoted ? uncertain : ignored).push([start, end]);
+      continue;
+    }
+    if (edge && (edge[1]![0] !== '`' || !edge[2]!.includes('`'))) {
+      flush(start);
+      if (container || quoted) uncertain.push([start, text.length]);
+      ignored.push([start, end]);
+      fence = edge[1]!;
+    } else if (/^ {0,3}<!--/u.test(content)) {
+      flush(start);
+      const opening = content.indexOf('<!--');
+      const closing = content.indexOf('-->', opening + 4);
+      ignored.push([start + opening + 4, closing < 0 ? end : start + closing + 3]);
+      if (closing < 0) comment = true;
+    } else if (/^ {0,3}<\/?[A-Za-z!?]/u.test(content)) {
+      flush(start);
+      uncertain.push([start, end]);
+      const closing = /^ {0,3}<\?/u.test(content)
+        ? /\?>/u
+        : /^ {0,3}<!\[CDATA\[/u.test(content)
+          ? /\]\]>/u
+          : /^ {0,3}<!/u.test(content)
+            ? />/u
+            : /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)/iu.test(content)
+              ? /<\/(?:pre|script|style|textarea)>/iu
+              : null;
+      htmlEnd = closing === null ? 'blank' : closing.test(content) ? null : closing;
+    } else if (
+      /^ {0,3}(?:#{1,6}(?:[ \t]|$)|(?:[-+*]|\d+[.)])[ \t])/u.test(content) ||
+      /^ {0,3}(?:=+|-+)[ \t]*$/u.test(content) ||
+      /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$/u.test(content)
+    ) {
+      flush(start);
+      inline.push([start, end]);
+      container = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]/u.test(content);
+    } else {
+      if (quoted || container) uncertain.push([start, end]);
+      paragraph ??= start;
+    }
+    blank = false;
+  }
+  flush(text.length);
+  for (const [start, end] of inline) {
+    const unit = text.slice(start, end);
+    const tokens = /\\[\\`<]|`+|<!--/gu;
+    for (let token = tokens.exec(unit); token; token = tokens.exec(unit)) {
+      if (token[0].startsWith('\\')) {
+        ignored.push([start + token.index + 1, start + tokens.lastIndex]);
+      } else if (token[0] === '<!--') {
+        const closing = unit.indexOf('-->', tokens.lastIndex);
+        if (closing < 0) uncertain.push([start + token.index, end]);
+        else {
+          ignored.push([start + tokens.lastIndex, start + closing + 3]);
+          tokens.lastIndex = closing + 3;
+        }
+      } else {
+        const ticks = /`+/gu;
+        ticks.lastIndex = tokens.lastIndex;
+        for (let closing = ticks.exec(unit); closing; closing = ticks.exec(unit)) {
+          if (closing[0].length !== token[0].length) continue;
+          ignored.push([start + token.index, start + ticks.lastIndex]);
+          tokens.lastIndex = ticks.lastIndex;
+          break;
+        }
+      }
+    }
+  }
+  const candidates = [...text.matchAll(pattern)].map((match) => match.index);
+  if (candidates.some((position) => uncertain.some(([start, end]) => position >= start && position < end))) return null;
+  return candidates.filter((position) => !ignored.some(([start, end]) => position >= start && position < end));
+}
+/** A forgeable usage indicator, not publication or merge authority. */
+export function hasDeliveryPrMarker(body: string): boolean {
+  if (!body.endsWith(DeliveryPrFooter)) return false;
+  const prefix = body.slice(0, -DeliveryPrFooter.length);
+  const active = activeMarkerPositions(body, /<!--\s*ai-delivery:pr@[^\n]*?(?:-->|$)/gmu);
+  return Boolean(prefix.trim()) && active?.length === 1 && active[0] === prefix.length + 2;
+}
+export function hasDeliveryMergeTrailer(message: string): boolean {
+  const trailer = /\n\nDelivered-by: ai-delivery\n?$/u.exec(message);
+  if (!trailer || !message.slice(0, trailer.index).trim()) return false;
+  const active = activeMarkerPositions(message, /^Delivered-by: ai-delivery[ \t]*$/gmu);
+  return active?.length === 1 && active[0] === trailer.index + 2;
+}
+
 function hasClosingLink(body: string | null, issueNumber: number) {
   const line = `Closes #${issueNumber}`;
   return body === line || body?.startsWith(`${line}\n`) === true || body?.startsWith(`${line}\r\n`) === true;

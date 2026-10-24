@@ -4,6 +4,73 @@ import { publishPr, mergePr, finishIssue, prChecks, queueChecks, queuePr } from 
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
 import { recordedBaseDrift, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
+import * as prReaders from './pr.js';
+
+it('markers require their exact canonical footer/trailer', () => {
+  const bodyMarker = Reflect.get(prReaders, 'hasDeliveryPrMarker') as ((body: string) => boolean) | undefined;
+  const trailer = Reflect.get(prReaders, 'hasDeliveryMergeTrailer') as ((body: string) => boolean) | undefined;
+  assert.equal(typeof bodyMarker, 'function');
+  assert.equal(typeof trailer, 'function');
+  const marker = '<!-- ai-delivery:pr@1 -->';
+  assert.equal(bodyMarker!(`Closes #17\n\nProof.\n\n${marker}`), true);
+  assert.equal(bodyMarker!(`Closes #17\n\nDocument ai-delivery:pr@1 semantics.\n\n${marker}`), true);
+  assert.equal(bodyMarker!(`Proof\n\n\`\`\`md\n${marker}\n\`\`\`\n\n${marker}`), true);
+  assert.equal(bodyMarker!(`Proof\n\n> ${marker}\n\n${marker}`), true);
+  for (const example of [
+    `Proof\n\n    ${marker}`,
+    `Proof\n\n\t${marker}`,
+    `Proof\n\n~~~md\n${marker}\n~~~`,
+    `Proof \`multiline\n    text ${marker}\ntext\`.`,
+    `Escaped \\${marker} remains literal.`,
+    `The literal marker is \`${marker}\`.`,
+    `The literal marker is \`\`before \` ${marker}\`\`.`,
+    `Example \`multiline\ntext ${marker}\ntext\`.`,
+    'An unmatched backtick is literal: `',
+  ])
+    assert.equal(bodyMarker!(`Closes #17\n\n${example}\n\n${marker}`), true, example);
+  assert.equal(bodyMarker!(`Closes #17\n\nEscaped \\\`${marker} remains active.\n\n${marker}`), false);
+  for (const indent of ['', ' ', '  ', '   '])
+    assert.equal(
+      bodyMarker!(`Closes #17\n\nExample \`multiline\n${indent}${marker}\ntext\`.\n\n${marker}`),
+      false,
+      'A comment block interrupts the paragraph before inline code parsing',
+    );
+  for (const boundary of ['=', '--', '___'])
+    assert.equal(bodyMarker!(`Proof \`open\n${boundary}\ntext ${marker}\nclose\`.\n\n${marker}`), false);
+  for (const body of [
+    `Proof\n\n<div>\n\`\`\`\n${marker}\n\`\`\`\n</div>\n\n${marker}`,
+    `Proof\n\n<?instruction\n\n${marker}`,
+    `Proof\n\n<![CDATA[\n\n${marker}`,
+    `Proof \`multiline\n# Heading\ntext ${marker}\ntext\`.\n\n${marker}`,
+    `Proof \`multiline\n- New block\ntext ${marker}\ntext\`.\n\n${marker}`,
+    `Proof\n\n\`\`\`\`\n${marker}\n\`\`\`\n\n${marker}`,
+    `Proof\n\n\`\`\`\n${marker}\n~~~\n\n${marker}`,
+    `Proof\n\n<!-- outer comment\n\n${marker}`,
+    `Proof\n\n<pre>\n\n${marker}`,
+    `Proof\n    ${marker}\n\n${marker}`,
+    `Proof\n\n- Container\n    ${marker}\n\n${marker}`,
+    marker,
+    `Proof\n${marker}`,
+    `Proof\n\n> ${marker}`,
+    `Proof\n\n\`\`\`\n${marker}\n\`\`\``,
+    `Proof\n\n${marker}\nextra`,
+    `Proof\n\n${marker}\n\n${marker}`,
+    `Proof\n\n${marker}\n`,
+  ])
+    assert.equal(bodyMarker!(body), false, body);
+  for (const message of ['Title\n\nDelivered-by: ai-delivery', 'Title\n\nDelivered-by: ai-delivery\n'])
+    assert.equal(trailer!(message), true);
+  assert.equal(trailer!('Document Delivered-by: ai-delivery in the guide\n\nDelivered-by: ai-delivery'), true);
+  assert.equal(trailer!('Document `multiline\nDelivered-by: ai-delivery\nexample`\n\nDelivered-by: ai-delivery'), true);
+  for (const message of [
+    'Delivered-by: ai-delivery\nextra',
+    'Title\n\n> Delivered-by: ai-delivery',
+    'Title\n\n```\nDelivered-by: ai-delivery\n```',
+    'Title\n\nDelivered-by: ai-delivery\n\nDelivered-by: ai-delivery',
+    'Title\n\nDelivered-by: other',
+  ])
+    assert.equal(trailer!(message), false, message);
+});
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
