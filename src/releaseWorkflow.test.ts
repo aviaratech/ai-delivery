@@ -110,7 +110,11 @@ const qualification = (await import(new URL('../scripts/current-qualification.mj
   }): Promise<{ qualified: boolean; error?: string }>;
 };
 type LaneChecks = {
-  RELEASE_CASES: { file: string; title: string; kind: 'mandatory' | 'external-historical-qualification' }[];
+  RELEASE_CASES: {
+    file: string;
+    title: string;
+    kind: 'mandatory' | 'external-historical-qualification' | 'parent-launched-helper';
+  }[];
   runChecks(options: {
     cwd: string;
     resultsDir: string;
@@ -282,7 +286,7 @@ function diagnosticFixture() {
     assert.ok(path);
     assert.equal(dirname(dirname(path)), root);
     const bytes = readFileSync(path, 'utf8');
-    assert.ok(Buffer.byteLength(bytes) <= 256 * 1024);
+    assert.ok(Buffer.byteLength(bytes) <= 64 * 1024);
     assert.ok(!bytes.includes(sensitive));
     assert.ok(!bytes.includes(root), 'runtime paths must not cross the public projection');
     return JSON.parse(bytes) as Json;
@@ -1177,7 +1181,7 @@ function fixture() {
       files: new Set(laneChecks.RELEASE_CASES.map((test) => test.file)).size,
       total: laneChecks.RELEASE_CASES.length,
       passed: laneChecks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length,
-      skips: laneChecks.RELEASE_CASES.filter((test) => test.kind === 'external-historical-qualification'),
+      skips: laneChecks.RELEASE_CASES.filter((test) => test.kind !== 'mandatory'),
       selectedCases: laneChecks.RELEASE_CASES.map(({ file, title }) => ({ file, title })),
       laneExcluded: [],
     },
@@ -1378,7 +1382,7 @@ test('release scope runs only the exact mandatory inventory without another buil
       );
       const stdoutPath = join(options.directory, 'stdout.txt');
       const stderrPath = join(options.directory, 'stderr.txt');
-      writeFileSync(stdoutPath, '');
+      writeFileSync(stdoutPath, 'SETUP_INTERRUPTION_RECEIPT SETUP_CLI_PHASE_RECEIPT');
       writeFileSync(stderrPath, '');
       if (driftDuringTest) writeFileSync(join(f.source, files[0]!), '// changed ignored compiled bytes\n');
       return {

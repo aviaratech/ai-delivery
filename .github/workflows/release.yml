@@ -278,7 +278,7 @@ jobs:
           };
           // Keep every mapped case and its bounded frames as the release inventory grows.
           const bytes = JSON.stringify(diagnostic) + '\n';
-          if (Buffer.byteLength(bytes) > 256 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
+          if (Buffer.byteLength(bytes) > 64 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
           const output = join(mkdtempSync(join(temporary, 'release-qualification-diagnostics-')), 'diagnostics.json');
           writeFileSync(output, bytes, { flag: 'wx', mode: 0o600 });
           appendFileSync(env.GITHUB_OUTPUT, `file=${output}\n`);

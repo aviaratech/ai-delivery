@@ -23,8 +23,8 @@ for the changed contracts, using fresh owned results outside the checkout:
 npm run checks:fast -- --test-file dist/contributorChecks.test.js --test-file dist/stagedChecks.test.js --results-dir /owned/new/local-results
 ```
 
-This runs format/lint/types, one clean TypeScript compilation and only the
-selected test files. Add `--build-plugin` only when those selected contracts
+This runs format/lint/native TypeScript checking, one clean esbuild JavaScript
+emit and only the selected compiled test files. Add `--build-plugin` only when those selected contracts
 need the bundled plugin artifact. Select tests deliberately: an existing mixed
 file can contain real npm installation/archive cases, which are not ordinary
 local validation. The local runner never implicitly provisions dependencies,
@@ -39,13 +39,17 @@ It resolves existing temporary-directory aliases to their physical paths so
 macOS synthetic fixtures do not mistake `/var` or `/tmp` aliases for managed
 plugin symlinks; this creates no new destination or host setting.
 The PR entry `npm run checks`, used by current CI, runs `scripts/checks.mjs`:
-formatting, native type-aware lint, strict TypeScript, a **clean single build**,
-all intended PR cases in the compiled Vitest files, and complete
+formatting, native type-aware lint, strict native TypeScript with declaration-only
+emit, a **clean single JavaScript/plugin build** through esbuild,
+all intended PR cases directly from `src/**/*.test.ts`, and complete
 dry inventory validation. Release cases are excluded by the native `release`
 tag and the default test configuration, including direct focused invocations.
-Independent files use a two-worker fork project; process/interruption fixtures
-use a serial project that runs after it. Both projects inherit a 60-second
-default test timeout. Existing case-specific operation and drain bounds remain;
+Vitest uses isolated fork workers sized by `availableParallelism()` for both source
+and admitted compiled release files. Files own separate temporary roots; mutable
+test ports and environment changes remain inside each worker. Native TypeScript
+7 runs once for the producer's declarations; esbuild does not repeat type analysis.
+Formatting and type-aware lint use their default worker counts. The default test
+timeout remains 60 seconds. Existing case-specific operation and drain bounds remain;
 the existing 15-minute CI job limit is the backstop for native blocking.
 The immutable
 `contributor-checks@1` snapshot records those six gates; its `fullSuccess` means
@@ -54,11 +58,16 @@ the release omissions; it does not pack or install a candidate archive.
 
 Explicit `npm run checks:release -- --results-dir /owned/new/release-results`
 runs `scripts/current-qualification.mjs`: the same PR producer, one actual
-scripts-disabled candidate pack, the 23 reviewed mandatory release cases, then
+scripts-disabled candidate pack, the exact reviewed mandatory release inventory in
+`scripts/checks.mjs`, then
 an owned, credential-free production-only consumer installation of that exact
 archive. Only the existing qualification contract can enable the release lane;
 setting a lane variable or supplying an arbitrary path cannot authorize it.
 Both packed test helpers copy the original archive instead of packing again.
+The release inventory includes native Git, process, cancellation, credential-probe,
+CLI, interruption and installation contracts moved from the regular lane. Case
+identities and tags are checked together; relocation preserves their assertions.
+Setup producer and CLI scenarios share one fixture and run in separate files.
 The release cases retain their existing synthetic fixture installations;
 these are distinct from the final current-archive production installation.
 Overall `ai-delivery.current-qualification@1` requires complete release tests,
@@ -140,9 +149,11 @@ retry. A lost response or missing CI artifact means completion is **unknown**:
 inspect the original result and PID/birth records, prove owned quiescence, then
 start a fresh attempt. Abrupt process/service loss can prevent final transport.
 
-The reviewed `SKIP_ALLOWLIST` names only two top-level skips. The setup
-interruption helper requires passing recovery parents and its receipt; their
-launch is distinct from its top-level skip. Absent
+The reviewed `SKIP_ALLOWLIST` names three top-level release skips. The setup
+interruption helper requires passing recovery parents and its interruption receipt.
+The separate CLI preparation helper requires passing CLI/preparation parents and
+its phase receipt. Each helper remains in the exact release inventory; its owned
+child launch is distinct from its top-level skip. Absent
 `AI_DELIVERY_REAL_PACKAGE_ARCHIVE` (an explicitly supplied path is forwarded
 and must not silently become an absent-input skip), the historical reviewed 0.3.4 archive
 qualification remains **unexecuted** in the release lane. It remains excluded in

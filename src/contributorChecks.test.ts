@@ -73,7 +73,9 @@ type Toolchain = {
   libraryConsumer: { version: string; executable: string };
 };
 type Checks = {
-  RELEASE_CASES: (CaseIdentity & { kind: 'mandatory' | 'external-historical-qualification' })[];
+  RELEASE_CASES: (CaseIdentity & {
+    kind: 'mandatory' | 'external-historical-qualification' | 'parent-launched-helper';
+  })[];
   FULL_GATES: string[];
   FAST_GATES: string[];
   safeEnvironment(input: Record<string, string>): Record<string, string>;
@@ -92,7 +94,8 @@ type Checks = {
     files: number;
     total: number;
     passed: number;
-    skips: object[];
+    skips: (CaseIdentity & { kind: string })[];
+    parentLaunchedHelperProved: boolean;
     selectedCases: CaseIdentity[];
     laneExcluded: CaseIdentity[];
   };
@@ -244,9 +247,16 @@ test('PR reports exclude release identities while scoped release reports require
     assert.equal(pr.total, files.length);
     assert.deepEqual(pr.skips, []);
     assert.equal(pr.laneExcluded.length, checks.RELEASE_CASES.length);
-    const release = checks.analyzeTests(report(true), files, f.cwd, '', {}, 'release');
+    const release = checks.analyzeTests(
+      report(true),
+      files,
+      f.cwd,
+      'SETUP_INTERRUPTION_RECEIPT SETUP_CLI_PHASE_RECEIPT',
+      {},
+      'release',
+    );
     assert.equal(release.passed, checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length);
-    assert.equal(release.skips.length, 1);
+    assert.equal(release.skips.length, checks.RELEASE_CASES.filter((test) => test.kind !== 'mandatory').length);
     for (const failure of ['missing', 'duplicate', 'unexpected', 'failed', 'pr-executed', 'historical-input']) {
       const data = report(failure !== 'pr-executed');
       const tests = data.testResults[0]!.assertionResults;
@@ -902,43 +912,45 @@ test('toolchain preflight rejects absent/inaccessible/wrong consumer before gate
   }
 });
 
-test('selection, counts and explicit skip reasons reject unexpected/zero/excluded or unproved results', () => {
+test('release helper skips require every mapped parent, native receipt and exact identity', () => {
   const cwd = '/synthetic/repo';
-  const report = passingReport(cwd, ['dist/setup.test.js']);
-  const file = report.testResults[0]!;
-  file.assertionResults = [
-    {
-      fullName:
-        'stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-      status: 'passed',
-    },
-    {
-      fullName:
-        'native stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-      status: 'passed',
-    },
-    { fullName: 'setup interruption child', status: 'pending' },
-    {
-      fullName:
-        'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer',
-      status: 'pending',
-    },
-  ];
-  report.numTotalTests = 4;
-  report.numPassedTests = 2;
-  const result = checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT');
-  assert.equal(result.skips.length, 1);
-  assert.equal(
-    checks.analyzeTests(report, ['dist/setup.test.js'], cwd, 'SETUP_INTERRUPTION_RECEIPT', {
-      AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/synthetic/explicit.tgz',
-    }).skips.length,
-    1,
-  );
-  assert.ok(result.laneExcluded.some((test) => test.title.startsWith('actual reviewed 0.3.4')));
-  assert.throws(() => checks.analyzeTests(report, ['dist/setup.test.js'], cwd, ''), /proof is missing/u);
-  assert.throws(() => checks.analyzeTests(report, ['dist/other.test.js'], cwd, ''), /unexpected file/u);
-  file.assertionResults[2]!.fullName = 'unexpected conditional skip';
-  assert.throws(() => checks.analyzeTests(report, ['dist/setup.test.js'], cwd, ''), /Unexpected skip/u);
+  for (const [file, receipt] of [
+    ['dist/setup.test.js', 'SETUP_INTERRUPTION_RECEIPT'],
+    ['dist/setupCli.test.js', 'SETUP_CLI_PHASE_RECEIPT'],
+  ] as const) {
+    const data = passingReport(cwd, [file]);
+    const assertions = checks.RELEASE_CASES.filter((entry) => entry.file === file).map((entry) => ({
+      fullName: entry.title,
+      status: entry.kind === 'mandatory' ? 'passed' : 'pending',
+    }));
+    data.testResults[0]!.assertionResults = assertions;
+    data.numTotalTests = assertions.length;
+    data.numPassedTests = assertions.filter((entry) => entry.status === 'passed').length;
+    const result = checks.analyzeTests(data, [file], cwd, receipt, {}, 'release');
+    assert.equal(result.parentLaunchedHelperProved, true);
+    assert.equal(result.skips.filter((entry) => entry.kind === 'parent-launched-helper').length, 1);
+    assert.throws(() => checks.analyzeTests(data, [file], cwd, '', {}, 'release'), /proof is missing/u);
+    assert.throws(
+      () => checks.analyzeTests(data, ['dist/other.test.js'], cwd, receipt, {}, 'release'),
+      /unexpected file/u,
+    );
+    const helper = assertions.find((entry) => entry.fullName.includes(' child'))!;
+    const title = helper.fullName;
+    helper.fullName = 'unexpected conditional skip';
+    assert.throws(
+      () => checks.analyzeTests(data, [file], cwd, receipt, {}, 'release'),
+      /Required release identity is missing/u,
+    );
+    helper.fullName = title;
+    assertions.push({ fullName: 'unexpected conditional skip', status: 'pending' });
+    data.numTotalTests++;
+    assert.ok(
+      checks
+        .analyzeTests(data, [file], cwd, receipt, {}, 'release')
+        .laneExcluded.some((entry) => entry.title === 'unexpected conditional skip'),
+      'Unowned regular cases remain excluded from release proof.',
+    );
+  }
   assert.throws(
     () => checks.analyzeTests({ success: true, numTotalTests: 0, numPassedTests: 0, testResults: [] }, [], cwd, ''),
     /Zero tests/u,

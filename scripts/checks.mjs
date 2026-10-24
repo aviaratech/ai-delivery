@@ -44,7 +44,7 @@ export function errorMessage(error) {
 
 export const FULL_GATES = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
 export const FAST_GATES = ['format', 'lint', 'types'];
-/** @type {(CaseIdentity & {kind:"mandatory"|"external-historical-qualification"})[]} */
+/** @type {(CaseIdentity & {kind:"mandatory"|"external-historical-qualification"|"parent-launched-helper"})[]} */
 export const RELEASE_CASES = [
   {
     file: 'dist/setup.test.js',
@@ -67,27 +67,27 @@ export const RELEASE_CASES = [
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI stage/admit separates preparation from substantive command progress',
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI prepared handoff rejects a mismatched stage identity without reinstall or admission',
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI preparation failure retains owned evidence through native drain',
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI preparation cancel retains owned evidence through native drain',
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI stage/admit keeps a stalled admission response owned until native quiescence',
     kind: 'mandatory',
   },
@@ -545,9 +545,133 @@ export const RELEASE_CASES = [
       ],
     },
   ].flatMap(({ file, titles }) => titles.map((title) => ({ file, title, kind: /** @type {const} */ ('mandatory') }))),
+  ...[
+    'native stage binds exact copied runtime paths and bytes, reuses and admits only that completed stage',
+    'native stage refuses unreviewed cache bytes without completing or mutating the cache',
+    'native stage rejects aliased or overlapping cache paths before installing',
+    'runtime-stage controller memory is bounded before authenticated preflight',
+    'runtime-stage controller growth during preflight fails before installing',
+    'runtime-stage unavailable initial controller observation refuses preflight and installer release',
+    'runtime-stage resource breach aborts a delayed preflight request and releases ownership before continuation',
+    'runtime-stage caller cancellation aborts a delayed preflight request and releases ownership before continuation',
+    'runtime-stage failure logs honor the caller retained-output cap outside the stage',
+    'runtime-stage retries share the retained-output allowance and preserve earlier failure evidence',
+    'runtime-stage first publication bounds oversized shared output absent from its ledger',
+    'runtime-stage first publication bounds corrupt shared output absent from its ledger',
+    'runtime-stage first publication bounds valid shared output absent from its ledger',
+    'runtime-stage first publication bounds empty shared output absent from its ledger',
+    'runtime-stage retained-output corrupt ledger refuses another installer without resetting its allowance',
+    'runtime-stage retained-output incompatible controller refuses another installer without resetting its allowance',
+    'runtime-stage retained-output missing evidence refuses another installer without resetting its allowance',
+    'runtime-stage retained-output corrupt evidence refuses another installer without resetting its allowance',
+    'runtime-stage retained-output oversized evidence refuses another installer without resetting its allowance',
+    'runtime-stage explicitly isolates npm cache, logs, configuration and temporary destinations',
+    'runtime-stage cancellation shares prior failure charges and identical evidence is reused',
+    'runtime-stage post-install preflight growth cannot publish completion',
+    'runtime-stage bounds actual controller and npm memory and preserves an unrelated live peer',
+    'runtime-stage changed resource intent preserves compatible completed bytes without reinstalling',
+    'completed stages refuse missing, corrupt or incompatible dependency metadata without reinstalling or rewriting',
+    'lost completion response refuses package.json drift during final preflight without reinstalling',
+    'lost completion response refuses package-lock.json drift during final preflight without reinstalling',
+    'public producer stages exact bytes, explicitly admits and reuses completed work without installing again',
+    'archive replacement and restoration during install cannot admit alternate bytes under the reviewed digest',
+    'completed snapshot missing rejects reuse and admission while preserving current admission',
+    'completed snapshot corrupt rejects reuse and admission while preserving current admission',
+    'completed snapshot symlink rejects reuse and admission while preserving current admission',
+    'completed snapshot hardlink rejects reuse and admission while preserving current admission',
+    'archive snapshot consumes the bounded stage output allowance before running npm',
+    'snapshot durability failure removes the owned partial copy and preserves the original and unrelated files',
+    'stage rejects authority before adopting or publishing a runtime',
+    'stage rejects archive before adopting or publishing a runtime',
+    'stage rejects version before adopting or publishing a runtime',
+    'stage rejects source before adopting or publishing a runtime',
+    'stage rejects config before adopting or publishing a runtime',
+    'stage rejects identity before adopting or publishing a runtime',
+    'stage rejects same-actor before adopting or publishing a runtime',
+    'stage rejects reviewer-access before adopting or publishing a runtime',
+    'stage rejects unowned before adopting or publishing a runtime',
+    'admission rejects CAS and actual byte or actor drift while preserving the prior record',
+    'post-rename errors reconcile desired bytes and never overwrite third-party replacement',
+    'failure and cancellation remove only the owned incomplete stage and preserve unrelated output',
+    'native failure and cancellation remove only the owned incomplete stage and preserve unrelated output',
+    'native cancellation fixture waits for delayed installer readiness',
+    'native cancellation fixture preserves an early staging rejection',
+    'native cancellation fixture settles a real installer before assertion-failure cleanup',
+    'output retirement retains a bounded operation cause without exposing installer failure data',
+    'output retirement retains a bounded operation cause without exposing accessors failure data',
+    'output retirement retains a bounded operation cause without exposing cycle failure data',
+    'output retirement retains a bounded operation cause without exposing proxy failure data',
+    'output retirement retains a bounded operation cause without exposing observer failure data',
+    'output retirement retains a bounded operation cause without exposing observer-zero failure data',
+    'output retirement retains a bounded operation cause without exposing observer-retired failure data',
+    'output retirement retains a bounded operation cause without exposing observer-missing failure data',
+    'output retirement retains a bounded operation cause without exposing observer-negative failure data',
+    'output retirement retains a bounded operation cause without exposing observer-fractional failure data',
+    'output retirement retains a bounded operation cause without exposing observer-unsafe failure data',
+    'output retirement retains a bounded operation cause without exposing observer-nonfinite failure data',
+    'output retirement retains a bounded operation cause without exposing observer-string failure data',
+    'output retirement retains a bounded operation cause without exposing observer-array failure data',
+    'output retirement retains a bounded operation cause without exposing observer-malformed failure data',
+    'output retirement retains a bounded operation cause without exposing observer-trailing failure data',
+    'output retirement retains a bounded operation cause without exposing inherited-message failure data',
+    'output retirement retains a bounded operation cause without exposing proxy-root failure data',
+    'output retirement preserves primary cause descriptors for nonextensible errors',
+    'output retirement preserves primary cause descriptors for readonly errors',
+    'output retirement preserves primary cause descriptors for accessor errors',
+    'output retirement preserves primary cause descriptors for mutable-nonextensible errors',
+    'output retirement preserves an operation failure when native retirement succeeds',
+    'output retirement preserves its existing cause after a successful real stage',
+    'admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes',
+    'setup preserves completed output and admission on candidate',
+    'setup preserves completed output and admission on symlink',
+    'setup preserves completed output and admission on capability',
+    'setup preserves completed output and admission on complete-corrupt',
+    'setup preserves completed output and admission on archive-drift',
+    'setup preserves completed output and admission on source-drift',
+    'setup preserves completed output and admission on config-drift',
+    'runtime-stage retained-output recovery preserves charges after hard interruption at reservation',
+    'runtime-stage retained-output recovery preserves charges after hard interruption at publication',
+    'stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
+    'native stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
+    'live routing and reviewer access drift cannot replace an already admitted stage',
+  ].map((title) => ({ file: 'dist/setup.test.js', title, kind: /** @type {const} */ ('mandatory') })),
+  ...[
+    'CLI stage and admit execute the same public producer with explicit authority and prior absence',
+    'CLI stage/admit completes substantive work beyond the former aggregate command limit',
+    'CLI stage/admit keeps an unfinished real installer owned until native quiescence',
+    'CLI stage/admit joins a failed real installer before restoring its fixture',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: missing',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: oversized',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: records',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: write',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-duplicate',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-unmatched',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-rejected',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-malformed',
+  ].map((title) => ({ file: 'dist/setupCli.test.js', title, kind: /** @type {const} */ ('mandatory') })),
+  ...[
+    {
+      file: 'dist/setup.test.js',
+      title: 'setup interruption child',
+      kind: 'parent-launched-helper',
+    },
+    {
+      file: 'dist/setupCli.test.js',
+      title: 'setup CLI preparation child',
+      kind: 'parent-launched-helper',
+    },
+  ].map((entry) => ({ ...entry, kind: /** @type {const} */ ('parent-launched-helper') })),
 ];
 
 export const SKIP_ALLOWLIST = [
+  {
+    file: 'dist/setupCli.test.js',
+    title: 'setup CLI preparation child',
+    reason:
+      'Top-level CLI preparation helper lacks its owned preparation input; passing CLI parents launch it separately.',
+    kind: 'parent-launched-helper',
+  },
+
   {
     file: 'dist/setup.test.js',
     title: 'setup interruption child',
@@ -956,7 +1080,12 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
       (test) => key(compiledTestFile(test.file), test.fullName) === key(expected.file, expected.title),
     );
     assert.ok(observed.length <= 1, 'A release identity executed more than once.');
-    if (lane === 'release' && (expected.kind === 'mandatory' || env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE)) {
+    if (lane === 'release') assert.equal(observed.length, 1, 'Required release identity is missing.');
+    if (
+      lane === 'release' &&
+      (expected.kind === 'mandatory' ||
+        (expected.kind === 'external-historical-qualification' && env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE))
+    ) {
       assert.equal(observed.length, 1, 'Required release case is missing.');
       assert.equal(observed[0].status, 'passed', 'Required release case did not pass.');
     }
@@ -986,22 +1115,27 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
       );
       return { ...allowed, file: test.file };
     });
-  if (skips.some((entry) => entry.kind === 'parent-launched-helper')) {
-    assert.ok(
-      passed.some(
-        (test) =>
-          test.fullName ===
+  for (const helper of skips.filter((entry) => entry.kind === 'parent-launched-helper')) {
+    const cli = compiledTestFile(helper.file) === 'dist/setupCli.test.js';
+    const parents = cli
+      ? [
+          'CLI stage and admit execute the same public producer with explicit authority and prior absence',
+          'CLI preparation failure retains owned evidence through native drain',
+          'CLI preparation cancel retains owned evidence through native drain',
+        ]
+      : [
           'stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-      ),
-    );
-    assert.ok(
-      passed.some(
-        (test) =>
-          test.fullName ===
           'native stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-      ),
+        ];
+    for (const title of parents)
+      assert.ok(
+        passed.some((test) => compiledTestFile(test.file) === compiledTestFile(helper.file) && test.fullName === title),
+        'Parent-launched helper parent did not pass.',
+      );
+    assert.ok(
+      output.includes(cli ? 'SETUP_CLI_PHASE_RECEIPT' : 'SETUP_INTERRUPTION_RECEIPT'),
+      'Parent-launched helper proof is missing.',
     );
-    assert.ok(output.includes('SETUP_INTERRUPTION_RECEIPT'), 'Parent-launched helper proof is missing.');
   }
   return {
     files: selected.length,
@@ -1138,7 +1272,7 @@ function persist(directory, report) {
       (step) => `${step.stage}: ${step.status}; exit=${step.exitCode}; signal=${step.signal}; log=${step.directory}`,
     ),
   ];
-  if (report.selectedTestFiles) lines.push(`Selected compiled test files: ${report.selectedTestFiles.length}`);
+  if (report.selectedTestFiles) lines.push(`Selected test files: ${report.selectedTestFiles.length}`);
   if (report.observedTests)
     lines.push(
       `Observed test results (full success still requires validated proof): ${report.observedTests.files} files; ${report.observedTests.passed}/${report.observedTests.total} passed; ${report.observedTests.failed} failed`,

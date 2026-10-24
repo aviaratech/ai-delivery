@@ -1,3 +1,13 @@
+import {
+  producer,
+  fixture,
+  git,
+  admitInput,
+  beginControllerObservation,
+  runtimeSetupState,
+  type SetupInput,
+  type Stage,
+} from './fixtures/runtimeSetup.js';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
@@ -8,27 +18,23 @@ import {
   linkSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join, relative, isAbsolute, sep } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { afterEach, test, vi } from 'vitest';
-import { z } from 'zod';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
 import * as privateFiles from './delivery/common.js';
 import { digestBytes, digestValue } from './delivery/index.js';
-import { syntheticDiscoveryClients, syntheticOverrides, syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { assertDeliveryRuntimeAdmitted, type RuntimeAdmission } from './services/deliveryAdmission.js';
 import * as atomicJson from './utils/atomicJson.js';
 
+const { actors, controllerObservation, syncFailure, sharedOutputRead, retirementFailure } = runtimeSetupState;
 afterEach(() => vi.unstubAllEnvs());
 
 function assertReviewedResolved(actual: unknown, expected: string): void {
@@ -147,380 +153,61 @@ test('resolved closure diagnostics retain distinct closure invocation coordinate
   assert.notEqual(frames[0]?.[2], frames[1]?.[2]);
 });
 
-// These two unit scenarios isolate the synthetic controller RSS contract from host-wide PS latency.
-// Every integration scenario retains native observation; this is never fallback for a failed native call.
-const controllerObservation = vi.hoisted(() => ({
-  mode: 'native' as 'native' | 'healthy-controller' | 'unavailable-controller',
-}));
-vi.mock('node:child_process', async (original) => {
-  const actual = await original<typeof import('node:child_process')>();
-  return {
-    ...actual,
-    spawn: (...args: Parameters<typeof actual.spawn>) => {
-      if (controllerObservation.mode !== 'native')
-        throw new Error('Controller unit fixture must not launch an owned child.');
-      return actual.spawn(...args);
-    },
-    spawnSync: (...args: Parameters<typeof actual.spawnSync>) => {
-      if (controllerObservation.mode === 'native') return actual.spawnSync(...args);
-      // Native synchronous probes (including inert Git config) retain their actual result and failure.
-      const psCommand = args[0] === 'ps' || args[0].endsWith('/ps');
-      if (!psCommand) return actual.spawnSync(...args);
-      if (
-        (args[0] !== '/usr/bin/ps' && args[0] !== '/bin/ps') ||
-        !Array.isArray(args[1]) ||
-        args[1].join('|') !== '-A|-o|pid=,ppid=,pgid=,rss=,stat=,lstart=' ||
-        args[2]?.encoding !== 'utf8' ||
-        args[2]?.timeout !== 1_000 ||
-        args[2]?.maxBuffer !== 4 * 1024 ** 2
-      )
-        throw new Error('Controller unit fixture received an unsupported observation signature.');
-      if (controllerObservation.mode === 'unavailable-controller')
-        return {
-          status: null,
-          error: Object.assign(new Error('Synthetic controller observation unavailable'), { code: 'ETIMEDOUT' }),
-          signal: 'SIGTERM',
-          stdout: '',
-          stderr: '',
-        };
-      // This unit owns its own writer and gate; no real child is allowed in this one-controller universe.
-      return {
-        status: 0,
-        signal: null,
-        stdout: `${process.pid} 0 ${process.pid} 32 S controller unit birth\n`,
-        stderr: '',
-      };
-    },
-  };
-});
-function beginControllerObservation(mode: 'healthy-controller' | 'unavailable-controller'): void {
-  assert.equal(controllerObservation.mode, 'native', 'a controller unit observation scope leaked');
-  assert.equal(
-    process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE,
-    undefined,
-    'controller unit observation requires its own fixture gate',
-  );
-  controllerObservation.mode = mode;
-}
+test(
+  'native stage binds exact copied runtime paths and bytes, reuses and admits only that completed stage',
+  { tags: ['release'] },
+  async () => {
+    const f = await fixture(true);
+    try {
+      const api = await producer();
+      const staged = await api.stageRuntime(f.input);
+      assert.equal(staged.admission.cliPath, join(f.input.nativePluginRoot!, 'runtime', 'dist', 'cli.js'));
+      assert.equal(staged.admission.mcpLauncherPath, join(f.input.nativePluginRoot!, 'dist', 'mcp-launcher.js'));
+      const record = readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'));
+      assert.equal((await api.stageRuntime(f.input)).reused, true);
+      assert.deepEqual(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json')), record);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      const other = join(f.base, 'other-native-plugin');
+      cpSync(f.input.nativePluginRoot!, other, { recursive: true });
+      await assert.rejects(api.stageRuntime({ ...f.input, nativePluginRoot: other }), /incompatible setup intent/u);
+      const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
+      assert.equal(admitted.admission.admissionId, staged.admission.admissionId);
+      assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
+      const readback = await assertDeliveryRuntimeAdmitted({
+        repoRoot: f.root,
+        runtimeEntryPath: staged.admission.cliPath,
+      });
+      assert.equal(readback.admissionId, staged.admission.admissionId);
+      writeFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'Changed native plugin bytes.\n');
+      await assert.rejects(api.stageRuntime(f.input), /native plugin.*reviewed/iu);
+      await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /native plugin.*reviewed/iu);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-const syncFailure = vi.hoisted(() => ({ directory: '' }));
-const sharedOutputRead = vi.hoisted(() => ({ path: '', unboundedReads: 0 }));
-const retirementFailure = vi.hoisted(() => ({ directory: '', error: undefined as Error | undefined, hits: 0 }));
-vi.mock('node:fs', async (original) => {
-  const actual = await original<typeof import('node:fs')>();
-  return {
-    ...actual,
-    rmdirSync: (...args: Parameters<typeof actual.rmdirSync>) => {
-      const result = actual.rmdirSync(...args);
-      const path = String(args[0]);
-      if (
-        retirementFailure.error !== undefined &&
-        dirname(dirname(path)) === retirementFailure.directory &&
-        /^[a-f0-9]{64}[/\\][a-f0-9-]{36}$/u.test(path.slice(retirementFailure.directory.length + 1))
-      ) {
-        retirementFailure.hits++;
-        const error = retirementFailure.error;
-        retirementFailure.error = undefined;
-        throw error;
-      }
-      return result;
-    },
-    readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
-      if (sharedOutputRead.path && String(args[0]) === sharedOutputRead.path) {
-        sharedOutputRead.unboundedReads++;
-        throw new Error('Unbounded shared command-output read attempted');
-      }
-      return actual.readFileSync(...args);
-    },
-    fsyncSync: (fd: number) => {
-      if (
-        syncFailure.directory &&
-        actual.existsSync(syncFailure.directory) &&
-        actual.fstatSync(fd).ino === actual.statSync(syncFailure.directory).ino
-      )
-        throw new Error('Synthetic directory durability unavailable');
-      actual.fsyncSync(fd);
-    },
-  };
-});
+test(
+  'native stage refuses unreviewed cache bytes without completing or mutating the cache',
+  { tags: ['release'] },
+  async () => {
+    const f = await fixture(true);
+    try {
+      const api = await producer();
+      const target = join(f.input.nativePluginRoot!, 'runtime', 'dist', 'cli.js');
+      const altered = 'console.log("unreviewed");\n';
+      writeFileSync(target, altered);
+      await assert.rejects(api.stageRuntime(f.input), /native plugin.*reviewed/iu);
+      assert.equal(readFileSync(target, 'utf8'), altered);
+      assert.equal(existsSync(join(f.root, '.git', 'ai-delivery', 'runtime-admission.json')), false);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-const actors = vi.hoisted(() => ({
-  author: 'host-user',
-  reviewer: 'reviewer[bot]',
-  access: true,
-  projectId: 'PROJECT-1',
-  authorCalls: 0,
-  reviewerCalls: 0,
-  authorStarted: false,
-  authorAborted: false,
-  pauseAuthor: false,
-  authorDelayMs: 4_000,
-}));
-// Only GitHub HTTP/authentication is synthetic. Resolver, process ownership and file operations are real.
-vi.mock('./github/client.js', async (original) => ({
-  ...(await original<typeof import('./github/client.js')>()),
-  createDeliveryGitHubClients: async (input: { role: string; signal?: AbortSignal }) => ({
-    ...syntheticDiscoveryClients(),
-    graphql: async (query: string, variables: Record<string, unknown>) => {
-      const result = await syntheticDiscoveryClients().graphql(query, variables);
-      if (query.includes('ProjectDeliveryConfiguration'))
-        (result as { organization: { projectV2: { id: string } } }).organization.projectV2.id = actors.projectId;
-      return result;
-    },
-    authSource: input.role === 'author' ? 'personal' : 'app',
-    credentialSource: input.role === 'author' ? 'env:AUTHOR_TOKEN' : 'app:reviewer',
-    role: input.role,
-    authenticatedAuthor: async (signal?: AbortSignal) => {
-      actors.authorCalls++;
-      actors.authorStarted = true;
-      if (actors.pauseAuthor) {
-        await new Promise<void>((resolve, reject) => {
-          // A delayed HTTP response bounds this fixture's request, not the stage's elapsed duration.
-          const response = setTimeout(resolve, actors.authorDelayMs);
-          const abort = () => {
-            clearTimeout(response);
-            actors.authorAborted = true;
-            reject(new Error('Synthetic author HTTP request aborted'));
-          };
-          const requestSignal = signal ?? input.signal;
-          if (requestSignal?.aborted) abort();
-          else requestSignal?.addEventListener('abort', abort, { once: true });
-        });
-      }
-      return { actorLogin: actors.author, credentialIdentity: 'user:37' };
-    },
-    appActorLogin: async () => {
-      actors.reviewerCalls++;
-      return actors.reviewer;
-    },
-    rest: {
-      repos: {
-        get: async () => {
-          if (!actors.access) throw new Error('Synthetic reviewer access denied');
-          return { data: { full_name: 'example/widget' } };
-        },
-      },
-      request: async () => {
-        throw new Error('Synthetic rules visibility unavailable');
-      },
-    },
-  }),
-}));
-
-type SetupInput = {
-  authority: string;
-  repoRoot: string;
-  identity: string;
-  archivePath: string;
-  expectedArchiveSha256: string;
-  packageVersion: string;
-  expectedSourceCommit: string;
-  expectedConfigDigest: string;
-  runtimeDirectory: string;
-  nativePluginRoot?: string;
-  signal?: AbortSignal;
-  resourceBounds?: {
-    maxAggregateRssBytes: number;
-    minFreeDiskBytes: number;
-    maxNewOutputBytes: number;
-    maxCapturedOutputBytes?: number;
-  };
-};
-type Stage = { stageId: string; admission: RuntimeAdmission; reused: boolean };
-type Producer = {
-  stageRuntime(input: SetupInput): Promise<Stage>;
-  admitRuntime(
-    input: Omit<SetupInput, 'archivePath' | 'expectedArchiveSha256' | 'packageVersion'> & {
-      stageId: string;
-      expectedPriorAdmissionSha256: string | null;
-    },
-  ): Promise<{ admission: RuntimeAdmission; reused: boolean }>;
-};
-async function producer(): Promise<Producer> {
-  const modulePath = new URL('./setup.js', import.meta.url).href;
-  const result = (await import(modulePath).catch(() => ({}))) as Partial<Producer>;
-  assert.equal(typeof result.stageRuntime, 'function', 'supported producer stage API is missing');
-  assert.equal(typeof result.admitRuntime, 'function', 'supported producer admission API is missing');
-  return result as Producer;
-}
-function git(root: string, ...args: string[]): string {
-  return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
-}
-async function fixture(native = false, parent = tmpdir()) {
-  actors.author = 'host-user';
-  actors.reviewer = 'reviewer[bot]';
-  actors.access = true;
-  actors.projectId = 'PROJECT-1';
-  actors.authorCalls = 0;
-  actors.reviewerCalls = 0;
-  actors.authorStarted = false;
-  actors.authorAborted = false;
-  actors.pauseAuthor = false;
-  actors.authorDelayMs = 4_000;
-  const base = realpathSync(mkdtempSync(join(parent, 'ai-delivery-setup-')));
-  const root = join(base, 'consumer');
-  mkdirSync(root);
-  git(root, 'init', '-q', '-b', 'main');
-  git(root, 'config', 'user.name', 'Synthetic Delivery');
-  git(root, 'config', 'user.email', 'delivery@example.test');
-  git(root, 'remote', 'add', 'origin', 'https://github.com/example/widget.git');
-  writeFileSync(join(root, 'ai-delivery.config.json'), JSON.stringify(syntheticOverrides(syntheticDiscoveryConfig)));
-  const roles = {
-    author: { authSource: 'personal', identity: 'host-author', credentialEnv: { token: 'AUTHOR_TOKEN' } },
-    reviewer: {
-      identity: 'synthetic-reviewer',
-      credentialEnv: {
-        appId: 'REVIEWER_APP_ID',
-        installationId: 'REVIEWER_INSTALLATION_ID',
-        privateKeyPath: 'REVIEWER_KEY_PATH',
-      },
-    },
-  };
-  writeFileSync(
-    join(root, 'policy.mjs'),
-    `export const deliverySettings=${JSON.stringify({ roles, commandPolicy: { checks: { format: 'REQUIRED', gitClean: 'REQUIRED', lint: 'REQUIRED', test: 'REQUIRED', typecheck: 'REQUIRED' }, timeoutsMs: { lint: 60000, test: 60000, typecheck: 60000 } } })};\n`,
-  );
-  const {
-    policy: _policy,
-    repository: _repository,
-    remote: _remote,
-    schemaVersion: _schema,
-    ...overrides
-  } = syntheticOverrides(syntheticDiscoveryConfig);
-  const userPath = join(base, 'user.json');
-  writeFileSync(
-    userPath,
-    JSON.stringify({ schemaVersion: 'ai-delivery.user@1', roles, checkoutRoots: [], ...overrides }),
-  );
-  vi.stubEnv('AI_DELIVERY_CONFIG', userPath);
-  git(root, 'add', '.');
-  git(root, 'commit', '-qm', 'Synthetic consumer');
-  git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
-  const packageRoot = join(base, 'archive', 'package');
-  const files: Record<string, string> = {
-    'package.json': JSON.stringify({
-      name: '@aviaratech/ai-delivery',
-      version: '0.3.5',
-      type: 'module',
-      bin: { 'ai-delivery': './dist/cli.js' },
-    }),
-    'dist/cli.js': "#!/usr/bin/env node\nconsole.log('0.3.5');\n",
-    'dist/agent.js': 'export const proof = 2;\n',
-    'plugins/ai-delivery/dist/mcp-launcher.js': '/* Synthetic launcher bytes */\n',
-    'plugins/ai-delivery/.claude-plugin/plugin.json': JSON.stringify({
-      name: 'ai-delivery',
-      packageVersion: '0.3.5',
-      deliveryCapabilityVersion: 2,
-    }),
-  };
-  if (native) {
-    files['plugins/ai-delivery/runtime/package.json'] = files['package.json']!;
-    files['plugins/ai-delivery/runtime/dist/cli.js'] = files['dist/cli.js']!;
-    files['plugins/ai-delivery/README.md'] = 'Synthetic copied native plugin.\n';
-  }
-  for (const [relative, bytes] of Object.entries(files)) {
-    const path = join(packageRoot, relative);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, bytes);
-  }
-  const archivePath = join(base, 'reviewed archive; inert.tgz');
-  execFileSync('tar', ['-czf', archivePath, '-C', dirname(packageRoot), 'package']);
-  const nativePluginRoot = join(base, 'native-plugin');
-  if (native) cpSync(join(packageRoot, 'plugins', 'ai-delivery'), nativePluginRoot, { recursive: true });
-  const bin = join(base, 'bin');
-  mkdirSync(bin);
-  const counter = join(base, 'installs');
-  const marker = join(base, 'installer-running');
-  // Synthetic installer boundary: the real owned command copies fixture bytes; no process manager is mocked.
-  writeFileSync(
-    join(bin, 'npm'),
-    `#!${process.execPath}\nconst fs=require('fs'),cp=require('child_process'),path=require('path');\nconst args=process.argv.slice(2);\nif(args[0]!=='install'||!['--omit=dev','--ignore-scripts','--no-audit','--no-fund'].every(x=>args.includes(x)))process.exit(9);\nfs.appendFileSync(${JSON.stringify(counter)},'x');\nfs.writeFileSync(${JSON.stringify(marker)},String(process.pid));\nconst prefix=args[args.indexOf('--prefix')+1],archive=args.at(-1);\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-settings'))},JSON.stringify({args,cwd:process.cwd(),TMPDIR:process.env.TMPDIR,TMP:process.env.TMP,TEMP:process.env.TEMP}));\nfs.writeFileSync(${JSON.stringify(join(base, 'installer-archive'))},archive);\nconst original=${JSON.stringify(archivePath)},replacement=${JSON.stringify(join(base, 'replacement.tgz'))};\nconst saved=fs.existsSync(replacement)?fs.readFileSync(original):undefined;\nif(saved)fs.copyFileSync(replacement,original);\nconst target=path.join(prefix,'node_modules/@aviaratech/ai-delivery');fs.mkdirSync(target,{recursive:true});\ntry{cp.execFileSync('tar',['-xzf',archive,'--strip-components=1','-C',target]);}finally{if(saved)fs.writeFileSync(original,saved);}\nconst dependency={'@aviaratech/ai-delivery':'file:reviewed-archive.tgz'};fs.writeFileSync(path.join(prefix,'package.json'),JSON.stringify({dependencies:dependency}));\nif(!args.includes('--package-lock=false')){const targetPackage=JSON.parse(fs.readFileSync(path.join(target,'package.json'),'utf8')),integrity='sha512-'+require('node:crypto').createHash('sha512').update(fs.readFileSync(archive)).digest('base64');fs.writeFileSync(path.join(prefix,'package-lock.json'),JSON.stringify({lockfileVersion:3,packages:{'':{dependencies:dependency},'node_modules/@aviaratech/ai-delivery':{version:targetPackage.version,resolved:'file:reviewed-archive.tgz',integrity}}}));}\nfs.mkdirSync(path.join(prefix,'node_modules/.bin'),{recursive:true});\nfs.symlinkSync('../@aviaratech/ai-delivery/dist/cli.js',path.join(prefix,'node_modules/.bin/ai-delivery'));\nconst logs=${JSON.stringify(join(base, 'log-bytes'))};\nif(fs.existsSync(logs))process.stdout.write(Buffer.alloc(Number(fs.readFileSync(logs,'utf8')),65),()=>{if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);});\nelse if(fs.existsSync(${JSON.stringify(join(base, 'fail'))}))process.exit(7);\nconst memory=${JSON.stringify(join(base, 'memory-bytes'))};\nif(fs.existsSync(memory)){globalThis.fixtureAllocation=Buffer.alloc(Number(fs.readFileSync(memory,'utf8')),1);setInterval(()=>{},1000);}\nif(fs.existsSync(${JSON.stringify(join(base, 'wait'))}))setInterval(()=>{if(fs.existsSync(${JSON.stringify(join(base, 'wait-noise'))})){fs.appendFileSync(${JSON.stringify(join(base, 'noise-writes'))},'x');process.stdout.write('pending installer heartbeat\\n');}},1000);\n`,
-  );
-  chmodSync(join(bin, 'npm'), 0o755);
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${bin}:${previousPath ?? ''}`;
-  const input: SetupInput = {
-    authority: 'runtime:stage',
-    identity: 'host-author',
-    repoRoot: root,
-    archivePath,
-    expectedArchiveSha256: digestBytes(readFileSync(archivePath)),
-    packageVersion: '0.3.5',
-    expectedSourceCommit: git(root, 'rev-parse', 'HEAD'),
-    expectedConfigDigest: (await loadDeliveryConfig(root)).configDigest,
-    runtimeDirectory: join(base, 'staged'),
-    ...(native ? { nativePluginRoot } : {}),
-  };
-  return {
-    base,
-    root,
-    input,
-    counter,
-    marker,
-    cleanup: (retainFiles = false) => {
-      process.env.PATH = previousPath;
-      if (!retainFiles) rmSync(base, { recursive: true, force: true });
-    },
-  };
-}
-function admitInput(input: SetupInput, stageId: string, prior: string | null = null) {
-  const {
-    archivePath: _archive,
-    expectedArchiveSha256: _digest,
-    packageVersion: _version,
-    nativePluginRoot: _native,
-    ...rest
-  } = input;
-  return { ...rest, authority: 'runtime:admit', stageId, expectedPriorAdmissionSha256: prior };
-}
-
-test('native stage binds exact copied runtime paths and bytes, reuses and admits only that completed stage', async () => {
-  const f = await fixture(true);
-  try {
-    const api = await producer();
-    const staged = await api.stageRuntime(f.input);
-    assert.equal(staged.admission.cliPath, join(f.input.nativePluginRoot!, 'runtime', 'dist', 'cli.js'));
-    assert.equal(staged.admission.mcpLauncherPath, join(f.input.nativePluginRoot!, 'dist', 'mcp-launcher.js'));
-    const record = readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'));
-    assert.equal((await api.stageRuntime(f.input)).reused, true);
-    assert.deepEqual(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json')), record);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    const other = join(f.base, 'other-native-plugin');
-    cpSync(f.input.nativePluginRoot!, other, { recursive: true });
-    await assert.rejects(api.stageRuntime({ ...f.input, nativePluginRoot: other }), /incompatible setup intent/u);
-    const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
-    assert.equal(admitted.admission.admissionId, staged.admission.admissionId);
-    assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
-    const readback = await assertDeliveryRuntimeAdmitted({
-      repoRoot: f.root,
-      runtimeEntryPath: staged.admission.cliPath,
-    });
-    assert.equal(readback.admissionId, staged.admission.admissionId);
-    writeFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'Changed native plugin bytes.\n');
-    await assert.rejects(api.stageRuntime(f.input), /native plugin.*reviewed/iu);
-    await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /native plugin.*reviewed/iu);
-  } finally {
-    f.cleanup();
-  }
-});
-
-test('native stage refuses unreviewed cache bytes without completing or mutating the cache', async () => {
-  const f = await fixture(true);
-  try {
-    const api = await producer();
-    const target = join(f.input.nativePluginRoot!, 'runtime', 'dist', 'cli.js');
-    const altered = 'console.log("unreviewed");\n';
-    writeFileSync(target, altered);
-    await assert.rejects(api.stageRuntime(f.input), /native plugin.*reviewed/iu);
-    assert.equal(readFileSync(target, 'utf8'), altered);
-    assert.equal(existsSync(join(f.root, '.git', 'ai-delivery', 'runtime-admission.json')), false);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-  } finally {
-    f.cleanup();
-  }
-});
-
-test('native stage rejects aliased or overlapping cache paths before installing', async () => {
+test('native stage rejects aliased or overlapping cache paths before installing', { tags: ['release'] }, async () => {
   const f = await fixture(true);
   try {
     const api = await producer();
@@ -534,7 +221,7 @@ test('native stage rejects aliased or overlapping cache paths before installing'
   }
 });
 
-test('runtime-stage controller memory is bounded before authenticated preflight', async () => {
+test('runtime-stage controller memory is bounded before authenticated preflight', { tags: ['release'] }, async () => {
   const api = await producer();
   const f = await fixture();
   try {
@@ -553,7 +240,7 @@ test('runtime-stage controller memory is bounded before authenticated preflight'
   }
 });
 
-test('runtime-stage controller growth during preflight fails before installing', async () => {
+test('runtime-stage controller growth during preflight fails before installing', { tags: ['release'] }, async () => {
   const api = await producer();
   const f = await fixture();
   const memoryUsage = process.memoryUsage.bind(process);
@@ -590,229 +277,254 @@ test('runtime-stage controller growth during preflight fails before installing',
   }
 });
 
-test('runtime-stage unavailable initial controller observation refuses preflight and installer release', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    beginControllerObservation('unavailable-controller');
-    await assert.rejects(
-      api.stageRuntime({
-        ...f.input,
-        resourceBounds: {
-          maxAggregateRssBytes: 512 * 1024 ** 2,
-          minFreeDiskBytes: 1,
-          maxNewOutputBytes: 128 * 1024 ** 2,
-        },
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.equal(error.name, 'DeliveryError');
-        const prefix = 'Owned process resource observation failed. ';
-        assert.ok(error.message.startsWith(prefix));
-        const metadata = JSON.parse(error.message.slice(prefix.length)) as Record<string, unknown>;
-        assert.ok(typeof metadata.elapsedMs === 'number' && Number.isSafeInteger(metadata.elapsedMs));
-        assert.ok(metadata.elapsedMs >= 0);
-        assert.deepEqual(metadata, {
-          status: null,
-          errorCode: 'ETIMEDOUT',
-          signal: 'SIGTERM',
-          stdoutPresent: true,
-          stdoutTerminated: false,
-          elapsedMs: metadata.elapsedMs,
-          stdoutBytes: 0,
-          completeLines: 0,
-        });
-        return true;
-      },
-    );
-    assert.equal(actors.authorCalls, 0, 'unavailable observation must refuse before authenticated preflight');
-    assert.equal(existsSync(f.counter), false, 'unavailable observation must not release the npm command');
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-  } finally {
-    try {
-      f.cleanup();
-    } finally {
-      controllerObservation.mode = 'native';
-    }
-  }
-});
-
-for (const interruption of ['resource breach', 'caller cancellation'] as const) {
-  test(`runtime-stage ${interruption} aborts a delayed preflight request and releases ownership before continuation`, async () => {
+test(
+  'runtime-stage unavailable initial controller observation refuses preflight and installer release',
+  { tags: ['release'] },
+  async () => {
     const api = await producer();
     const f = await fixture();
-    const cancellation = new AbortController();
-    const actualMemory = process.memoryUsage.bind(process);
-    const memory = vi.spyOn(process, 'memoryUsage').mockImplementation(() => ({
-      ...actualMemory(),
-      rss: interruption === 'resource breach' && actors.authorStarted ? 1024 ** 3 : 64 * 1024 ** 2,
-    }));
-    actors.pauseAuthor = true;
     try {
-      const rejected = assert.rejects(
+      beginControllerObservation('unavailable-controller');
+      await assert.rejects(
         api.stageRuntime({
           ...f.input,
-          signal: cancellation.signal,
           resourceBounds: {
             maxAggregateRssBytes: 512 * 1024 ** 2,
             minFreeDiskBytes: 1,
             maxNewOutputBytes: 128 * 1024 ** 2,
-            maxCapturedOutputBytes: 1024 ** 2,
           },
         }),
-        interruption === 'resource breach' ? /aggregate RSS .* exceeded limit/u : /cancelled/u,
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.name, 'DeliveryError');
+          const prefix = 'Owned process resource observation failed. ';
+          assert.ok(error.message.startsWith(prefix));
+          const metadata = JSON.parse(error.message.slice(prefix.length)) as Record<string, unknown>;
+          assert.ok(typeof metadata.elapsedMs === 'number' && Number.isSafeInteger(metadata.elapsedMs));
+          assert.ok(metadata.elapsedMs >= 0);
+          assert.deepEqual(metadata, {
+            status: null,
+            errorCode: 'ETIMEDOUT',
+            signal: 'SIGTERM',
+            stdoutPresent: true,
+            stdoutTerminated: false,
+            elapsedMs: metadata.elapsedMs,
+            stdoutBytes: 0,
+            completeLines: 0,
+          });
+          return true;
+        },
       );
-      if (interruption === 'caller cancellation') {
-        while (!actors.authorStarted) await new Promise((resolve) => setTimeout(resolve, 10));
-        cancellation.abort();
-      }
-      await rejected;
-      assert.equal(actors.authorAborted, true, 'in-flight author request must receive scope cancellation');
-      assert.equal(actors.reviewerCalls, 0, 'reviewer preflight must not continue after detection');
-      assert.equal(existsSync(f.counter), false);
+      assert.equal(actors.authorCalls, 0, 'unavailable observation must refuse before authenticated preflight');
+      assert.equal(existsSync(f.counter), false, 'unavailable observation must not release the npm command');
       assert.equal(existsSync(f.input.runtimeDirectory), false);
-      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-      memory.mockRestore();
-      actors.pauseAuthor = false;
-      const retry = await api.stageRuntime(f.input);
-      assert.equal(retry.reused, false, 'cancelled preflight must release writer ownership for a clean retry');
-      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
     } finally {
-      memory.mockRestore();
-      f.cleanup();
+      try {
+        f.cleanup();
+      } finally {
+        controllerObservation.mode = 'native';
+      }
     }
-  });
+  },
+);
+
+for (const interruption of ['resource breach', 'caller cancellation'] as const) {
+  test(
+    `runtime-stage ${interruption} aborts a delayed preflight request and releases ownership before continuation`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      const cancellation = new AbortController();
+      const actualMemory = process.memoryUsage.bind(process);
+      const memory = vi.spyOn(process, 'memoryUsage').mockImplementation(() => ({
+        ...actualMemory(),
+        rss: interruption === 'resource breach' && actors.authorStarted ? 1024 ** 3 : 64 * 1024 ** 2,
+      }));
+      actors.pauseAuthor = true;
+      try {
+        const rejected = assert.rejects(
+          api.stageRuntime({
+            ...f.input,
+            signal: cancellation.signal,
+            resourceBounds: {
+              maxAggregateRssBytes: 512 * 1024 ** 2,
+              minFreeDiskBytes: 1,
+              maxNewOutputBytes: 128 * 1024 ** 2,
+              maxCapturedOutputBytes: 1024 ** 2,
+            },
+          }),
+          interruption === 'resource breach' ? /aggregate RSS .* exceeded limit/u : /cancelled/u,
+        );
+        if (interruption === 'caller cancellation') {
+          while (!actors.authorStarted) await new Promise((resolve) => setTimeout(resolve, 10));
+          cancellation.abort();
+        }
+        await rejected;
+        assert.equal(actors.authorAborted, true, 'in-flight author request must receive scope cancellation');
+        assert.equal(actors.reviewerCalls, 0, 'reviewer preflight must not continue after detection');
+        assert.equal(existsSync(f.counter), false);
+        assert.equal(existsSync(f.input.runtimeDirectory), false);
+        assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+        memory.mockRestore();
+        actors.pauseAuthor = false;
+        const retry = await api.stageRuntime(f.input);
+        assert.equal(retry.reused, false, 'cancelled preflight must release writer ownership for a clean retry');
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+        assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+      } finally {
+        memory.mockRestore();
+        f.cleanup();
+      }
+    },
+  );
 }
 
-test('runtime-stage failure logs honor the caller retained-output cap outside the stage', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const logLimit = 1024 ** 2;
-  try {
-    writeFileSync(join(f.base, 'log-bytes'), String(2 * logLimit));
-    writeFileSync(join(f.base, 'fail'), 'go');
-    await assert.rejects(
-      api.stageRuntime({
-        ...f.input,
-        resourceBounds: {
-          maxAggregateRssBytes: 512 * 1024 ** 2,
-          minFreeDiskBytes: 1,
-          maxNewOutputBytes: 128 * 1024 ** 2,
-          maxCapturedOutputBytes: logLimit,
-        },
-      }),
-      /captured output exceeded/u,
-    );
-    const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
-    const logs = readdirSync(outputDirectory);
-    assert.equal(logs.length, 1);
-    assert.ok(lstatSync(join(outputDirectory, logs[0]!)).size <= logLimit);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-  } finally {
-    f.cleanup();
-  }
-});
-
-test('runtime-stage retries share the retained-output allowance and preserve earlier failure evidence', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const logLimit = 1024 ** 2;
-  const input = {
-    ...f.input,
-    resourceBounds: {
-      maxAggregateRssBytes: 512 * 1024 ** 2,
-      minFreeDiskBytes: 1,
-      maxNewOutputBytes: 128 * 1024 ** 2,
-      maxCapturedOutputBytes: logLimit,
-    },
-  };
-  const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
-  try {
-    writeFileSync(join(f.base, 'fail'), 'go');
-    writeFileSync(join(f.base, 'log-bytes'), String(600 * 1024));
-    await assert.rejects(api.stageRuntime(input), /failed/u);
-    const prior = readdirSync(outputDirectory).map((name) => ({
-      name,
-      bytes: readFileSync(join(outputDirectory, name)),
-    }));
-    writeFileSync(join(f.base, 'log-bytes'), String(700 * 1024));
-    await assert.rejects(api.stageRuntime(input), /failed|captured output exceeded/u);
-    const total = readdirSync(outputDirectory).reduce(
-      (bytes, name) => bytes + lstatSync(join(outputDirectory, name)).size,
-      0,
-    );
-    assert.ok(total <= logLimit, `Retained retry logs ${total} exceed total allowance ${logLimit}.`);
-    for (const evidence of prior) assert.deepEqual(readFileSync(join(outputDirectory, evidence.name)), evidence.bytes);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-    await assert.rejects(api.stageRuntime(input), /retained.*exhausted/u);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'xx', 'exhausted allowance must refuse another installer invocation');
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-  } finally {
-    f.cleanup();
-  }
-});
-
-for (const existing of ['oversized', 'corrupt', 'valid', 'empty'] as const) {
-  test(`runtime-stage first publication bounds ${existing} shared output absent from its ledger`, async () => {
+test(
+  'runtime-stage failure logs honor the caller retained-output cap outside the stage',
+  { tags: ['release'] },
+  async () => {
     const api = await producer();
     const f = await fixture();
-    const bytes = Buffer.alloc(existing === 'empty' ? 0 : 100 * 1024, 65);
-    const digest = digestBytes(bytes);
-    const directory = join(f.root, '.git/ai-delivery/verification@1/command-output');
-    const evidence = join(directory, `${digest.slice(7)}.bin`);
-    const ledgerDirectory = join(
-      f.root,
-      '.git/ai-delivery/verification@1/runtime-output',
-      digestValue(f.root).slice(7),
-    );
+    const logLimit = 1024 ** 2;
     try {
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      writeFileSync(evidence, existing === 'corrupt' ? Buffer.alloc(bytes.length, 66) : bytes, { mode: 0o600 });
-      if (existing === 'oversized') truncateSync(evidence, 9 * 1024 ** 2);
-      const originalDigest = digestBytes(readFileSync(evidence));
-      const originalIdentity = lstatSync(evidence);
-      assert.equal(existsSync(ledgerDirectory), false, 'shared evidence must precede this stage ledger');
+      writeFileSync(join(f.base, 'log-bytes'), String(2 * logLimit));
       writeFileSync(join(f.base, 'fail'), 'go');
-      writeFileSync(join(f.base, 'log-bytes'), String(bytes.length));
-      sharedOutputRead.path = evidence;
-      sharedOutputRead.unboundedReads = 0;
-      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
-      assert.equal(sharedOutputRead.unboundedReads, 0, 'publication must bound existing evidence before reading it');
-      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      const ledgerPath = join(ledgerDirectory, readdirSync(ledgerDirectory)[0]!);
-      const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as {
-        outputs: { digest: string; bytes: number; status: string }[];
-      };
-      const refused = existing === 'oversized' || existing === 'corrupt';
-      assert.deepEqual(ledger.outputs, [{ digest, bytes: bytes.length, status: refused ? 'reserved' : 'complete' }]);
-      const retainedLedger = readFileSync(ledgerPath);
-      await assert.rejects(api.stageRuntime(f.input), refused ? /corrupt|size.*bound/u : /exit 7/u);
-      assert.equal(readFileSync(f.counter, 'utf8'), refused ? 'x' : 'xx');
-      assert.equal(sharedOutputRead.unboundedReads, 0);
-      assert.deepEqual(
-        readFileSync(ledgerPath),
-        retainedLedger,
-        'retry must preserve the existing reservation or completed charge',
+      await assert.rejects(
+        api.stageRuntime({
+          ...f.input,
+          resourceBounds: {
+            maxAggregateRssBytes: 512 * 1024 ** 2,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: 128 * 1024 ** 2,
+            maxCapturedOutputBytes: logLimit,
+          },
+        }),
+        /captured output exceeded/u,
       );
-      sharedOutputRead.path = '';
-      assert.equal(
-        digestBytes(readFileSync(evidence)),
-        originalDigest,
-        'existing shared evidence must remain immutable',
-      );
-      const after = lstatSync(evidence);
-      assert.equal(after.ino, originalIdentity.ino);
-      assert.equal(after.size, originalIdentity.size);
+      const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+      const logs = readdirSync(outputDirectory);
+      assert.equal(logs.length, 1);
+      assert.ok(lstatSync(join(outputDirectory, logs[0]!)).size <= logLimit);
       assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
     } finally {
-      sharedOutputRead.path = '';
-      sharedOutputRead.unboundedReads = 0;
       f.cleanup();
     }
-  });
+  },
+);
+
+test(
+  'runtime-stage retries share the retained-output allowance and preserve earlier failure evidence',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    const logLimit = 1024 ** 2;
+    const input = {
+      ...f.input,
+      resourceBounds: {
+        maxAggregateRssBytes: 512 * 1024 ** 2,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 128 * 1024 ** 2,
+        maxCapturedOutputBytes: logLimit,
+      },
+    };
+    const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+    try {
+      writeFileSync(join(f.base, 'fail'), 'go');
+      writeFileSync(join(f.base, 'log-bytes'), String(600 * 1024));
+      await assert.rejects(api.stageRuntime(input), /failed/u);
+      const prior = readdirSync(outputDirectory).map((name) => ({
+        name,
+        bytes: readFileSync(join(outputDirectory, name)),
+      }));
+      writeFileSync(join(f.base, 'log-bytes'), String(700 * 1024));
+      await assert.rejects(api.stageRuntime(input), /failed|captured output exceeded/u);
+      const total = readdirSync(outputDirectory).reduce(
+        (bytes, name) => bytes + lstatSync(join(outputDirectory, name)).size,
+        0,
+      );
+      assert.ok(total <= logLimit, `Retained retry logs ${total} exceed total allowance ${logLimit}.`);
+      for (const evidence of prior)
+        assert.deepEqual(readFileSync(join(outputDirectory, evidence.name)), evidence.bytes);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+      await assert.rejects(api.stageRuntime(input), /retained.*exhausted/u);
+      assert.equal(
+        readFileSync(f.counter, 'utf8'),
+        'xx',
+        'exhausted allowance must refuse another installer invocation',
+      );
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+for (const existing of ['oversized', 'corrupt', 'valid', 'empty'] as const) {
+  test(
+    `runtime-stage first publication bounds ${existing} shared output absent from its ledger`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      const bytes = Buffer.alloc(existing === 'empty' ? 0 : 100 * 1024, 65);
+      const digest = digestBytes(bytes);
+      const directory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+      const evidence = join(directory, `${digest.slice(7)}.bin`);
+      const ledgerDirectory = join(
+        f.root,
+        '.git/ai-delivery/verification@1/runtime-output',
+        digestValue(f.root).slice(7),
+      );
+      try {
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        writeFileSync(evidence, existing === 'corrupt' ? Buffer.alloc(bytes.length, 66) : bytes, { mode: 0o600 });
+        if (existing === 'oversized') truncateSync(evidence, 9 * 1024 ** 2);
+        const originalDigest = digestBytes(readFileSync(evidence));
+        const originalIdentity = lstatSync(evidence);
+        assert.equal(existsSync(ledgerDirectory), false, 'shared evidence must precede this stage ledger');
+        writeFileSync(join(f.base, 'fail'), 'go');
+        writeFileSync(join(f.base, 'log-bytes'), String(bytes.length));
+        sharedOutputRead.path = evidence;
+        sharedOutputRead.unboundedReads = 0;
+        await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+        assert.equal(sharedOutputRead.unboundedReads, 0, 'publication must bound existing evidence before reading it');
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+        const ledgerPath = join(ledgerDirectory, readdirSync(ledgerDirectory)[0]!);
+        const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as {
+          outputs: { digest: string; bytes: number; status: string }[];
+        };
+        const refused = existing === 'oversized' || existing === 'corrupt';
+        assert.deepEqual(ledger.outputs, [{ digest, bytes: bytes.length, status: refused ? 'reserved' : 'complete' }]);
+        const retainedLedger = readFileSync(ledgerPath);
+        await assert.rejects(api.stageRuntime(f.input), refused ? /corrupt|size.*bound/u : /exit 7/u);
+        assert.equal(readFileSync(f.counter, 'utf8'), refused ? 'x' : 'xx');
+        assert.equal(sharedOutputRead.unboundedReads, 0);
+        assert.deepEqual(
+          readFileSync(ledgerPath),
+          retainedLedger,
+          'retry must preserve the existing reservation or completed charge',
+        );
+        sharedOutputRead.path = '';
+        assert.equal(
+          digestBytes(readFileSync(evidence)),
+          originalDigest,
+          'existing shared evidence must remain immutable',
+        );
+        const after = lstatSync(evidence);
+        assert.equal(after.ino, originalIdentity.ino);
+        assert.equal(after.size, originalIdentity.size);
+        assert.equal(existsSync(f.input.runtimeDirectory), false);
+      } finally {
+        sharedOutputRead.path = '';
+        sharedOutputRead.unboundedReads = 0;
+        f.cleanup();
+      }
+    },
+  );
 }
 
 for (const fault of [
@@ -822,137 +534,149 @@ for (const fault of [
   'corrupt evidence',
   'oversized evidence',
 ] as const) {
-  test(`runtime-stage retained-output ${fault} refuses another installer without resetting its allowance`, async () => {
+  test(
+    `runtime-stage retained-output ${fault} refuses another installer without resetting its allowance`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      try {
+        writeFileSync(join(f.base, 'fail'), 'go');
+        writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+        await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+        const directory = join(f.root, '.git/ai-delivery/verification@1/runtime-output', digestValue(f.root).slice(7));
+        const path = join(directory, readdirSync(directory)[0]!);
+        const ledger = JSON.parse(readFileSync(path, 'utf8')) as {
+          contentDigest: string;
+          producerDigest: string;
+          outputs: { digest: string }[];
+        };
+        const evidence = join(
+          f.root,
+          '.git/ai-delivery/verification@1/command-output',
+          `${ledger.outputs[0]!.digest.slice(7)}.bin`,
+        );
+        if (fault === 'corrupt ledger') {
+          ledger.contentDigest = `sha256:${'0'.repeat(64)}`;
+          writeFileSync(path, JSON.stringify(ledger));
+        } else if (fault === 'incompatible controller') {
+          ledger.producerDigest = `sha256:${'0'.repeat(64)}`;
+          const { contentDigest: _digest, ...content } = ledger;
+          ledger.contentDigest = digestValue(content);
+          writeFileSync(path, JSON.stringify(ledger));
+        } else if (fault === 'missing evidence') rmSync(evidence);
+        else if (fault === 'oversized evidence') truncateSync(evidence, 9 * 1024 ** 2);
+        else writeFileSync(evidence, 'changed immutable output');
+        const retained = readFileSync(path);
+        await assert.rejects(api.stageRuntime(f.input), /corrupt|incompatible|ENOENT|size.*bound/u);
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+        assert.deepEqual(readFileSync(path), retained, 'failed integrity check must preserve the charged ledger');
+        assert.equal(readdirSync(directory).length, 1);
+        assert.equal(existsSync(f.input.runtimeDirectory), false);
+      } finally {
+        f.cleanup();
+      }
+    },
+  );
+}
+
+test(
+  'runtime-stage explicitly isolates npm cache, logs, configuration and temporary destinations',
+  { tags: ['release'] },
+  async () => {
     const api = await producer();
     const f = await fixture();
     try {
-      writeFileSync(join(f.base, 'fail'), 'go');
-      writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
-      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
-      const directory = join(f.root, '.git/ai-delivery/verification@1/runtime-output', digestValue(f.root).slice(7));
-      const path = join(directory, readdirSync(directory)[0]!);
-      const ledger = JSON.parse(readFileSync(path, 'utf8')) as {
-        contentDigest: string;
-        producerDigest: string;
-        outputs: { digest: string }[];
+      await api.stageRuntime(f.input);
+      const settings = JSON.parse(readFileSync(join(f.base, 'installer-settings'), 'utf8')) as {
+        args: string[];
+        cwd: string;
+        TMPDIR: string;
+        TMP: string;
+        TEMP: string;
       };
-      const evidence = join(
-        f.root,
-        '.git/ai-delivery/verification@1/command-output',
-        `${ledger.outputs[0]!.digest.slice(7)}.bin`,
-      );
-      if (fault === 'corrupt ledger') {
-        ledger.contentDigest = `sha256:${'0'.repeat(64)}`;
-        writeFileSync(path, JSON.stringify(ledger));
-      } else if (fault === 'incompatible controller') {
-        ledger.producerDigest = `sha256:${'0'.repeat(64)}`;
-        const { contentDigest: _digest, ...content } = ledger;
-        ledger.contentDigest = digestValue(content);
-        writeFileSync(path, JSON.stringify(ledger));
-      } else if (fault === 'missing evidence') rmSync(evidence);
-      else if (fault === 'oversized evidence') truncateSync(evidence, 9 * 1024 ** 2);
-      else writeFileSync(evidence, 'changed immutable output');
-      const retained = readFileSync(path);
-      await assert.rejects(api.stageRuntime(f.input), /corrupt|incompatible|ENOENT|size.*bound/u);
+      const stage = f.input.runtimeDirectory;
+      for (const option of ['--cache', '--logs-dir', '--userconfig', '--globalconfig']) {
+        assert.ok(settings.args.includes(option), `missing explicit npm ${option}`);
+        const value = settings.args[settings.args.indexOf(option) + 1]!;
+        assert.ok(value.startsWith(`${stage}/`), `npm ${option} must stay inside the owned stage`);
+        assert.ok(existsSync(value));
+      }
+      assert.equal(settings.cwd, stage);
+      for (const key of ['TMPDIR', 'TMP', 'TEMP'] as const) {
+        assert.ok(settings[key].startsWith(`${stage}/`), `${key} must stay inside the owned stage`);
+        assert.ok(existsSync(settings[key]));
+      }
+      assert.equal((await api.stageRuntime(f.input)).reused, true);
       assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      assert.deepEqual(readFileSync(path), retained, 'failed integrity check must preserve the charged ledger');
-      assert.equal(readdirSync(directory).length, 1);
-      assert.equal(existsSync(f.input.runtimeDirectory), false);
     } finally {
       f.cleanup();
     }
-  });
-}
+  },
+);
 
-test('runtime-stage explicitly isolates npm cache, logs, configuration and temporary destinations', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    await api.stageRuntime(f.input);
-    const settings = JSON.parse(readFileSync(join(f.base, 'installer-settings'), 'utf8')) as {
-      args: string[];
-      cwd: string;
-      TMPDIR: string;
-      TMP: string;
-      TEMP: string;
+test(
+  'runtime-stage cancellation shares prior failure charges and identical evidence is reused',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    const cancellation = new AbortController();
+    const input = {
+      ...f.input,
+      resourceBounds: {
+        maxAggregateRssBytes: 512 * 1024 ** 2,
+        minFreeDiskBytes: 1,
+        maxNewOutputBytes: 128 * 1024 ** 2,
+        maxCapturedOutputBytes: 1024 ** 2,
+      },
     };
-    const stage = f.input.runtimeDirectory;
-    for (const option of ['--cache', '--logs-dir', '--userconfig', '--globalconfig']) {
-      assert.ok(settings.args.includes(option), `missing explicit npm ${option}`);
-      const value = settings.args[settings.args.indexOf(option) + 1]!;
-      assert.ok(value.startsWith(`${stage}/`), `npm ${option} must stay inside the owned stage`);
-      assert.ok(existsSync(value));
-    }
-    assert.equal(settings.cwd, stage);
-    for (const key of ['TMPDIR', 'TMP', 'TEMP'] as const) {
-      assert.ok(settings[key].startsWith(`${stage}/`), `${key} must stay inside the owned stage`);
-      assert.ok(existsSync(settings[key]));
-    }
-    assert.equal((await api.stageRuntime(f.input)).reused, true);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-  } finally {
-    f.cleanup();
-  }
-});
-
-test('runtime-stage cancellation shares prior failure charges and identical evidence is reused', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const cancellation = new AbortController();
-  const input = {
-    ...f.input,
-    resourceBounds: {
-      maxAggregateRssBytes: 512 * 1024 ** 2,
-      minFreeDiskBytes: 1,
-      maxNewOutputBytes: 128 * 1024 ** 2,
-      maxCapturedOutputBytes: 1024 ** 2,
-    },
-  };
-  const directory = join(f.root, '.git/ai-delivery/verification@1/command-output');
-  const write = process.stderr.write.bind(process.stderr);
-  let sawCaptured = false;
-  const observation = vi.spyOn(process.stderr, 'write').mockImplementation((chunk, ...args) => {
-    const text = String(chunk);
-    if (text.startsWith('ai-delivery.verify ')) {
-      const value = JSON.parse(text.slice('ai-delivery.verify '.length)) as { capturedOutputBytes?: number };
-      if (value.capturedOutputBytes === 200 * 1024) {
-        sawCaptured = true;
-        cancellation.abort();
+    const directory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+    const write = process.stderr.write.bind(process.stderr);
+    let sawCaptured = false;
+    const observation = vi.spyOn(process.stderr, 'write').mockImplementation((chunk, ...args) => {
+      const text = String(chunk);
+      if (text.startsWith('ai-delivery.verify ')) {
+        const value = JSON.parse(text.slice('ai-delivery.verify '.length)) as { capturedOutputBytes?: number };
+        if (value.capturedOutputBytes === 200 * 1024) {
+          sawCaptured = true;
+          cancellation.abort();
+        }
       }
+      return write(chunk, ...args);
+    });
+    try {
+      writeFileSync(join(f.base, 'fail'), 'go');
+      writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+      await assert.rejects(api.stageRuntime(input), /exit 7/u);
+      await assert.rejects(api.stageRuntime(input), /exit 7/u);
+      assert.equal(readdirSync(directory).length, 1, 'identical complete command evidence must be reused');
+      const prior = readFileSync(join(directory, readdirSync(directory)[0]!));
+      rmSync(join(f.base, 'fail'));
+      writeFileSync(join(f.base, 'wait'), 'go');
+      writeFileSync(join(f.base, 'log-bytes'), String(200 * 1024));
+      await assert.rejects(api.stageRuntime({ ...input, signal: cancellation.signal }), /cancelled/u);
+      assert.equal(sawCaptured, true, 'cancel only after the full owned output is captured');
+      assert.ok(readdirSync(directory).some((name) => readFileSync(join(directory, name)).equals(prior)));
+      const ledgerRoot = join(f.root, '.git/ai-delivery/verification@1/runtime-output', digestValue(f.root).slice(7));
+      const ledger = JSON.parse(readFileSync(join(ledgerRoot, readdirSync(ledgerRoot)[0]!), 'utf8')) as {
+        outputs: { bytes: number }[];
+      };
+      assert.equal(
+        ledger.outputs.reduce((total, output) => total + output.bytes, 0),
+        300 * 1024,
+      );
+      assert.equal(readFileSync(f.counter, 'utf8'), 'xxx');
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+    } finally {
+      cancellation.abort();
+      observation.mockRestore();
+      f.cleanup();
     }
-    return write(chunk, ...args);
-  });
-  try {
-    writeFileSync(join(f.base, 'fail'), 'go');
-    writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
-    await assert.rejects(api.stageRuntime(input), /exit 7/u);
-    await assert.rejects(api.stageRuntime(input), /exit 7/u);
-    assert.equal(readdirSync(directory).length, 1, 'identical complete command evidence must be reused');
-    const prior = readFileSync(join(directory, readdirSync(directory)[0]!));
-    rmSync(join(f.base, 'fail'));
-    writeFileSync(join(f.base, 'wait'), 'go');
-    writeFileSync(join(f.base, 'log-bytes'), String(200 * 1024));
-    await assert.rejects(api.stageRuntime({ ...input, signal: cancellation.signal }), /cancelled/u);
-    assert.equal(sawCaptured, true, 'cancel only after the full owned output is captured');
-    assert.ok(readdirSync(directory).some((name) => readFileSync(join(directory, name)).equals(prior)));
-    const ledgerRoot = join(f.root, '.git/ai-delivery/verification@1/runtime-output', digestValue(f.root).slice(7));
-    const ledger = JSON.parse(readFileSync(join(ledgerRoot, readdirSync(ledgerRoot)[0]!), 'utf8')) as {
-      outputs: { bytes: number }[];
-    };
-    assert.equal(
-      ledger.outputs.reduce((total, output) => total + output.bytes, 0),
-      300 * 1024,
-    );
-    assert.equal(readFileSync(f.counter, 'utf8'), 'xxx');
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-  } finally {
-    cancellation.abort();
-    observation.mockRestore();
-    f.cleanup();
-  }
-});
+  },
+);
 
-test('runtime-stage post-install preflight growth cannot publish completion', async () => {
+test('runtime-stage post-install preflight growth cannot publish completion', { tags: ['release'] }, async () => {
   const api = await producer();
   const f = await fixture();
   const memoryUsage = process.memoryUsage.bind(process);
@@ -981,69 +705,77 @@ test('runtime-stage post-install preflight growth cannot publish completion', as
   }
 });
 
-test('runtime-stage bounds actual controller and npm memory and preserves an unrelated live peer', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-  const closed = new Promise<void>((resolve) => peer.once('close', () => resolve()));
-  try {
-    await new Promise<void>((resolve, reject) => {
-      peer.once('spawn', () => resolve());
-      peer.once('error', reject);
-    });
-    writeFileSync(join(f.base, 'memory-bytes'), String(512 * 1024 ** 2));
-    await assert.rejects(
-      api.stageRuntime({
-        ...f.input,
-        resourceBounds: {
-          maxAggregateRssBytes: 512 * 1024 ** 2,
-          minFreeDiskBytes: 1,
-          maxNewOutputBytes: 128 * 1024 ** 2,
-          maxCapturedOutputBytes: 1024 ** 2,
-        },
-      }),
-      /aggregate RSS .* exceeded limit/u,
-    );
-    const ownedPid = Number(readFileSync(f.marker, 'utf8'));
-    assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
-    assert.equal(peer.exitCode, null);
-    process.kill(peer.pid!, 0);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-  } finally {
-    peer.kill('SIGKILL');
-    await closed;
-    f.cleanup();
-  }
-});
+test(
+  'runtime-stage bounds actual controller and npm memory and preserves an unrelated live peer',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    const peer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const closed = new Promise<void>((resolve) => peer.once('close', () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        peer.once('spawn', () => resolve());
+        peer.once('error', reject);
+      });
+      writeFileSync(join(f.base, 'memory-bytes'), String(512 * 1024 ** 2));
+      await assert.rejects(
+        api.stageRuntime({
+          ...f.input,
+          resourceBounds: {
+            maxAggregateRssBytes: 512 * 1024 ** 2,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: 128 * 1024 ** 2,
+            maxCapturedOutputBytes: 1024 ** 2,
+          },
+        }),
+        /aggregate RSS .* exceeded limit/u,
+      );
+      const ownedPid = Number(readFileSync(f.marker, 'utf8'));
+      assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
+      assert.equal(peer.exitCode, null);
+      process.kill(peer.pid!, 0);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+    } finally {
+      peer.kill('SIGKILL');
+      await closed;
+      f.cleanup();
+    }
+  },
+);
 
-test('runtime-stage changed resource intent preserves compatible completed bytes without reinstalling', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const stage = await api.stageRuntime(f.input);
-    const path = join(f.input.runtimeDirectory, 'runtime-stage.json');
-    const completion = readFileSync(path);
-    await assert.rejects(
-      api.stageRuntime({
-        ...f.input,
-        resourceBounds: {
-          maxAggregateRssBytes: 512 * 1024 ** 2,
-          minFreeDiskBytes: 1,
-          maxNewOutputBytes: 128 * 1024 ** 2,
-          maxCapturedOutputBytes: 512 * 1024,
-        },
-      }),
-      /incompatible setup intent/u,
-    );
-    assert.deepEqual(readFileSync(path), completion);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    assert.equal((await api.stageRuntime(f.input)).stageId, stage.stageId);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'runtime-stage changed resource intent preserves compatible completed bytes without reinstalling',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const stage = await api.stageRuntime(f.input);
+      const path = join(f.input.runtimeDirectory, 'runtime-stage.json');
+      const completion = readFileSync(path);
+      await assert.rejects(
+        api.stageRuntime({
+          ...f.input,
+          resourceBounds: {
+            maxAggregateRssBytes: 512 * 1024 ** 2,
+            minFreeDiskBytes: 1,
+            maxNewOutputBytes: 128 * 1024 ** 2,
+            maxCapturedOutputBytes: 512 * 1024,
+          },
+        }),
+        /incompatible setup intent/u,
+      );
+      assert.deepEqual(readFileSync(path), completion);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.equal((await api.stageRuntime(f.input)).stageId, stage.stageId);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 for (const mode of ['success', 'failure', 'cancel'] as const) {
   test(
@@ -1276,283 +1008,311 @@ test(
   },
 );
 
-test('completed stages refuse missing, corrupt or incompatible dependency metadata without reinstalling or rewriting', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const staged = await api.stageRuntime(f.input);
-    const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
-    const complete = readFileSync(record);
-    const paths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
-    const retained = paths.map((path) => (existsSync(path) ? readFileSync(path) : undefined));
-    for (const [index, path] of paths.entries()) {
-      for (const fault of [
-        'missing',
-        'corrupt',
-        'incompatible',
-        'symlink',
-        'hardlink',
-        'fifo',
-        ...(index === 1 ? ['version', 'resolved', 'integrity'] : []),
-      ]) {
-        const sentinel = join(f.base, `unrelated-metadata-${index}-${fault}`);
-        if (fault === 'missing') rmSync(path, { force: true });
-        else if (fault === 'symlink' || fault === 'hardlink') {
-          writeFileSync(sentinel, retained[index]!);
-          rmSync(path);
-          if (fault === 'symlink') symlinkSync(sentinel, path);
-          else linkSync(sentinel, path);
-        } else if (fault === 'fifo') {
-          rmSync(path);
-          execFileSync('mkfifo', [path]);
-        } else if (['version', 'resolved', 'integrity'].includes(fault)) {
-          const lock = JSON.parse(retained[index]!.toString('utf8')) as {
-            packages: Record<string, Record<string, unknown>>;
-          };
-          lock.packages['node_modules/@aviaratech/ai-delivery']![fault] = 'incompatible';
-          writeFileSync(path, JSON.stringify(lock));
-        } else
-          writeFileSync(
-            path,
-            fault === 'corrupt'
-              ? '{'
-              : JSON.stringify(
-                  index === 0
-                    ? { dependencies: { '@aviaratech/ai-delivery': 'file:other.tgz' } }
-                    : { lockfileVersion: 99, packages: {} },
-                ),
-          );
-        const damaged = fault !== 'fifo' && existsSync(path) ? readFileSync(path) : undefined;
-        await assert.rejects(
-          api.stageRuntime(f.input),
-          fault === 'symlink' ? /symbolic link/iu : fault === 'fifo' ? /unsupported file/iu : /dependency metadata/iu,
-        );
-        await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /dependency metadata/iu);
-        assert.deepEqual(readFileSync(record), complete);
-        if (fault === 'fifo') assert.equal(lstatSync(path).isFIFO(), true);
-        else assert.deepEqual(existsSync(path) ? readFileSync(path) : undefined, damaged);
-        if (fault === 'symlink' || fault === 'hardlink') {
-          assert.deepEqual(readFileSync(sentinel), retained[index]);
-          assert.equal(lstatSync(path).isSymbolicLink(), fault === 'symlink');
-        }
-        assert.equal(readFileSync(f.counter, 'utf8'), 'x', 'metadata refusal must not reinstall');
-        rmSync(path, { force: true });
-        if (retained[index] !== undefined) writeFileSync(path, retained[index]!);
-      }
-    }
-  } finally {
-    f.cleanup();
-  }
-});
-
-for (const metadata of ['package.json', 'package-lock.json']) {
-  test(`lost completion response refuses ${metadata} drift during final preflight without reinstalling`, async () => {
-    const api = await producer();
-    const f = await fixture();
-    let operation: Promise<Stage> | undefined;
-    try {
-      const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
-      const target = join(f.input.runtimeDirectory, metadata);
-      let complete: Buffer | undefined;
-      let notifyWritten: (() => void) | undefined;
-      const written = new Promise<void>((resolve) => {
-        notifyWritten = resolve;
-      });
-      const actual = atomicJson.writePrivateJsonFileAtomically;
-      vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
-        actual(path, value);
-        if (path === record && (value as { status?: string }).status === 'complete') {
-          complete = readFileSync(record);
-          actors.authorStarted = false;
-          actors.pauseAuthor = true;
-          notifyWritten!();
-          throw new Error('Synthetic completion response lost after durable write');
-        }
-      });
-      operation = api.stageRuntime(f.input);
-      const settled = operation.then(
-        (value) => ({ status: 'fulfilled' as const, value }),
-        (error: unknown) => ({ status: 'rejected' as const, error }),
-      );
-      const prematurelySettled = settled.then((result) => {
-        if (result.status === 'rejected') throw result.error;
-        throw new Error('Stage completed before the recovery fault was injected.');
-      });
-      await Promise.race([written, prematurelySettled]);
-      while (!actors.authorStarted)
-        await Promise.race([new Promise((resolve) => setTimeout(resolve, 10)), prematurelySettled]);
-      assert.ok(complete);
-      assert.equal((JSON.parse(complete.toString('utf8')) as { status: string }).status, 'complete');
-      if (metadata === 'package.json') rmSync(target);
-      else writeFileSync(target, '{');
-      const damaged = existsSync(target) ? readFileSync(target) : undefined;
-      await assert.rejects(operation, /dependency metadata/iu);
-      assert.deepEqual(readFileSync(record), complete);
-      assert.deepEqual(existsSync(target) ? readFileSync(target) : undefined, damaged);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-    } finally {
-      await operation?.catch(() => undefined);
-      actors.pauseAuthor = false;
-      vi.restoreAllMocks();
-      f.cleanup();
-    }
-  });
-}
-
-test('public producer stages exact bytes, explicitly admits and reuses completed work without installing again', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const staged = await api.stageRuntime(f.input);
-    const admissionPath = join(f.root, '.git/ai-delivery/runtime-admission.json');
-    assert.equal(existsSync(admissionPath), false);
-    assert.equal(staged.admission.sourceCommit, f.input.expectedSourceCommit);
-    assert.equal(staged.admission.sourceArchiveSha256, f.input.expectedArchiveSha256);
-    const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
-    assert.equal(
-      (await assertDeliveryRuntimeAdmitted({ repoRoot: f.root, runtimeEntryPath: staged.admission.cliPath }))
-        .admissionId,
-      admitted.admission.admissionId,
-    );
-    assert.equal((await api.stageRuntime(f.input)).reused, true);
-    assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-  } finally {
-    f.cleanup();
-  }
-});
-
-test('archive replacement and restoration during install cannot admit alternate bytes under the reviewed digest', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const reviewed = readFileSync(f.input.archivePath);
-    const cli = join(f.base, 'archive/package/dist/cli.js');
-    const expectedCli = readFileSync(cli);
-    writeFileSync(cli, "#!/usr/bin/env node\nconsole.log('same version, alternate archive bytes');\n");
-    execFileSync('tar', ['-czf', join(f.base, 'replacement.tgz'), '-C', join(f.base, 'archive'), 'package']);
-    assert.notEqual(digestBytes(readFileSync(join(f.base, 'replacement.tgz'))), f.input.expectedArchiveSha256);
-    // The separate installer process replaces the public pathname before extraction and restores A afterward.
-    const staged = await api.stageRuntime(f.input);
-    const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
-    assert.ok(
-      readFileSync(f.input.archivePath).equals(reviewed),
-      'the original archive was restored before revalidation',
-    );
-    assert.ok(
-      readFileSync(admitted.admission.cliPath).equals(expectedCli),
-      'alternate archive B was installed and admitted under reviewed archive A digest',
-    );
-    assert.equal(admitted.admission.sourceArchiveSha256, digestBytes(reviewed));
-    assert.equal(admitted.admission.cliSha256, digestBytes(expectedCli));
-    const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
-    assert.equal(readFileSync(join(f.base, 'installer-archive'), 'utf8'), snapshot);
-    assert.ok(readFileSync(snapshot).equals(reviewed));
-    const metadata = lstatSync(snapshot);
-    assert.ok(metadata.isFile() && !metadata.isSymbolicLink());
-    assert.equal(metadata.mode & 0o777, 0o600);
-    assert.equal(metadata.nlink, 1);
-    assert.equal((await api.stageRuntime(f.input)).reused, true);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    console.log(
-      'ARCHIVE_SUBSTITUTION_RECEIPT',
-      JSON.stringify({
-        stageId: staged.stageId,
-        archiveSha256: digestBytes(reviewed),
-        installedCliSha256: digestBytes(expectedCli),
-        originalRestored: true,
-        privateSnapshotInstalled: true,
-        completeRetrySkipped: true,
-      }),
-    );
-  } finally {
-    f.cleanup();
-  }
-});
-
-for (const corruption of ['missing', 'corrupt', 'symlink', 'hardlink'] as const) {
-  test(`completed snapshot ${corruption} rejects reuse and admission while preserving current admission`, async () => {
+test(
+  'completed stages refuse missing, corrupt or incompatible dependency metadata without reinstalling or rewriting',
+  { tags: ['release'] },
+  async () => {
     const api = await producer();
     const f = await fixture();
     try {
       const staged = await api.stageRuntime(f.input);
-      await api.admitRuntime(admitInput(f.input, staged.stageId));
-      const admissionPath = join(f.root, '.git/ai-delivery/runtime-admission.json');
-      const prior = readFileSync(admissionPath);
-      const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
-      assert.ok(existsSync(snapshot), 'completed stage must retain its verified archive snapshot');
-      if (corruption === 'corrupt') writeFileSync(snapshot, 'alternate bytes');
-      else {
-        rmSync(snapshot);
-        if (corruption === 'symlink') symlinkSync(f.input.archivePath, snapshot);
-        if (corruption === 'hardlink') linkSync(f.input.archivePath, snapshot);
+      const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
+      const complete = readFileSync(record);
+      const paths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
+      const retained = paths.map((path) => (existsSync(path) ? readFileSync(path) : undefined));
+      for (const [index, path] of paths.entries()) {
+        for (const fault of [
+          'missing',
+          'corrupt',
+          'incompatible',
+          'symlink',
+          'hardlink',
+          'fifo',
+          ...(index === 1 ? ['version', 'resolved', 'integrity'] : []),
+        ]) {
+          const sentinel = join(f.base, `unrelated-metadata-${index}-${fault}`);
+          if (fault === 'missing') rmSync(path, { force: true });
+          else if (fault === 'symlink' || fault === 'hardlink') {
+            writeFileSync(sentinel, retained[index]!);
+            rmSync(path);
+            if (fault === 'symlink') symlinkSync(sentinel, path);
+            else linkSync(sentinel, path);
+          } else if (fault === 'fifo') {
+            rmSync(path);
+            execFileSync('mkfifo', [path]);
+          } else if (['version', 'resolved', 'integrity'].includes(fault)) {
+            const lock = JSON.parse(retained[index]!.toString('utf8')) as {
+              packages: Record<string, Record<string, unknown>>;
+            };
+            lock.packages['node_modules/@aviaratech/ai-delivery']![fault] = 'incompatible';
+            writeFileSync(path, JSON.stringify(lock));
+          } else
+            writeFileSync(
+              path,
+              fault === 'corrupt'
+                ? '{'
+                : JSON.stringify(
+                    index === 0
+                      ? { dependencies: { '@aviaratech/ai-delivery': 'file:other.tgz' } }
+                      : { lockfileVersion: 99, packages: {} },
+                  ),
+            );
+          const damaged = fault !== 'fifo' && existsSync(path) ? readFileSync(path) : undefined;
+          await assert.rejects(
+            api.stageRuntime(f.input),
+            fault === 'symlink' ? /symbolic link/iu : fault === 'fifo' ? /unsupported file/iu : /dependency metadata/iu,
+          );
+          await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /dependency metadata/iu);
+          assert.deepEqual(readFileSync(record), complete);
+          if (fault === 'fifo') assert.equal(lstatSync(path).isFIFO(), true);
+          else assert.deepEqual(existsSync(path) ? readFileSync(path) : undefined, damaged);
+          if (fault === 'symlink' || fault === 'hardlink') {
+            assert.deepEqual(readFileSync(sentinel), retained[index]);
+            assert.equal(lstatSync(path).isSymbolicLink(), fault === 'symlink');
+          }
+          assert.equal(readFileSync(f.counter, 'utf8'), 'x', 'metadata refusal must not reinstall');
+          rmSync(path, { force: true });
+          if (retained[index] !== undefined) writeFileSync(path, retained[index]!);
+        }
       }
-      await assert.rejects(api.stageRuntime(f.input));
-      await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)));
-      assert.ok(readFileSync(admissionPath).equals(prior));
-      assert.equal(existsSync(f.input.runtimeDirectory), true);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+for (const metadata of ['package.json', 'package-lock.json']) {
+  test(
+    `lost completion response refuses ${metadata} drift during final preflight without reinstalling`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      let operation: Promise<Stage> | undefined;
+      try {
+        const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
+        const target = join(f.input.runtimeDirectory, metadata);
+        let complete: Buffer | undefined;
+        let notifyWritten: (() => void) | undefined;
+        const written = new Promise<void>((resolve) => {
+          notifyWritten = resolve;
+        });
+        const actual = atomicJson.writePrivateJsonFileAtomically;
+        vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+          actual(path, value);
+          if (path === record && (value as { status?: string }).status === 'complete') {
+            complete = readFileSync(record);
+            actors.authorStarted = false;
+            actors.pauseAuthor = true;
+            notifyWritten!();
+            throw new Error('Synthetic completion response lost after durable write');
+          }
+        });
+        operation = api.stageRuntime(f.input);
+        const settled = operation.then(
+          (value) => ({ status: 'fulfilled' as const, value }),
+          (error: unknown) => ({ status: 'rejected' as const, error }),
+        );
+        const prematurelySettled = settled.then((result) => {
+          if (result.status === 'rejected') throw result.error;
+          throw new Error('Stage completed before the recovery fault was injected.');
+        });
+        await Promise.race([written, prematurelySettled]);
+        while (!actors.authorStarted)
+          await Promise.race([new Promise((resolve) => setTimeout(resolve, 10)), prematurelySettled]);
+        assert.ok(complete);
+        assert.equal((JSON.parse(complete.toString('utf8')) as { status: string }).status, 'complete');
+        if (metadata === 'package.json') rmSync(target);
+        else writeFileSync(target, '{');
+        const damaged = existsSync(target) ? readFileSync(target) : undefined;
+        await assert.rejects(operation, /dependency metadata/iu);
+        assert.deepEqual(readFileSync(record), complete);
+        assert.deepEqual(existsSync(target) ? readFileSync(target) : undefined, damaged);
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+        assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
+      } finally {
+        await operation?.catch(() => undefined);
+        actors.pauseAuthor = false;
+        vi.restoreAllMocks();
+        f.cleanup();
+      }
+    },
+  );
+}
+
+test(
+  'public producer stages exact bytes, explicitly admits and reuses completed work without installing again',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const staged = await api.stageRuntime(f.input);
+      const admissionPath = join(f.root, '.git/ai-delivery/runtime-admission.json');
+      assert.equal(existsSync(admissionPath), false);
+      assert.equal(staged.admission.sourceCommit, f.input.expectedSourceCommit);
+      assert.equal(staged.admission.sourceArchiveSha256, f.input.expectedArchiveSha256);
+      const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
+      assert.equal(
+        (await assertDeliveryRuntimeAdmitted({ repoRoot: f.root, runtimeEntryPath: staged.admission.cliPath }))
+          .admissionId,
+        admitted.admission.admissionId,
+      );
+      assert.equal((await api.stageRuntime(f.input)).reused, true);
+      assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
       assert.equal(readFileSync(f.counter, 'utf8'), 'x');
     } finally {
       f.cleanup();
     }
-  });
+  },
+);
+
+test(
+  'archive replacement and restoration during install cannot admit alternate bytes under the reviewed digest',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const reviewed = readFileSync(f.input.archivePath);
+      const cli = join(f.base, 'archive/package/dist/cli.js');
+      const expectedCli = readFileSync(cli);
+      writeFileSync(cli, "#!/usr/bin/env node\nconsole.log('same version, alternate archive bytes');\n");
+      execFileSync('tar', ['-czf', join(f.base, 'replacement.tgz'), '-C', join(f.base, 'archive'), 'package']);
+      assert.notEqual(digestBytes(readFileSync(join(f.base, 'replacement.tgz'))), f.input.expectedArchiveSha256);
+      // The separate installer process replaces the public pathname before extraction and restores A afterward.
+      const staged = await api.stageRuntime(f.input);
+      const admitted = await api.admitRuntime(admitInput(f.input, staged.stageId));
+      assert.ok(
+        readFileSync(f.input.archivePath).equals(reviewed),
+        'the original archive was restored before revalidation',
+      );
+      assert.ok(
+        readFileSync(admitted.admission.cliPath).equals(expectedCli),
+        'alternate archive B was installed and admitted under reviewed archive A digest',
+      );
+      assert.equal(admitted.admission.sourceArchiveSha256, digestBytes(reviewed));
+      assert.equal(admitted.admission.cliSha256, digestBytes(expectedCli));
+      const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
+      assert.equal(readFileSync(join(f.base, 'installer-archive'), 'utf8'), snapshot);
+      assert.ok(readFileSync(snapshot).equals(reviewed));
+      const metadata = lstatSync(snapshot);
+      assert.ok(metadata.isFile() && !metadata.isSymbolicLink());
+      assert.equal(metadata.mode & 0o777, 0o600);
+      assert.equal(metadata.nlink, 1);
+      assert.equal((await api.stageRuntime(f.input)).reused, true);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      console.log(
+        'ARCHIVE_SUBSTITUTION_RECEIPT',
+        JSON.stringify({
+          stageId: staged.stageId,
+          archiveSha256: digestBytes(reviewed),
+          installedCliSha256: digestBytes(expectedCli),
+          originalRestored: true,
+          privateSnapshotInstalled: true,
+          completeRetrySkipped: true,
+        }),
+      );
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+for (const corruption of ['missing', 'corrupt', 'symlink', 'hardlink'] as const) {
+  test(
+    `completed snapshot ${corruption} rejects reuse and admission while preserving current admission`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      try {
+        const staged = await api.stageRuntime(f.input);
+        await api.admitRuntime(admitInput(f.input, staged.stageId));
+        const admissionPath = join(f.root, '.git/ai-delivery/runtime-admission.json');
+        const prior = readFileSync(admissionPath);
+        const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
+        assert.ok(existsSync(snapshot), 'completed stage must retain its verified archive snapshot');
+        if (corruption === 'corrupt') writeFileSync(snapshot, 'alternate bytes');
+        else {
+          rmSync(snapshot);
+          if (corruption === 'symlink') symlinkSync(f.input.archivePath, snapshot);
+          if (corruption === 'hardlink') linkSync(f.input.archivePath, snapshot);
+        }
+        await assert.rejects(api.stageRuntime(f.input));
+        await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)));
+        assert.ok(readFileSync(admissionPath).equals(prior));
+        assert.equal(existsSync(f.input.runtimeDirectory), true);
+        assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      } finally {
+        f.cleanup();
+      }
+    },
+  );
 }
 
-test('archive snapshot consumes the bounded stage output allowance before running npm', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    await assert.rejects(
-      api.stageRuntime({
-        ...f.input,
-        resourceBounds: {
-          maxAggregateRssBytes: 1024 ** 3,
-          minFreeDiskBytes: 256 * 1024 ** 2,
-          maxNewOutputBytes: readFileSync(f.input.archivePath).length - 1,
-        },
-      }),
-      /output.*limit|allowance/u,
-    );
-    assert.equal(existsSync(f.counter), false);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'archive snapshot consumes the bounded stage output allowance before running npm',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      await assert.rejects(
+        api.stageRuntime({
+          ...f.input,
+          resourceBounds: {
+            maxAggregateRssBytes: 1024 ** 3,
+            minFreeDiskBytes: 256 * 1024 ** 2,
+            maxNewOutputBytes: readFileSync(f.input.archivePath).length - 1,
+          },
+        }),
+        /output.*limit|allowance/u,
+      );
+      assert.equal(existsSync(f.counter), false);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('snapshot durability failure removes the owned partial copy and preserves the original and unrelated files', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const actual = privateFiles.writeCreateOnly;
-  const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
-  const unrelated = join(f.base, 'unrelated');
-  try {
-    writeFileSync(unrelated, 'keep');
-    const write = vi.spyOn(privateFiles, 'writeCreateOnly').mockImplementation((path, bytes, digest) => {
-      if (path === snapshot) syncFailure.directory = dirname(path);
-      try {
-        return actual(path, bytes, digest);
-      } finally {
-        syncFailure.directory = '';
-      }
-    });
-    await assert.rejects(api.stageRuntime(f.input), /durability unavailable/u);
-    write.mockRestore();
-    assert.equal(existsSync(f.counter), false);
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-    assert.equal(readFileSync(unrelated, 'utf8'), 'keep');
-    const stage = await api.stageRuntime(f.input);
-    assert.equal(stage.reused, false);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-  } finally {
-    syncFailure.directory = '';
-    vi.restoreAllMocks();
-    f.cleanup();
-  }
-});
+test(
+  'snapshot durability failure removes the owned partial copy and preserves the original and unrelated files',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    const actual = privateFiles.writeCreateOnly;
+    const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
+    const unrelated = join(f.base, 'unrelated');
+    try {
+      writeFileSync(unrelated, 'keep');
+      const write = vi.spyOn(privateFiles, 'writeCreateOnly').mockImplementation((path, bytes, digest) => {
+        if (path === snapshot) syncFailure.directory = dirname(path);
+        try {
+          return actual(path, bytes, digest);
+        } finally {
+          syncFailure.directory = '';
+        }
+      });
+      await assert.rejects(api.stageRuntime(f.input), /durability unavailable/u);
+      write.mockRestore();
+      assert.equal(existsSync(f.counter), false);
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+      assert.equal(readFileSync(unrelated, 'utf8'), 'keep');
+      const stage = await api.stageRuntime(f.input);
+      assert.equal(stage.reused, false);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    } finally {
+      syncFailure.directory = '';
+      vi.restoreAllMocks();
+      f.cleanup();
+    }
+  },
+);
 
 for (const denied of [
   'authority',
@@ -1565,7 +1325,7 @@ for (const denied of [
   'reviewer-access',
   'unowned',
 ] as const) {
-  test(`stage rejects ${denied} before adopting or publishing a runtime`, async () => {
+  test(`stage rejects ${denied} before adopting or publishing a runtime`, { tags: ['release'] }, async () => {
     const api = await producer();
     const f = await fixture();
     try {
@@ -1593,60 +1353,68 @@ for (const denied of [
   });
 }
 
-test('admission rejects CAS and actual byte or actor drift while preserving the prior record', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const staged = await api.stageRuntime(f.input);
-    const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, 'prior admission\n', { mode: 0o600 });
-    await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /prior|conflict|compare/u);
-    const prior = digestBytes(readFileSync(path));
-    actors.author = 'changed-host-user';
-    await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId, prior)), /actor|route/u);
-    actors.author = 'host-user';
-    writeFileSync(staged.admission.cliPath, 'changed bytes');
-    await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId, prior)), /source|bytes|admission/u);
-    assert.equal(readFileSync(path, 'utf8'), 'prior admission\n');
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'admission rejects CAS and actual byte or actor drift while preserving the prior record',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const staged = await api.stageRuntime(f.input);
+      const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, 'prior admission\n', { mode: 0o600 });
+      await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /prior|conflict|compare/u);
+      const prior = digestBytes(readFileSync(path));
+      actors.author = 'changed-host-user';
+      await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId, prior)), /actor|route/u);
+      actors.author = 'host-user';
+      writeFileSync(staged.admission.cliPath, 'changed bytes');
+      await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId, prior)), /source|bytes|admission/u);
+      assert.equal(readFileSync(path, 'utf8'), 'prior admission\n');
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('post-rename errors reconcile desired bytes and never overwrite third-party replacement', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const staged = await api.stageRuntime(f.input);
-    const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
-    const actual = atomicJson.writePrivateJsonFileAtomically;
-    const write = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((target, value) => {
-      actual(target, value);
-      if (target === path) throw new Error('Synthetic response lost after rename');
-    });
-    assert.equal(
-      (await api.admitRuntime(admitInput(f.input, staged.stageId))).admission.admissionId,
-      staged.admission.admissionId,
-    );
-    write.mockRestore();
-    assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
-    rmSync(path);
-    const replacement = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((target, value) => {
-      actual(target, value);
-      if (target === path) {
-        writeFileSync(path, 'third-party replacement\n');
-        throw new Error('Synthetic concurrent replacement');
-      }
-    });
-    await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /conflict|replacement/u);
-    replacement.mockRestore();
-    assert.equal(readFileSync(path, 'utf8'), 'third-party replacement\n');
-  } finally {
-    vi.restoreAllMocks();
-    f.cleanup();
-  }
-});
+test(
+  'post-rename errors reconcile desired bytes and never overwrite third-party replacement',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const staged = await api.stageRuntime(f.input);
+      const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
+      const actual = atomicJson.writePrivateJsonFileAtomically;
+      const write = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((target, value) => {
+        actual(target, value);
+        if (target === path) throw new Error('Synthetic response lost after rename');
+      });
+      assert.equal(
+        (await api.admitRuntime(admitInput(f.input, staged.stageId))).admission.admissionId,
+        staged.admission.admissionId,
+      );
+      write.mockRestore();
+      assert.equal((await api.admitRuntime(admitInput(f.input, staged.stageId))).reused, true);
+      rmSync(path);
+      const replacement = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((target, value) => {
+        actual(target, value);
+        if (target === path) {
+          writeFileSync(path, 'third-party replacement\n');
+          throw new Error('Synthetic concurrent replacement');
+        }
+      });
+      await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /conflict|replacement/u);
+      replacement.mockRestore();
+      assert.equal(readFileSync(path, 'utf8'), 'third-party replacement\n');
+    } finally {
+      vi.restoreAllMocks();
+      f.cleanup();
+    }
+  },
+);
 
 async function cancelNativeStageWhenReady(
   running: Promise<Stage>,
@@ -1694,48 +1462,52 @@ async function cancelNativeStageWhenReady(
 }
 
 for (const native of [false, true]) {
-  test(`${native ? 'native ' : ''}failure and cancellation remove only the owned incomplete stage and preserve unrelated output`, async () => {
-    const api = await producer();
-    const f = await fixture(native);
-    const controller = new AbortController();
-    try {
-      const unrelated = join(f.base, 'unrelated');
-      mkdirSync(unrelated);
-      writeFileSync(join(unrelated, 'keep'), 'keep');
-      writeFileSync(join(f.base, 'fail'), 'go');
-      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
-      assert.equal(existsSync(f.input.runtimeDirectory), false);
-      rmSync(join(f.base, 'fail'));
-      writeFileSync(join(f.base, 'wait'), 'go');
-      const running = api.stageRuntime({ ...f.input, signal: controller.signal });
-      if (native) await cancelNativeStageWhenReady(running, f.input, controller);
-      else {
-        void running.catch(() => undefined);
-        for (let i = 0; i < 100 && !existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery')); i++)
-          await new Promise((resolve) => setTimeout(resolve, 20));
-        assert.equal(
-          digestBytes(readFileSync(join(f.input.runtimeDirectory, 'reviewed-archive.tgz'))),
-          f.input.expectedArchiveSha256,
-        );
+  test(
+    `${native ? 'native ' : ''}failure and cancellation remove only the owned incomplete stage and preserve unrelated output`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture(native);
+      const controller = new AbortController();
+      try {
+        const unrelated = join(f.base, 'unrelated');
+        mkdirSync(unrelated);
+        writeFileSync(join(unrelated, 'keep'), 'keep');
+        writeFileSync(join(f.base, 'fail'), 'go');
+        await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+        assert.equal(existsSync(f.input.runtimeDirectory), false);
+        rmSync(join(f.base, 'fail'));
+        writeFileSync(join(f.base, 'wait'), 'go');
+        const running = api.stageRuntime({ ...f.input, signal: controller.signal });
+        if (native) await cancelNativeStageWhenReady(running, f.input, controller);
+        else {
+          void running.catch(() => undefined);
+          for (let i = 0; i < 100 && !existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery')); i++)
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.equal(
+            digestBytes(readFileSync(join(f.input.runtimeDirectory, 'reviewed-archive.tgz'))),
+            f.input.expectedArchiveSha256,
+          );
+          controller.abort();
+          await assert.rejects(running, /cancelled/u);
+        }
+        assert.equal(existsSync(f.input.runtimeDirectory), false);
+        assert.equal(readFileSync(join(unrelated, 'keep'), 'utf8'), 'keep');
+        assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
+        if (native)
+          assert.equal(
+            readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
+            'Synthetic copied native plugin.\n',
+          );
+      } finally {
         controller.abort();
-        await assert.rejects(running, /cancelled/u);
+        f.cleanup();
       }
-      assert.equal(existsSync(f.input.runtimeDirectory), false);
-      assert.equal(readFileSync(join(unrelated, 'keep'), 'utf8'), 'keep');
-      assert.equal(digestBytes(readFileSync(f.input.archivePath)), f.input.expectedArchiveSha256);
-      if (native)
-        assert.equal(
-          readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
-          'Synthetic copied native plugin.\n',
-        );
-    } finally {
-      controller.abort();
-      f.cleanup();
-    }
-  });
+    },
+  );
 }
 
-test('native cancellation fixture waits for delayed installer readiness', async () => {
+test('native cancellation fixture waits for delayed installer readiness', { tags: ['release'] }, async () => {
   const api = await producer();
   const f = await fixture(true);
   const controller = new AbortController();
@@ -1766,7 +1538,7 @@ test('native cancellation fixture waits for delayed installer readiness', async 
   }
 });
 
-test('native cancellation fixture preserves an early staging rejection', async () => {
+test('native cancellation fixture preserves an early staging rejection', { tags: ['release'] }, async () => {
   const api = await producer();
   const f = await fixture(true);
   const controller = new AbortController();
@@ -1790,50 +1562,54 @@ test('native cancellation fixture preserves an early staging rejection', async (
   }
 });
 
-test('native cancellation fixture settles a real installer before assertion-failure cleanup', async () => {
-  const api = await producer();
-  const f = await fixture(true);
-  const controller = new AbortController();
-  writeFileSync(join(f.base, 'wait'), 'go');
-  writeFileSync(join(f.base, 'unrelated'), 'keep');
-  const running = api.stageRuntime({ ...f.input, signal: controller.signal });
-  let finished = false;
-  const settled = running.then(
-    () => {
-      finished = true;
-    },
-    () => {
-      finished = true;
-    },
-  );
-  const fault = new Error('Synthetic assertion failed with a pending native installer');
-  try {
-    // Establish readiness independently so this regression isolates teardown ordering.
-    while (!existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery'))) {
-      if (finished) await running;
-      assert.equal(finished, false, 'Stage settled before the pending installer became ready');
-      await new Promise((resolve) => setTimeout(resolve, 20));
+test(
+  'native cancellation fixture settles a real installer before assertion-failure cleanup',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture(true);
+    const controller = new AbortController();
+    writeFileSync(join(f.base, 'wait'), 'go');
+    writeFileSync(join(f.base, 'unrelated'), 'keep');
+    const running = api.stageRuntime({ ...f.input, signal: controller.signal });
+    let finished = false;
+    const settled = running.then(
+      () => {
+        finished = true;
+      },
+      () => {
+        finished = true;
+      },
+    );
+    const fault = new Error('Synthetic assertion failed with a pending native installer');
+    try {
+      // Establish readiness independently so this regression isolates teardown ordering.
+      while (!existsSync(join(f.input.runtimeDirectory, 'node_modules/.bin/ai-delivery'))) {
+        if (finished) await running;
+        assert.equal(finished, false, 'Stage settled before the pending installer became ready');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await assert.rejects(
+        cancelNativeStageWhenReady(running, f.input, controller, () => {
+          throw fault;
+        }),
+        (error) => error === fault,
+      );
+      assert.equal(finished, true, 'Fixture cleanup must wait for actual staging settlement');
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.equal(readFileSync(join(f.base, 'unrelated'), 'utf8'), 'keep');
+      assert.equal(
+        readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
+        'Synthetic copied native plugin.\n',
+      );
+    } finally {
+      controller.abort();
+      await settled;
+      f.cleanup();
     }
-    await assert.rejects(
-      cancelNativeStageWhenReady(running, f.input, controller, () => {
-        throw fault;
-      }),
-      (error) => error === fault,
-    );
-    assert.equal(finished, true, 'Fixture cleanup must wait for actual staging settlement');
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    assert.equal(readFileSync(join(f.base, 'unrelated'), 'utf8'), 'keep');
-    assert.equal(
-      readFileSync(join(f.input.nativePluginRoot!, 'README.md'), 'utf8'),
-      'Synthetic copied native plugin.\n',
-    );
-  } finally {
-    controller.abort();
-    await settled;
-    f.cleanup();
-  }
-});
+  },
+);
 
 async function assertRetirementErrorBoundaries(error: Error, repoRoot: string, forbidden: string[]): Promise<void> {
   const { printCommandError } = await import('./cliResult.js');
@@ -1896,160 +1672,165 @@ for (const fault of [
   'inherited-message',
   'proxy-root',
 ] as const) {
-  test(`output retirement retains a bounded operation cause without exposing ${fault} failure data`, async () => {
-    const api = await producer();
-    const f = await fixture();
-    const secret = 'fictional_operation_credential';
-    const priorSecret = 'fictional_existing_cause_credential';
-    const prior = new Error(priorSecret);
-    Object.defineProperty(prior, 'cause', { value: prior });
-    const primary = new Error('Synthetic retirement refusal', { cause: prior });
-    let reads = 0;
-    let operation: unknown = new Error(secret.repeat(2048));
-    let expectedNumbers: string | undefined;
-    if (fault.startsWith('observer') || fault === 'inherited-message' || fault === 'proxy-root') {
-      const metadata: Record<string, unknown> = {
-        errorCode: 'ETIMEDOUT',
-        elapsedMs: 1001,
-        stdoutBytes: 57,
-        completeLines: 1,
-        rawRows: secret,
-        argv: [secret],
-      };
-      if (fault === 'observer-missing') {
-        delete metadata.completeLines;
-        Object.defineProperty(metadata, '__proto__', { value: { completeLines: 1 }, enumerable: true });
-      } else if (fault === 'observer-negative') metadata.elapsedMs = -1;
-      else if (fault === 'observer-fractional') metadata.stdoutBytes = 0.5;
-      else if (fault === 'observer-unsafe') metadata.completeLines = Number.MAX_SAFE_INTEGER + 1;
-      else if (fault === 'observer-nonfinite') metadata.elapsedMs = Infinity;
-      else if (fault === 'observer-string') metadata.stdoutBytes = '57';
-      else if (fault === 'observer-zero') {
-        metadata.elapsedMs = 0;
-        metadata.stdoutBytes = 0;
-        metadata.completeLines = 0;
-      }
-      let payload = JSON.stringify(fault === 'observer-array' ? [metadata] : metadata);
-      if (fault === 'observer-malformed') payload = `{"errorCode":"ETIMEDOUT","rawRows":"${secret}"`;
-      else if (fault === 'observer-trailing') payload += secret;
-      else if (fault === 'observer-retired') payload += ' Output-gate retirement: wrappedOperation=failed.';
-      const message = 'Owned process resource observation failed. ' + payload;
-      operation = new Error(message);
-      if (fault === 'observer' || fault === 'observer-retired')
-        expectedNumbers = 'elapsedMs=1001; stdoutBytes=57; completeLines=1';
-      else if (fault === 'observer-zero') expectedNumbers = 'elapsedMs=0; stdoutBytes=0; completeLines=0';
-      if (fault === 'inherited-message') {
-        Reflect.deleteProperty(operation as Error, 'message');
-        Object.setPrototypeOf(
-          operation,
-          Object.create(Error.prototype, {
-            message: {
-              get: () => {
-                reads++;
-                throw new Error(message);
+  test(
+    `output retirement retains a bounded operation cause without exposing ${fault} failure data`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      const secret = 'fictional_operation_credential';
+      const priorSecret = 'fictional_existing_cause_credential';
+      const prior = new Error(priorSecret);
+      Object.defineProperty(prior, 'cause', { value: prior });
+      const primary = new Error('Synthetic retirement refusal', { cause: prior });
+      let reads = 0;
+      let operation: unknown = new Error(secret.repeat(2048));
+      let expectedNumbers: string | undefined;
+      if (fault.startsWith('observer') || fault === 'inherited-message' || fault === 'proxy-root') {
+        const metadata: Record<string, unknown> = {
+          errorCode: 'ETIMEDOUT',
+          elapsedMs: 1001,
+          stdoutBytes: 57,
+          completeLines: 1,
+          rawRows: secret,
+          argv: [secret],
+        };
+        if (fault === 'observer-missing') {
+          delete metadata.completeLines;
+          Object.defineProperty(metadata, '__proto__', { value: { completeLines: 1 }, enumerable: true });
+        } else if (fault === 'observer-negative') metadata.elapsedMs = -1;
+        else if (fault === 'observer-fractional') metadata.stdoutBytes = 0.5;
+        else if (fault === 'observer-unsafe') metadata.completeLines = Number.MAX_SAFE_INTEGER + 1;
+        else if (fault === 'observer-nonfinite') metadata.elapsedMs = Infinity;
+        else if (fault === 'observer-string') metadata.stdoutBytes = '57';
+        else if (fault === 'observer-zero') {
+          metadata.elapsedMs = 0;
+          metadata.stdoutBytes = 0;
+          metadata.completeLines = 0;
+        }
+        let payload = JSON.stringify(fault === 'observer-array' ? [metadata] : metadata);
+        if (fault === 'observer-malformed') payload = `{"errorCode":"ETIMEDOUT","rawRows":"${secret}"`;
+        else if (fault === 'observer-trailing') payload += secret;
+        else if (fault === 'observer-retired') payload += ' Output-gate retirement: wrappedOperation=failed.';
+        const message = 'Owned process resource observation failed. ' + payload;
+        operation = new Error(message);
+        if (fault === 'observer' || fault === 'observer-retired')
+          expectedNumbers = 'elapsedMs=1001; stdoutBytes=57; completeLines=1';
+        else if (fault === 'observer-zero') expectedNumbers = 'elapsedMs=0; stdoutBytes=0; completeLines=0';
+        if (fault === 'inherited-message') {
+          Reflect.deleteProperty(operation as Error, 'message');
+          Object.setPrototypeOf(
+            operation,
+            Object.create(Error.prototype, {
+              message: {
+                get: () => {
+                  reads++;
+                  throw new Error(message);
+                },
               },
+            }) as object,
+          );
+        } else if (fault === 'proxy-root') {
+          const trap = (): never => {
+            reads++;
+            throw new Error(secret);
+          };
+          operation = new Proxy(operation as Error, { get: trap, ownKeys: trap, getOwnPropertyDescriptor: trap });
+        }
+      }
+      if (fault === 'accessors') {
+        operation = Object.defineProperties(new Error(), {
+          message: {
+            get: () => {
+              reads++;
+              throw new Error(secret);
             },
-          }) as object,
-        );
-      } else if (fault === 'proxy-root') {
+          },
+          name: {
+            get: () => {
+              reads++;
+              throw new Error(secret);
+            },
+          },
+          stack: {
+            get: () => {
+              reads++;
+              throw new Error(secret);
+            },
+          },
+          cause: {
+            get: () => {
+              reads++;
+              throw new Error(secret);
+            },
+          },
+        });
+      } else if (fault === 'cycle') {
+        Object.defineProperty(operation, 'cause', { value: operation });
+        Object.freeze(operation);
+      } else if (fault === 'proxy') {
         const trap = (): never => {
           reads++;
           throw new Error(secret);
         };
-        operation = new Proxy(operation as Error, { get: trap, ownKeys: trap, getOwnPropertyDescriptor: trap });
+        operation = new Error(secret, {
+          // The spy checks the thrown root with instanceof; the diagnostic must never inspect its hostile cause.
+          cause: new Proxy({}, { get: trap, getPrototypeOf: trap, ownKeys: trap, getOwnPropertyDescriptor: trap }),
+        });
       }
-    }
-    if (fault === 'accessors') {
-      operation = Object.defineProperties(new Error(), {
-        message: {
-          get: () => {
-            reads++;
-            throw new Error(secret);
-          },
-        },
-        name: {
-          get: () => {
-            reads++;
-            throw new Error(secret);
-          },
-        },
-        stack: {
-          get: () => {
-            reads++;
-            throw new Error(secret);
-          },
-        },
-        cause: {
-          get: () => {
-            reads++;
-            throw new Error(secret);
-          },
-        },
+      const write = atomicJson.writePrivateJsonFileAtomically;
+      const injected = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+        if (fault !== 'installer' && path === join(f.input.runtimeDirectory, 'runtime-stage.json')) throw operation;
+        write(path, value);
       });
-    } else if (fault === 'cycle') {
-      Object.defineProperty(operation, 'cause', { value: operation });
-      Object.freeze(operation);
-    } else if (fault === 'proxy') {
-      const trap = (): never => {
-        reads++;
-        throw new Error(secret);
-      };
-      operation = new Error(secret, {
-        // The spy checks the thrown root with instanceof; the diagnostic must never inspect its hostile cause.
-        cause: new Proxy({}, { get: trap, getPrototypeOf: trap, ownKeys: trap, getOwnPropertyDescriptor: trap }),
-      });
-    }
-    const write = atomicJson.writePrivateJsonFileAtomically;
-    const injected = vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
-      if (fault !== 'installer' && path === join(f.input.runtimeDirectory, 'runtime-stage.json')) throw operation;
-      write(path, value);
-    });
-    try {
-      if (fault === 'installer') writeFileSync(join(f.base, 'fail'), '');
-      retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
-      retirementFailure.error = primary;
-      retirementFailure.hits = 0;
-      let received: unknown;
       try {
-        await api.stageRuntime(f.input);
-      } catch (error) {
-        received = error;
+        if (fault === 'installer') writeFileSync(join(f.base, 'fail'), '');
+        retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
+        retirementFailure.error = primary;
+        retirementFailure.hits = 0;
+        let received: unknown;
+        try {
+          await api.stageRuntime(f.input);
+        } catch (error) {
+          received = error;
+        }
+        assert.equal(retirementFailure.hits, 1, 'the actual gate must retire before the injected refusal');
+        assert.equal(received, primary, 'retirement failure keeps its original instance and precedence');
+        assert.equal(primary.message, 'Synthetic retirement refusal');
+        const cause: unknown = Object.getOwnPropertyDescriptor(primary, 'cause')?.value;
+        assert.notEqual(cause, prior, 'the masked operation must have its own bounded diagnostic cause');
+        assert.ok(cause instanceof Error);
+        assert.match(cause.message, /^Wrapped operation failed/u);
+        if (fault === 'installer') assert.match(cause.message, /exit=7/u);
+        if (fault.startsWith('observer')) assert.match(cause.message, /observation=ETIMEDOUT/u);
+        if (expectedNumbers === undefined)
+          assert.doesNotMatch(cause.message, /elapsedMs=|stdoutBytes=|completeLines=/u);
+        else assert.ok(cause.message.includes(expectedNumbers));
+        assert.ok(cause.message.length < 1024);
+        assert.equal(cause.message.includes(secret), false);
+        assert.equal(
+          Object.getOwnPropertyDescriptor(cause, 'cause')?.value,
+          prior,
+          'existing retirement cause is retained',
+        );
+        assert.equal(reads, 0, 'operation getters, proxy traps and cause graphs are never evaluated');
+        await assertRetirementErrorBoundaries(primary, f.root, [secret, priorSecret]);
+        assert.equal(reads, 0);
+        assert.equal(existsSync(f.input.runtimeDirectory), false);
+        if (fault === 'installer') assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+        else assert.equal(existsSync(f.counter), false);
+      } finally {
+        retirementFailure.directory = '';
+        retirementFailure.error = undefined;
+        injected.mockRestore();
+        f.cleanup();
       }
-      assert.equal(retirementFailure.hits, 1, 'the actual gate must retire before the injected refusal');
-      assert.equal(received, primary, 'retirement failure keeps its original instance and precedence');
-      assert.equal(primary.message, 'Synthetic retirement refusal');
-      const cause: unknown = Object.getOwnPropertyDescriptor(primary, 'cause')?.value;
-      assert.notEqual(cause, prior, 'the masked operation must have its own bounded diagnostic cause');
-      assert.ok(cause instanceof Error);
-      assert.match(cause.message, /^Wrapped operation failed/u);
-      if (fault === 'installer') assert.match(cause.message, /exit=7/u);
-      if (fault.startsWith('observer')) assert.match(cause.message, /observation=ETIMEDOUT/u);
-      if (expectedNumbers === undefined) assert.doesNotMatch(cause.message, /elapsedMs=|stdoutBytes=|completeLines=/u);
-      else assert.ok(cause.message.includes(expectedNumbers));
-      assert.ok(cause.message.length < 1024);
-      assert.equal(cause.message.includes(secret), false);
-      assert.equal(
-        Object.getOwnPropertyDescriptor(cause, 'cause')?.value,
-        prior,
-        'existing retirement cause is retained',
-      );
-      assert.equal(reads, 0, 'operation getters, proxy traps and cause graphs are never evaluated');
-      await assertRetirementErrorBoundaries(primary, f.root, [secret, priorSecret]);
-      assert.equal(reads, 0);
-      assert.equal(existsSync(f.input.runtimeDirectory), false);
-      if (fault === 'installer') assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      else assert.equal(existsSync(f.counter), false);
-    } finally {
-      retirementFailure.directory = '';
-      retirementFailure.error = undefined;
-      injected.mockRestore();
-      f.cleanup();
-    }
-  });
+    },
+  );
 }
 
 for (const shape of ['nonextensible', 'readonly', 'accessor', 'mutable-nonextensible'] as const) {
-  test(`output retirement preserves primary cause descriptors for ${shape} errors`, async () => {
+  test(`output retirement preserves primary cause descriptors for ${shape} errors`, { tags: ['release'] }, async () => {
     const api = await producer();
     const f = await fixture();
     const secret = 'fictional_descriptor_credential';
@@ -2114,63 +1895,75 @@ for (const shape of ['nonextensible', 'readonly', 'accessor', 'mutable-nonextens
   });
 }
 
-test('output retirement preserves an operation failure when native retirement succeeds', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    writeFileSync(join(f.base, 'fail'), '');
-    await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-    assert.equal(existsSync(f.input.runtimeDirectory), false);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'output retirement preserves an operation failure when native retirement succeeds',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      writeFileSync(join(f.base, 'fail'), '');
+      await assert.rejects(api.stageRuntime(f.input), /exit 7/u);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+      assert.equal(existsSync(f.input.runtimeDirectory), false);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('output retirement preserves its existing cause after a successful real stage', async () => {
-  const api = await producer();
-  const f = await fixture();
-  const prior = new Error('Existing retirement cause');
-  const primary = new Error('Synthetic retirement refusal', { cause: prior });
-  try {
-    retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
-    retirementFailure.error = primary;
-    retirementFailure.hits = 0;
-    await assert.rejects(api.stageRuntime(f.input), (error: unknown) => error === primary);
-    assert.equal(retirementFailure.hits, 1);
-    assert.equal(primary.cause, prior, 'successful operation does not add a failure cause');
-    assert.equal(
-      (JSON.parse(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'), 'utf8')) as { status: string })
-        .status,
-      'complete',
-    );
-    assert.equal((await api.stageRuntime(f.input)).reused, true);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-  } finally {
-    retirementFailure.directory = '';
-    retirementFailure.error = undefined;
-    f.cleanup();
-  }
-});
+test(
+  'output retirement preserves its existing cause after a successful real stage',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    const prior = new Error('Existing retirement cause');
+    const primary = new Error('Synthetic retirement refusal', { cause: prior });
+    try {
+      retirementFailure.directory = join(f.root, '.git/ai-delivery/output-observation');
+      retirementFailure.error = primary;
+      retirementFailure.hits = 0;
+      await assert.rejects(api.stageRuntime(f.input), (error: unknown) => error === primary);
+      assert.equal(retirementFailure.hits, 1);
+      assert.equal(primary.cause, prior, 'successful operation does not add a failure cause');
+      assert.equal(
+        (JSON.parse(readFileSync(join(f.input.runtimeDirectory, 'runtime-stage.json'), 'utf8')) as { status: string })
+          .status,
+        'complete',
+      );
+      assert.equal((await api.stageRuntime(f.input)).reused, true);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    } finally {
+      retirementFailure.directory = '';
+      retirementFailure.error = undefined;
+      f.cleanup();
+    }
+  },
+);
 
-test('admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const stage = await api.stageRuntime(f.input);
-    const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
-    syncFailure.directory = dirname(path);
-    await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /commit-status-unknown.*same stage/u);
-    const desired = readFileSync(path, 'utf8');
-    assert.equal((JSON.parse(desired) as RuntimeAdmission).admissionId, stage.admission.admissionId);
-    syncFailure.directory = '';
-    assert.equal((await api.admitRuntime(admitInput(f.input, stage.stageId))).reused, true);
-    assert.equal(readFileSync(path, 'utf8'), desired);
-  } finally {
-    syncFailure.directory = '';
-    f.cleanup();
-  }
-});
+test(
+  'admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const stage = await api.stageRuntime(f.input);
+      const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
+      syncFailure.directory = dirname(path);
+      await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /commit-status-unknown.*same stage/u);
+      const desired = readFileSync(path, 'utf8');
+      assert.equal((JSON.parse(desired) as RuntimeAdmission).admissionId, stage.admission.admissionId);
+      syncFailure.directory = '';
+      assert.equal((await api.admitRuntime(admitInput(f.input, stage.stageId))).reused, true);
+      assert.equal(readFileSync(path, 'utf8'), desired);
+    } finally {
+      syncFailure.directory = '';
+      f.cleanup();
+    }
+  },
+);
 
 for (const denied of [
   'candidate',
@@ -2181,7 +1974,7 @@ for (const denied of [
   'source-drift',
   'config-drift',
 ] as const) {
-  test(`setup preserves completed output and admission on ${denied}`, async () => {
+  test(`setup preserves completed output and admission on ${denied}`, { tags: ['release'] }, async () => {
     const api = await producer();
     const f = await fixture();
     try {
@@ -2237,1554 +2030,237 @@ for (const denied of [
   });
 }
 
-test('setup interruption child', { skip: !process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT }, async () => {
-  if (process.env.AI_DELIVERY_CLI_PREPARE) {
-    await prepareOwnedCliStage();
-    return;
-  }
-  const api = await producer();
-  const phase = process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE;
-  if (phase) {
-    const actual = atomicJson.writePrivateJsonFileAtomically;
-    vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
-      const record = value as { outputs?: { status: string }[] };
-      const interrupt =
-        path.includes('/runtime-output/') &&
-        record.outputs?.[0]?.status === (phase === 'reservation' ? 'reserved' : 'complete');
-      if (!(interrupt && phase === 'publication')) actual(path, value);
-      if (interrupt) {
-        writeFileSync(
-          process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_MARKER!,
-          JSON.stringify({ phase, path, owner: process.pid }),
-        );
-        process.kill(process.pid, 'SIGKILL');
-      }
-    });
-  }
-  await api.stageRuntime(JSON.parse(process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT!) as SetupInput);
-});
+test(
+  'setup interruption child',
+  { tags: ['release'], skip: !process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT },
+  async () => {
+    const api = await producer();
+    const phase = process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE;
+    if (phase) {
+      const actual = atomicJson.writePrivateJsonFileAtomically;
+      vi.spyOn(atomicJson, 'writePrivateJsonFileAtomically').mockImplementation((path, value) => {
+        const record = value as { outputs?: { status: string }[] };
+        const interrupt =
+          path.includes('/runtime-output/') &&
+          record.outputs?.[0]?.status === (phase === 'reservation' ? 'reserved' : 'complete');
+        if (!(interrupt && phase === 'publication')) actual(path, value);
+        if (interrupt) {
+          writeFileSync(
+            process.env.AI_DELIVERY_SETUP_LOG_INTERRUPT_MARKER!,
+            JSON.stringify({ phase, path, owner: process.pid }),
+          );
+          process.kill(process.pid, 'SIGKILL');
+        }
+      });
+    }
+    await api.stageRuntime(JSON.parse(process.env.AI_DELIVERY_SETUP_INTERRUPT_INPUT!) as SetupInput);
+  },
+);
 
 for (const phase of ['reservation', 'publication'] as const) {
-  test(`runtime-stage retained-output recovery preserves charges after hard interruption at ${phase}`, async () => {
-    const api = await producer();
-    const f = await fixture();
-    const marker = join(f.base, 'log-interruption-marker');
-    const input = {
-      ...f.input,
-      resourceBounds: {
-        maxAggregateRssBytes: 512 * 1024 ** 2,
-        minFreeDiskBytes: 1,
-        maxNewOutputBytes: 128 * 1024 ** 2,
-        maxCapturedOutputBytes: 1024 ** 2,
-      },
-    };
-    let child: ReturnType<typeof spawn> | undefined;
-    try {
-      writeFileSync(join(f.base, 'fail'), 'go');
-      writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
-      child = spawn(
-        process.execPath,
-        [
-          join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
-          'run',
-          '--mode=compiled',
-          new URL(import.meta.url).pathname,
-          '-t',
-          '^setup interruption child$',
-          '--maxWorkers=1',
-          '--no-file-parallelism',
-        ],
-        {
-          env: {
-            ...process.env,
-            AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(input),
-            AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE: phase,
-            AI_DELIVERY_SETUP_LOG_INTERRUPT_MARKER: marker,
-          },
-          stdio: 'ignore',
+  test(
+    `runtime-stage retained-output recovery preserves charges after hard interruption at ${phase}`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      const marker = join(f.base, 'log-interruption-marker');
+      const input = {
+        ...f.input,
+        resourceBounds: {
+          maxAggregateRssBytes: 512 * 1024 ** 2,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 128 * 1024 ** 2,
+          maxCapturedOutputBytes: 1024 ** 2,
         },
-      );
-      await new Promise<void>((resolve) => child!.once('close', () => resolve()));
-      assert.equal(existsSync(marker), true, 'hard interruption must occur at the selected durable log boundary');
-      const writerPath = join(f.root, '.git/ai-delivery/writers@1', `${digestValue(f.root).slice(7)}.json`);
-      const stale = new Date(Date.now() - 20_000);
-      utimesSync(`${writerPath}.lock`, stale, stale);
-      const { path } = JSON.parse(readFileSync(marker, 'utf8')) as { path: string };
-      const prior = JSON.parse(readFileSync(path, 'utf8')) as {
-        outputs: { bytes: number; digest: string; status: string }[];
       };
-      assert.equal(prior.outputs[0]!.status, 'reserved');
-      assert.equal(prior.outputs[0]!.bytes, 100 * 1024);
-      const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
-      const priorOutput = join(outputDirectory, `${prior.outputs[0]!.digest.slice(7)}.bin`);
-      assert.equal(existsSync(priorOutput), phase === 'publication');
-      const preserved = phase === 'publication' ? readFileSync(priorOutput) : undefined;
-      writeFileSync(join(f.base, 'log-bytes'), String(128 * 1024));
-      await assert.rejects(api.stageRuntime(input), /exit 7/u);
-      const recovered = JSON.parse(readFileSync(path, 'utf8')) as typeof prior;
-      assert.equal(
-        recovered.outputs.reduce((total, output) => total + output.bytes, 0),
-        228 * 1024,
-      );
-      assert.equal(recovered.outputs[0]!.status, phase === 'publication' ? 'complete' : 'reserved');
-      if (preserved) assert.deepEqual(readFileSync(priorOutput), preserved);
-      if (phase === 'reservation') {
+      let child: ReturnType<typeof spawn> | undefined;
+      try {
+        writeFileSync(join(f.base, 'fail'), 'go');
         writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
-        await assert.rejects(api.stageRuntime(input), /identical output cannot be rewritten/u);
-        assert.equal(
-          existsSync(priorOutput),
-          false,
-          'unresolved reservation must not authorize a second raw-log write',
+        child = spawn(
+          process.execPath,
+          [
+            join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+            'run',
+            '--mode=compiled',
+            new URL(import.meta.url).pathname,
+            '-t',
+            '^setup interruption child$',
+            '--maxWorkers=1',
+            '--no-file-parallelism',
+          ],
+          {
+            env: {
+              ...process.env,
+              AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(input),
+              AI_DELIVERY_SETUP_LOG_INTERRUPT_PHASE: phase,
+              AI_DELIVERY_SETUP_LOG_INTERRUPT_MARKER: marker,
+            },
+            stdio: 'ignore',
+          },
         );
+        await new Promise<void>((resolve) => child!.once('close', () => resolve()));
+        assert.equal(existsSync(marker), true, 'hard interruption must occur at the selected durable log boundary');
+        const writerPath = join(f.root, '.git/ai-delivery/writers@1', `${digestValue(f.root).slice(7)}.json`);
+        const stale = new Date(Date.now() - 20_000);
+        utimesSync(`${writerPath}.lock`, stale, stale);
+        const { path } = JSON.parse(readFileSync(marker, 'utf8')) as { path: string };
+        const prior = JSON.parse(readFileSync(path, 'utf8')) as {
+          outputs: { bytes: number; digest: string; status: string }[];
+        };
+        assert.equal(prior.outputs[0]!.status, 'reserved');
+        assert.equal(prior.outputs[0]!.bytes, 100 * 1024);
+        const outputDirectory = join(f.root, '.git/ai-delivery/verification@1/command-output');
+        const priorOutput = join(outputDirectory, `${prior.outputs[0]!.digest.slice(7)}.bin`);
+        assert.equal(existsSync(priorOutput), phase === 'publication');
+        const preserved = phase === 'publication' ? readFileSync(priorOutput) : undefined;
+        writeFileSync(join(f.base, 'log-bytes'), String(128 * 1024));
+        await assert.rejects(api.stageRuntime(input), /exit 7/u);
+        const recovered = JSON.parse(readFileSync(path, 'utf8')) as typeof prior;
+        assert.equal(
+          recovered.outputs.reduce((total, output) => total + output.bytes, 0),
+          228 * 1024,
+        );
+        assert.equal(recovered.outputs[0]!.status, phase === 'publication' ? 'complete' : 'reserved');
+        if (preserved) assert.deepEqual(readFileSync(priorOutput), preserved);
+        if (phase === 'reservation') {
+          writeFileSync(join(f.base, 'log-bytes'), String(100 * 1024));
+          await assert.rejects(api.stageRuntime(input), /identical output cannot be rewritten/u);
+          assert.equal(
+            existsSync(priorOutput),
+            false,
+            'unresolved reservation must not authorize a second raw-log write',
+          );
+        }
+        rmSync(join(f.base, 'fail'));
+        rmSync(join(f.base, 'log-bytes'));
+        const completed = await api.stageRuntime(input);
+        const count = readFileSync(f.counter, 'utf8');
+        assert.equal(completed.reused, false);
+        assert.equal((await api.stageRuntime(input)).reused, true);
+        assert.equal(readFileSync(f.counter, 'utf8'), count, 'completed recovered stage must skip the installer');
+        assert.equal(readFileSync(completed.admission.cliPath, 'utf8'), "#!/usr/bin/env node\nconsole.log('0.3.5');\n");
+      } finally {
+        if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        f.cleanup();
       }
-      rmSync(join(f.base, 'fail'));
-      rmSync(join(f.base, 'log-bytes'));
-      const completed = await api.stageRuntime(input);
-      const count = readFileSync(f.counter, 'utf8');
-      assert.equal(completed.reused, false);
-      assert.equal((await api.stageRuntime(input)).reused, true);
-      assert.equal(readFileSync(f.counter, 'utf8'), count, 'completed recovered stage must skip the installer');
-      assert.equal(readFileSync(completed.admission.cliPath, 'utf8'), "#!/usr/bin/env node\nconsole.log('0.3.5');\n");
-    } finally {
-      if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      f.cleanup();
-    }
-  });
+    },
+  );
 }
 
 for (const native of [false, true]) {
-  test(`${native ? 'native ' : ''}stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install`, async () => {
-    const api = await producer();
-    const f = await fixture(native);
-    let child: ReturnType<typeof spawn> | undefined;
-    let ownedPid: number | undefined;
-    let ownedIdentity: string | undefined;
-    let ownerPid: number | undefined;
-    const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
-    try {
-      writeFileSync(join(f.base, 'wait'), 'go');
-      child = spawn(
-        process.execPath,
-        [
-          join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
-          'run',
-          '--mode=compiled',
-          'dist/setup.test.js',
-          '-t',
-          '^setup interruption child$',
-        ],
-        {
-          cwd: process.cwd(),
-          stdio: 'ignore',
-          env: { ...process.env, AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(f.input) },
-        },
-      );
-      const closed = new Promise((resolve) => child!.once('close', resolve));
-      const writerPath = join(
-        f.root,
-        '.git/ai-delivery/writers@1',
-        `${(await import('./delivery/index.js')).digestValue(f.root).slice(7)}.json`,
-      );
-      let record:
-        | { owner: { pid: number }; command: { phase: string; root?: { pid: number; identity: string } } }
-        | undefined;
-      // Bound this cold installer-start observation, not the recovery run.
-      for (let i = 0; i < 1000; i++) {
-        if (existsSync(writerPath)) record = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof record;
-        if (record?.command.phase === 'running' && existsSync(f.marker)) break;
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      assert.equal(record?.command.phase, 'running');
-      assert.equal(existsSync(f.marker), true, 'interrupt only after the owned installer actually starts');
-      const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
-      assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
-      ownerPid = record!.owner.pid;
-      ownedPid = record!.command.root!.pid;
-      ownedIdentity = record!.command.root!.identity;
-      process.kill(ownerPid, 'SIGSTOP');
-      const stale = new Date(Date.now() - 20_000);
-      utimesSync(`${writerPath}.lock`, stale, stale);
-      await assert.rejects(api.stageRuntime(f.input), /live verification writer/u);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      process.kill(ownerPid, 'SIGKILL');
-      ownerPid = undefined;
-      await closed;
-      process.kill(ownedPid, 0);
-      writeFileSync(snapshot, 'interrupted incomplete snapshot');
-      rmSync(join(f.base, 'wait'));
-      const recovered = await api.stageRuntime(f.input).catch((error: unknown) => {
-        if (error instanceof Error)
-          error.message += ` Fictional setup interruption phase=orphan-recovery; native=${native}.`;
-        throw error;
-      });
-      assert.equal(recovered.reused, false);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-      assert.equal(existsSync(writerPath), false);
-      assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
-      const completedSnapshot = lstatSync(snapshot);
-      process.kill(peer.pid!, 0);
-      const state = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
-      assert.ok(state.status === 1 || state.stdout.trim().startsWith('Z'));
-      ownedPid = undefined;
-      assert.equal((await api.stageRuntime(f.input)).reused, true);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
-      assert.equal(lstatSync(snapshot).ino, completedSnapshot.ino);
-      console.log(
-        'SETUP_INTERRUPTION_RECEIPT',
-        JSON.stringify({
-          completedStageId: recovered.stageId,
-          installerExecutions: 2,
-          peerPreserved: true,
-          ownedCleanupConfirmed: true,
-          completedRetrySkipped: true,
-          incompleteSnapshotRebuilt: true,
-          completedSnapshotReused: true,
-          archiveSha256: f.input.expectedArchiveSha256,
-          nativePluginRoot: f.input.nativePluginRoot ?? null,
-        }),
-      );
-    } finally {
-      if (ownerPid !== undefined) {
-        process.kill(ownerPid, 'SIGCONT');
-        process.kill(ownerPid, 'SIGKILL');
-      }
-      if (
-        ownedPid !== undefined &&
-        spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim() ===
-          ownedIdentity
-      )
-        process.kill(ownedPid, 'SIGKILL');
-      if (peer.exitCode === null && peer.signalCode === null) peer.kill('SIGKILL');
-      if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      f.cleanup();
-    }
-  });
-}
-
-const stageAdmitCase = 'CLI stage and admit execute the same public producer with explicit authority and prior absence';
-const preparedCliSchema = z.strictObject({
-  ownerRoot: z.string(),
-  base: z.string(),
-  stageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  configPath: z.string(),
-  npmBin: z.string(),
-  author: z.literal('host-user'),
-  reviewer: z.literal('reviewer[bot]'),
-  input: z.strictObject({
-    authority: z.literal('runtime:stage'),
-    identity: z.literal('host-author'),
-    repoRoot: z.string(),
-    archivePath: z.string(),
-    expectedArchiveSha256: z.string(),
-    packageVersion: z.literal('0.3.5'),
-    expectedSourceCommit: z.string(),
-    expectedConfigDigest: z.string(),
-    runtimeDirectory: z.string(),
-  }),
-  files: z.array(z.strictObject({ path: z.string(), digest: z.string() })).length(6),
-});
-type PreparedCli = z.infer<typeof preparedCliSchema>;
-
-function preparedCliClosure(input: SetupInput): void {
-  const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
-  assert.equal(
-    (JSON.parse(readFileSync(join(npmRoot, 'package.json'), 'utf8')) as { version: string }).version,
-    '11.19.0',
-  );
-  const result = spawnSync(
-    process.execPath,
-    [
-      join(npmRoot, 'bin/npm-cli.js'),
-      'ls',
-      '--prefix',
-      input.runtimeDirectory,
-      '--omit=dev',
-      '--all',
-      '--json',
-      '--logs-max',
-      '0',
-    ],
-    {
-      cwd: input.repoRoot,
-      encoding: 'utf8',
-      maxBuffer: 1024 ** 2,
-    },
-  );
-  assert.equal(result.error, undefined);
-  assert.equal(result.status, 0, result.stderr + result.stdout);
-  const graph = JSON.parse(result.stdout) as {
-    problems?: string[];
-    dependencies: Record<string, { version: string; resolved: string; invalid?: unknown; missing?: unknown }>;
-  };
-  assert.equal(graph.problems, undefined);
-  const dependency = graph.dependencies['@aviaratech/ai-delivery']!;
-  assert.equal(dependency.version, input.packageVersion);
-  assert.equal(dependency.resolved, `file:${join(input.runtimeDirectory, 'reviewed-archive.tgz')}`);
-  assert.equal(dependency.invalid, undefined);
-  assert.equal(dependency.missing, undefined);
-}
-
-function readPreparedCli(ownerRoot: string): PreparedCli {
-  assert.equal(realpathSync(ownerRoot), ownerRoot);
-  const prepared = preparedCliSchema.parse(
-    JSON.parse(
-      privateFiles.assertPrivateFile(join(ownerRoot, 'prepared.json'), { maxBytes: 16 * 1024 }).toString('utf8'),
-    ),
-  );
-  assert.equal(prepared.ownerRoot, ownerRoot);
-  const below = (path: string): void => {
-    const name = relative(ownerRoot, path);
-    assert.ok(name !== '' && name !== '..' && !name.startsWith('..' + sep) && !isAbsolute(name));
-    assert.equal(realpathSync(path), path);
-  };
-  for (const path of [
-    prepared.base,
-    prepared.configPath,
-    prepared.npmBin,
-    prepared.input.repoRoot,
-    prepared.input.archivePath,
-    prepared.input.runtimeDirectory,
-    ...prepared.files.map((f) => f.path),
-  ])
-    below(path);
-  assert.equal(dirname(prepared.base), ownerRoot);
-  assert.ok(prepared.base.split(sep).at(-1)!.startsWith('ai-delivery-setup-'));
-  assert.equal(prepared.input.repoRoot, join(prepared.base, 'consumer'));
-  assert.equal(prepared.input.runtimeDirectory, join(prepared.base, 'staged'));
-  assert.equal(prepared.input.archivePath, join(prepared.base, 'reviewed archive; inert.tgz'));
-  assert.equal(prepared.configPath, join(prepared.base, 'user.json'));
-  assert.equal(prepared.npmBin, join(prepared.base, 'prepared-npm'));
-  assert.equal(digestBytes(readFileSync(prepared.input.archivePath)), prepared.input.expectedArchiveSha256);
-  assert.equal(git(prepared.input.repoRoot, 'rev-parse', 'HEAD'), prepared.input.expectedSourceCommit);
-  assert.equal(git(prepared.input.repoRoot, 'status', '--porcelain'), '');
-  const recordPath = join(prepared.input.runtimeDirectory, 'runtime-stage.json');
-  const record = JSON.parse(privateFiles.assertPrivateFile(recordPath).toString('utf8')) as {
-    status: string;
-    stageId: string;
-    recordId: string;
-    intent: Record<string, unknown>;
-  };
-  const { recordId, ...content } = record;
-  assert.equal(digestValue(content), recordId);
-  assert.equal(record.status, 'complete');
-  assert.equal(record.stageId, prepared.stageId, 'Prepared CLI stage identity mismatch');
-  assert.equal(digestValue(record.intent), prepared.stageId);
-  for (const [field, value] of Object.entries({
-    repoRoot: prepared.input.repoRoot,
-    runtimeDirectory: prepared.input.runtimeDirectory,
-    sourceCommit: prepared.input.expectedSourceCommit,
-    configDigest: prepared.input.expectedConfigDigest,
-    archivePath: prepared.input.archivePath,
-    archiveSha256: prepared.input.expectedArchiveSha256,
-    packageVersion: prepared.input.packageVersion,
-  }))
-    assert.equal(record.intent[field], value);
-  assert.deepEqual(record.intent.resourceBounds, {
-    maxAggregateRssBytes: 1024 ** 3,
-    minFreeDiskBytes: 256 * 1024 ** 2,
-    maxNewOutputBytes: 512 * 1024 ** 2,
-    maxCapturedOutputBytes: 1024 ** 2,
-  });
-  const expectedPaths = [
-    recordPath,
-    join(prepared.input.runtimeDirectory, 'package.json'),
-    join(prepared.input.runtimeDirectory, 'package-lock.json'),
-    join(prepared.input.runtimeDirectory, 'reviewed-archive.tgz'),
-    join(prepared.input.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/dist/cli.js'),
-    prepared.configPath,
-  ];
-  assert.deepEqual(
-    prepared.files.map((f) => f.path),
-    expectedPaths,
-  );
-  for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
-  assert.equal(readFileSync(join(prepared.base, 'installs'), 'utf8'), 'x');
-  return prepared;
-}
-
-async function prepareOwnedCliStage(): Promise<void> {
-  const ownerRoot = process.env.AI_DELIVERY_CLI_PREPARE!;
-  const f = await fixture(false, ownerRoot);
-  const previousPath = process.env.PATH;
-  const scenario = process.env.AI_DELIVERY_STAGE_ADMIT_SCENARIO;
-  try {
-    writeFileSync(join(f.base, 'unrelated-preparation'), 'unrelated');
-    const npmRoot = join(dirname(process.execPath), '../lib/node_modules/npm');
-    assert.equal(
-      (JSON.parse(readFileSync(join(npmRoot, 'package.json'), 'utf8')) as { version: string }).version,
-      '11.19.0',
-    );
-    const npmBin = join(f.base, 'prepared-npm');
-    mkdirSync(npmBin);
-    writeFileSync(
-      join(npmBin, 'npm'),
-      `#!${process.execPath}\nconst fs=require('node:fs'),assert=require('node:assert/strict');if(process.argv[2]==='install'){assert.ok(process.argv.includes('--ignore-scripts'));fs.appendFileSync(${JSON.stringify(f.counter)},'x');fs.writeFileSync(${JSON.stringify(f.marker)},String(process.pid));}${scenario === 'preparation-failure' ? "process.argv[2]='synthetic-unknown-command';" : ''}${scenario === 'preparation-cancel' ? 'setInterval(()=>{},1000);' : ''}require(${JSON.stringify(join(npmRoot, 'bin/npm-cli.js'))});\n`,
-    );
-    chmodSync(join(npmBin, 'npm'), 0o755);
-    process.env.PATH = `${npmBin}:${previousPath ?? ''}`;
-    const stage = await (await producer()).stageRuntime(f.input);
-    preparedCliClosure(f.input);
-    assert.equal(stage.reused, false);
-    assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-    const files = [
-      join(f.input.runtimeDirectory, 'runtime-stage.json'),
-      join(f.input.runtimeDirectory, 'package.json'),
-      join(f.input.runtimeDirectory, 'package-lock.json'),
-      join(f.input.runtimeDirectory, 'reviewed-archive.tgz'),
-      stage.admission.cliPath,
-      join(f.base, 'user.json'),
-    ].map((path) => ({ path, digest: digestBytes(readFileSync(path)) }));
-    atomicJson.writePrivateJsonFileAtomically(join(ownerRoot, 'prepared.json'), {
-      ownerRoot,
-      base: f.base,
-      stageId: stage.stageId,
-      configPath: join(f.base, 'user.json'),
-      npmBin,
-      author: actors.author,
-      reviewer: actors.reviewer,
-      input: f.input,
-      files,
-    });
-    readPreparedCli(ownerRoot);
-  } finally {
-    // The outer supervisor owns fixture disposal, including a killed preparation process.
-    process.env.PATH = previousPath;
-  }
-}
-
-const cliBindingSchema = z.strictObject({
-  ownerRoot: z.string(),
-  scenario: z.string(),
-  repoRoot: z.string(),
-  sourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
-  configDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  userConfigDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  archivePath: z.string(),
-  archiveSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  runtimeDirectory: z.string(),
-});
-type CliBinding = z.infer<typeof cliBindingSchema>;
-const cliUnitSchema = z.strictObject({
-  command: z.enum(['runtime:stage', 'runtime:admit']),
-  kind: z.enum(['context', 'preflight', 'installer', 'authority']),
-  call: z.number().int().min(1).max(3),
-  binding: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  result: z
-    .string()
-    .regex(/^sha256:[a-f0-9]{64}$/u)
-    .optional(),
-});
-type CliUnit = z.infer<typeof cliUnitSchema>;
-type CliPhase = { phase: string; event: 'start' | 'end' | 'settled' | 'pending'; atMs: number; unit?: CliUnit };
-function cliUnitResult(unit: CliUnit): string {
-  const { result: _result, ...operation } = unit;
-  return digestValue({ ...operation, result: 'validated-success' });
-}
-type CliScenario =
-  | 'normal'
-  | 'progress'
-  | 'budget'
-  | 'unfinished'
-  | 'installer-failure'
-  | 'admission-stall'
-  | 'handoff-mismatch'
-  | 'preparation-failure'
-  | 'preparation-cancel';
-type CliTraceFault =
-  | 'missing'
-  | 'oversized'
-  | 'records'
-  | 'write'
-  | 'completion-duplicate'
-  | 'completion-unmatched'
-  | 'completion-rejected'
-  | 'completion-malformed';
-type CliCaseFailure = Error & {
-  root: string;
-  nativeIdle: boolean;
-  cleanupState: import('./verification.js').OwnedProcessState | undefined;
-  receiptFailure: string | undefined;
-  residualInstaller: { pid: number; counter: string } | undefined;
-  retainedPhaseCount: number;
-  traceFaultInjected: boolean;
-  restoredGlobalsWithPending: boolean;
-};
-
-// Re-enter this same case so cancellation can contain synchronous CLI work as well as promises.
-// The existing producer supervisor owns the native process; these callbacks only retain its observations.
-async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFault?: CliTraceFault) {
-  const { runStageCommand } = await import('./verification.js');
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-cli-case-')));
-  const tracePath = join(root, 'phases.json');
-  const cancellation = new AbortController();
-  let idle = false;
-  let cleanupFailure: string | undefined;
-  let receiptFailure: string | undefined;
-  let lastPhase: CliPhase[] = [];
-  let deadline = 0;
-  const active = new Map<string, number>();
-  const pendingUnits = new Map<string, CliUnit>();
-  const startedUnits = new Set<string>();
-  const completedUnits: string[] = [];
-  let fixtureBinding: CliBinding | undefined;
-  let seen = 0;
-  let cancelledPhase: string | undefined;
-  let failure: string | undefined;
-  let failedBytes: Buffer | undefined;
-  let owned: unknown;
-  const identities = new Map<string, { pid: number; identity: string; pgid: number }>();
-  let residualInstaller: { pid: number; counter: string; noiseWrites: number } | undefined;
-  let cleanupState: import('./verification.js').OwnedProcessState | undefined;
-  let traceFaultInjected = false;
-  let unreadableSince: number | undefined;
-  let prepared: PreparedCli | undefined;
-  let preparationStartedAt: number | undefined;
-  let preparationElapsedMs: number | undefined;
-  let preparationCompleted = false;
-  const needsPreparation = [
-    'budget',
-    'admission-stall',
-    'handoff-mismatch',
-    'preparation-failure',
-    'preparation-cancel',
-  ].includes(scenario);
-  const readPhases = (): CliPhase[] => {
-    const value: unknown = JSON.parse(
-      privateFiles.assertPrivateFile(tracePath, { maxBytes: 64 * 1024 }).toString('utf8'),
-    );
-    assert.ok(Array.isArray(value) && value.length <= 64, 'CLI phase count exceeded its bound');
-    let previous = -1;
-    for (const item of value as unknown[]) {
-      assert.ok(
-        item !== null &&
-          typeof item === 'object' &&
-          Object.keys(item).length === ('unit' in item ? 4 : 3) &&
-          Object.keys(item).every((key) => ['phase', 'event', 'atMs', 'unit'].includes(key)),
-        'CLI phase entry is invalid',
-      );
-      const entry = item as Partial<CliPhase>;
-      assert.ok(
-        typeof entry.phase === 'string' &&
-          entry.phase.length <= 64 &&
-          ['start', 'end', 'settled', 'pending'].includes(entry.event ?? '') &&
-          typeof entry.atMs === 'number' &&
-          Number.isFinite(entry.atMs) &&
-          entry.atMs >= 0 &&
-          entry.atMs >= previous,
-        'CLI phase entry is invalid',
-      );
-      previous = entry.atMs;
-      if (entry.unit !== undefined) cliUnitSchema.parse(entry.unit);
-    }
-    const phases = value as CliPhase[];
-    assert.ok(
-      phases.length >= lastPhase.length &&
-        lastPhase.every((entry, index) => {
-          const current = phases[index]!;
-          return (
-            current.phase === entry.phase &&
-            current.event === entry.event &&
-            current.atMs === entry.atMs &&
-            JSON.stringify(current.unit) === JSON.stringify(entry.unit)
-          );
-        }),
-      'CLI phase history changed after observation',
-    );
-    return phases;
-  };
-  const save = (): void => {
-    try {
-      writeFileSync(join(root, 'ownership.json'), JSON.stringify({ idle, owned, cleanupFailure, receiptFailure }), {
-        mode: 0o600,
-      });
-    } catch (error) {
-      receiptFailure = error instanceof Error ? error.message : String(error);
-      cancellation.abort();
-    }
-  };
-  let watch: ReturnType<typeof setInterval> | undefined;
-  const readBinding = (): CliBinding => {
-    const binding = cliBindingSchema.parse(
-      JSON.parse(
-        privateFiles.assertPrivateFile(join(root, 'producer-binding.json'), { maxBytes: 8 * 1024 }).toString('utf8'),
-      ),
-    );
-    assert.equal(binding.ownerRoot, root);
-    assert.equal(binding.scenario, scenario);
-    assert.equal(realpathSync(binding.repoRoot), binding.repoRoot);
-    assert.equal(dirname(dirname(binding.repoRoot)), root);
-    assert.equal(binding.runtimeDirectory, join(dirname(binding.repoRoot), 'staged'));
-    assert.equal(binding.archivePath, join(dirname(binding.repoRoot), 'reviewed archive; inert.tgz'));
-    assert.equal(
-      digestBytes(privateFiles.assertPrivateFile(join(dirname(binding.repoRoot), 'user.json'))),
-      binding.userConfigDigest,
-    );
-    if (fixtureBinding === undefined) {
-      assert.equal(git(binding.repoRoot, 'rev-parse', 'HEAD'), binding.sourceCommit);
-      assert.equal(digestBytes(readFileSync(binding.archivePath)), binding.archiveSha256);
-      fixtureBinding = binding;
-    } else assert.deepEqual(binding, fixtureBinding, 'CLI producer binding changed');
-    return binding;
-  };
-  const watchPhases = (injectFault = true): void => {
-    try {
-      if (existsSync(tracePath)) {
-        const phases = readPhases();
-        unreadableSince = undefined;
-        for (const entry of phases.slice(seen)) {
-          if (entry.unit !== undefined) {
-            const unit = cliUnitSchema.parse(entry.unit);
-            assert.equal(entry.phase, `unit:${unit.command}:${unit.kind}:${unit.call}`);
-            assert.equal(unit.binding, digestValue(readBinding()));
-            assert.ok(active.has(unit.command), 'Completion record is outside its actual CLI invocation');
-            assert.ok(unit.kind !== 'installer' || (unit.command === 'runtime:stage' && unit.call === 1));
-            assert.ok(unit.kind !== 'authority' || unit.command === 'runtime:admit');
-            if (entry.event === 'start') {
-              assert.equal(unit.result, undefined);
-              assert.ok(!startedUnits.has(entry.phase), 'Duplicate CLI unit start');
-              assert.equal(
-                unit.call,
-                1 + [...startedUnits].filter((name) => name.startsWith(`unit:${unit.command}:${unit.kind}:`)).length,
-              );
-              if (unit.kind === 'preflight')
-                assert.ok(
-                  completedUnits.includes(`unit:${unit.command}:context:${unit.call}`),
-                  'Preflight preceded its validated context',
-                );
-              if (unit.kind === 'context' && unit.call > 1)
-                assert.ok(
-                  completedUnits.includes(`unit:${unit.command}:preflight:${unit.call - 1}`),
-                  'Context recheck preceded its prior preflight',
-                );
-              if (unit.kind === 'installer')
-                assert.ok(
-                  completedUnits.includes('unit:runtime:stage:preflight:1'),
-                  'Installer preceded real preflight',
-                );
-              if (unit.kind === 'authority')
-                assert.ok(
-                  pendingUnits.has(`unit:runtime:admit:preflight:${unit.call}`),
-                  'Authority check is outside its real preflight',
-                );
-              startedUnits.add(entry.phase);
-              pendingUnits.set(entry.phase, unit);
-            } else {
-              assert.equal(entry.event, 'end', 'Only successful delegated units may report completion');
-              const started = pendingUnits.get(entry.phase);
-              assert.ok(started, 'Unmatched or duplicate CLI unit completion');
-              assert.deepEqual({ ...unit, result: undefined }, { ...started, result: undefined });
-              assert.equal(unit.result, cliUnitResult(started), 'CLI unit result binding is invalid');
-              if (unit.command === 'runtime:admit' && unit.kind === 'preflight')
-                assert.ok(
-                  completedUnits.includes(`unit:runtime:admit:authority:${unit.call}`),
-                  'Admission preflight lacks successful authority readback',
-                );
-              pendingUnits.delete(entry.phase);
-              completedUnits.push(entry.phase);
-              // This measures inactivity between verified substantive units, never total command duration.
-              active.set(
-                unit.command,
-                performance.now() + (scenario === 'unfinished' && unit.command === 'runtime:stage' ? 30_000 : 15_000),
-              );
-            }
-            continue;
-          }
-          if (entry.phase.startsWith('unit:')) {
-            assert.equal(entry.event, 'settled', 'CLI unit completion lacks a validated result');
-            assert.ok(pendingUnits.delete(entry.phase), 'Unmatched rejected CLI unit');
-            continue; // A rejected operation is settled, but cannot refresh the stall clock.
-          }
-          if (entry.event === 'start')
-            active.set(
-              entry.phase,
-              performance.now() + (scenario === 'unfinished' && entry.phase === 'runtime:stage' ? 30_000 : 15_000),
-            );
-          else if (entry.event === 'end' || entry.event === 'settled') active.delete(entry.phase);
-        }
-        lastPhase = phases;
-        if (phases.length > seen) deadline = performance.now() + 15_000;
-        seen = phases.length;
-        if (injectFault && !idle && traceFault !== undefined && traceFault !== 'write' && !traceFaultInjected) {
-          const fixtureRoot = readdirSync(root).find((name) => name.startsWith('ai-delivery-setup-'));
-          const marker = fixtureRoot === undefined ? undefined : join(root, fixtureRoot, 'installer-running');
-          if (marker !== undefined && existsSync(marker)) {
-            assert.equal(readFileSync(join(dirname(marker), 'installs'), 'utf8'), 'x');
-            traceFaultInjected = true;
-            if (traceFault === 'missing') rmSync(tracePath);
-            else if (traceFault === 'oversized') {
-              writeFileSync(tracePath, Buffer.alloc(64 * 1024 + 1, 32));
-              sharedOutputRead.path = tracePath;
-            } else if (traceFault.startsWith('completion-')) {
-              const source = phases.find((entry) =>
-                traceFault === 'completion-malformed'
-                  ? entry.unit?.kind === 'installer' && entry.event === 'start' && pendingUnits.has(entry.phase)
-                  : entry.unit !== undefined && entry.event === 'end',
-              );
-              assert.ok(source?.unit, 'A completion fault needs its matching real delegated unit first');
-              const injected: CliPhase = {
-                ...source,
-                event: 'end',
-                atMs: phases.at(-1)!.atMs + 0.001,
-                unit: { ...source.unit },
-              };
-              if (traceFault === 'completion-unmatched') {
-                injected.unit!.call++;
-                injected.phase = `unit:${injected.unit!.command}:${injected.unit!.kind}:${injected.unit!.call}`;
-              } else if (traceFault === 'completion-rejected') injected.event = 'settled';
-              else if (traceFault === 'completion-malformed') injected.unit!.result = 'sha256:' + '0'.repeat(64);
-              writeFileSync(tracePath, JSON.stringify([...phases, injected]));
-            } else writeFileSync(tracePath, JSON.stringify(Array.from({ length: 65 }, () => phases[0])));
-          }
-        }
-      } else if (seen > 0) throw new Error('CLI phase evidence disappeared after observation');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // Atomic replacement can race an identity-bound read. Retry only that bounded observation,
-      // while operation deadlines continue to run; missing, oversized or invalid history fails immediately.
-      const changing =
-        /identity changed before its bounded read|truncated during its bounded read|bytes are missing, corrupt or changed during its bounded read/u.test(
-          message,
-        );
-      if (changing) unreadableSince ??= performance.now();
-      if (!changing || performance.now() - unreadableSince! >= 1_000) {
-        receiptFailure ??= message;
-        cancellation.abort();
-      }
-    }
-    const overdue = [...active].find(([, limit]) => performance.now() >= limit);
-    if (overdue !== undefined || (active.size === 0 && performance.now() >= deadline)) {
-      cancelledPhase ??= overdue?.[0] ?? (seen === 0 ? 'bootstrap' : 'native-drain');
-      cancellation.abort();
-    }
-  };
-  const executeChild = async (preparing: boolean): Promise<void> => {
-    idle = false;
-    failedBytes = undefined;
-    const output = await runStageCommand(
-      process.cwd(),
-      [
-        process.execPath,
-        join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
-        'run',
-        '--mode=compiled',
-        'dist/setup.test.js',
-        '-t',
-        preparing ? '^setup interruption child$' : `^${stageAdmitCase}$`,
-      ],
-      cancellation.signal,
-      undefined,
-      // This bounded synthetic case uses the fixture floor, not a local host's 100 GiB reserve.
-      { maxAggregateRssBytes: 3 * 1024 ** 3, minFreeDiskBytes: 256 * 1024 ** 2 },
-      undefined,
-      undefined,
-      {
-        starting: () => {
-          idle = false;
-          save();
-        },
-        observed: (state) => {
-          cleanupState = { ...state, tracked: new Map(state.tracked) };
-          for (const member of state.tracked.values()) {
-            if (identities.size >= 512 && !identities.has(`${member.pid}:${member.identity}`)) {
-              receiptFailure ??= 'CLI ownership observation count exceeded its bound';
-              cancellation.abort();
-              break;
-            }
-            identities.set(`${member.pid}:${member.identity}`, {
-              pid: member.pid,
-              identity: member.identity,
-              pgid: member.pgid,
-            });
-          }
-          owned = {
-            rootPid: state.rootPid,
-            rootIdentity: state.rootIdentity,
-            sampled: state.sampled,
-            tracked: [...identities.values()],
-          };
-          save();
-        },
-        idle: () => {
-          idle = true;
-          save();
-        },
-        assertQuiescent: () => assert.ok(idle && cleanupFailure === undefined),
-      },
-      {
-        environment: {
-          ...process.env,
-          TMPDIR: root,
-          TMP: root,
-          TEMP: root,
-          AI_DELIVERY_STAGE_ADMIT_CHILD: tracePath,
-          AI_DELIVERY_STAGE_ADMIT_SCENARIO: scenario,
-          AI_DELIVERY_STAGE_ADMIT_TRACE_FAULT: traceFault ?? '',
-          AI_DELIVERY_CLI_PREPARE: preparing ? root : '',
-          ...(preparing ? { AI_DELIVERY_SETUP_INTERRUPT_INPUT: 'owned-cli-preparation' } : {}),
-          AI_DELIVERY_CLI_PREPARED_ROOT: !preparing && prepared !== undefined ? root : '',
-        },
-        maxCapturedOutputBytes: 32 * 1024 ** 2,
-        includeControllerTree: true,
-        failedOutput: (bytes) => {
-          failedBytes = bytes;
-          if (bytes.includes(Buffer.from('SETUP_CLI_TRACE_WRITE_FAULT_WITH_PENDING'))) traceFaultInjected = true;
-          if (bytes.includes(Buffer.from('SETUP_CLI_TRACE_FAILURE'))) receiptFailure ??= 'Child CLI phase write failed';
-          return ` CLI case output ${digestBytes(bytes)} (${bytes.length} bytes).`;
-        },
-        onCleanupFailure: (reason) => {
-          cleanupFailure = reason;
-          save();
-        },
-      },
-    );
-    if (output.includes(Buffer.from('SETUP_CLI_TRACE_FAILURE'))) receiptFailure ??= 'Child CLI phase write failed';
-    process.stdout.write(output);
-  };
-  try {
-    if (needsPreparation) {
-      preparationStartedAt = performance.now();
-      const cancelPreparation =
-        scenario === 'preparation-cancel'
-          ? setInterval(() => {
-              const base = readdirSync(root).find((name) => name.startsWith('ai-delivery-setup-'));
-              if (base !== undefined && existsSync(join(root, base, 'installer-running'))) cancellation.abort();
-            }, 50)
-          : undefined;
+  test(
+    `${native ? 'native ' : ''}stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture(native);
+      let child: ReturnType<typeof spawn> | undefined;
+      let ownedPid: number | undefined;
+      let ownedIdentity: string | undefined;
+      let ownerPid: number | undefined;
+      const peer = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
       try {
-        await executeChild(true);
-        assert.ok(idle && cleanupFailure === undefined, 'preparation must settle with native quiescence');
-        prepared = readPreparedCli(root);
-        preparedCliClosure(prepared.input);
-        preparationCompleted = true;
-        if (scenario === 'handoff-mismatch')
-          atomicJson.writePrivateJsonFileAtomically(join(root, 'prepared.json'), {
-            ...prepared,
-            stageId: 'sha256:' + '0'.repeat(64),
-          });
-      } finally {
-        if (cancelPreparation !== undefined) clearInterval(cancelPreparation);
-        preparationElapsedMs = performance.now() - preparationStartedAt;
-      }
-    }
-    deadline = performance.now() + 15_000;
-    watch = setInterval(watchPhases, 50);
-    await executeChild(false);
-  } catch (error) {
-    failure = error instanceof Error ? error.message : String(error);
-    if (failedBytes !== undefined) process.stdout.write(failedBytes);
-  } finally {
-    if (watch !== undefined) clearInterval(watch);
-    if (needsPreparation && !preparationCompleted) receiptFailure ??= 'CLI preparation failed before completed handoff';
-    else {
-      try {
-        watchPhases(false);
-      } catch (error) {
-        receiptFailure ??= error instanceof Error ? error.message : String(error);
-      }
-    }
-    if (idle && cleanupFailure === undefined) {
-      try {
-        for (const name of readdirSync(root).filter((name) => name.startsWith('ai-delivery-setup-'))) {
-          const base = join(root, name);
-          const marker = join(base, 'installer-running');
-          if (existsSync(marker)) {
-            assert.ok(lstatSync(marker).size <= 64 && lstatSync(join(base, 'installs')).size <= 64);
-            residualInstaller = {
-              pid: Number(readFileSync(marker, 'utf8')),
-              counter: readFileSync(join(base, 'installs'), 'utf8'),
-              noiseWrites: existsSync(join(base, 'noise-writes')) ? lstatSync(join(base, 'noise-writes')).size : 0,
-            };
-          }
-        }
-      } catch (error) {
-        receiptFailure ??= error instanceof Error ? error.message : String(error);
-      }
-    }
-    process.stdout.write(
-      'SETUP_CLI_PHASE_RECEIPT ' +
-        JSON.stringify({
-          scenario,
-          traceFault,
-          traceFaultInjected,
-          phases: lastPhase,
-          nativeIdle: idle,
-          cancelledPhase,
-          failure,
-          cleanupFailure,
-          receiptFailure,
-          owned,
-          root,
-          residualInstaller,
-          preparationElapsedMs,
-          preparationCompleted,
-          completedUnits,
-        }) +
-        '\n',
-    );
-  }
-  if (!idle || cleanupFailure !== undefined || receiptFailure !== undefined)
-    throw Object.assign(new Error(`CLI case ownership unresolved; preserve ${root}`), {
-      root,
-      nativeIdle: idle,
-      cleanupState,
-      receiptFailure,
-      residualInstaller,
-      retainedPhaseCount: lastPhase.length,
-      traceFaultInjected,
-      restoredGlobalsWithPending: failedBytes?.includes(Buffer.from('SETUP_CLI_ENV_RESTORED_WITH_PENDING')) ?? false,
-    });
-  if (fixtureBinding !== undefined) {
-    const savedConfig = process.env.AI_DELIVERY_CONFIG;
-    try {
-      process.env.AI_DELIVERY_CONFIG = join(dirname(fixtureBinding.repoRoot), 'user.json');
-      assert.equal((await loadDeliveryConfig(fixtureBinding.repoRoot)).configDigest, fixtureBinding.configDigest);
-    } finally {
-      if (savedConfig === undefined) delete process.env.AI_DELIVERY_CONFIG;
-      else process.env.AI_DELIVERY_CONFIG = savedConfig;
-    }
-    if (failure === undefined) {
-      assert.equal(pendingUnits.size, 0, 'A successful CLI retained an unfinished semantic unit');
-      const stage = JSON.parse(
-        privateFiles.assertPrivateFile(join(fixtureBinding.runtimeDirectory, 'runtime-stage.json')).toString('utf8'),
-      ) as {
-        status: string;
-        recordId: string;
-        intent: { sourceCommit: string; configDigest: string; archiveSha256: string };
-        admission: RuntimeAdmission;
-      };
-      const { recordId, ...content } = stage;
-      assert.equal(recordId, digestValue(content));
-      assert.equal(stage.status, 'complete');
-      assert.equal(stage.intent.sourceCommit, fixtureBinding.sourceCommit);
-      assert.equal(stage.intent.configDigest, fixtureBinding.configDigest);
-      assert.equal(stage.intent.archiveSha256, fixtureBinding.archiveSha256);
-      assert.deepEqual(
-        JSON.parse(
-          privateFiles
-            .assertPrivateFile(join(fixtureBinding.repoRoot, '.git/ai-delivery/runtime-admission.json'))
-            .toString('utf8'),
-        ),
-        stage.admission,
-      );
-      assert.ok(completedUnits.includes('unit:runtime:stage:installer:1') || prepared !== undefined);
-    }
-  }
-  if (prepared !== undefined) {
-    // Parent retains original validated bindings even when the child receives the mismatch fault.
-    for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
-    assert.equal(readFileSync(join(prepared.base, 'installs'), 'utf8'), 'x');
-    preparedCliClosure(prepared.input);
-    if (scenario !== 'budget' || failure !== undefined)
-      assert.equal(existsSync(join(prepared.input.repoRoot, '.git/ai-delivery/runtime-admission.json')), false);
-  }
-  rmSync(root, { recursive: true, force: true });
-  assert.equal(existsSync(root), false, 'Owned CLI case root was not removed');
-  return {
-    phases: lastPhase,
-    completedUnits,
-    nativeIdle: idle,
-    cancelledPhase,
-    failure,
-    rootRemoved: true,
-    residualInstaller,
-    identities: [...identities.values()],
-    installerFailureReported: failedBytes?.includes(Buffer.from('exit 7')) ?? false,
-    handoffMismatchReported: failedBytes?.includes(Buffer.from('Prepared CLI stage identity mismatch')) ?? false,
-  };
-}
-
-test(
-  stageAdmitCase,
-  async () => {
-    const tracePath = process.env.AI_DELIVERY_STAGE_ADMIT_CHILD;
-    if (tracePath === undefined) {
-      const result = await observeStageAdmitCase();
-      assert.equal(result.failure, undefined);
-      return;
-    }
-    const scenario = process.env.AI_DELIVERY_STAGE_ADMIT_SCENARIO as CliScenario;
-    const traceFault = process.env.AI_DELIVERY_STAGE_ADMIT_TRACE_FAULT as CliTraceFault;
-    const phases: CliPhase[] = [];
-    let activeCommands = 0;
-    let traceFailure: Error | undefined;
-    const phase = (name: string, event: CliPhase['event'], unit?: CliUnit): void => {
-      if (traceFailure !== undefined) return;
-      try {
-        assert.ok(phases.length < 64, 'CLI phase count exceeded its bound');
-        phases.push({ phase: name, event, atMs: performance.now(), ...(unit === undefined ? {} : { unit }) });
-        if (traceFault === 'write' && name === 'import:runtime:stage' && event === 'end') {
-          assert.ok(activeCommands > 0, 'Trace write fault requires an actually pending CLI command');
-          process.stderr.write('SETUP_CLI_TRACE_WRITE_FAULT_WITH_PENDING\n');
-          rmSync(tracePath);
-          mkdirSync(tracePath);
-        }
-        atomicJson.writePrivateJsonFileAtomically(tracePath, phases);
-      } catch (error) {
-        traceFailure = error instanceof Error ? error : new Error(String(error));
-        try {
-          process.stderr.write('SETUP_CLI_TRACE_FAILURE\n');
-        } catch {
-          /* The parent also validates the retained trace. */
-        }
-      }
-    };
-    phase('preparation', 'start');
-    if (scenario === 'budget') await new Promise((resolve) => setTimeout(resolve, 12_000));
-    const preparedRoot = process.env.AI_DELIVERY_CLI_PREPARED_ROOT;
-    const prepared = preparedRoot ? readPreparedCli(preparedRoot) : undefined;
-    const ownedFixture = prepared === undefined ? await fixture() : undefined;
-    const f = ownedFixture ?? {
-      base: prepared!.base,
-      root: prepared!.input.repoRoot,
-      input: prepared!.input,
-      counter: join(prepared!.base, 'installs'),
-      marker: join(prepared!.base, 'installer-running'),
-    };
-    const previousPath = process.env.PATH;
-    if (prepared !== undefined) {
-      vi.stubEnv('AI_DELIVERY_CONFIG', prepared.configPath);
-      process.env.PATH = `${prepared.npmBin}:${previousPath ?? ''}`;
-      assert.equal((await loadDeliveryConfig(f.root)).configDigest, f.input.expectedConfigDigest);
-      assert.equal(actors.author, prepared.author);
-      assert.equal(actors.reviewer, prepared.reviewer);
-      assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-      preparedCliClosure(f.input);
-    }
-    if (scenario === 'unfinished') {
-      writeFileSync(join(f.base, 'wait'), '');
-      writeFileSync(join(f.base, 'wait-noise'), '');
-    }
-    if (scenario === 'installer-failure') writeFileSync(join(f.base, 'fail'), '');
-    chmodSync(join(f.base, 'user.json'), 0o600);
-    const binding: CliBinding = {
-      ownerRoot: dirname(tracePath),
-      scenario,
-      repoRoot: f.root,
-      sourceCommit: f.input.expectedSourceCommit,
-      configDigest: f.input.expectedConfigDigest,
-      userConfigDigest: digestBytes(readFileSync(join(f.base, 'user.json'))),
-      archivePath: f.input.archivePath,
-      archiveSha256: f.input.expectedArchiveSha256,
-      runtimeDirectory: f.input.runtimeDirectory,
-    };
-    atomicJson.writePrivateJsonFileAtomically(join(dirname(tracePath), 'producer-binding.json'), binding);
-    phase('preparation', 'end');
-    const argv = process.argv;
-    const exitCode = process.exitCode;
-    const stdout = vi.spyOn(process.stdout, 'write');
-    const pending: Promise<unknown>[] = [];
-    const restoreObservations: (() => void)[] = [];
-    const restoreEnvs = vi.unstubAllEnvs.bind(vi);
-    const environmentProbe =
-      traceFault === 'write'
-        ? vi.spyOn(vi, 'unstubAllEnvs').mockImplementation(() => {
-            if (activeCommands > 0) process.stderr.write('SETUP_CLI_ENV_RESTORED_WITH_PENDING\n');
-            return restoreEnvs();
-          })
-        : undefined;
-    try {
-      const runCli = async (args: string[]): Promise<Record<string, unknown>> => {
-        const begin = stdout.mock.calls.length;
-        let settled = false;
-        process.argv = [
+        writeFileSync(join(f.base, 'wait'), 'go');
+        child = spawn(
           process.execPath,
-          join(process.cwd(), 'dist/cli.js'),
-          '--repo-root',
+          [
+            join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
+            'run',
+            '--mode=compiled',
+            'dist/setup.test.js',
+            '-t',
+            '^setup interruption child$',
+          ],
+          {
+            cwd: process.cwd(),
+            stdio: 'ignore',
+            env: { ...process.env, AI_DELIVERY_SETUP_INTERRUPT_INPUT: JSON.stringify(f.input) },
+          },
+        );
+        const closed = new Promise((resolve) => child!.once('close', resolve));
+        const writerPath = join(
           f.root,
-          '--identity',
-          'host-author',
-          ...args,
-        ];
-        vi.resetModules();
-        const calls = { context: 0, preflight: 0, installer: 0, authority: 0 };
-        const observeUnit = async <T>(
-          kind: CliUnit['kind'],
-          operation: () => Promise<T>,
-          validate: (value: T) => void,
-        ): Promise<T> => {
-          const unit: CliUnit = {
-            command: args[0] as CliUnit['command'],
-            kind,
-            call: ++calls[kind],
-            binding: digestValue(binding),
-          };
-          const name = `unit:${unit.command}:${unit.kind}:${unit.call}`;
-          phase(name, 'start', unit);
-          try {
-            const value = await operation();
-            validate(value);
-            phase(name, 'end', { ...unit, result: cliUnitResult(unit) });
-            return value;
-          } catch (error) {
-            phase(name, 'settled'); // Failure is evidence of settlement, never successful progress.
-            throw error;
-          }
-        };
-        const contextModule = await import('./issue.js');
-        const context = contextModule.loadDeliveryContext;
-        const contextObserver = vi.spyOn(contextModule, 'loadDeliveryContext').mockImplementation((...input) =>
-          observeUnit(
-            'context',
-            () => context(...input),
-            (value) => {
-              assert.equal(input[0].repoRoot, f.root);
-              assert.equal(input[0].identity, 'host-author');
-              assert.equal(input[0].role, 'author');
-              assert.equal(value.config.repository, 'example/widget');
-              assert.equal(value.configuration?.configDigest, f.input.expectedConfigDigest);
-              assert.equal(value.clients.role, 'author');
-              assert.equal(value.clients.authSource, 'personal');
-              assert.equal(value.clients.credentialSource, 'env:AUTHOR_TOKEN');
-            },
-          ),
+          '.git/ai-delivery/writers@1',
+          `${(await import('./delivery/index.js')).digestValue(f.root).slice(7)}.json`,
         );
-        restoreObservations.push(() => contextObserver.mockRestore());
-        const preflightModule = await import('./pr.js');
-        const preflight = preflightModule.preflightReviewRoute;
-        const preflightObserver = vi.spyOn(preflightModule, 'preflightReviewRoute').mockImplementation((...input) =>
-          observeUnit(
-            'preflight',
-            () => preflight(...input),
-            (value) => {
-              assert.equal(value.author.actorLogin, 'host-user');
-              assert.equal(value.author.identity, 'host-author');
-              assert.equal(value.author.authSource, 'personal');
-              assert.equal(value.reviewer.actorLogin, 'reviewer[bot]');
-              assert.equal(value.reviewer.identity, 'synthetic-reviewer');
-              assert.equal(value.reviewer.repositoryAccess, 'readable');
-              assert.equal(value.rules.visibility, 'unknown');
-              assert.equal(value.rules.observedRequiredApprovals, null);
-              assert.equal(value.approvalEligibility, 'unknown');
-            },
-          ),
-        );
-        restoreObservations.push(() => preflightObserver.mockRestore());
-        const verificationModule = await import('./verification.js');
-        const writer = verificationModule.withRuntimeSetupWriter;
-        const observedWriter: typeof writer = (root, operation, scope) =>
-          writer(
-            root,
-            (runner) =>
-              operation({
-                ...runner,
-                run: (...input) =>
-                  observeUnit(
-                    'installer',
-                    () => runner.run(...input),
-                    () => {
-                      assert.equal(root, f.root);
-                      assert.equal(input[0][0], 'npm');
-                      assert.equal(input[0][1], 'install');
-                      assert.equal(input[0][input[0].indexOf('--prefix') + 1], f.input.runtimeDirectory);
-                      assert.equal(input[0].at(-1), join(f.input.runtimeDirectory, 'reviewed-archive.tgz'));
-                      assert.equal(input[4], f.input.runtimeDirectory);
-                      runner.assertQuiescent();
-                      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-                      const installed = JSON.parse(
-                        readFileSync(
-                          join(f.input.runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/package.json'),
-                          'utf8',
-                        ),
-                      ) as { name: string; version: string };
-                      assert.equal(installed.name, '@aviaratech/ai-delivery');
-                      assert.equal(installed.version, f.input.packageVersion);
-                      const lock = JSON.parse(
-                        readFileSync(join(f.input.runtimeDirectory, 'package-lock.json'), 'utf8'),
-                      ) as { packages: Record<string, { version: string }> };
-                      assert.equal(
-                        lock.packages['node_modules/@aviaratech/ai-delivery']?.version,
-                        f.input.packageVersion,
-                      );
-                    },
-                  ),
-              }),
-            scope,
-          );
-        const writerObserver = vi
-          .spyOn(verificationModule, 'withRuntimeSetupWriter')
-          .mockImplementation(observedWriter);
-        restoreObservations.push(() => writerObserver.mockRestore());
-        if (args[0] === 'runtime:admit') {
-          const clientsModule = await import('./github/client.js');
-          const create = clientsModule.createDeliveryGitHubClients;
-          let authorChecks = 0;
-          const clients = vi
-            .spyOn(clientsModule, 'createDeliveryGitHubClients')
-            .mockImplementation(async (...input) => {
-              const client = await create(...input);
-              const authenticatedAuthor = client.authenticatedAuthor;
-              if (authenticatedAuthor !== undefined) {
-                client.authenticatedAuthor = async (...request) => {
-                  const name = `admit:author:${++authorChecks}${actors.pauseAuthor ? ':delayed' : ''}`;
-                  phase(name, 'start');
-                  try {
-                    assert.ok(
-                      scenario !== 'budget' || authorChecks === 1 || !actors.pauseAuthor,
-                      'Budget fixture repeated its deliberate HTTP delay at another required authority check',
-                    );
-                    return await observeUnit(
-                      'authority',
-                      async () => {
-                        const response = await authenticatedAuthor(...request);
-                        // This fictional HTTP port can withhold its response; the actual CLI parse remains pending.
-                        if (scenario === 'admission-stall') await new Promise<void>(() => {});
-                        return response;
-                      },
-                      (response) => {
-                        assert.equal(response.actorLogin, 'host-user');
-                        assert.equal(response.credentialIdentity, 'user:37');
-                      },
-                    );
-                  } finally {
-                    // The budget regression needs one four-second response, not one per required recheck.
-                    if (scenario === 'budget') actors.pauseAuthor = false;
-                    phase(name, 'end');
-                  }
-                };
-              }
-              return client;
-            });
-          restoreObservations.push(() => clients.mockRestore());
-        }
-        const { Command } = await import('commander');
-        const descriptor = Object.getOwnPropertyDescriptor(Command.prototype, 'parseAsync');
-        assert.equal(typeof descriptor?.value, 'function', 'Commander parse operation is unavailable');
-        const parse = descriptor!.value as typeof Command.prototype.parseAsync;
-        let command: Promise<import('commander').Command> | undefined;
-        let observation: Promise<void> | undefined;
-        const observe = vi.spyOn(Command.prototype, 'parseAsync').mockImplementation(function (
-          this: import('commander').Command,
-          ...input
-        ) {
-          phase(args[0]!, 'start');
-          if (traceFailure !== undefined) throw traceFailure;
-          const operation = parse.apply(this, input);
-          activeCommands++;
-          command = operation;
-          observation = operation.then(
-            () => {
-              activeCommands--;
-              settled = true;
-              phase(args[0]!, 'settled');
-            },
-            () => {
-              activeCommands--;
-              settled = true;
-              phase(args[0]!, 'settled');
-            },
-          );
-          pending.push(operation, observation);
-          // Retain observer failures for the explicit join without an interim unhandled rejection.
-          void observation.catch(() => {});
-          return operation;
-        });
-        try {
-          phase(`import:${args[0]!}`, 'start');
-          if (traceFailure !== undefined) throw traceFailure;
-          await import('./cli.js');
-          phase(`import:${args[0]!}`, 'end');
-        } finally {
-          observe.mockRestore();
-        }
-        assert.ok(command, 'CLI import did not start its actual parse operation');
-        await command;
-        await observation;
-        if (traceFailure !== undefined) throw traceFailure;
-        for (let i = 0; i < 300; i++) {
-          const output = stdout.mock.calls
-            .slice(begin)
-            .map(([bytes]) => String(bytes))
-            .find((bytes) => bytes.startsWith('{'));
-          if (output) {
-            phase(`return:${args[0]!}`, settled ? 'end' : 'pending');
-            return JSON.parse(output) as Record<string, unknown>;
-          }
+        let record:
+          | { owner: { pid: number }; command: { phase: string; root?: { pid: number; identity: string } } }
+          | undefined;
+        // Bound this cold installer-start observation, not the recovery run.
+        for (let i = 0; i < 1000; i++) {
+          if (existsSync(writerPath)) record = JSON.parse(readFileSync(writerPath, 'utf8')) as typeof record;
+          if (record?.command.phase === 'running' && existsSync(f.marker)) break;
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        phase(`return:${args[0]!}`, settled ? 'end' : 'pending');
-        throw new Error('CLI completion output unavailable');
-      };
-      const common = [
-        '--source-commit',
-        f.input.expectedSourceCommit,
-        '--config-digest',
-        f.input.expectedConfigDigest,
-        '--runtime-directory',
-        f.input.runtimeDirectory,
-      ];
-      if (scenario === 'progress') {
-        // Two actual authority responses alone exceed the old aggregate command limit.
-        actors.pauseAuthor = true;
-        actors.authorDelayMs = 8_000;
-      }
-      const staged = await runCli([
-        'runtime:stage',
-        '--authorize-stage',
-        '--archive',
-        f.input.archivePath,
-        '--archive-sha256',
-        f.input.expectedArchiveSha256,
-        '--package-version',
-        f.input.packageVersion,
-        ...common,
-      ]);
-      phase('assertions:stageId', 'start');
-      assert.equal(typeof staged.stageId, 'string');
-      if (prepared !== undefined) {
-        assert.equal(staged.reused, true, 'the actual CLI must reuse the completed prepared stage');
-        assert.equal(staged.stageId, prepared.stageId);
+        assert.equal(record?.command.phase, 'running');
+        assert.equal(existsSync(f.marker), true, 'interrupt only after the owned installer actually starts');
+        const snapshot = join(f.input.runtimeDirectory, 'reviewed-archive.tgz');
+        assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
+        ownerPid = record!.owner.pid;
+        ownedPid = record!.command.root!.pid;
+        ownedIdentity = record!.command.root!.identity;
+        process.kill(ownerPid, 'SIGSTOP');
+        const stale = new Date(Date.now() - 20_000);
+        utimesSync(`${writerPath}.lock`, stale, stale);
+        await assert.rejects(api.stageRuntime(f.input), /live verification writer/u);
         assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-        for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
+        process.kill(ownerPid, 'SIGKILL');
+        ownerPid = undefined;
+        await closed;
+        process.kill(ownedPid, 0);
+        writeFileSync(snapshot, 'interrupted incomplete snapshot');
+        rmSync(join(f.base, 'wait'));
+        const recovered = await api.stageRuntime(f.input).catch((error: unknown) => {
+          if (error instanceof Error)
+            error.message += ` Fictional setup interruption phase=orphan-recovery; native=${native}.`;
+          throw error;
+        });
+        assert.equal(recovered.reused, false);
+        assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+        assert.equal(existsSync(writerPath), false);
+        assert.equal(digestBytes(readFileSync(snapshot)), f.input.expectedArchiveSha256);
+        const completedSnapshot = lstatSync(snapshot);
+        process.kill(peer.pid!, 0);
+        const state = spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'stat='], { encoding: 'utf8' });
+        assert.ok(state.status === 1 || state.stdout.trim().startsWith('Z'));
+        ownedPid = undefined;
+        assert.equal((await api.stageRuntime(f.input)).reused, true);
+        assert.equal(readFileSync(f.counter, 'utf8'), 'xx');
+        assert.equal(lstatSync(snapshot).ino, completedSnapshot.ino);
+        console.log(
+          'SETUP_INTERRUPTION_RECEIPT',
+          JSON.stringify({
+            completedStageId: recovered.stageId,
+            installerExecutions: 2,
+            peerPreserved: true,
+            ownedCleanupConfirmed: true,
+            completedRetrySkipped: true,
+            incompleteSnapshotRebuilt: true,
+            completedSnapshotReused: true,
+            archiveSha256: f.input.expectedArchiveSha256,
+            nativePluginRoot: f.input.nativePluginRoot ?? null,
+          }),
+        );
+      } finally {
+        if (ownerPid !== undefined) {
+          process.kill(ownerPid, 'SIGCONT');
+          process.kill(ownerPid, 'SIGKILL');
+        }
+        if (
+          ownedPid !== undefined &&
+          spawnSync('/bin/ps', ['-p', String(ownedPid), '-o', 'lstart='], { encoding: 'utf8' }).stdout.trim() ===
+            ownedIdentity
+        )
+          process.kill(ownedPid, 'SIGKILL');
+        if (peer.exitCode === null && peer.signalCode === null) peer.kill('SIGKILL');
+        if (child?.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        f.cleanup();
       }
-      phase('assertions:stageId', 'end');
-      if (scenario === 'progress') actors.pauseAuthor = false;
-      const authorCallsBeforeAdmission = actors.authorCalls;
-      if (scenario === 'budget') actors.pauseAuthor = true;
-      const admitted = await runCli([
-        'runtime:admit',
-        '--authorize-admit',
-        '--stage-id',
-        String(staged.stageId),
-        '--expected-absent',
-        ...common,
-      ]);
-      phase('assertions', 'start');
-      assert.equal(
-        actors.authorCalls - authorCallsBeforeAdmission,
-        3,
-        'Admission must authenticate at its initial, locked and final controller checks',
-      );
-      assert.equal((admitted.admission as RuntimeAdmission).sourceCommit, f.input.expectedSourceCommit);
-      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-      assert.equal(process.exitCode, exitCode);
-      phase('assertions', 'end');
-    } finally {
-      phase('drain', 'start');
-      await Promise.allSettled(pending);
-      for (const restore of restoreObservations) restore();
-      environmentProbe?.mockRestore();
-      phase('drain', 'end');
-      phase('cleanup', 'start');
-      stdout.mockRestore();
-      process.argv = argv;
-      process.exitCode = exitCode;
-      // The existing parent owns final artifact corroboration and disposal after native quiescence.
-      if (ownedFixture !== undefined) ownedFixture.cleanup(true);
-      else process.env.PATH = previousPath;
-      phase('cleanup', 'end');
-    }
-    if (traceFailure !== undefined) throw traceFailure;
-  },
-  // The parent supervises bootstrap, each overlapping phase, and native drain independently.
-  // Cancellation may terminate this isolated process; it never proves JavaScript settlement.
-  0,
-);
-
-test('CLI stage/admit completes substantive work beyond the former aggregate command limit', async () => {
-  const result = await observeStageAdmitCase('progress');
-  assert.equal(result.failure, undefined, 'The actual CLI must complete while real producer units keep completing');
-  const start = result.phases.find((entry) => entry.phase === 'runtime:stage' && entry.event === 'start');
-  const end = result.phases.find((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled');
-  assert.ok(start && end && end.atMs - start.atMs > 15_000);
-  assert.ok(result.nativeIdle && result.rootRemoved);
-  assert.ok(result.phases.some((entry) => entry.phase === 'runtime:admit' && entry.event === 'settled'));
-});
-
-test('CLI stage/admit separates preparation from substantive command progress', { tags: ['release'] }, async () => {
-  const result = await observeStageAdmitCase('budget');
-  const authorChecks = result.phases.filter(
-    (entry) => entry.phase.startsWith('admit:author:') && entry.event === 'start',
+    },
   );
-  assert.equal(authorChecks.length, 3, 'All three admission authority checks must execute');
-  assert.equal(
-    authorChecks.filter((entry) => entry.phase.endsWith(':delayed')).length,
-    1,
-    'The aggregate-budget regression must inject one delayed HTTP response, not repeat it for every authority check',
-  );
-  assert.equal(result.failure, undefined, 'A CLI operation failed; inspect the retained phase and ownership evidence');
-  assert.ok(result.phases.at(-1)!.atMs - result.phases[0]!.atMs > 15_000);
-  for (const entry of result.phases.filter((entry) => entry.event === 'start')) {
-    const end = result.phases.find(
-      (candidate) => candidate.phase === entry.phase && ['end', 'settled'].includes(candidate.event),
-    );
-    assert.ok(end !== undefined, `${entry.phase} did not settle`);
-  }
-});
-
-test(
-  'CLI prepared handoff rejects a mismatched stage identity without reinstall or admission',
-  { tags: ['release'] },
-  async () => {
-    const result = await observeStageAdmitCase('handoff-mismatch');
-    assert.equal(result.handoffMismatchReported, true, 'the actual child must refuse its mismatched prepared stage');
-    assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
-    assert.equal(
-      result.phases.some((entry) => entry.phase === 'runtime:admit'),
-      false,
-    );
-  },
-);
-
-for (const fault of ['failure', 'cancel'] as const) {
-  test(`CLI preparation ${fault} retains owned evidence through native drain`, { tags: ['release'] }, async () => {
-    const previousPath = process.env.PATH;
-    let received: unknown;
-    try {
-      await observeStageAdmitCase(`preparation-${fault}`);
-    } catch (error) {
-      received = error;
-    }
-    assert.ok(received instanceof Error, 'failed preparation must retain its owned root for recovery');
-    const error = received as CliCaseFailure;
-    assert.equal(error.nativeIdle, true);
-    assert.ok(error.cleanupState !== undefined);
-    assert.equal(error.restoredGlobalsWithPending, false);
-    assert.equal(realpathSync(error.root), error.root);
-    assert.equal(dirname(error.root), realpathSync(tmpdir()));
-    assert.match(error.root, /ai-delivery-cli-case-/u);
-    const ownership = JSON.parse(
-      privateFiles.assertPrivateFile(join(error.root, 'ownership.json')).toString('utf8'),
-    ) as {
-      idle: boolean;
-      owned: { rootPid: number; rootIdentity: string };
-    };
-    assert.equal(ownership.idle, true);
-    assert.equal(ownership.owned.rootPid, error.cleanupState.rootPid);
-    assert.equal(ownership.owned.rootIdentity, error.cleanupState.rootIdentity);
-    const { confirmOwnedCleanup } = await import('./verification.js');
-    await confirmOwnedCleanup(error.cleanupState);
-    try {
-      const bases = readdirSync(error.root).filter((name) => name.startsWith('ai-delivery-setup-'));
-      assert.equal(bases.length, 1);
-      const base = join(error.root, bases[0]!);
-      assert.equal(readFileSync(join(base, 'unrelated-preparation'), 'utf8'), 'unrelated');
-      assert.equal(readFileSync(join(base, 'installs'), 'utf8'), 'x');
-      assert.equal(existsSync(join(base, 'consumer/.git/ai-delivery/runtime-admission.json')), false);
-      if (fault === 'cancel') {
-        assert.equal(error.residualInstaller?.counter, 'x');
-        assert.ok(error.cleanupState.tracked.has(error.residualInstaller!.pid));
-      }
-      assert.equal(process.env.PATH, previousPath);
-    } finally {
-      rmSync(error.root, { recursive: true, force: true });
-    }
-    assert.equal(existsSync(error.root), false);
-    process.stdout.write(
-      'SETUP_CLI_PREPARATION_RECOVERY ' +
-        JSON.stringify({ fault, root: error.root, quiescenceRechecked: true, removed: true }) +
-        '\n',
-    );
-  });
 }
-
-test('CLI stage/admit keeps an unfinished real installer owned until native quiescence', async () => {
-  const result = await observeStageAdmitCase('unfinished');
-  assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
-  assert.equal(result.residualInstaller?.counter, 'x', 'A real installer must execute exactly once');
-  assert.ok(
-    result.identities.some((member) => member.pid === result.residualInstaller?.pid),
-    'Installer birth identity was not observed by the native supervisor',
-  );
-  assert.equal(
-    result.phases.some((entry) => entry.event === 'pending'),
-    false,
-    'CLI caller relinquished an unfinished command',
-  );
-  assert.equal(result.cancelledPhase, 'runtime:stage');
-  assert.ok(
-    (result.residualInstaller?.noiseWrites ?? 0) >= 2,
-    'The actually stalled installer must emit repeated noise',
-  );
-  assert.equal(result.completedUnits.includes('unit:runtime:stage:installer:1'), false);
-  assert.equal(
-    result.phases.some((entry) => entry.phase === 'cleanup'),
-    false,
-    'Child cleaned a fixture with active work',
-  );
-});
-
-test('CLI stage/admit joins a failed real installer before restoring its fixture', async () => {
-  const result = await observeStageAdmitCase('installer-failure');
-  assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
-  assert.equal(result.installerFailureReported, true, 'The real installer failure was not reported');
-  const settled = result.phases.findIndex((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled');
-  const cleanup = result.phases.findIndex((entry) => entry.phase === 'cleanup' && entry.event === 'start');
-  assert.ok(settled >= 0 && cleanup > settled, 'Failure cleanup preceded actual command settlement');
-  assert.equal(
-    result.phases.some((entry) => entry.phase === 'runtime:admit'),
-    false,
-  );
-});
-
-test(
-  'CLI stage/admit keeps a stalled admission response owned until native quiescence',
-  { tags: ['release'] },
-  async () => {
-    const result = await observeStageAdmitCase('admission-stall');
-    assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
-    assert.equal(result.cancelledPhase, 'runtime:admit');
-    assert.ok(result.phases.some((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled'));
-    assert.ok(result.phases.some((entry) => entry.phase === 'admit:author:1' && entry.event === 'start'));
-    assert.equal(
-      result.phases.some(
-        (entry) =>
-          entry.phase === 'cleanup' ||
-          entry.phase === 'return:runtime:admit' ||
-          (entry.phase === 'admit:author:1' && entry.event === 'end'),
-      ),
-      false,
-      'The stalled HTTP response must keep the original command pending until native cancellation',
-    );
-  },
-);
-
-test.each([
-  'missing',
-  'oversized',
-  'records',
-  'write',
-  'completion-duplicate',
-  'completion-unmatched',
-  'completion-rejected',
-  'completion-malformed',
-] as const)('CLI stage/admit preserves owned recovery evidence when its trace fails: %s', async (fault) => {
-  let failure: CliCaseFailure | undefined;
-  sharedOutputRead.unboundedReads = 0;
-  try {
-    try {
-      await observeStageAdmitCase('unfinished', fault);
-    } catch (error) {
-      assert.ok(error instanceof Error);
-      failure = error as CliCaseFailure;
-    }
-    assert.ok(failure?.receiptFailure, 'Unavailable phase evidence was accepted');
-    if (fault === 'completion-malformed') assert.match(failure.receiptFailure, /CLI unit result binding is invalid/u);
-    assert.equal(failure.nativeIdle, true);
-    assert.equal(failure.traceFaultInjected, true, 'The real pending CLI trace fault did not execute');
-    assert.equal(existsSync(failure.root), true, 'Untrusted phase evidence was discarded before recovery');
-    assert.ok(failure.retainedPhaseCount <= 64, 'Invalid final trace replaced validated bounded evidence');
-    assert.equal(sharedOutputRead.unboundedReads, 0, 'Failure handling attempted an unbounded final trace read');
-    assert.equal(failure.restoredGlobalsWithPending, false, 'Trace failure bypassed the actual command join');
-    if (fault !== 'write') assert.equal(failure.residualInstaller?.counter, 'x');
-  } finally {
-    sharedOutputRead.path = '';
-    if (failure?.nativeIdle && failure.cleanupState !== undefined) {
-      const recorded = JSON.parse(
-        privateFiles.assertPrivateFile(join(failure.root, 'ownership.json'), { maxBytes: 256 * 1024 }).toString('utf8'),
-      ) as { idle: boolean; owned: { rootPid: number } };
-      assert.equal(recorded.idle, true);
-      assert.equal(recorded.owned.rootPid, failure.cleanupState.rootPid);
-      const { confirmOwnedCleanup } = await import('./verification.js');
-      await confirmOwnedCleanup(failure.cleanupState);
-      rmSync(failure.root, { recursive: true, force: true });
-      assert.equal(existsSync(failure.root), false);
-      process.stdout.write(
-        `SETUP_CLI_TRACE_RECOVERY ${JSON.stringify({ fault, root: failure.root, quiescenceRechecked: true, removed: true })}\n`,
-      );
-    }
-    sharedOutputRead.unboundedReads = 0;
-  }
-});
 
 test(
   'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer',
@@ -3846,27 +2322,31 @@ test(
   },
 );
 
-test('live routing and reviewer access drift cannot replace an already admitted stage', async () => {
-  const api = await producer();
-  const f = await fixture();
-  try {
-    const stage = await api.stageRuntime(f.input);
-    await api.admitRuntime(admitInput(f.input, stage.stageId));
-    const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
-    const before = readFileSync(path);
-    actors.projectId = 'PROJECT-2';
-    await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /config digest/u);
-    const changed = { ...f.input, expectedConfigDigest: (await loadDeliveryConfig(f.root)).configDigest };
-    await assert.rejects(api.admitRuntime(admitInput(changed, stage.stageId)), /configuration/u);
-    actors.projectId = 'PROJECT-1';
-    actors.access = false;
-    await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /cannot read/u);
-    actors.access = true;
-    await assert.rejects(api.admitRuntime({ ...admitInput(f.input, stage.stageId), authority: '' }), /authority/u);
-    await assert.rejects(api.stageRuntime({ ...f.input, packageVersion: '0.3.4' }), /incompatible/u);
-    assert.deepEqual(readFileSync(path), before);
-    assert.equal(readFileSync(f.counter, 'utf8'), 'x');
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'live routing and reviewer access drift cannot replace an already admitted stage',
+  { tags: ['release'] },
+  async () => {
+    const api = await producer();
+    const f = await fixture();
+    try {
+      const stage = await api.stageRuntime(f.input);
+      await api.admitRuntime(admitInput(f.input, stage.stageId));
+      const path = join(f.root, '.git/ai-delivery/runtime-admission.json');
+      const before = readFileSync(path);
+      actors.projectId = 'PROJECT-2';
+      await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /config digest/u);
+      const changed = { ...f.input, expectedConfigDigest: (await loadDeliveryConfig(f.root)).configDigest };
+      await assert.rejects(api.admitRuntime(admitInput(changed, stage.stageId)), /configuration/u);
+      actors.projectId = 'PROJECT-1';
+      actors.access = false;
+      await assert.rejects(api.admitRuntime(admitInput(f.input, stage.stageId)), /cannot read/u);
+      actors.access = true;
+      await assert.rejects(api.admitRuntime({ ...admitInput(f.input, stage.stageId), authority: '' }), /authority/u);
+      await assert.rejects(api.stageRuntime({ ...f.input, packageVersion: '0.3.4' }), /incompatible/u);
+      assert.deepEqual(readFileSync(path), before);
+      assert.equal(readFileSync(f.counter, 'utf8'), 'x');
+    } finally {
+      f.cleanup();
+    }
+  },
+);
