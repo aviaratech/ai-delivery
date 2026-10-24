@@ -415,6 +415,7 @@ test(
         process.execPath,
         fileURLToPath(new URL('../node_modules/vitest/vitest.mjs', import.meta.url)),
         'run',
+        '--mode=compiled',
         fileURLToPath(import.meta.url),
         '-t',
         neverReleasedCase,

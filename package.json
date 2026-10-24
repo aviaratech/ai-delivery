@@ -46,12 +46,11 @@
     "access": "public"
   },
   "scripts": {
-    "format": "oxfmt --threads=1 src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "format:check": "oxfmt --threads=1 --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
-    "lint": "oxlint --threads=1",
+    "format": "oxfmt src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "format:check": "oxfmt --check src scripts package.json tsconfig.json tsconfig.build.json vitest.config.ts .oxlintrc.json .oxfmtrc.json",
+    "lint": "oxlint",
     "typecheck": "tsc -p tsconfig.json",
-    "build": "tsc -p tsconfig.build.json && node scripts/build-plugin.mjs",
-    "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
+    "build": "node scripts/build.mjs --clean --declarations --plugin",
     "test": "npm run build && vitest run",
     "checks": "node scripts/checks.mjs",
     "checks:release": "node scripts/current-qualification.mjs",
@@ -73,10 +72,11 @@
   "devDependencies": {
     "@types/node": "^25.9.1",
     "@types/proper-lockfile": "^4.1.4",
+    "esbuild": "0.28.2",
     "oxfmt": "0.70.0",
     "oxlint": "1.85.0",
     "oxlint-tsgolint": "7.0.2003",
-    "typescript": "6.0.2",
+    "typescript": "7.0.2",
     "vitest": "5.0.1"
   },
   "engines": {

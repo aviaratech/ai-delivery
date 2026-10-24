@@ -283,11 +283,17 @@ function walk(root, path = '') {
     .sort();
 }
 
-/** @param {string} cwd */
-export function expectedTests(cwd) {
+/** @param {string} file */
+export function compiledTestFile(file) {
+  return file.replace(/^src\/(.*)\.test\.ts$/u, 'dist/$1.test.js');
+}
+
+/** @param {string} cwd @param {'source'|'compiled'} [mode] */
+export function expectedTests(cwd, mode = 'compiled') {
+  assert.ok(mode === 'source' || mode === 'compiled', 'Unknown test input mode.');
   const sources = walk(join(cwd, 'src')).filter((path) => path.endsWith('.test.ts'));
   assert.ok(sources.length, 'No intended source tests selected.');
-  return sources.map((path) => `dist/${path.slice(0, -3)}.js`);
+  return sources.map((path) => (mode === 'source' ? `src/${path}` : `dist/${path.slice(0, -3)}.js`));
 }
 
 /** @param {string} cwd @param {string[]} requested */
@@ -567,15 +573,19 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
   const key = (file, title) => JSON.stringify([file, title]);
   const inventory = new Map(RELEASE_CASES.map((test) => [key(test.file, test.title), test]));
   /** @param {{file:string,fullName:string}} test */
-  const releaseCase = (test) => inventory.has(key(test.file, test.fullName));
+  const releaseCase = (test) => inventory.has(key(compiledTestFile(test.file), test.fullName));
   for (const test of cases) {
     if (test.tags !== undefined)
       assert.equal(test.tags.includes('release'), releaseCase(test), 'Tags differ from reviewed release inventory.');
     if ((lane === 'pr' && releaseCase(test)) || (lane === 'release' && !releaseCase(test)))
       assert.notEqual(test.status, 'passed', 'A case executed outside its owned lane.');
   }
-  for (const expected of RELEASE_CASES.filter((test) => selected.includes(test.file))) {
-    const observed = cases.filter((test) => key(test.file, test.fullName) === key(expected.file, expected.title));
+  for (const expected of RELEASE_CASES.filter((test) =>
+    selected.some((file) => compiledTestFile(file) === test.file),
+  )) {
+    const observed = cases.filter(
+      (test) => key(compiledTestFile(test.file), test.fullName) === key(expected.file, expected.title),
+    );
     assert.ok(observed.length <= 1, 'A release identity executed more than once.');
     if (lane === 'release' && (expected.kind === 'mandatory' || env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE)) {
       assert.equal(observed.length, 1, 'Required release case is missing.');
@@ -597,13 +607,15 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
   const skips = owned
     .filter((test) => ['pending', 'skipped'].includes(test.status))
     .map((test) => {
-      const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
+      const allowed = SKIP_ALLOWLIST.find(
+        (entry) => entry.file === compiledTestFile(test.file) && entry.title === test.fullName,
+      );
       assert.ok(allowed, `Unexpected skip: ${test.file}: ${test.fullName}`);
       assert.ok(
         allowed.kind !== 'external-historical-qualification' || !env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE,
         'Historical archive qualification skipped despite explicit AI_DELIVERY_REAL_PACKAGE_ARCHIVE input.',
       );
-      return allowed;
+      return { ...allowed, file: test.file };
     });
   if (skips.some((entry) => entry.kind === 'parent-launched-helper')) {
     assert.ok(
@@ -632,7 +644,14 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
     selectedCases: owned.map((test) => ({ file: test.file, title: test.fullName })),
     laneExcluded:
       lane === 'pr'
-        ? RELEASE_CASES.filter((test) => selected.includes(test.file)).map(({ file, title }) => ({ file, title }))
+        ? RELEASE_CASES.filter((test) => selected.some((file) => compiledTestFile(file) === test.file)).map(
+            ({ file, title }) => ({
+              file: selected.some((name) => name.startsWith('src/'))
+                ? file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts')
+                : file,
+              title,
+            }),
+          )
         : cases.filter((test) => !releaseCase(test)).map((test) => ({ file: test.file, title: test.fullName })),
   };
 }
@@ -919,7 +938,9 @@ export async function runChecks({
           skips: cases
             .filter((test) => ['pending', 'skipped'].includes(test.status))
             .map((test) => {
-              const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
+              const allowed = SKIP_ALLOWLIST.find(
+                (entry) => entry.file === compiledTestFile(test.file) && entry.title === test.fullName,
+              );
               return {
                 file: test.file,
                 title: test.fullName,
@@ -948,6 +969,7 @@ export async function runChecks({
         process.execPath,
         join(cwd, 'node_modules/vitest/vitest.mjs'),
         'run',
+        `--mode=${fast || release ? 'compiled' : 'source'}`,
         `--tags-filter=${release ? 'release' : '!release'}`,
         '--reporter=default',
         '--reporter=json',
@@ -1002,19 +1024,19 @@ export async function runChecks({
       if (install) await run('dependency-provisioning', [...npm, 'ci', '--no-audit', '--no-fund']);
       await run('format', [...npm, 'run', 'format:check']);
       await run('lint', [...npm, 'run', 'lint']);
-      await run('types', [...npm, 'run', 'typecheck']);
+      // Native declaration analysis runs once in the producer; fast mode stays noEmit.
+      if (!fast || report.selectedTestFiles) rmSync(join(cwd, 'dist'), { recursive: true, force: true });
+      await run('types', [
+        ...npm,
+        'run',
+        'typecheck',
+        ...(!fast ? ['--', '--noEmit', 'false', '--emitDeclarationOnly'] : []),
+      ]);
       if (!fast || report.selectedTestFiles) {
-        // Clean output once, immediately before the only compiled build in this graph.
-        rmSync(join(cwd, 'dist'), { recursive: true, force: true });
-        await run(
-          'build',
-          fast
-            ? [process.execPath, join(cwd, 'node_modules/typescript/lib/tsc.js'), '-p', 'tsconfig.build.json']
-            : [...npm, 'run', 'build'],
-        );
+        await run('build', [process.execPath, join(cwd, 'scripts/build.mjs'), ...(!fast ? ['--plugin'] : [])]);
         if (fast && buildPlugin) await run('plugin-build', [process.execPath, join(cwd, 'scripts/build-plugin.mjs')]);
         const allTests = assertCleanSelection(cwd);
-        report.selectedTestFiles ??= allTests;
+        report.selectedTestFiles ??= expectedTests(cwd, 'source');
         await testSelected(allTests);
         if (!fast) {
           const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);

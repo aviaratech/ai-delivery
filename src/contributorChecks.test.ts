@@ -13,7 +13,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'vitest';
@@ -78,6 +78,7 @@ type Checks = {
   FAST_GATES: string[];
   safeEnvironment(input: Record<string, string>): Record<string, string>;
   validateToolchain(cwd: string, env: Record<string, string>): Toolchain;
+  expectedTests(cwd: string, mode?: string): string[];
   assertCleanSelection(cwd: string): string[];
   treeIdentity(cwd: string): { sha256: string };
   analyzeTests(
@@ -120,13 +121,11 @@ type Checks = {
 const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as Checks;
 const repository = fileURLToPath(new URL('../', import.meta.url));
 
-test('Vitest projects select every compiled file once with bounded parallelism and finite timeouts', async () => {
+test('Vitest source and compiled projects select every input once with core-aware workers', async () => {
   const f = fixture();
   try {
-    const {
-      default: { test: config },
-    } = (await import(pathToFileURL(join(repository, 'vitest.config.ts')).href)) as {
-      default: {
+    const { default: configure } = (await import(pathToFileURL(join(repository, 'vitest.config.ts')).href)) as {
+      default: (env: { mode: string }) => {
         test: {
           testTimeout: number;
           pool: string;
@@ -136,33 +135,48 @@ test('Vitest projects select every compiled file once with bounded parallelism a
         };
       };
     };
-    assert.deepEqual(config.projects?.map((project) => project.test.name).sort(), ['parallel', 'serial']);
-    assert.ok(Number.isFinite(config.testTimeout) && config.testTimeout > 0);
-    assert.equal(config.pool, 'forks');
-    const parallel = config.projects.find((project) => project.test.name === 'parallel')!.test;
-    const serial = config.projects.find((project) => project.test.name === 'serial')!.test;
-    assert.ok(parallel.fileParallelism && parallel.maxWorkers > 1 && parallel.maxWorkers <= 2);
-    assert.equal(serial.fileParallelism, false);
-    assert.equal(serial.maxWorkers, 1);
-    assert.ok(parallel.sequence.groupOrder < serial.sequence.groupOrder);
-    const output = join(f.base, 'projects.json');
-    execFileSync(
-      process.execPath,
-      [join(repository, 'node_modules/vitest/vitest.mjs'), 'list', '--filesOnly', `--json=${output}`],
-      {
-        cwd: repository,
-        env: checks.safeEnvironment({ PATH: process.env.PATH ?? '' }),
-        encoding: 'utf8',
-        maxBuffer: 1024 ** 2,
-      },
-    );
-    const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; projectName: string }[];
-    const selected = rows.map((row) => relative(repository, row.file).replaceAll('\\', '/'));
-    assert.deepEqual([...selected].sort(), checks.assertCleanSelection(repository));
-    assert.equal(new Set(selected).size, selected.length, 'No file may belong to both projects');
-    assert.deepEqual([...new Set(rows.map((row) => row.projectName))].sort(), ['parallel', 'serial']);
-    for (const name of ['setup', 'lifecycle', 'contributorChecks']) {
-      assert.ok(rows.some((row) => row.file.endsWith(`/dist/${name}.test.js`) && row.projectName === 'serial'));
+    assert.equal(typeof configure, 'function');
+    for (const mode of ['source', 'compiled']) {
+      const config = configure({ mode }).test;
+      const parallel = config.projects.find((project) => project.test.name === 'parallel')!.test;
+      const serial = config.projects.find((project) => project.test.name === 'serial')!.test;
+      assert.ok(Number.isFinite(config.testTimeout) && config.testTimeout > 0);
+      assert.equal(config.pool, 'forks');
+      assert.equal(parallel.maxWorkers, availableParallelism());
+      assert.equal(serial.fileParallelism, false);
+      assert.equal(serial.maxWorkers, 1);
+      assert.ok(parallel.sequence.groupOrder < serial.sequence.groupOrder);
+      const output = join(f.base, `projects-${mode}.json`);
+      execFileSync(
+        process.execPath,
+        [
+          join(repository, 'node_modules/vitest/vitest.mjs'),
+          'list',
+          `--mode=${mode}`,
+          '--filesOnly',
+          `--json=${output}`,
+        ],
+        {
+          cwd: repository,
+          env: checks.safeEnvironment({ PATH: process.env.PATH ?? '' }),
+          encoding: 'utf8',
+          maxBuffer: 1024 ** 2,
+        },
+      );
+      const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; projectName: string }[];
+      const selected = rows.map((row) => relative(repository, row.file).replaceAll('\\', '/'));
+      assert.deepEqual([...selected].sort(), checks.expectedTests(repository, mode));
+      assert.equal(new Set(selected).size, selected.length, 'No file may belong to both projects');
+      assert.deepEqual([...new Set(rows.map((row) => row.projectName))].sort(), ['parallel', 'serial']);
+      for (const name of ['setup', 'lifecycle', 'contributorChecks']) {
+        assert.ok(
+          rows.some(
+            (row) =>
+              row.file.endsWith(mode === 'compiled' ? `/dist/${name}.test.js` : `/src/${name}.test.ts`) &&
+              row.projectName === 'serial',
+          ),
+        );
+      }
     }
   } finally {
     f.cleanup();
@@ -288,7 +302,7 @@ test('runtime-expanded tags match every reviewed mandatory identity without exec
     const base = pathToFileURL(join(repository, 'vitest.config.ts')).href;
     writeFileSync(
       config,
-      `if(!process.argv.includes('list'))throw new Error('Collection only');const base=(await import(${JSON.stringify(base)})).default;export default {...base,test:{...base.test,tags:base.test.tags.map(tag=>tag.name==='release'?{...tag,skip:false}:tag)}};`,
+      `if(!process.argv.includes('list'))throw new Error('Collection only');const base=(await import(${JSON.stringify(base)})).default({mode:'compiled'});export default {...base,test:{...base.test,tags:base.test.tags.map(tag=>tag.name==='release'?{...tag,skip:false}:tag)}};`,
     );
     const output = join(f.base, 'inventory.json');
     execFileSync(
@@ -423,6 +437,7 @@ function directFocus(f: ReturnType<typeof fixture>, title: string, env: Record<s
       guardUrl,
       join(repository, 'node_modules/vitest/vitest.mjs'),
       'run',
+      '--mode=compiled',
       'dist/setup.test.js',
       ...workerArgs,
       '-t',
@@ -641,7 +656,7 @@ function executor(f: ReturnType<typeof fixture>, failStage = ''): Checks['execut
       }
     }
     if (stage === 'tests') {
-      const names = command.filter((arg) => arg.startsWith('dist/') && arg.endsWith('.test.js'));
+      const names = command.filter((arg) => /^(?:dist\/.*\.test\.js|src\/.*\.test\.ts)$/u.test(arg));
       assert.equal(names.length, 1);
       const path = command
         .find((arg) => arg.startsWith('--outputFile.json='))!
@@ -726,7 +741,9 @@ test('clean full graph removes deleted/renamed compiled tests and retains exact 
       report.commands.map((entry) => entry.stage),
       checks.FULL_GATES,
     );
-    assert.deepEqual(report.selectedTestFiles, ['dist/renamed.test.js']);
+    assert.deepEqual(report.selectedTestFiles, ['src/renamed.test.ts']);
+    assert.ok(report.commands[2]!.command.includes('--emitDeclarationOnly'));
+    assert.deepEqual(report.commands[3]!.command.slice(1), [join(f.cwd, 'scripts/build.mjs'), '--plugin']);
     assert.match(readFileSync(join(resultsDir, 'result.txt'), 'utf8'), /FULL contributor checks: passed/u);
     assert.equal(existsSync(join(f.cwd, 'dist/stale.test.js')), false);
     await assert.rejects(checks.runChecks({ cwd: f.cwd, resultsDir }), /Existing result/u);
@@ -800,11 +817,7 @@ test('explicit focused files run only their compilation and tests without instal
         report.commands.map((entry) => entry.stage),
         ['format', 'lint', 'types', 'build', 'tests'],
       );
-      assert.deepEqual(report.commands[3]!.command.slice(1), [
-        join(f.cwd, 'node_modules/typescript/lib/tsc.js'),
-        '-p',
-        'tsconfig.build.json',
-      ]);
+      assert.deepEqual(report.commands[3]!.command.slice(1), [join(f.cwd, 'scripts/build.mjs')]);
       assert.ok(report.omitted.includes('unselected tests'));
       assert.ok(report.omitted.includes('inventory'));
       assert.equal(
@@ -1363,7 +1376,7 @@ function qualificationFixture() {
         cleanupConfirmed: true,
       })),
       tests: { files: 1, total: 1, passed: 1, skips: [] },
-      selectedTestFiles: ['dist/original.test.js'],
+      selectedTestFiles: ['src/original.test.ts'],
       toolchain: f.toolchain,
       inventory: {
         kind: 'dry-inventory-only',

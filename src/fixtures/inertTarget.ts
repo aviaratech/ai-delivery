@@ -84,7 +84,8 @@ export function inertTarget(
   const owner = Symbol('inert-target');
   fixtureOwner = owner;
   const shutdown = new AbortController();
-  const fixtureSignal = signal === undefined ? shutdown.signal : AbortSignal.any([shutdown.signal, signal]);
+  const fixtureSignal: AbortSignal =
+    signal === undefined ? shutdown.signal : AbortSignal.any([shutdown.signal, signal]);
   const activeCalls = new Set<Promise<unknown>>();
   const connections = new Set<{ close(): Promise<void> }>();
   const userPath = join(base, 'user.json');

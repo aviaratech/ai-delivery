@@ -383,7 +383,7 @@ function producerFixture(): {
     status: 'passed',
     fullSuccess: true,
     exitCode: 0,
-    selectedTestFiles: ['dist/fictional.test.js'],
+    selectedTestFiles: ['src/fictional.test.ts'],
     tests: { files: 1, total: 1, passed: 1, skips: [] },
     gates,
     omitted: [],

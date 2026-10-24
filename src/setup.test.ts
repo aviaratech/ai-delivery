@@ -2287,6 +2287,7 @@ for (const phase of ['reservation', 'publication'] as const) {
         [
           join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
           'run',
+          '--mode=compiled',
           new URL(import.meta.url).pathname,
           '-t',
           '^setup interruption child$',
@@ -2367,6 +2368,7 @@ for (const native of [false, true]) {
         [
           join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
           'run',
+          '--mode=compiled',
           'dist/setup.test.js',
           '-t',
           '^setup interruption child$',
@@ -2964,6 +2966,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
         process.execPath,
         join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
         'run',
+        '--mode=compiled',
         'dist/setup.test.js',
         '-t',
         preparing ? '^setup interruption child$' : `^${stageAdmitCase}$`,

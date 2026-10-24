@@ -1,3 +1,4 @@
+import { availableParallelism } from 'node:os';
 import { defineConfig } from 'vitest/config';
 
 const lane = process.env.AI_DELIVERY_TEST_LANE ?? 'pr';
@@ -28,31 +29,37 @@ const serialFiles = [
   'dist/worktreeTransition.test.js',
 ];
 
-export default defineConfig({
-  test: {
-    tags: [{ name: 'release', description: 'Owned archive/install qualification', skip: lane !== 'release' }],
-    pool: 'forks',
-    testTimeout: 60_000,
-    projects: [
-      {
-        test: {
-          name: 'parallel',
-          include: ['dist/**/*.test.js'],
-          exclude: serialFiles,
-          fileParallelism: true,
-          maxWorkers: 2,
-          sequence: { groupOrder: 0 },
+export default defineConfig(({ mode }) => {
+  const compiled = mode === 'compiled' || lane === 'release';
+  const serial = compiled
+    ? serialFiles
+    : serialFiles.map((file) => file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts'));
+  return {
+    test: {
+      tags: [{ name: 'release', description: 'Owned archive/install qualification', skip: lane !== 'release' }],
+      pool: 'forks',
+      testTimeout: 60_000,
+      projects: [
+        {
+          test: {
+            name: 'parallel',
+            include: [compiled ? 'dist/**/*.test.js' : 'src/**/*.test.ts'],
+            exclude: serial,
+            fileParallelism: true,
+            maxWorkers: availableParallelism(),
+            sequence: { groupOrder: 0 },
+          },
         },
-      },
-      {
-        test: {
-          name: 'serial',
-          include: serialFiles,
-          fileParallelism: false,
-          maxWorkers: 1,
-          sequence: { groupOrder: 1 },
+        {
+          test: {
+            name: 'serial',
+            include: serial,
+            fileParallelism: false,
+            maxWorkers: 1,
+            sequence: { groupOrder: 1 },
+          },
         },
-      },
-    ],
-  },
+      ],
+    },
+  };
 });
