@@ -557,6 +557,7 @@ Pass `repo: "owner/name"` to MCP calls or global `--repo owner/name` to the CLI,
 | Reparent one issue | `issue_update` | `update --issue N --parent P` |
 | Plan / apply a batch | `issue_batch_update` | `batch:update --items-file <items.json> [--dry-run]` |
 | Reconcile Project membership / Status | `board_reconcile` | `board:reconcile --repositories <owner/repo...> [--dry-run]`; retained plan and result JSON for apply/recovery |
+| Read delivery attention / readiness | `delivery_board` | `board --repos owner/a,owner/b [--decision-labels needs-decision] [--json]` |
 | Record a typed journal | `issue_comment` | See the [typed journal contract](#typed-issue-journals); the MCP call returns the authored comment identity and readback |
 | Close with a reason | `issue_update` | `update --issue N --state closed --close-reason not_planned --superseded-by S` |
 
@@ -758,6 +759,39 @@ status read and ten oldest issues; bounds are 500 issues, 20 pages per read
 and 20 oldest issues. `--max-project-pages` bounds Project status collection. Limits and read failures
 produce explicit partial **observed** counts, not complete zeroes. Issues whose
 current Project status cannot be resolved have a separate unknown count.
+
+## Read-only delivery board
+
+```sh
+ai-delivery board --repos example/widget,example/service --decision-labels needs-decision
+ai-delivery board --repos example/widget,example/service --json
+```
+
+MCP `delivery_board` accepts required `repos: ["example/widget", "example/service"]`,
+optional `decisionLabels` and the common `verbose` flag. Explicit repositories
+are required, including outside Git. Global CLI `--repo` is compatible only with
+one equal selector. No setup, Project reconciliation or queue advance occurs.
+
+The five sections show pending attention from the latest unambiguous typed
+journal or selected labels, native ready PRs, blocked PRs with reason codes,
+open In Progress issues inactive for at least 72 hours, and the existing merge
+queue on **this host**. Shared Project inventory is read once per verified
+principal and mapping within the request. Unknown status, unreadable repositories
+and incomplete reads remain explicit; an observed empty section differs from an
+unavailable one. A partial board is successful data. These non-atomic observations
+record their collection times and confer no merge authority.
+
+Default CLI text and MCP's JSON-encoded text stay below 4,000 characters. Titles
+are dropped first; omitted rows and, for oversized metadata, omitted repository
+details are counted explicitly. CLI `--json` alone and MCP `verbose: true` retain
+all collected rows, identities, coverage and diagnostics as `ai-delivery.board@1`.
+
+Each repository reports independent opened and merged PR marker fractions for
+the rolling seven-day `[asOf - 7 days, asOf)` window. The PR creation footer and
+squash commit trailer are forgeable usage indicators; an absent marker does not
+prove a bypass. Unmarked and non-squash merges remain in the denominator. Complete
+0/0 is **n/a**; incomplete observations have no percentage. Compact fractions
+are observed counts when coverage is incomplete.
 
 ## Scoped Project reconciliation
 

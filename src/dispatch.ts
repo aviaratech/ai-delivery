@@ -1,4 +1,5 @@
 import { deliveryHealth, type DeliveryHealthRequest } from './services/deliveryHealthService.js';
+import { collectDeliveryBoard, parseDeliveryBoardRequest } from './deliveryBoard.js';
 import {
   boardReconcile,
   boardReconcileGap,
@@ -296,6 +297,8 @@ export async function executeTool(
 ): Promise<unknown> {
   const definition = getAiDeliveryMcpTool(name);
   if (!definition) throw new DeliveryError(`Unknown ai-delivery tool ${name}.`);
+  if (name === 'delivery_board')
+    return collectDeliveryBoard(parseDeliveryBoardRequest(definition.inputSchema.parse(raw)), execution);
   if (name === 'board_reconcile') {
     let request = parseBoardReconcileRequest(raw);
     if (execution.repo !== undefined) {

@@ -439,7 +439,7 @@ describe('remote closing PR creation', () => {
       assert.equal(branchLinks.mock.calls.length, 0);
       assert.equal(
         state.body,
-        'Closes #17\n\n## Outcome\n\nWidgets improve.\n\n## Acceptance criteria\n\n- [ ] Reject invalid widgets.\n  Verified by: A synthetic widget test.',
+        'Closes #17\n\n## Outcome\n\nWidgets improve.\n\n## Acceptance criteria\n\n- [ ] Reject invalid widgets.\n  Verified by: A synthetic widget test.\n\n<!-- ai-delivery:pr@1 -->',
       );
       assert.deepEqual(result, {
         prNumber: 23,
@@ -1168,6 +1168,111 @@ describe('authoritative existing PR promotion', () => {
     state.reviewerActor = 'author';
     await assert.rejects(publishPr(context, input), /distinct/u);
     assert.equal(state.promotions, 0);
+  });
+});
+
+describe('canonical publication footer and exact-body recovery', () => {
+  const footer = '\n\n<!-- ai-delivery:pr@1 -->';
+  const substantive = 'Original intent.\r\nKeep trailing spaces.  \n\n';
+
+  for (const ready of [false, true]) {
+    it(`marks new closing publication once and reuses original unmarked input (${ready ? 'ready' : 'draft'})`, async () => {
+      const { context, state } = fixture(false);
+      state.linked = true;
+      state.remoteHead = head;
+      state.expectedCreationDraft = !ready;
+      const input = { issueNumber: 17, headBranch: 'issue/17', body: substantive, draft: !ready };
+      const expected = `Closes #17\n\n${substantive}${footer}`;
+      const preview = await publishPr(context, { ...input, dryRun: true });
+      assert.equal(Reflect.get(preview, 'body'), expected);
+      assert.equal(state.creations + state.updates + state.promotions, 0);
+      await publishPr(context, input);
+      assert.equal(state.body, expected);
+      await publishPr(context, input);
+      await publishPr(context, { ...input, draft: false });
+      await publishPr(context, { ...input, body: expected, draft: false });
+      assert.equal(state.body, expected);
+      assert.equal(state.creations, 1);
+      assert.equal(state.updates, 0);
+      assert.equal(state.promotions, ready ? 0 : 1);
+    });
+  }
+
+  it('marks admitted non-closing creation and continues with original unmarked intent', async () => {
+    const { context, state } = fixture(false, true);
+    state.linked = true;
+    state.remoteHead = head;
+    const input = { ...nonClosingCreation, body: `References ${repo}#17\n\n${substantive}` };
+    const preview = await publishPr(context, { ...input, dryRun: true });
+    assert.equal(Reflect.get(preview, 'body'), input.body + footer);
+    await publishPr(context, input);
+    await publishPr(context, { ...input, prNumber: 23 });
+    await publishPr(context, { issueNumber: 17, prNumber: 23, nonClosing: true, body: input.body, draft: false });
+    assert.equal(state.body, input.body + footer);
+    assert.equal(state.creations, 1);
+    assert.equal(state.updates, 0);
+    assert.equal(state.promotions, 1);
+    assert.equal(state.issueState, 'open');
+  });
+
+  for (const nonClosing of [false, true]) {
+    it(`reconciles lost creation acknowledgement with original body without another mutation (${nonClosing})`, async () => {
+      const { context, state } = fixture(false, nonClosing);
+      state.linked = true;
+      state.remoteHead = head;
+      state.failCreateAck = true;
+      const input = nonClosing ? nonClosingCreation : { issueNumber: 17, body: substantive };
+      await assert.rejects(publishPr(context, input), /acknowledgement is uncertain/u);
+      const expected = nonClosing ? nonClosingCreation.body : `Closes #17\n\n${substantive}`;
+      assert.equal(state.body, expected + footer);
+      state.failCreateAck = false;
+      await publishPr(context, { ...input, prNumber: 23 });
+      assert.equal(state.creations, 1);
+      assert.equal(state.updates, 0);
+      assert.equal(state.body, expected + footer);
+    });
+
+    it(`does not backfill a historical unmarked PR or permit a marker-only transition (${nonClosing})`, async () => {
+      const { context, state } = fixture(true, nonClosing);
+      const original = state.body;
+      const input = { issueNumber: 17, prNumber: 23, nonClosing, body: original };
+      await publishPr(context, input);
+      assert.equal(state.body, original);
+      await assert.rejects(publishPr(context, { ...input, body: original + footer }), /marker|footer|conflict/iu);
+      assert.equal(state.body, original);
+      assert.equal(state.creations + state.updates + state.promotions, 0);
+    });
+  }
+
+  for (const malformed of [
+    'Closes #17\n\n<!-- ai-delivery:pr@2 -->',
+    `Closes #17${footer}\n`,
+    `Closes #17${footer}${footer}`,
+    `Closes #17${footer}\n\nLater text.`,
+    `Closes #17\n\n<div>\n${footer}\n</div>`,
+  ]) {
+    for (const published of [false, true]) {
+      it(`refuses malformed or ambiguous publication markers without repair (${published}, ${JSON.stringify(malformed)})`, async () => {
+        const { context, state } = fixture(published);
+        state.linked = true;
+        state.remoteHead = head;
+        if (published) state.body = malformed;
+        await assert.rejects(publishPr(context, { issueNumber: 17, body: malformed }), /marker|footer|conflict/iu);
+        assert.equal(state.creations + state.updates + state.promotions, 0);
+      });
+    }
+  }
+
+  it('preserves quoted marker examples and substantive bytes while adding one active footer', async () => {
+    const { context, state } = fixture(false);
+    state.linked = true;
+    state.remoteHead = head;
+    const body = 'Closes #17\n\nExample:\n\n```md\n<!-- ai-delivery:pr@1 -->\n```\n\nText.  \r\n';
+    await publishPr(context, { issueNumber: 17, body });
+    await publishPr(context, { issueNumber: 17, prNumber: 23, body });
+    assert.equal(state.body, body + footer);
+    assert.equal(state.creations, 1);
+    assert.equal(state.updates, 0);
   });
 });
 
