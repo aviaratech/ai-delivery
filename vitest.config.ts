@@ -14,52 +14,15 @@ if (lane === 'release') {
   }
 }
 
-// These fixtures assert process ownership, interruption or shared checkout state.
-const serialFiles = [
-  'dist/contributorChecks.test.js',
-  'dist/currentConsumer.test.js',
-  'dist/delivery/delivery.test.js',
-  'dist/lifecycle.test.js',
-  'dist/pluginAuthProbe.test.js',
-  'dist/pluginInstaller.test.js',
-  'dist/pluginPackaging.test.js',
-  'dist/setup.test.js',
-  'dist/stagedChecks.test.js',
-  'dist/targetPolicyLocal.test.js',
-  'dist/worktreeTransition.test.js',
-];
-
-export default defineConfig(({ mode }) => {
-  const compiled = mode === 'compiled' || lane === 'release';
-  const serial = compiled
-    ? serialFiles
-    : serialFiles.map((file) => file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts'));
-  return {
-    test: {
-      tags: [{ name: 'release', description: 'Owned archive/install qualification', skip: lane !== 'release' }],
-      pool: 'forks',
-      testTimeout: 60_000,
-      projects: [
-        {
-          test: {
-            name: 'parallel',
-            include: [compiled ? 'dist/**/*.test.js' : 'src/**/*.test.ts'],
-            exclude: serial,
-            fileParallelism: true,
-            maxWorkers: availableParallelism(),
-            sequence: { groupOrder: 0 },
-          },
-        },
-        {
-          test: {
-            name: 'serial',
-            include: serial,
-            fileParallelism: false,
-            maxWorkers: 1,
-            sequence: { groupOrder: 1 },
-          },
-        },
-      ],
-    },
-  };
-});
+// Files own disjoint temporary roots. Forks isolate mutable test ports; the
+// producer finishes before source/archive readers, with existing RSS/cleanup guards.
+export default defineConfig(({ mode }) => ({
+  test: {
+    tags: [{ name: 'release', description: 'Owned process/archive/install qualification', skip: lane !== 'release' }],
+    pool: 'forks',
+    testTimeout: 60_000,
+    include: [mode === 'compiled' || lane === 'release' ? 'dist/**/*.test.js' : 'src/**/*.test.ts'],
+    fileParallelism: true,
+    maxWorkers: availableParallelism(),
+  },
+}));

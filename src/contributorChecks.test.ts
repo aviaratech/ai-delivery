@@ -121,31 +121,21 @@ type Checks = {
 const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as Checks;
 const repository = fileURLToPath(new URL('../', import.meta.url));
 
-test('Vitest source and compiled projects select every input once with core-aware workers', async () => {
+test('Vitest source and compiled inputs are unique and use isolated core-aware fork workers', async () => {
   const f = fixture();
   try {
     const { default: configure } = (await import(pathToFileURL(join(repository, 'vitest.config.ts')).href)) as {
       default: (env: { mode: string }) => {
-        test: {
-          testTimeout: number;
-          pool: string;
-          projects: {
-            test: { name: string; maxWorkers: number; fileParallelism: boolean; sequence: { groupOrder: number } };
-          }[];
-        };
+        test: { testTimeout: number; pool: string; maxWorkers: number; fileParallelism: boolean };
       };
     };
     assert.equal(typeof configure, 'function');
     for (const mode of ['source', 'compiled']) {
       const config = configure({ mode }).test;
-      const parallel = config.projects.find((project) => project.test.name === 'parallel')!.test;
-      const serial = config.projects.find((project) => project.test.name === 'serial')!.test;
       assert.ok(Number.isFinite(config.testTimeout) && config.testTimeout > 0);
       assert.equal(config.pool, 'forks');
-      assert.equal(parallel.maxWorkers, availableParallelism());
-      assert.equal(serial.fileParallelism, false);
-      assert.equal(serial.maxWorkers, 1);
-      assert.ok(parallel.sequence.groupOrder < serial.sequence.groupOrder);
+      assert.equal(config.maxWorkers, availableParallelism());
+      assert.equal(config.fileParallelism, true);
       const output = join(f.base, `projects-${mode}.json`);
       execFileSync(
         process.execPath,
@@ -163,20 +153,10 @@ test('Vitest source and compiled projects select every input once with core-awar
           maxBuffer: 1024 ** 2,
         },
       );
-      const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string; projectName: string }[];
+      const rows = JSON.parse(readFileSync(output, 'utf8')) as { file: string }[];
       const selected = rows.map((row) => relative(repository, row.file).replaceAll('\\', '/'));
       assert.deepEqual([...selected].sort(), checks.expectedTests(repository, mode));
-      assert.equal(new Set(selected).size, selected.length, 'No file may belong to both projects');
-      assert.deepEqual([...new Set(rows.map((row) => row.projectName))].sort(), ['parallel', 'serial']);
-      for (const name of ['setup', 'lifecycle', 'contributorChecks']) {
-        assert.ok(
-          rows.some(
-            (row) =>
-              row.file.endsWith(mode === 'compiled' ? `/dist/${name}.test.js` : `/src/${name}.test.ts`) &&
-              row.projectName === 'serial',
-          ),
-        );
-      }
+      assert.equal(new Set(selected).size, selected.length, 'No file may execute more than once');
     }
   } finally {
     f.cleanup();
@@ -1503,35 +1483,39 @@ function qualificationFixture() {
   };
 }
 
-test('qualification checkpoints one producer and pack, resumes without replay, and retains immutable digests', async () => {
-  const f = qualificationFixture();
-  try {
-    const report = await qualification.runQualification({ ...f.options, producerOnly: true });
-    assert.equal(report.status, 'incomplete');
-    assert.equal(report.qualified, false);
-    assert.equal(report.exitCode, 2);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
-    const checkpoint = join(f.options.resultsDir, 'checkpoint.json');
-    const producer = readFileSync(join(f.options.resultsDir, 'producer/result.json'));
-    const resumed = await qualification.runQualification({
-      ...f.options,
-      resume: checkpoint,
-      resultsDir: join(f.base, 'resumed'),
-    });
-    assert.equal(resumed.qualified, true);
-    assert.equal(resumed.exitCode, 0);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
-    assert.deepEqual(readFileSync(join(f.options.resultsDir, 'producer/result.json')), producer);
-    await assert.rejects(
-      qualification.runQualification({ ...f.options, resume: checkpoint, resultsDir: join(f.base, 'resumed') }),
-      /Existing overall result/u,
-    );
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'qualification checkpoints one producer and pack, resumes without replay, and retains immutable digests',
+  { tags: ['release'] },
+  async () => {
+    const f = qualificationFixture();
+    try {
+      const report = await qualification.runQualification({ ...f.options, producerOnly: true });
+      assert.equal(report.status, 'incomplete');
+      assert.equal(report.qualified, false);
+      assert.equal(report.exitCode, 2);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+      const checkpoint = join(f.options.resultsDir, 'checkpoint.json');
+      const producer = readFileSync(join(f.options.resultsDir, 'producer/result.json'));
+      const resumed = await qualification.runQualification({
+        ...f.options,
+        resume: checkpoint,
+        resultsDir: join(f.base, 'resumed'),
+      });
+      assert.equal(resumed.qualified, true);
+      assert.equal(resumed.exitCode, 0);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+      assert.deepEqual(readFileSync(join(f.options.resultsDir, 'producer/result.json')), producer);
+      await assert.rejects(
+        qualification.runQualification({ ...f.options, resume: checkpoint, resultsDir: join(f.base, 'resumed') }),
+        /Existing overall result/u,
+      );
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('qualification joins producer pack release tests and consumer in order', async () => {
+test('qualification joins producer pack release tests and consumer in order', { tags: ['release'] }, async () => {
   const f = qualificationFixture();
   try {
     const report = await qualification.runQualification(f.options);
@@ -1557,7 +1541,7 @@ test('producer-only omits release and consumer proof', async () => {
   }
 });
 
-test('resume reuses compatible completed release proof', async () => {
+test('resume reuses compatible completed release proof', { tags: ['release'] }, async () => {
   const f = qualificationFixture();
   try {
     const first = await qualification.runQualification(f.options);
@@ -1605,70 +1589,74 @@ test('uncertain release attempt blocks a duplicate launch through fresh outer re
   }
 });
 
-test('interrupted release retry preserves prior evidence and skips completed producer and pack', async () => {
-  const f = qualificationFixture();
-  try {
-    await qualification.runQualification({ ...f.options, producerOnly: true });
-    const controller = new AbortController();
-    const sentinel = join(f.base, 'unrelated');
-    writeFileSync(sentinel, 'preserve');
-    f.releaseHook(async ({ resultsDir, signal }) =>
-      checks.executeCommand(
-        [process.execPath, '-e', "console.log('controlled release started');setInterval(()=>{},1000)"],
-        {
-          cwd: f.cwd,
-          env: checks.safeEnvironment({}),
-          directory: join(resultsDir, 'tests'),
-          ...(signal ? { signal } : {}),
-          progress: (partial) => {
-            if ((partial as CommandResult).observedProcesses?.length) controller.abort();
-          },
-        },
-      ),
-    );
-    const resume = join(f.options.resultsDir, 'checkpoint.json');
-    const interrupted = await qualification.runQualification({
-      ...f.options,
-      resume,
-      signal: controller.signal,
-      resultsDir: join(f.base, 'release-interrupted'),
-    });
-    assert.equal(interrupted.status, 'cancelled');
-    const attemptPath = join(f.options.resultsDir, 'release-tests-attempt.json');
-    const old = readFileSync(attemptPath);
-    const prior = JSON.parse(old.toString()) as {
-      directory: string;
-      receipt: { path: string };
-      command: CommandResult;
-    };
-    assert.equal(prior.command.cleanupConfirmed, true);
-    assert.ok(prior.command.observedProcesses?.length);
-    const receipt = readFileSync(prior.receipt.path);
-    f.releaseHook(async () => {});
-    const retried = await qualification.runQualification({
-      ...f.options,
-      resume,
-      resultsDir: join(f.base, 'release-retry'),
-    });
-    assert.equal(retried.qualified, true, retried.error);
-    assert.deepEqual(readFileSync(join(prior.directory, 'retired-attempt.json')), old);
-    assert.deepEqual(readFileSync(prior.receipt.path), receipt);
-    assert.equal(readFileSync(sentinel, 'utf8'), 'preserve');
-    assert.equal(f.releases(), 2);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
-    const uninterrupted = qualificationFixture();
+test(
+  'interrupted release retry preserves prior evidence and skips completed producer and pack',
+  { tags: ['release'] },
+  async () => {
+    const f = qualificationFixture();
     try {
-      assert.equal((await qualification.runQualification(uninterrupted.options)).qualified, true);
-      assert.deepEqual(uninterrupted.order, ['producer', 'pack', 'release', 'consumer']);
+      await qualification.runQualification({ ...f.options, producerOnly: true });
+      const controller = new AbortController();
+      const sentinel = join(f.base, 'unrelated');
+      writeFileSync(sentinel, 'preserve');
+      f.releaseHook(async ({ resultsDir, signal }) =>
+        checks.executeCommand(
+          [process.execPath, '-e', "console.log('controlled release started');setInterval(()=>{},1000)"],
+          {
+            cwd: f.cwd,
+            env: checks.safeEnvironment({}),
+            directory: join(resultsDir, 'tests'),
+            ...(signal ? { signal } : {}),
+            progress: (partial) => {
+              if ((partial as CommandResult).observedProcesses?.length) controller.abort();
+            },
+          },
+        ),
+      );
+      const resume = join(f.options.resultsDir, 'checkpoint.json');
+      const interrupted = await qualification.runQualification({
+        ...f.options,
+        resume,
+        signal: controller.signal,
+        resultsDir: join(f.base, 'release-interrupted'),
+      });
+      assert.equal(interrupted.status, 'cancelled');
+      const attemptPath = join(f.options.resultsDir, 'release-tests-attempt.json');
+      const old = readFileSync(attemptPath);
+      const prior = JSON.parse(old.toString()) as {
+        directory: string;
+        receipt: { path: string };
+        command: CommandResult;
+      };
+      assert.equal(prior.command.cleanupConfirmed, true);
+      assert.ok(prior.command.observedProcesses?.length);
+      const receipt = readFileSync(prior.receipt.path);
+      f.releaseHook(async () => {});
+      const retried = await qualification.runQualification({
+        ...f.options,
+        resume,
+        resultsDir: join(f.base, 'release-retry'),
+      });
+      assert.equal(retried.qualified, true, retried.error);
+      assert.deepEqual(readFileSync(join(prior.directory, 'retired-attempt.json')), old);
+      assert.deepEqual(readFileSync(prior.receipt.path), receipt);
+      assert.equal(readFileSync(sentinel, 'utf8'), 'preserve');
+      assert.equal(f.releases(), 2);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+      const uninterrupted = qualificationFixture();
+      try {
+        assert.equal((await qualification.runQualification(uninterrupted.options)).qualified, true);
+        assert.deepEqual(uninterrupted.order, ['producer', 'pack', 'release', 'consumer']);
+      } finally {
+        uninterrupted.cleanup();
+      }
     } finally {
-      uninterrupted.cleanup();
+      f.cleanup();
     }
-  } finally {
-    f.cleanup();
-  }
-});
+  },
+);
 
-test('two competing resumes release at most one checkpoint-owned test child', async () => {
+test('two competing resumes release at most one checkpoint-owned test child', { tags: ['release'] }, async () => {
   const f = qualificationFixture();
   try {
     await qualification.runQualification({ ...f.options, producerOnly: true });
@@ -1746,149 +1734,164 @@ test('resume rejects changed generated bytes and missing retained producer membe
   }
 });
 
-test('consumer cancellation retains actual PID/birth and logs, and resume cannot duplicate it', async () => {
-  const f = qualificationFixture();
-  try {
-    await qualification.runQualification({ ...f.options, producerOnly: true });
-    const controller = new AbortController();
-    let launches = 0;
-    const execute: NonNullable<QualificationOptions['execute']> = async (_command, options) => {
-      launches++;
-      return checks.executeCommand(
-        [process.execPath, '-e', "console.log('fictional consumer started');setInterval(()=>{},1000)"],
-        {
-          ...options,
-          progress: (partial) => {
-            options.progress?.(partial);
-            if ((partial as CommandResult).observedProcesses?.length) controller.abort();
+test(
+  'consumer cancellation retains actual PID/birth and logs, and resume cannot duplicate it',
+  { tags: ['release'] },
+  async () => {
+    const f = qualificationFixture();
+    try {
+      await qualification.runQualification({ ...f.options, producerOnly: true });
+      const controller = new AbortController();
+      let launches = 0;
+      const execute: NonNullable<QualificationOptions['execute']> = async (_command, options) => {
+        launches++;
+        return checks.executeCommand(
+          [process.execPath, '-e', "console.log('fictional consumer started');setInterval(()=>{},1000)"],
+          {
+            ...options,
+            progress: (partial) => {
+              options.progress?.(partial);
+              if ((partial as CommandResult).observedProcesses?.length) controller.abort();
+            },
           },
-        },
-      );
-    };
-    const resume = join(f.options.resultsDir, 'checkpoint.json');
-    const report = await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      signal: controller.signal,
-      resultsDir: join(f.base, 'cancelled-consumer'),
-    });
-    assert.equal(report.status, 'cancelled');
-    const attempt = JSON.parse(readFileSync(join(f.options.resultsDir, 'consumer-attempt.json'), 'utf8')) as {
-      status: string;
-      tempRoot: string;
-      command: CommandResult;
-    };
-    assert.equal(attempt.status, 'completed');
-    assert.equal(attempt.command.status, 'cancelled');
-    assert.equal(attempt.command.cleanupConfirmed, true);
-    assert.ok(attempt.command.observedProcesses!.every((row) => row.birth.length > 0));
-    assert.ok(existsSync(attempt.tempRoot));
-    const retried = await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      resultsDir: join(f.base, 'blocked-retry'),
-    });
-    assert.equal(retried.qualified, false);
-    assert.equal(launches, 1);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
-  } finally {
-    f.cleanup();
-  }
-});
+        );
+      };
+      const resume = join(f.options.resultsDir, 'checkpoint.json');
+      const report = await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        signal: controller.signal,
+        resultsDir: join(f.base, 'cancelled-consumer'),
+      });
+      assert.equal(report.status, 'cancelled');
+      const attempt = JSON.parse(readFileSync(join(f.options.resultsDir, 'consumer-attempt.json'), 'utf8')) as {
+        status: string;
+        tempRoot: string;
+        command: CommandResult;
+      };
+      assert.equal(attempt.status, 'completed');
+      assert.equal(attempt.command.status, 'cancelled');
+      assert.equal(attempt.command.cleanupConfirmed, true);
+      assert.ok(attempt.command.observedProcesses!.every((row) => row.birth.length > 0));
+      assert.ok(existsSync(attempt.tempRoot));
+      const retried = await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        resultsDir: join(f.base, 'blocked-retry'),
+      });
+      assert.equal(retried.qualified, false);
+      assert.equal(launches, 1);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('lost consumer completion retains a reservation, blocks duplicate launch and reconciles without producer or pack replay', async () => {
-  const f = qualificationFixture();
-  try {
-    await qualification.runQualification({ ...f.options, producerOnly: true });
-    const resume = join(f.options.resultsDir, 'checkpoint.json');
-    const contract = JSON.parse(readFileSync(join(f.options.resultsDir, 'contract.json'), 'utf8')) as SyntheticContract;
-    const fictionalReceipt = await f.consume(contract, { authorizeInstall: true });
-    let launches = 0;
-    const execute: NonNullable<QualificationOptions['execute']> = async (command, options) => {
-      launches++;
-      const resultPath = command[3];
-      assert.ok(resultPath, 'Synthetic consumer requires a result path.');
-      // A real credential-free child writes fictional application evidence.
-      // Withhold terminal supervisor transport after its actual quiescent exit.
-      const code = "const fs=require('node:fs');setTimeout(()=>fs.writeFileSync(process.argv[1],process.argv[2]),200)";
-      const completed = await checks.executeCommand(
-        [process.execPath, '-e', code, resultPath, JSON.stringify(fictionalReceipt)],
-        {
-          ...options,
-          progress: (partial) => {
-            if (!(partial as { completedAt?: string }).completedAt) options.progress?.(partial);
+test(
+  'lost consumer completion retains a reservation, blocks duplicate launch and reconciles without producer or pack replay',
+  { tags: ['release'] },
+  async () => {
+    const f = qualificationFixture();
+    try {
+      await qualification.runQualification({ ...f.options, producerOnly: true });
+      const resume = join(f.options.resultsDir, 'checkpoint.json');
+      const contract = JSON.parse(
+        readFileSync(join(f.options.resultsDir, 'contract.json'), 'utf8'),
+      ) as SyntheticContract;
+      const fictionalReceipt = await f.consume(contract, { authorizeInstall: true });
+      let launches = 0;
+      const execute: NonNullable<QualificationOptions['execute']> = async (command, options) => {
+        launches++;
+        const resultPath = command[3];
+        assert.ok(resultPath, 'Synthetic consumer requires a result path.');
+        // A real credential-free child writes fictional application evidence.
+        // Withhold terminal supervisor transport after its actual quiescent exit.
+        const code =
+          "const fs=require('node:fs');setTimeout(()=>fs.writeFileSync(process.argv[1],process.argv[2]),200)";
+        const completed = await checks.executeCommand(
+          [process.execPath, '-e', code, resultPath, JSON.stringify(fictionalReceipt)],
+          {
+            ...options,
+            progress: (partial) => {
+              if (!(partial as { completedAt?: string }).completedAt) options.progress?.(partial);
+            },
           },
-        },
-      );
-      assert.equal(completed.cleanupConfirmed, true);
-      throw new Error('fictional controller lost terminal consumer response');
-    };
-    const lost = await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      resultsDir: join(f.base, 'lost-response'),
-    });
-    assert.equal(lost.qualified, false);
-    const attemptPath = join(f.options.resultsDir, 'consumer-attempt.json');
-    const attempt = JSON.parse(readFileSync(attemptPath, 'utf8')) as { status: string; command: CommandResult };
-    assert.equal(attempt.status, 'running');
-    assert.ok(attempt.command.observedProcesses!.length > 0);
-    const blocked = await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      resultsDir: join(f.base, 'unreconciled'),
-    });
-    assert.match(blocked.error!, /Unresolved consumer attempt/u);
-    const reconciled = await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      reconcileConsumer: true,
-      resultsDir: join(f.base, 'reconciled'),
-    });
-    assert.equal(reconciled.qualified, true);
-    assert.equal(launches, 1);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
-    assert.equal((JSON.parse(readFileSync(attemptPath, 'utf8')) as { status: string }).status, 'reconciled');
-  } finally {
-    f.cleanup();
-  }
-});
+        );
+        assert.equal(completed.cleanupConfirmed, true);
+        throw new Error('fictional controller lost terminal consumer response');
+      };
+      const lost = await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        resultsDir: join(f.base, 'lost-response'),
+      });
+      assert.equal(lost.qualified, false);
+      const attemptPath = join(f.options.resultsDir, 'consumer-attempt.json');
+      const attempt = JSON.parse(readFileSync(attemptPath, 'utf8')) as { status: string; command: CommandResult };
+      assert.equal(attempt.status, 'running');
+      assert.ok(attempt.command.observedProcesses!.length > 0);
+      const blocked = await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        resultsDir: join(f.base, 'unreconciled'),
+      });
+      assert.match(blocked.error!, /Unresolved consumer attempt/u);
+      const reconciled = await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        reconcileConsumer: true,
+        resultsDir: join(f.base, 'reconciled'),
+      });
+      assert.equal(reconciled.qualified, true);
+      assert.equal(launches, 1);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+      assert.equal((JSON.parse(readFileSync(attemptPath, 'utf8')) as { status: string }).status, 'reconciled');
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('reservation before launch survives an uncertain spawn and refuses automatic retry', async () => {
-  const f = qualificationFixture();
-  try {
-    await qualification.runQualification({ ...f.options, producerOnly: true });
-    let launches = 0;
-    const execute: NonNullable<QualificationOptions['execute']> = async () => {
-      launches++;
-      throw new Error('fictional spawn response unknown');
-    };
-    const resume = join(f.options.resultsDir, 'checkpoint.json');
-    await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      resultsDir: join(f.base, 'uncertain-launch'),
-    });
-    const blocked = await qualification.runQualification({
-      ...f.options,
-      execute,
-      resume,
-      reconcileConsumer: true,
-      resultsDir: join(f.base, 'uncertain-retry'),
-    });
-    assert.match(blocked.error!, /launch identity is unavailable/u);
-    assert.equal(launches, 1);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'reservation before launch survives an uncertain spawn and refuses automatic retry',
+  { tags: ['release'] },
+  async () => {
+    const f = qualificationFixture();
+    try {
+      await qualification.runQualification({ ...f.options, producerOnly: true });
+      let launches = 0;
+      const execute: NonNullable<QualificationOptions['execute']> = async () => {
+        launches++;
+        throw new Error('fictional spawn response unknown');
+      };
+      const resume = join(f.options.resultsDir, 'checkpoint.json');
+      await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        resultsDir: join(f.base, 'uncertain-launch'),
+      });
+      const blocked = await qualification.runQualification({
+        ...f.options,
+        execute,
+        resume,
+        reconcileConsumer: true,
+        resultsDir: join(f.base, 'uncertain-retry'),
+      });
+      assert.match(blocked.error!, /launch identity is unavailable/u);
+      assert.equal(launches, 1);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 0 });
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 for (const mutation of ['zero-selection', 'counts', 'skip', 'inventory', 'command-cleanup', 'ordered-gates']) {
   test(`qualification rejects ${mutation} producer proof without installation`, async () => {
@@ -1976,37 +1979,43 @@ for (const mutation of ['wrong-head', 'producer-digest', 'archive-digest', 'cont
   });
 }
 
-test('external consumer join never installs twice and rejects unconfirmed owned removal', async () => {
-  const f = qualificationFixture();
-  try {
-    await qualification.runQualification({ ...f.options, producerOnly: true });
-    const contract = JSON.parse(readFileSync(join(f.options.resultsDir, 'contract.json'), 'utf8')) as SyntheticContract;
-    const receipt = await f.consume(contract, { authorizeInstall: true });
-    const consumerResult = join(f.base, 'external-consumer.json');
-    writeFileSync(consumerResult, JSON.stringify(receipt));
-    const resume = join(f.options.resultsDir, 'checkpoint.json');
-    const joined = await qualification.runQualification({
-      ...f.options,
-      resume,
-      consumerResult,
-      resultsDir: join(f.base, 'join'),
-    });
-    assert.equal(joined.qualified, true);
-    assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
-    receipt.cleanup = { quiescent: true, removed: false };
-    writeFileSync(consumerResult, JSON.stringify(receipt));
-    const bad = await qualification.runQualification({
-      ...f.options,
-      resume,
-      consumerResult,
-      resultsDir: join(f.base, 'bad-join'),
-    });
-    assert.equal(bad.qualified, false);
-    assert.match(bad.error!, /removal/u);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'external consumer join never installs twice and rejects unconfirmed owned removal',
+  { tags: ['release'] },
+  async () => {
+    const f = qualificationFixture();
+    try {
+      await qualification.runQualification({ ...f.options, producerOnly: true });
+      const contract = JSON.parse(
+        readFileSync(join(f.options.resultsDir, 'contract.json'), 'utf8'),
+      ) as SyntheticContract;
+      const receipt = await f.consume(contract, { authorizeInstall: true });
+      const consumerResult = join(f.base, 'external-consumer.json');
+      writeFileSync(consumerResult, JSON.stringify(receipt));
+      const resume = join(f.options.resultsDir, 'checkpoint.json');
+      const joined = await qualification.runQualification({
+        ...f.options,
+        resume,
+        consumerResult,
+        resultsDir: join(f.base, 'join'),
+      });
+      assert.equal(joined.qualified, true);
+      assert.deepEqual(f.counts(), { producers: 1, packs: 1, consumers: 1 });
+      receipt.cleanup = { quiescent: true, removed: false };
+      writeFileSync(consumerResult, JSON.stringify(receipt));
+      const bad = await qualification.runQualification({
+        ...f.options,
+        resume,
+        consumerResult,
+        resultsDir: join(f.base, 'bad-join'),
+      });
+      assert.equal(bad.qualified, false);
+      assert.match(bad.error!, /removal/u);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 for (const status of ['failed', 'timed-out', 'cancelled', 'cleanup-unconfirmed']) {
   test(`actual pack ${status} cannot produce a successful checkpoint`, async () => {

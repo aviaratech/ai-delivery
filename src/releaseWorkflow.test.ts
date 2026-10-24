@@ -282,7 +282,7 @@ function diagnosticFixture() {
     assert.ok(path);
     assert.equal(dirname(dirname(path)), root);
     const bytes = readFileSync(path, 'utf8');
-    assert.ok(Buffer.byteLength(bytes) <= 64 * 1024);
+    assert.ok(Buffer.byteLength(bytes) <= 256 * 1024);
     assert.ok(!bytes.includes(sensitive));
     assert.ok(!bytes.includes(root), 'runtime paths must not cross the public projection');
     return JSON.parse(bytes) as Json;
@@ -340,6 +340,34 @@ test('diagnostic frames preserve message order, repeats, file URLs and distinct 
         { file: 'dist/setup.test.js', line: 100, column: 4, message: 2 },
       ],
     });
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostics retain the complete release inventory with four failure frames per case', () => {
+  const f = diagnosticFixture();
+  try {
+    f.save(`release-tests-${f.runId}/vitest.json`, {
+      testResults: [...new Set(laneChecks.RELEASE_CASES.map((entry) => entry.file))].map((file) => ({
+        name: join(f.sourceRoot, file),
+        assertionResults: laneChecks.RELEASE_CASES.filter((entry) => entry.file === file).map(({ title }) => ({
+          fullName: title,
+          status: 'failed',
+          failureMessages: [
+            Array.from({ length: 4 }, () => `    at caller (${join(f.sourceRoot, file)}:1110:3)`).join('\n'),
+          ],
+        })),
+      })),
+    });
+    const observed = (f.execute()['release'] as Json)['cases'] as Json[];
+    assert.equal(observed.length, laneChecks.RELEASE_CASES.length);
+    for (const entry of observed) {
+      assert.equal(entry['status'], 'failed');
+      const frames = entry['failureFrames'] as Json;
+      assert.equal(frames['status'], 'matched');
+      assert.equal((frames['frames'] as Json[]).length, 4);
+    }
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

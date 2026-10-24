@@ -182,168 +182,172 @@ const driver = fileURLToPath(new URL('./fixtures/inertEntrypointChild.js', impor
 const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
 for (const kind of ['tracked', 'edited'] as const satisfies readonly EntrypointPolicy[]) {
   for (const scenario of scenarios) {
-    test(`${scenario.name} leaves ${kind} consumer policy inert in a fresh native process`, () => {
-      const f = freshEntrypointFixture(kind);
-      let negative: Observation | undefined;
-      const controls: Observation[] = [];
-      let cleaned = false;
-      let observationPassed = false;
-      try {
-        const requestPath = join(f.base, 'request.json');
-        const env = { ...f.env, AI_DELIVERY_ENTRYPOINT_REQUEST: requestPath };
-        const run = (request: EntrypointRequest, main: string, args: string[] = []) => {
-          writeFileSync(requestPath, JSON.stringify(request), { mode: 0o600 });
-          const stdout = execFileSync(
-            process.execPath,
-            ['--max-old-space-size=96', '--experimental-test-module-mocks', '--import', driver, main, ...args],
-            {
-              env,
-              cwd: f.root,
-              timeout: 5_000,
-              maxBuffer: 64 * 1024,
-              encoding: 'utf8',
-              stdio: ['ignore', 'pipe', 'pipe'],
-            },
-          );
-          assert.ok(existsSync(request.report), 'Missing complete child observation');
-          const observation: unknown = JSON.parse(readFileSync(request.report, 'utf8'));
-          assert.ok(observation && typeof observation === 'object' && !Array.isArray(observation));
-          assert.ok('pid' in observation && typeof observation.pid === 'number');
-          assert.ok('mode' in observation && typeof observation.mode === 'string');
-          assert.ok('calls' in observation && Array.isArray(observation.calls));
-          const calls = observation.calls.map((call: unknown) => {
-            assert.ok(call && typeof call === 'object' && 'name' in call && typeof call.name === 'string');
-            assert.ok('input' in call);
-            return { name: call.name, input: call.input };
-          });
-          assert.ok(
-            'interpreter' in observation && observation.interpreter && typeof observation.interpreter === 'object',
-          );
-          const interpreter = observation.interpreter;
-          assert.ok('version' in interpreter && typeof interpreter.version === 'string');
-          assert.ok('executable' in interpreter && typeof interpreter.executable === 'string');
-          assert.ok('fixtureDriver' in observation && typeof observation.fixtureDriver === 'string');
-          const value: unknown = request.mode === 'control' ? null : JSON.parse(stdout);
-          assert.ok(value === null || (typeof value === 'object' && !Array.isArray(value)));
-          return {
-            pid: observation.pid,
-            mode: observation.mode,
-            calls,
-            interpreter: { version: interpreter.version, executable: interpreter.executable },
-            fixtureDriver: observation.fixtureDriver,
-            value: value as Record<string, unknown> | null,
-            entrypointOutputBytes: Buffer.byteLength(stdout),
-          };
-        };
-        for (const [index, bytes] of (kind === 'tracked' ? [f.tracked] : [f.tracked, f.selected]).entries()) {
-          writeFileSync(f.policy, bytes);
-          const observation = run(
-            { root: f.root, report: join(f.base, `control-${index}.json`), head: f.head, mode: 'control', args: [] },
-            f.policy,
-          );
-          controls.push(observation);
-          assert.deepEqual(JSON.parse(readFileSync(f.sentinel, 'utf8')), {
-            marker: index === 0 ? 'tracked' : 'edited',
-            module: pathToFileURL(f.policy).href,
-          });
-          rmSync(f.sentinel);
-        }
-        writeFileSync(f.policy, f.selected);
-        f.assertInert();
-        let args = [...scenario.args];
-        if (scenario.name === 'CLI offline migration') {
-          const inventory = join(f.base, 'legacy.json');
-          writeFileSync(
-            inventory,
-            JSON.stringify({
-              issues: [
-                {
-                  number: 17,
-                  body: 'Verification prose: node consumer-trap.cjs and npm run trap.',
-                  labels: ['effort:s', 'type:task'],
-                },
-              ],
-            }),
-          );
-          args.push('--input-file', inventory);
-        }
-        negative = run(
-          { root: f.root, report: join(f.base, 'negative.json'), head: f.head, mode: scenario.mode, args },
-          scenario.mode === 'cli' ? cli : driver,
-          scenario.mode === 'cli' ? ['--repo', 'example/widget', '--repo-root', f.root, ...args] : [],
-        );
-        assert.equal(negative.mode, scenario.mode);
-        assert.equal(negative.interpreter.executable, process.execPath);
-        assert.ok(
-          controls.every((control) => control.pid !== negative!.pid),
-          'Positive and negative controls must use separate process launches',
-        );
-        assert.ok(negative.value && typeof negative.value === 'object' && !Array.isArray(negative.value));
-        scenario.verify(negative.value);
-        if (scenario.witness)
-          assert.ok(
-            negative.calls.some((c) => c.name === scenario.witness),
-            `Missing actual external-port witness ${scenario.witness}`,
-          );
-        else
-          assert.deepEqual(
-            negative.calls,
-            [],
-            'Offline/plugin dispositions must not authenticate or contact a remote port',
-          );
-        if (scenario.name.startsWith('CLI plugin')) {
-          assert.equal(
-            existsSync(join(f.home, '.cache')),
-            false,
-            'Dry-run/uninstalled doctor must not create managed state',
-          );
-          assert.equal(existsSync(join(f.home, '.codex')), false, 'No native host settings may be created');
-        }
-        f.assertInert();
-        f.assertBound();
-        for (const call of negative.calls) {
-          const input = call.input as Record<string, unknown> | null;
-          if (input && 'owner' in input) assert.equal(input.owner, 'example');
-          if (input && 'repo' in input) assert.equal(input.repo, 'widget');
-          if (input && 'name' in input) assert.equal(input.name, 'widget');
-          if (input && 'issue_number' in input) {
-            if (call.name === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values')
-              assert.ok(
-                [17, 18, 19].includes(input.issue_number as number),
-                'Only parent and declared direct children may supply fields',
-              );
-            else assert.equal(input.issue_number, 17);
-          }
-          if (input && 'pull_number' in input) assert.equal(input.pull_number, 23);
-          if (call.name === 'checks.listForRef' || call.name === 'repos.getCombinedStatusForRef')
-            assert.equal(input?.ref, f.head);
-        }
-        observationPassed = true;
-      } finally {
-        const policyInert = !existsSync(f.sentinel);
+    test(
+      `${scenario.name} leaves ${kind} consumer policy inert in a fresh native process`,
+      { tags: ['release'], timeout: 15_000 },
+      () => {
+        const f = freshEntrypointFixture(kind);
+        let negative: Observation | undefined;
+        const controls: Observation[] = [];
+        let cleaned = false;
+        let observationPassed = false;
         try {
-          f.cleanup();
-          cleaned = true;
-        } finally {
-          const evidence = process.env.AI_DELIVERY_INERT_EVIDENCE_DIR;
-          if (evidence)
-            writeFileSync(
-              join(evidence, `${f.head}-${scenario.name.replace(/[^a-zA-Z0-9]/gu, '-')}-${kind}.json`),
-              JSON.stringify({
-                scenario: scenario.name,
-                policyState: kind,
-                selectedPayloadSha256: f.payloadSha256,
-                indexedPayloadSha256: f.indexedSha256,
-                controls,
-                negative,
-                policyInert,
-                observationPassed,
-                ownedCleanup: cleaned,
-              }) + '\n',
-              { flag: 'wx' },
+          const requestPath = join(f.base, 'request.json');
+          const env = { ...f.env, AI_DELIVERY_ENTRYPOINT_REQUEST: requestPath };
+          const run = (request: EntrypointRequest, main: string, args: string[] = []) => {
+            writeFileSync(requestPath, JSON.stringify(request), { mode: 0o600 });
+            const stdout = execFileSync(
+              process.execPath,
+              ['--max-old-space-size=96', '--experimental-test-module-mocks', '--import', driver, main, ...args],
+              {
+                env,
+                cwd: f.root,
+                timeout: 5_000,
+                maxBuffer: 64 * 1024,
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+              },
             );
+            assert.ok(existsSync(request.report), 'Missing complete child observation');
+            const observation: unknown = JSON.parse(readFileSync(request.report, 'utf8'));
+            assert.ok(observation && typeof observation === 'object' && !Array.isArray(observation));
+            assert.ok('pid' in observation && typeof observation.pid === 'number');
+            assert.ok('mode' in observation && typeof observation.mode === 'string');
+            assert.ok('calls' in observation && Array.isArray(observation.calls));
+            const calls = observation.calls.map((call: unknown) => {
+              assert.ok(call && typeof call === 'object' && 'name' in call && typeof call.name === 'string');
+              assert.ok('input' in call);
+              return { name: call.name, input: call.input };
+            });
+            assert.ok(
+              'interpreter' in observation && observation.interpreter && typeof observation.interpreter === 'object',
+            );
+            const interpreter = observation.interpreter;
+            assert.ok('version' in interpreter && typeof interpreter.version === 'string');
+            assert.ok('executable' in interpreter && typeof interpreter.executable === 'string');
+            assert.ok('fixtureDriver' in observation && typeof observation.fixtureDriver === 'string');
+            const value: unknown = request.mode === 'control' ? null : JSON.parse(stdout);
+            assert.ok(value === null || (typeof value === 'object' && !Array.isArray(value)));
+            return {
+              pid: observation.pid,
+              mode: observation.mode,
+              calls,
+              interpreter: { version: interpreter.version, executable: interpreter.executable },
+              fixtureDriver: observation.fixtureDriver,
+              value: value as Record<string, unknown> | null,
+              entrypointOutputBytes: Buffer.byteLength(stdout),
+            };
+          };
+          for (const [index, bytes] of (kind === 'tracked' ? [f.tracked] : [f.tracked, f.selected]).entries()) {
+            writeFileSync(f.policy, bytes);
+            const observation = run(
+              { root: f.root, report: join(f.base, `control-${index}.json`), head: f.head, mode: 'control', args: [] },
+              f.policy,
+            );
+            controls.push(observation);
+            assert.deepEqual(JSON.parse(readFileSync(f.sentinel, 'utf8')), {
+              marker: index === 0 ? 'tracked' : 'edited',
+              module: pathToFileURL(f.policy).href,
+            });
+            rmSync(f.sentinel);
+          }
+          writeFileSync(f.policy, f.selected);
+          f.assertInert();
+          let args = [...scenario.args];
+          if (scenario.name === 'CLI offline migration') {
+            const inventory = join(f.base, 'legacy.json');
+            writeFileSync(
+              inventory,
+              JSON.stringify({
+                issues: [
+                  {
+                    number: 17,
+                    body: 'Verification prose: node consumer-trap.cjs and npm run trap.',
+                    labels: ['effort:s', 'type:task'],
+                  },
+                ],
+              }),
+            );
+            args.push('--input-file', inventory);
+          }
+          negative = run(
+            { root: f.root, report: join(f.base, 'negative.json'), head: f.head, mode: scenario.mode, args },
+            scenario.mode === 'cli' ? cli : driver,
+            scenario.mode === 'cli' ? ['--repo', 'example/widget', '--repo-root', f.root, ...args] : [],
+          );
+          assert.equal(negative.mode, scenario.mode);
+          assert.equal(negative.interpreter.executable, process.execPath);
+          assert.ok(
+            controls.every((control) => control.pid !== negative!.pid),
+            'Positive and negative controls must use separate process launches',
+          );
+          assert.ok(negative.value && typeof negative.value === 'object' && !Array.isArray(negative.value));
+          scenario.verify(negative.value);
+          if (scenario.witness)
+            assert.ok(
+              negative.calls.some((c) => c.name === scenario.witness),
+              `Missing actual external-port witness ${scenario.witness}`,
+            );
+          else
+            assert.deepEqual(
+              negative.calls,
+              [],
+              'Offline/plugin dispositions must not authenticate or contact a remote port',
+            );
+          if (scenario.name.startsWith('CLI plugin')) {
+            assert.equal(
+              existsSync(join(f.home, '.cache')),
+              false,
+              'Dry-run/uninstalled doctor must not create managed state',
+            );
+            assert.equal(existsSync(join(f.home, '.codex')), false, 'No native host settings may be created');
+          }
+          f.assertInert();
+          f.assertBound();
+          for (const call of negative.calls) {
+            const input = call.input as Record<string, unknown> | null;
+            if (input && 'owner' in input) assert.equal(input.owner, 'example');
+            if (input && 'repo' in input) assert.equal(input.repo, 'widget');
+            if (input && 'name' in input) assert.equal(input.name, 'widget');
+            if (input && 'issue_number' in input) {
+              if (call.name === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values')
+                assert.ok(
+                  [17, 18, 19].includes(input.issue_number as number),
+                  'Only parent and declared direct children may supply fields',
+                );
+              else assert.equal(input.issue_number, 17);
+            }
+            if (input && 'pull_number' in input) assert.equal(input.pull_number, 23);
+            if (call.name === 'checks.listForRef' || call.name === 'repos.getCombinedStatusForRef')
+              assert.equal(input?.ref, f.head);
+          }
+          observationPassed = true;
+        } finally {
+          const policyInert = !existsSync(f.sentinel);
+          try {
+            f.cleanup();
+            cleaned = true;
+          } finally {
+            const evidence = process.env.AI_DELIVERY_INERT_EVIDENCE_DIR;
+            if (evidence)
+              writeFileSync(
+                join(evidence, `${f.head}-${scenario.name.replace(/[^a-zA-Z0-9]/gu, '-')}-${kind}.json`),
+                JSON.stringify({
+                  scenario: scenario.name,
+                  policyState: kind,
+                  selectedPayloadSha256: f.payloadSha256,
+                  indexedPayloadSha256: f.indexedSha256,
+                  controls,
+                  negative,
+                  policyInert,
+                  observationPassed,
+                  ownedCleanup: cleaned,
+                }) + '\n',
+                { flag: 'wx' },
+              );
+          }
         }
-      }
-    }, 15_000);
+      },
+    );
   }
 }

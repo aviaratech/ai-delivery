@@ -195,7 +195,7 @@ jobs:
           const vitest = read('vitest', releaseDirectory && [releaseDirectory, 'vitest.json']);
           const consumer = read('consumer', consumerDirectory && [consumerDirectory, 'result.json']);
           const workspace = realpathSync(env.GITHUB_WORKSPACE);
-          const publicFiles = ['setup', 'lifecycle', 'targetPolicyLocal', 'pluginPackaging'].flatMap(name => [`src/${name}.test.ts`, `dist/${name}.test.js`]);
+          const publicFiles = [...new Set(RELEASE_CASES.flatMap(({ file }) => [file, file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts')]))];
           const codeBounds = new Map();
           const bounds = file => {
             if (codeBounds.has(file)) return codeBounds.get(file);
@@ -276,8 +276,9 @@ jobs:
             release: { status: status(release?.status), command: command(releaseCommands.length === 1 ? releaseCommands[0] : null), cleanup: cleanup(release?.release?.temporary), counts: { total: number(vitest?.numTotalTests), passed: number(vitest?.numPassedTests), failed: number(vitest?.numFailedTests) }, cases },
             consumer: { status: status(consumer?.status), command: command(consumerDirectory ? consumerAttempt?.command : null), cleanup: cleanup(consumer?.cleanup) },
           };
-          const bytes = JSON.stringify(diagnostic, null, 2) + '\n';
-          if (Buffer.byteLength(bytes) > 64 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
+          // Keep every mapped case and its bounded frames as the release inventory grows.
+          const bytes = JSON.stringify(diagnostic) + '\n';
+          if (Buffer.byteLength(bytes) > 256 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
           const output = join(mkdtempSync(join(temporary, 'release-qualification-diagnostics-')), 'diagnostics.json');
           writeFileSync(output, bytes, { flag: 'wx', mode: 0o600 });
           appendFileSync(env.GITHUB_OUTPUT, `file=${output}\n`);
