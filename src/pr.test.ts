@@ -4,6 +4,317 @@ import { publishPr, mergePr, finishIssue, prChecks, queueChecks, queuePr } from 
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
 import { recordedBaseDrift, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
+import * as prReaders from './pr.js';
+
+it('markers require their exact canonical footer/trailer', () => {
+  const bodyMarker = Reflect.get(prReaders, 'hasDeliveryPrMarker') as ((body: string) => boolean) | undefined;
+  const trailer = Reflect.get(prReaders, 'hasDeliveryMergeTrailer') as ((body: string) => boolean) | undefined;
+  assert.equal(typeof bodyMarker, 'function');
+  assert.equal(typeof trailer, 'function');
+  const marker = '<!-- ai-delivery:pr@1 -->';
+  assert.equal(bodyMarker!(`Closes #17\n\nProof.\n\n${marker}`), true);
+  assert.equal(bodyMarker!(`Closes #17\n\nDocument ai-delivery:pr@1 semantics.\n\n${marker}`), true);
+  assert.equal(bodyMarker!(`Proof\n\n\`\`\`md\n${marker}\n\`\`\`\n\n${marker}`), true);
+  assert.equal(bodyMarker!(`Proof\n\n> ${marker}\n\n${marker}`), true);
+  for (const example of [
+    `Proof\n\n    ${marker}`,
+    `Proof\n\n\t${marker}`,
+    `Proof\n\n~~~md\n${marker}\n~~~`,
+    `Proof \`multiline\n    text ${marker}\ntext\`.`,
+    `Escaped \\${marker} remains literal.`,
+    `The literal marker is \`${marker}\`.`,
+    `The literal marker is \`\`before \` ${marker}\`\`.`,
+    `Example \`multiline\ntext ${marker}\ntext\`.`,
+    'An unmatched backtick is literal: `',
+  ])
+    assert.equal(bodyMarker!(`Closes #17\n\n${example}\n\n${marker}`), true, example);
+  assert.equal(bodyMarker!(`Closes #17\n\nEscaped \\\`${marker} remains active.\n\n${marker}`), false);
+  for (const indent of ['', ' ', '  ', '   '])
+    assert.equal(
+      bodyMarker!(`Closes #17\n\nExample \`multiline\n${indent}${marker}\ntext\`.\n\n${marker}`),
+      false,
+      'A comment block interrupts the paragraph before inline code parsing',
+    );
+  for (const boundary of ['=', '--', '___'])
+    assert.equal(bodyMarker!(`Proof \`open\n${boundary}\ntext ${marker}\nclose\`.\n\n${marker}`), false);
+  for (const body of [
+    `Proof\n\n<div>\n\`\`\`\n${marker}\n\`\`\`\n</div>\n\n${marker}`,
+    `Proof\n\n<?instruction\n\n${marker}`,
+    `Proof\n\n<![CDATA[\n\n${marker}`,
+    `Proof \`multiline\n# Heading\ntext ${marker}\ntext\`.\n\n${marker}`,
+    `Proof \`multiline\n- New block\ntext ${marker}\ntext\`.\n\n${marker}`,
+    `Proof\n\n\`\`\`\`\n${marker}\n\`\`\`\n\n${marker}`,
+    `Proof\n\n\`\`\`\n${marker}\n~~~\n\n${marker}`,
+    `Proof\n\n<!-- outer comment\n\n${marker}`,
+    `Proof\n\n<pre>\n\n${marker}`,
+    `Proof\n    ${marker}\n\n${marker}`,
+    `Proof\n\n- Container\n    ${marker}\n\n${marker}`,
+    marker,
+    `Proof\n${marker}`,
+    `Proof\n\n> ${marker}`,
+    `Proof\n\n\`\`\`\n${marker}\n\`\`\``,
+    `Proof\n\n${marker}\nextra`,
+    `Proof\n\n${marker}\n\n${marker}`,
+    `Proof\n\n${marker}\n`,
+  ])
+    assert.equal(bodyMarker!(body), false, body);
+  for (const message of ['Title\n\nDelivered-by: ai-delivery', 'Title\n\nDelivered-by: ai-delivery\n'])
+    assert.equal(trailer!(message), true);
+  assert.equal(trailer!('Document Delivered-by: ai-delivery in the guide\n\nDelivered-by: ai-delivery'), true);
+  assert.equal(trailer!('Document `multiline\nDelivered-by: ai-delivery\nexample`\n\nDelivered-by: ai-delivery'), true);
+  for (const message of [
+    'Delivered-by: ai-delivery\nextra',
+    'Title\n\n> Delivered-by: ai-delivery',
+    'Title\n\n```\nDelivered-by: ai-delivery\n```',
+    'Title\n\nDelivered-by: ai-delivery\n\nDelivered-by: ai-delivery',
+    'Title\n\nDelivered-by: other',
+  ])
+    assert.equal(trailer!(message), false, message);
+});
+
+type BoardTestFacts = {
+  ready: boolean;
+  reasons: string[];
+  review: { observed?: boolean; reviewDecision: unknown };
+  checks: { state: string; complete: boolean; proof?: Array<{ name: string; appId: number | null; id: number }> };
+  closingLinks: { complete: boolean };
+  headRepository: { name: string; id: string };
+};
+async function boardFacts(context: DeliveryContext) {
+  const read = Reflect.get(prReaders, 'readPrBoardFacts') as
+    | ((context: Pick<DeliveryContext, 'clients' | 'repo'>, number: number) => Promise<BoardTestFacts>)
+    | undefined;
+  assert.equal(typeof read, 'function', 'read-only PR board facts are available');
+  return read!({ clients: context.clients, repo: context.repo }, 23);
+}
+function boardFixture(
+  option: {
+    decision?: unknown;
+    missingDecision?: boolean;
+    unavailableReview?: boolean;
+    reviewHeadMoved?: boolean;
+    nativeState?: string;
+    draft?: boolean;
+    mergeable?: string;
+    drift?: 'head' | 'base' | 'body';
+    baseMoved?: boolean;
+    nonClosing?: boolean;
+    fork?: boolean;
+    headRef?: string;
+    baseRef?: string;
+    linksIncomplete?: boolean;
+    check?: 'none' | 'missing' | 'foreign' | 'pending' | 'failed' | 'truncated' | 'requirements-unknown';
+  } = {},
+) {
+  const { context } = fixture();
+  // Synthetic eligible transition over recorded zero-required-approval native facts.
+  // The source capture is draft; this fixture explicitly changes it to ready/CLEAN.
+  const projection = recordedZeroApproval.repository.pullRequest;
+  const head: string = projection.headRefOid;
+  const base: string = projection.baseRefOid;
+  const headRef = option.headRef ?? 'issue/17';
+  const baseRef = option.baseRef ?? 'main';
+  const calls: string[] = [];
+  let reads = 0;
+  const repository = { id: 'REPO', nameWithOwner: 'example/widget' };
+  const headRepository = option.fork ? { id: 'FORK', nameWithOwner: 'contributor/widget' } : repository;
+  const pr = () => ({
+    number: 23,
+    node_id: 'PR23',
+    html_url: 'https://github.com/example/widget/pull/23',
+    title: 'Improve widget',
+    body: option.nonClosing ? 'References example/widget#17\n\nProof.' : 'Closes #17\n\nProof.',
+    state: 'open',
+    merged: false,
+    draft: option.draft ?? false,
+    mergeable: option.mergeable !== 'CONFLICTING',
+    mergeable_state: 'clean',
+    head: { sha: head, ref: headRef, repo: { node_id: headRepository.id, full_name: headRepository.nameWithOwner } },
+    base: { sha: base, ref: baseRef, repo: { node_id: repository.id, full_name: repository.nameWithOwner } },
+  });
+  const run = { id: 10, name: 'checks', head_sha: head, app: { id: 7 }, status: 'completed', conclusion: 'success' };
+  context.clients.rest = {
+    request: async (route: string) => {
+      calls.push(route);
+      assert.ok(route.startsWith('GET '), 'no native writes');
+      if (option.check === 'requirements-unknown') throw { status: 403 };
+      if (route.endsWith('/rules/branches/{branch}'))
+        return {
+          status: 200,
+          headers: {},
+          data:
+            option.check === 'none'
+              ? []
+              : [
+                  {
+                    type: 'required_status_checks',
+                    parameters: { required_status_checks: [{ context: 'checks', integration_id: 7 }] },
+                  },
+                ],
+        };
+      assert.ok(route.endsWith('/protection'));
+      return { status: 200, headers: {}, data: { required_status_checks: null } };
+    },
+    pulls: {
+      get: async () => {
+        calls.push('pulls.get');
+        const result = pr();
+        if (++reads > 1) {
+          if (option.drift === 'head') result.head.sha = 'f'.repeat(40);
+          if (option.drift === 'base') result.base.sha = 'e'.repeat(40);
+          if (option.drift === 'body') result.body += '\nChanged';
+        }
+        return { data: result };
+      },
+    },
+    checks: {
+      listForRef: async () => {
+        calls.push('checks.listForRef');
+        const check_runs =
+          option.check === 'missing'
+            ? []
+            : option.check === 'foreign'
+              ? [{ ...run, app: { id: 8 } }]
+              : option.check === 'pending'
+                ? [run, { ...run, id: 11, status: 'in_progress', conclusion: null }]
+                : option.check === 'failed'
+                  ? [{ ...run, conclusion: 'failure' }]
+                  : [run];
+        return {
+          status: 200,
+          headers: option.check === 'truncated' ? { link: 'next' } : {},
+          data: { total_count: check_runs.length, check_runs },
+        };
+      },
+    },
+    repos: {
+      getCombinedStatusForRef: async () => {
+        calls.push('repos.getCombinedStatusForRef');
+        return { status: 200, headers: {}, data: { sha: head, total_count: 0, statuses: [] } };
+      },
+    },
+    git: {
+      getRef: async ({ ref }: { ref: string }) => {
+        calls.push('git.getRef');
+        assert.equal(ref, `heads/${baseRef}`);
+        return {
+          data: {
+            ref: `refs/heads/${baseRef}`,
+            object: { type: 'commit', sha: option.baseMoved ? 'd'.repeat(40) : base },
+          },
+        };
+      },
+    },
+  } as unknown as DeliveryContext['clients']['rest'];
+  context.clients.graphql = (async (query: string) => {
+    assert.ok(query.trimStart().startsWith('query'), 'no GraphQL writes');
+    if (query.includes('DeliveryReviewDecision')) {
+      calls.push('DeliveryReviewDecision');
+      if (option.unavailableReview) throw { status: 403 };
+      return {
+        repository: {
+          pullRequest: {
+            headRefOid: option.reviewHeadMoved ? '0'.repeat(40) : head,
+            ...(option.missingDecision
+              ? {}
+              : { reviewDecision: Object.hasOwn(option, 'decision') ? option.decision : null }),
+          },
+        },
+      };
+    }
+    assert.ok(query.includes('DeliveryBoardPr'), 'no extra review counts, approval or mutation queries');
+    calls.push('DeliveryBoardPr');
+    return {
+      repository: {
+        ...repository,
+        pullRequest: {
+          id: 'PR23',
+          number: 23,
+          state: 'OPEN',
+          isDraft: option.draft ?? false,
+          headRefOid: head,
+          baseRefOid: base,
+          headRefName: headRef,
+          baseRefName: baseRef,
+          baseRepository: repository,
+          headRepository,
+          mergeable: option.mergeable ?? 'MERGEABLE',
+          mergeStateStatus: option.nativeState ?? 'CLEAN',
+          closingIssuesReferences: {
+            nodes: option.nonClosing ? [] : [{ __typename: 'Issue', id: 'ISSUE17', number: 17, repository }],
+            pageInfo: { hasNextPage: option.linksIncomplete ?? false, endCursor: null },
+          },
+        },
+      },
+    };
+  }) as DeliveryContext['clients']['graphql'];
+  return { context, calls, head, base };
+}
+it('board accepts observed null with native CLEAN eligibility', async () => {
+  for (const option of [
+    {},
+    { decision: 'APPROVED' },
+    { check: 'none' as const },
+    { fork: true },
+    { fork: true, headRef: 'fix/café' },
+    { headRef: 'fix/$work', baseRef: 'release/été' },
+  ]) {
+    const f = boardFixture(option);
+    const result = await boardFacts(f.context);
+    assert.equal(result.ready, true, JSON.stringify(option));
+    assert.equal(result.review.observed, true);
+    assert.equal(result.review.reviewDecision, option.decision ?? null);
+    assert.equal(result.checks.state, 'passed');
+    assert.equal(result.closingLinks.complete, true);
+    assert.equal(result.headRepository.name, option.fork ? 'contributor/widget' : 'example/widget');
+    assert.equal(f.calls.filter((x) => x === 'DeliveryReviewDecision').length, 1);
+    if (option.check === 'none') {
+      assert.equal(f.calls.filter((x) => x === 'checks.listForRef').length, 0);
+      assert.equal(
+        (await queueChecks(f.context, 'main', f.head)).state,
+        'waiting',
+        'queue still requires actual checks',
+      );
+    }
+  }
+});
+it('board distinguishes unavailable review from explicit null', async () => {
+  for (const option of [
+    { unavailableReview: true },
+    { missingDecision: true },
+    { decision: 'malformed' },
+    { reviewHeadMoved: true },
+    { decision: 'REVIEW_REQUIRED' },
+    { decision: 'CHANGES_REQUESTED' },
+    { nativeState: 'UNKNOWN' },
+    { draft: true },
+    { mergeable: 'UNKNOWN' },
+    { mergeable: 'CONFLICTING' },
+    { nonClosing: true },
+    { linksIncomplete: true },
+  ]) {
+    const result = await boardFacts(boardFixture(option).context);
+    assert.equal(result.ready, false, JSON.stringify(option));
+    assert.ok(result.reasons.length > 0);
+    if (option.unavailableReview || option.missingDecision || option.decision === 'malformed' || option.reviewHeadMoved)
+      assert.equal(result.review.observed, false);
+  }
+});
+it('board retains required App producer and current base proof', async () => {
+  const ready = await boardFacts(boardFixture().context);
+  assert.deepEqual(ready.checks.proof, [{ name: 'checks', appId: 7, id: 10 }]);
+  for (const option of [
+    ...(['missing', 'foreign', 'pending', 'failed', 'truncated', 'requirements-unknown'] as const).map((check) => ({
+      check,
+    })),
+    ...(['head', 'base', 'body'] as const).map((drift) => ({ drift })),
+    { baseMoved: true },
+  ]) {
+    const result = await boardFacts(boardFixture(option).context);
+    assert.equal(result.ready, false, JSON.stringify(option));
+    assert.ok(result.reasons.length > 0);
+  }
+});
 
 const head = 'a'.repeat(40);
 const merge = 'b'.repeat(40);
@@ -324,6 +635,8 @@ function fixture(
     baseMoved?: boolean;
     nonClosing?: boolean;
     commitMessage?: string;
+    prBody?: string;
+    messageChangedAfterDecision?: 'title' | 'body';
     retainedIssueDrift?: boolean;
     mergeAckLost?: boolean;
     headMoved?: boolean;
@@ -390,8 +703,14 @@ function fixture(
     number: 23,
     node_id: 'PR23',
     changed_files: 1,
-    title: publicationTitle ?? 'Improve widget',
-    body: publicationBody ?? (option.nonClosing ? 'References example/widget#17\n\nImprove widget.' : 'Closes #17'),
+    title:
+      decisionRead && option.messageChangedAfterDecision === 'title'
+        ? 'Edited title'
+        : (publicationTitle ?? 'Improve widget'),
+    body:
+      publicationBody ??
+      (decisionRead && option.messageChangedAfterDecision === 'body' ? 'Closes #17\n\nEdited body.' : option.prBody) ??
+      (option.nonClosing ? 'References example/widget#17\n\nImprove widget.' : 'Closes #17'),
     html_url: 'https://github.com/example/widget/pull/23',
     state: merged ? 'closed' : 'open',
     draft: publicationDraft ?? false,
@@ -485,7 +804,7 @@ function fixture(
       list: async () => ({ data: [] }),
       listFiles: async () => ({ data: [{ filename: 'change.ts' }] }),
       create: async (input: Record<string, unknown>) => {
-        assert.equal(input.body, 'Closes #17\n\nPlain explanation');
+        assert.equal(input.body, 'Closes #17\n\nPlain explanation\n\n<!-- ai-delivery:pr@1 -->');
         assert.equal(typeof input.title, 'string');
         assert.equal(typeof input.draft, 'boolean');
         publicationBody = input.body as string;
@@ -960,6 +1279,99 @@ describe('remote GitHub lifecycle', () => {
   });
 });
 
+describe('managed squash usage trailer', () => {
+  const footer = '\n\n<!-- ai-delivery:pr@1 -->';
+  const trailer = '\n\nDelivered-by: ai-delivery';
+  const content = 'Closes #17\n\nOriginal body.  \r\n\n```md\n<!-- ai-delivery:pr@1 -->\n```';
+  for (const marked of [false, true]) {
+    for (const queued of [false, true]) {
+      it(`sends one closing squash trailer with exact substantive bytes (${marked}, queue=${queued})`, async () => {
+        const { context, merges } = fixture('clean', { prBody: content + (marked ? footer : '') });
+        const input = { issueNumber: 17, prNumber: 23, reviewedHeadSha: head };
+        const preview = await mergePr(context, { ...input, dryRun: true });
+        assert.equal(Reflect.get(preview, 'commit_title'), 'Improve widget');
+        assert.equal(Reflect.get(preview, 'commit_message'), content + trailer);
+        assert.notEqual(Reflect.get(preview, 'nonClosing'), true);
+        assert.equal(merges.length, 0);
+        const stages: string[] = [];
+        await mergePr(
+          context,
+          input,
+          queued
+            ? {
+                expectedBase: 'c'.repeat(40),
+                checkProof: async () => {
+                  stages.push('proof');
+                },
+                beforeMutation: async () => {
+                  stages.push('intent');
+                },
+              }
+            : undefined,
+        );
+        assert.deepEqual(stages, queued ? ['proof', 'intent'] : []);
+        assert.deepEqual(merges[0], {
+          owner: 'example',
+          repo: 'widget',
+          pull_number: 23,
+          sha: head,
+          merge_method: 'squash',
+          commit_title: 'Improve widget',
+          commit_message: content + trailer,
+        });
+        assert.equal((await mergePr(context, input)).reused, true);
+        assert.equal(merges.length, 1);
+      });
+    }
+  }
+  for (const strategy of ['merge', 'rebase'] as const) {
+    it(`preserves native ${strategy} messages without a squash trailer`, async () => {
+      const { context, merges } = fixture('clean', { prBody: content + footer, messageChangedAfterDecision: 'body' });
+      await mergePr(context, { issueNumber: 17, prNumber: 23, strategy });
+      assert.deepEqual(merges[0], {
+        owner: 'example',
+        repo: 'widget',
+        pull_number: 23,
+        sha: head,
+        merge_method: strategy,
+      });
+    });
+  }
+  for (const field of ['title', 'body'] as const) {
+    for (const mode of ['direct', 'queued', 'dry-run'] as const) {
+      it(`refuses closing squash ${field} drift after the review read (${mode})`, async () => {
+        const { context, merges } = fixture('clean', { messageChangedAfterDecision: field });
+        const stages: string[] = [];
+        await assert.rejects(
+          mergePr(
+            context,
+            { issueNumber: 17, prNumber: 23, dryRun: mode === 'dry-run' },
+            mode === 'queued'
+              ? {
+                  expectedBase: 'c'.repeat(40),
+                  checkProof: async () => {
+                    stages.push('proof');
+                  },
+                  beforeMutation: async () => {
+                    stages.push('intent');
+                  },
+                }
+              : undefined,
+          ),
+          /message.*changed|message.*drift/iu,
+        );
+        assert.equal(merges.length, 0);
+        assert.deepEqual(stages, []);
+      });
+    }
+  }
+  it('does not duplicate a canonical final trailer already present in substantive content', async () => {
+    const { context, merges } = fixture('clean', { prBody: content + trailer + footer });
+    await mergePr(context, { issueNumber: 17, prNumber: 23 });
+    assert.equal(merges[0]!.commit_message, content + trailer);
+  });
+});
+
 describe('retained issue guarded squash delivery', () => {
   const input = { issueNumber: 17, prNumber: 23, reviewedHeadSha: head, nonClosing: true };
   it('sends explicit safe squash messages at the approved SHA and reuses merged readback without closing', async () => {
@@ -967,7 +1379,10 @@ describe('retained issue guarded squash delivery', () => {
     const preview = await mergePr(context, { ...input, dryRun: true });
     assert.ok('commit_title' in preview && 'commit_message' in preview);
     assert.equal(preview.commit_title, 'Improve widget');
-    assert.equal(preview.commit_message, 'References example/widget#17\n\nDelivered by PR #23.');
+    assert.equal(
+      preview.commit_message,
+      'References example/widget#17\n\nDelivered by PR #23.\n\nDelivered-by: ai-delivery',
+    );
     assert.equal(merges.length, 0);
     const result = await mergePr(context, input);
     assert.equal(result.mergeSha, merge);
@@ -1099,6 +1514,8 @@ function recordedFlow(
       pull_number: 23,
       sha: headSha,
       merge_method: 'squash',
+      commit_title: 'Improve widget',
+      commit_message: 'Closes #17\n\nDelivered-by: ai-delivery',
     });
     return merge(...args);
   }) as typeof merge;

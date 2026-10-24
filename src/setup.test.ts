@@ -1008,19 +1008,20 @@ test(
   },
 );
 
-test(
-  'completed stages refuse missing, corrupt or incompatible dependency metadata without reinstalling or rewriting',
-  { tags: ['release'] },
-  async () => {
-    const api = await producer();
-    const f = await fixture();
-    try {
-      const staged = await api.stageRuntime(f.input);
-      const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
-      const complete = readFileSync(record);
-      const paths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
-      const retained = paths.map((path) => (existsSync(path) ? readFileSync(path) : undefined));
-      for (const [index, path] of paths.entries()) {
+for (const [index, metadata] of ['package.json', 'package-lock.json'].entries()) {
+  test(
+    `completed stages refuse missing, corrupt or incompatible ${metadata} dependency metadata without reinstalling or rewriting`,
+    { tags: ['release'] },
+    async () => {
+      const api = await producer();
+      const f = await fixture();
+      try {
+        const staged = await api.stageRuntime(f.input);
+        const record = join(f.input.runtimeDirectory, 'runtime-stage.json');
+        const complete = readFileSync(record);
+        const paths = ['package.json', 'package-lock.json'].map((name) => join(f.input.runtimeDirectory, name));
+        const retained = paths.map((path) => (existsSync(path) ? readFileSync(path) : undefined));
+        const path = paths[index]!;
         for (const fault of [
           'missing',
           'corrupt',
@@ -1030,6 +1031,7 @@ test(
           'fifo',
           ...(index === 1 ? ['version', 'resolved', 'integrity'] : []),
         ]) {
+          const startedAt = performance.now();
           const sentinel = join(f.base, `unrelated-metadata-${index}-${fault}`);
           if (fault === 'missing') rmSync(path, { force: true });
           else if (fault === 'symlink' || fault === 'hardlink') {
@@ -1062,7 +1064,9 @@ test(
             api.stageRuntime(f.input),
             fault === 'symlink' ? /symbolic link/iu : fault === 'fifo' ? /unsupported file/iu : /dependency metadata/iu,
           );
+          const stageCompletedAt = performance.now();
           await assert.rejects(api.admitRuntime(admitInput(f.input, staged.stageId)), /dependency metadata/iu);
+          const admitCompletedAt = performance.now();
           assert.deepEqual(readFileSync(record), complete);
           if (fault === 'fifo') assert.equal(lstatSync(path).isFIFO(), true);
           else assert.deepEqual(existsSync(path) ? readFileSync(path) : undefined, damaged);
@@ -1073,13 +1077,24 @@ test(
           assert.equal(readFileSync(f.counter, 'utf8'), 'x', 'metadata refusal must not reinstall');
           rmSync(path, { force: true });
           if (retained[index] !== undefined) writeFileSync(path, retained[index]!);
+          process.stdout.write(
+            'SETUP_METADATA_FAULT_RECEIPT ' +
+              JSON.stringify({
+                metadata: index === 0 ? 'package.json' : 'package-lock.json',
+                fault,
+                stageMs: stageCompletedAt - startedAt,
+                admitMs: admitCompletedAt - stageCompletedAt,
+                elapsedMs: performance.now() - startedAt,
+              }) +
+              '\n',
+          );
         }
+      } finally {
+        f.cleanup();
       }
-    } finally {
-      f.cleanup();
-    }
-  },
-);
+    },
+  );
+}
 
 for (const metadata of ['package.json', 'package-lock.json']) {
   test(

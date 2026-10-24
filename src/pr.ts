@@ -29,11 +29,192 @@ import {
   registerInvestigationCustody,
   type InvestigationPreparation,
 } from './services/worktreeRegistry.js';
-import { parseReviewArtifact, readRequiredReviewState, ReviewSubmissionError, submitReview } from './review.js';
+import {
+  parseReviewArtifact,
+  readRequiredReviewState,
+  ReviewSubmissionError,
+  submitReview,
+  type RequiredReviewState,
+} from './review.js';
 import { parseIssueBody } from './issueContract.js';
 
 const Sha = /^[a-f0-9]{40}$/u;
 const Branch = /^(?!.*(?:\.\.|@\{|\/\/))[A-Za-z0-9._/-]+$/u;
+
+export type PrReadContext = Pick<DeliveryContext, 'clients' | 'repo'>;
+
+const DeliveryPrFooter = '\n\n<!-- ai-delivery:pr@1 -->';
+function activeMarkerPositions(text: string, pattern: RegExp): number[] | null {
+  // A bounded context reader, not a Markdown renderer. Resolve blocks before inline
+  // quoting; unsupported container/HTML interactions cannot prove a usage marker.
+  const ignored: Array<[number, number]> = [];
+  const uncertain: Array<[number, number]> = [];
+  const inline: Array<[number, number]> = [];
+  let paragraph: number | null = null;
+  let fence: string | null = null;
+  let comment = false;
+  let htmlEnd: 'blank' | RegExp | null = null;
+  let container = false;
+  let quoted = false;
+  let blank = true;
+  const flush = (end: number) => {
+    if (paragraph !== null) inline.push([paragraph, end]);
+    paragraph = null;
+  };
+  for (const line of text.matchAll(/[^\n]*(?:\n|$)/gu)) {
+    if (!line[0]) continue;
+    const start = line.index;
+    const end = start + line[0].length;
+    const content = line[0].replace(/\r?\n$/u, '');
+    if (comment) {
+      const closing = content.indexOf('-->');
+      ignored.push([start, closing < 0 ? end : start + closing + 3]);
+      if (closing >= 0) comment = false;
+      continue;
+    }
+    if (htmlEnd !== null) {
+      if (htmlEnd === 'blank' && !content.trim()) htmlEnd = null;
+      else {
+        uncertain.push([start, end]);
+        if (htmlEnd !== 'blank' && htmlEnd.test(content)) htmlEnd = null;
+        continue;
+      }
+    }
+    const edge = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(content);
+    if (fence !== null) {
+      ignored.push([start, end]);
+      if (edge && edge[1]![0] === fence[0] && edge[1]!.length >= fence.length && !edge[2]!.trim()) fence = null;
+      continue;
+    }
+    if (!content.trim()) {
+      flush(start);
+      quoted = false;
+      blank = true;
+      continue;
+    }
+    if (/^ {0,3}>/u.test(content)) {
+      flush(start);
+      ignored.push([start, end]);
+      quoted = true;
+      blank = false;
+      continue;
+    }
+    if (blank && /^\S/u.test(content) && !/^[-+*\d]/u.test(content)) container = false;
+    const indented = /^(?: {4}| {0,3}\t)/u.test(content);
+    if (indented && paragraph === null) {
+      (container || quoted ? uncertain : ignored).push([start, end]);
+      continue;
+    }
+    if (edge && (edge[1]![0] !== '`' || !edge[2]!.includes('`'))) {
+      flush(start);
+      if (container || quoted) uncertain.push([start, text.length]);
+      ignored.push([start, end]);
+      fence = edge[1]!;
+    } else if (/^ {0,3}<!--/u.test(content)) {
+      flush(start);
+      const opening = content.indexOf('<!--');
+      const closing = content.indexOf('-->', opening + 4);
+      ignored.push([start + opening + 4, closing < 0 ? end : start + closing + 3]);
+      if (closing < 0) comment = true;
+    } else if (/^ {0,3}<\/?[A-Za-z!?]/u.test(content)) {
+      flush(start);
+      uncertain.push([start, end]);
+      const closing = /^ {0,3}<\?/u.test(content)
+        ? /\?>/u
+        : /^ {0,3}<!\[CDATA\[/u.test(content)
+          ? /\]\]>/u
+          : /^ {0,3}<!/u.test(content)
+            ? />/u
+            : /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)/iu.test(content)
+              ? /<\/(?:pre|script|style|textarea)>/iu
+              : null;
+      htmlEnd = closing === null ? 'blank' : closing.test(content) ? null : closing;
+    } else if (
+      /^ {0,3}(?:#{1,6}(?:[ \t]|$)|(?:[-+*]|\d+[.)])[ \t])/u.test(content) ||
+      /^ {0,3}(?:=+|-+)[ \t]*$/u.test(content) ||
+      /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$/u.test(content)
+    ) {
+      flush(start);
+      inline.push([start, end]);
+      container = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]/u.test(content);
+    } else {
+      if (quoted || container) uncertain.push([start, end]);
+      paragraph ??= start;
+    }
+    blank = false;
+  }
+  flush(text.length);
+  for (const [start, end] of inline) {
+    const unit = text.slice(start, end);
+    const tokens = /\\[\\`<]|`+|<!--/gu;
+    for (let token = tokens.exec(unit); token; token = tokens.exec(unit)) {
+      if (token[0].startsWith('\\')) {
+        ignored.push([start + token.index + 1, start + tokens.lastIndex]);
+      } else if (token[0] === '<!--') {
+        const closing = unit.indexOf('-->', tokens.lastIndex);
+        if (closing < 0) uncertain.push([start + token.index, end]);
+        else {
+          ignored.push([start + tokens.lastIndex, start + closing + 3]);
+          tokens.lastIndex = closing + 3;
+        }
+      } else {
+        const ticks = /`+/gu;
+        ticks.lastIndex = tokens.lastIndex;
+        for (let closing = ticks.exec(unit); closing; closing = ticks.exec(unit)) {
+          if (closing[0].length !== token[0].length) continue;
+          ignored.push([start + token.index, start + ticks.lastIndex]);
+          tokens.lastIndex = ticks.lastIndex;
+          break;
+        }
+      }
+    }
+  }
+  const candidates = [...text.matchAll(pattern)].map((match) => match.index);
+  if (candidates.some((position) => uncertain.some(([start, end]) => position >= start && position < end))) return null;
+  return candidates.filter((position) => !ignored.some(([start, end]) => position >= start && position < end));
+}
+/** A forgeable usage indicator, not publication or merge authority. */
+export function hasDeliveryPrMarker(body: string): boolean {
+  if (!body.endsWith(DeliveryPrFooter)) return false;
+  const prefix = body.slice(0, -DeliveryPrFooter.length);
+  const active = activeMarkerPositions(body, /<!--\s*ai-delivery:pr@[^\n]*?(?:-->|$)/gmu);
+  return Boolean(prefix.trim()) && active?.length === 1 && active[0] === prefix.length + 2;
+}
+export function hasDeliveryMergeTrailer(message: string): boolean {
+  const trailer = /\n\nDelivered-by: ai-delivery\n?$/u.exec(message);
+  if (!trailer || !message.slice(0, trailer.index).trim()) return false;
+  const active = activeMarkerPositions(message, /^Delivered-by: ai-delivery[ \t]*$/gmu);
+  return active?.length === 1 && active[0] === trailer.index + 2;
+}
+
+function publicationBody(body: string, previous: string | null | undefined): string {
+  function marked(value: string): boolean {
+    const active = activeMarkerPositions(value, /<!--\s*ai-delivery:pr@[^\n]*?(?:-->|$)/gmu);
+    if (active === null || (active.length > 0 && !hasDeliveryPrMarker(value)))
+      throw new DeliveryError('PR marker footer is malformed, misplaced or ambiguous; reconcile without repair.');
+    return active.length === 1;
+  }
+  const previousMarked = typeof previous === 'string' && marked(previous);
+  const requestedMarked = marked(body);
+  if (previous !== undefined && !previousMarked) {
+    if (requestedMarked) throw new DeliveryError('Historical unmarked PRs cannot receive a marker footer backfill.');
+    return body;
+  }
+  if (requestedMarked) return body;
+  const decorated = body + DeliveryPrFooter;
+  if (!hasDeliveryPrMarker(decorated))
+    throw new DeliveryError('PR marker footer would be ambiguous; retain the original body without repair.');
+  return decorated;
+}
+
+function deliverySquashMessage(body: string): string {
+  const substantive = hasDeliveryPrMarker(body) ? body.slice(0, -DeliveryPrFooter.length) : body;
+  if (hasDeliveryMergeTrailer(substantive)) return substantive;
+  const message = `${substantive}\n\nDelivered-by: ai-delivery`;
+  if (!hasDeliveryMergeTrailer(message))
+    throw new DeliveryError('Squash delivery trailer would be ambiguous; reconcile the message without repair.');
+  return message;
+}
 
 function hasClosingLink(body: string | null, issueNumber: number) {
   const line = `Closes #${issueNumber}`;
@@ -809,7 +990,7 @@ export async function listPrs(context: DeliveryContext, state: 'all' | 'closed' 
 }
 
 /** Enumerate configured requirements even when a check has never reported. */
-async function readRequiredCheckNames(context: DeliveryContext, base: string) {
+async function readRequiredCheckNames(context: PrReadContext, base: string) {
   const sources = await branchRuleSources(context, base);
   const { confirmedUnprotected, confirmedRulesetOnly } = await corroborateClassicProtectionAbsence(
     context,
@@ -884,9 +1065,14 @@ async function readRequiredCheckNames(context: DeliveryContext, base: string) {
 
 /** @internal Queue proof belongs to the exact published SHA and the required check producer. */
 export async function queueChecks(context: DeliveryContext, base: string, sha: string) {
+  return readRequiredCheckProof(context, base, sha, false);
+}
+async function readRequiredCheckProof(context: PrReadContext, base: string, sha: string, allowEmpty: boolean) {
   const requirements = await readRequiredCheckNames(context, base);
-  if (!requirements.complete || requirements.required.length === 0)
+  if (!requirements.complete || (!allowEmpty && requirements.required.length === 0))
     return { state: 'waiting' as const, reason: 'Required queue checks are absent or incompletely discovered.' };
+  if (requirements.required.length === 0)
+    return { state: 'passed' as const, reason: 'Native requirements are completely observed and empty.', proof: [] };
   const [runs, statuses] = await Promise.all([
     context.clients.rest.checks.listForRef({ ...context.repo, ref: sha, filter: 'latest', per_page: 100 }),
     context.clients.rest.repos.getCombinedStatusForRef({ ...context.repo, ref: sha, per_page: 100 }),
@@ -947,6 +1133,264 @@ export async function queueChecks(context: DeliveryContext, base: string, sha: s
     if (waiting) return { state: 'waiting' as const, reason: waiting };
   }
   return { state: 'passed' as const, reason: 'Current required queue SHA checks passed.', proof };
+}
+
+export interface PrBoardFacts {
+  repository: { id: string; name: string };
+  headRepository: { id: string; name: string };
+  number: number;
+  url: string;
+  title: string;
+  state: 'open' | 'closed';
+  draft: boolean;
+  nonClosing: boolean;
+  headSha: string;
+  baseSha: string;
+  headRef: string;
+  baseRef: string;
+  currentBaseSha: string | null;
+  mergeable: string | null;
+  mergeStateStatus: string | null;
+  review: RequiredReviewState;
+  checks: {
+    state: 'passed' | 'waiting' | 'failed';
+    reason: string;
+    complete: boolean;
+    proof?: Array<{ name: string; appId: number | null; id: number }>;
+  };
+  closingLinks: {
+    complete: boolean;
+    issues: Array<{ id: string; number: number; repository: { id: string; name: string } }>;
+  };
+  stable: boolean;
+  ready: boolean;
+  reasons: string[];
+}
+interface BoardNativePr {
+  id: string;
+  number: number;
+  state: string;
+  isDraft: boolean;
+  headRefOid: string;
+  baseRefOid: string;
+  headRefName: string;
+  baseRefName: string;
+  baseRepository: { id: string; nameWithOwner: string };
+  headRepository: { id: string; nameWithOwner: string };
+  mergeable: string;
+  mergeStateStatus: string;
+  closingIssuesReferences: NonNullable<
+    NonNullable<ClosingIssuesQuery['repository']>['pullRequest']
+  >['closingIssuesReferences'];
+}
+
+/** Current native observations for display only; never a merge grant. Fork heads are readable. */
+export async function readPrBoardFacts(context: PrReadContext, prNumber: number): Promise<PrBoardFacts> {
+  const repository = `${context.repo.owner}/${context.repo.repo}`;
+  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+  const baseRepo = pr.base.repo;
+  const headRepo = pr.head.repo;
+  if (
+    pr.number !== prNumber ||
+    !nativeId(pr.node_id) ||
+    pr.html_url?.toLowerCase() !== `https://github.com/${repository}/pull/${prNumber}`.toLowerCase() ||
+    typeof pr.title !== 'string' ||
+    (pr.body !== null && typeof pr.body !== 'string') ||
+    (pr.state !== 'open' && pr.state !== 'closed') ||
+    typeof pr.draft !== 'boolean' ||
+    typeof pr.merged !== 'boolean' ||
+    !baseRepo ||
+    !headRepo ||
+    !nativeId(baseRepo.node_id) ||
+    !nativeId(headRepo.node_id) ||
+    typeof baseRepo.full_name !== 'string' ||
+    typeof headRepo.full_name !== 'string' ||
+    baseRepo.full_name.toLowerCase() !== repository.toLowerCase() ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(headRepo.full_name) ||
+    typeof pr.head.ref !== 'string' ||
+    !pr.head.ref ||
+    typeof pr.base.ref !== 'string' ||
+    !pr.base.ref ||
+    !validSha(pr.head.sha) ||
+    !validSha(pr.base.sha)
+  )
+    throw new DeliveryError('Incomplete native PR identity for board display.');
+  // Native refs are observed names, not delivery branch inputs. Retain their
+  // exact bytes for the native comparisons and encoded API parameters below.
+  const baseRepository = { id: baseRepo.node_id, name: baseRepo.full_name };
+  const headRepository = { id: headRepo.node_id, name: headRepo.full_name };
+  const closingLinks: PrBoardFacts['closingLinks'] = { complete: false, issues: [] };
+  let native: BoardNativePr | null = null;
+  try {
+    let cursor: string | null = null;
+    const cursors = new Set<string>();
+    const issues = new Set<string>();
+    const issueNumbers = new Set<string>();
+    for (let page = 0; page < 20; page++) {
+      const data: { repository: { id: string; nameWithOwner: string; pullRequest: BoardNativePr | null } | null } =
+        await context.clients.graphql(
+          'query DeliveryBoardPr($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){id nameWithOwner pullRequest(number:$number){id number state isDraft headRefOid baseRefOid headRefName baseRefName baseRepository{id nameWithOwner} headRepository{id nameWithOwner} mergeable mergeStateStatus closingIssuesReferences(first:100,after:$cursor){nodes{__typename id number repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}',
+          { ...context.repo, number: prNumber, cursor },
+        );
+      const live = data.repository?.pullRequest;
+      const links = live?.closingIssuesReferences;
+      if (
+        data.repository?.id !== baseRepository.id ||
+        data.repository.nameWithOwner?.toLowerCase() !== repository.toLowerCase() ||
+        live?.id !== pr.node_id ||
+        live.number !== prNumber ||
+        live.headRefOid !== pr.head.sha ||
+        live.baseRefOid !== pr.base.sha ||
+        live.headRefName !== pr.head.ref ||
+        live.baseRefName !== pr.base.ref ||
+        live.baseRepository?.id !== baseRepository.id ||
+        live.baseRepository.nameWithOwner?.toLowerCase() !== baseRepository.name.toLowerCase() ||
+        live.headRepository?.id !== headRepository.id ||
+        live.headRepository.nameWithOwner?.toLowerCase() !== headRepository.name.toLowerCase() ||
+        live.state !== (pr.merged ? 'MERGED' : pr.state.toUpperCase()) ||
+        live.isDraft !== pr.draft ||
+        !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(live.mergeable) ||
+        typeof live.mergeStateStatus !== 'string' ||
+        (native !== null &&
+          (native.mergeable !== live.mergeable || native.mergeStateStatus !== live.mergeStateStatus)) ||
+        !links ||
+        !Array.isArray(links.nodes) ||
+        links.nodes.length > 100
+      )
+        throw new DeliveryError('Native PR board snapshot is incomplete or changed.');
+      native = live;
+      for (const issue of links.nodes) {
+        if (
+          issue?.__typename !== 'Issue' ||
+          !nativeId(issue.id) ||
+          !Number.isSafeInteger(issue.number) ||
+          issue.number <= 0 ||
+          !nativeId(issue.repository?.id) ||
+          typeof issue.repository.nameWithOwner !== 'string' ||
+          !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(issue.repository.nameWithOwner) ||
+          issues.has(issue.id) ||
+          issueNumbers.has(`${issue.repository.nameWithOwner.toLowerCase()}#${issue.number}`) ||
+          (issue.repository.nameWithOwner.toLowerCase() === repository.toLowerCase() &&
+            issue.repository.id !== baseRepository.id)
+        )
+          throw new DeliveryError('Native closing-issue board identity is incomplete.');
+        issues.add(issue.id);
+        issueNumbers.add(`${issue.repository.nameWithOwner.toLowerCase()}#${issue.number}`);
+        closingLinks.issues.push({
+          id: issue.id,
+          number: issue.number,
+          repository: { id: issue.repository.id, name: issue.repository.nameWithOwner },
+        });
+      }
+      cursor = pageCursor(links, cursors);
+      if (cursor === null) {
+        closingLinks.complete = true;
+        break;
+      }
+    }
+  } catch {
+    native = null;
+  }
+  const [decision, proof] = await Promise.allSettled([
+    readRequiredReviewState(context, prNumber, pr.head.sha),
+    readRequiredCheckProof(context, pr.base.ref, pr.head.sha, true),
+  ]);
+  const review: RequiredReviewState =
+    decision.status === 'fulfilled'
+      ? { ...decision.value, observed: decision.value.observed === true }
+      : {
+          observed: false,
+          reviewDecision: null,
+          status: 'unknown',
+          submittedReviewAuthorCanPushToRepository: null,
+          nextAction: 'Refresh exact-head native review evidence.',
+        };
+  const checks = {
+    ...(proof.status === 'fulfilled'
+      ? proof.value
+      : { state: 'waiting' as const, reason: 'Native required-check evidence is unavailable.' }),
+    complete: proof.status === 'fulfilled' && proof.value.state === 'passed',
+  };
+  const [current, reread] = await Promise.allSettled([
+    context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` }),
+    context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber }),
+  ]);
+  const ref = current.status === 'fulfilled' ? current.value.data : null;
+  const currentBaseSha =
+    ref?.ref === `refs/heads/${pr.base.ref}` && ref.object.type === 'commit' && validSha(ref.object.sha)
+      ? ref.object.sha
+      : null;
+  const final = reread.status === 'fulfilled' ? reread.value.data : null;
+  const stable =
+    final !== null &&
+    final.node_id === pr.node_id &&
+    final.number === pr.number &&
+    final.head.sha === pr.head.sha &&
+    final.base.sha === pr.base.sha &&
+    final.head.ref === pr.head.ref &&
+    final.base.ref === pr.base.ref &&
+    final.head.repo?.node_id === headRepository.id &&
+    final.head.repo.full_name?.toLowerCase() === headRepository.name.toLowerCase() &&
+    final.base.repo?.node_id === baseRepository.id &&
+    final.base.repo.full_name?.toLowerCase() === baseRepository.name.toLowerCase() &&
+    final.state === pr.state &&
+    final.merged === pr.merged &&
+    final.draft === pr.draft &&
+    final.body === pr.body &&
+    final.title === pr.title &&
+    final.mergeable === pr.mergeable &&
+    final.mergeable_state === pr.mergeable_state;
+  const reference = /^References ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#[1-9]\d*(?:\r?\n|$)/u.exec(pr.body ?? '');
+  const nonClosing = reference?.[1]?.toLowerCase() === repository.toLowerCase();
+  const reasons: string[] = [];
+  if (pr.state !== 'open' || pr.merged) reasons.push('pr-closed');
+  if (pr.draft) reasons.push('draft');
+  if (nonClosing) reasons.push('non-closing');
+  if (!native) reasons.push('native-eligibility-unknown');
+  else if (
+    native.mergeable !== 'MERGEABLE' ||
+    native.mergeStateStatus !== 'CLEAN' ||
+    pr.mergeable !== true ||
+    pr.mergeable_state !== 'clean'
+  )
+    reasons.push('native-not-clean');
+  if (!review.observed) reasons.push('review-unknown');
+  else if (review.reviewDecision !== 'APPROVED' && review.reviewDecision !== null)
+    reasons.push(review.reviewDecision === 'CHANGES_REQUESTED' ? 'changes-requested' : 'review-required');
+  if (checks.state !== 'passed') reasons.push(checks.state === 'failed' ? 'checks-failed' : 'checks-unproven');
+  if (!closingLinks.complete) reasons.push('closing-links-unknown');
+  else if (
+    !closingLinks.issues.some(
+      (issue) =>
+        issue.repository.id === baseRepository.id && issue.repository.name.toLowerCase() === repository.toLowerCase(),
+    )
+  )
+    reasons.push('no-closing-issue');
+  if (!stable) reasons.push('pr-drift-or-unavailable');
+  if (currentBaseSha !== pr.base.sha) reasons.push('base-moved-or-unavailable');
+  return {
+    repository: baseRepository,
+    headRepository,
+    number: pr.number,
+    url: pr.html_url,
+    title: pr.title,
+    state: pr.state,
+    draft: pr.draft,
+    nonClosing,
+    headSha: pr.head.sha,
+    baseSha: pr.base.sha,
+    headRef: pr.head.ref,
+    baseRef: pr.base.ref,
+    currentBaseSha,
+    mergeable: native?.mergeable ?? null,
+    mergeStateStatus: native?.mergeStateStatus ?? null,
+    review,
+    checks,
+    closingLinks,
+    stable,
+    ready: reasons.length === 0,
+    reasons,
+  };
 }
 
 export async function prChecks(context: DeliveryContext, prNumber: number) {
@@ -1021,7 +1465,7 @@ function emptyRulePage(response: { status: number; data: unknown; headers: { lin
   return completeRulePage(response) && Array.isArray(response.data) && response.data.length === 0;
 }
 
-function branchRuleSources(context: DeliveryContext, base: string, control?: { signal: AbortSignal }) {
+function branchRuleSources(context: PrReadContext, base: string, control?: { signal: AbortSignal }) {
   return Promise.allSettled([
     context.clients.rest.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
       ...context.repo,
@@ -1037,7 +1481,7 @@ function branchRuleSources(context: DeliveryContext, base: string, control?: { s
 }
 
 async function corroborateClassicProtectionAbsence(
-  context: DeliveryContext,
+  context: PrReadContext,
   base: string,
   [rulesetResult, protectionResult]: Awaited<ReturnType<typeof branchRuleSources>>,
   control?: { signal: AbortSignal; checkResources: () => Promise<void> },
@@ -1374,9 +1818,10 @@ export async function publishPr(
     input.body ?? pr?.body ?? (nonClosing ? referenceLine(context, input.issueNumber) : closingBody(issue));
   if ((nonClosing || input.body !== undefined) && !requestedBody.trim())
     throw new DeliveryError('PR body must contain text.');
-  const body = nonClosing
-    ? nonClosingBody(context, input.issueNumber, requestedBody)
-    : closingBody(issue, requestedBody);
+  const body = publicationBody(
+    nonClosing ? nonClosingBody(context, input.issueNumber, requestedBody) : closingBody(issue, requestedBody),
+    pr?.body,
+  );
   const closingRepair = !nonClosing && pr !== undefined && !hasClosingLink(pr.body, input.issueNumber);
   const transition = nonClosing && pr !== undefined && pr.body !== body;
   if (reconcileReference && transition)
@@ -1538,6 +1983,7 @@ export async function publishPr(
   if (input.dryRun)
     return {
       dryRun: true,
+      ...(pr === undefined ? { body } : {}),
       ...(pr === undefined ? {} : { prNumber: pr.number, draft: pr.draft }),
       ...(nonClosing
         ? {
@@ -1762,16 +2208,6 @@ export async function mergePr(
   let pr = await verifyIssuePr(context, input.issueNumber, input.prNumber, nonClosing);
   const initialPr = pr;
   const issue = nonClosing ? await openReferenceIssue(context, input.issueNumber) : undefined;
-  const squash = nonClosing
-    ? {
-        commit_title: pr.title,
-        commit_message: `${referenceLine(context, input.issueNumber)}\n\nDelivered by PR #${pr.number}.`,
-      }
-    : undefined;
-  if (squash) {
-    refuseClosingDirective(squash.commit_title);
-    refuseClosingDirective(squash.commit_message);
-  }
   if (input.reviewedHeadSha !== undefined && input.reviewedHeadSha !== pr.head.sha)
     throw new DeliveryError('Requested reviewed head differs from the GitHub PR.');
   if (pr.merged && pr.state === 'closed' && validSha(pr.merge_commit_sha))
@@ -1779,6 +2215,21 @@ export async function mergePr(
   if (pr.state !== 'open' || pr.draft) throw new DeliveryError('GitHub PR must be open and ready for merge.');
   if (pr.user.login.toLowerCase() !== author.actorLogin.toLowerCase())
     throw new DeliveryError('Merge requires the configured PR author.');
+  const squash =
+    (input.strategy ?? 'squash') === 'squash'
+      ? {
+          commit_title: pr.title,
+          commit_message: deliverySquashMessage(
+            nonClosing
+              ? `${referenceLine(context, input.issueNumber)}\n\nDelivered by PR #${pr.number}.`
+              : pr.body || `Closes #${input.issueNumber}`,
+          ),
+        }
+      : undefined;
+  if (nonClosing) {
+    refuseClosingDirective(squash!.commit_title);
+    refuseClosingDirective(squash!.commit_message);
+  }
   const reviewedHead = pr.head.sha;
   const blockers = await getNativeBlockerRelationships({
     graphql: context.clients.graphql,
@@ -1800,6 +2251,8 @@ export async function mergePr(
     sameReferencePr(initialPr, pr);
     sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
   }
+  if (squash && (pr.title !== initialPr.title || pr.body !== initialPr.body))
+    throw new DeliveryError('GitHub PR message changed; refresh squash delivery before merge.');
   if (pr.head.sha !== reviewedHead || pr.base.ref !== initialPr.base.ref || pr.base.sha !== initialPr.base.sha)
     throw new DeliveryError('GitHub head/base changed; refresh native merge eligibility.');
   if (
@@ -1824,7 +2277,8 @@ export async function mergePr(
       dryRun: true,
       headSha: reviewedHead,
       prNumber: pr.number,
-      ...(squash === undefined ? {} : { nonClosing: true, ...squash }),
+      ...(nonClosing ? { nonClosing: true } : {}),
+      ...squash,
     };
   if (queue) {
     await queue.checkProof();

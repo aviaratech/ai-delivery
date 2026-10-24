@@ -1,21 +1,26 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import {
   chmodSync,
   closeSync,
   constants,
   existsSync,
   fstatSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  readdirSync,
   readSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,6 +31,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'vitest';
 
 type Json = { [key: string]: unknown };
+type DiagnosticReads = { readSync?: typeof readSync; openSync?: typeof openSync; lstatSync?: typeof lstatSync };
 type Inputs = { source: string; version: string; digest: string };
 type DispatchInputs = Inputs & { qualificationOnly: string; artifactId: string };
 type ReleaseContext = {
@@ -111,6 +117,7 @@ const qualification = (await import(new URL('../scripts/current-qualification.mj
   }): Promise<{ qualified: boolean; error?: string }>;
 };
 type LaneChecks = {
+  executeCommand: unknown;
   RELEASE_CASES: {
     file: string;
     title: string;
@@ -143,6 +150,50 @@ function diagnosticStep(name: string) {
   return step;
 }
 
+function failureLogUpload(directory: string, outcome: string, scanned?: string) {
+  const step = diagnosticStep('Upload scanned failure logs');
+  const expression = /if: \$\{\{ (.+) \}\}/u.exec(step)?.[1];
+  assert.ok(expression);
+  const values: Record<string, unknown> = {
+    'always()': true,
+    'inputs.qualification_only': true,
+    'steps.failure_log_scan.outcome': outcome,
+    'steps.failure_log_scan.outputs.scanned': scanned ?? '',
+  };
+  const admitted = expression.split(' && ').every((term) => {
+    const comparison = /^(\S+) == '([^']*)'$/u.exec(term);
+    if (comparison) {
+      assert.ok(comparison[1]! in values, term);
+      return values[comparison[1]!] === comparison[2];
+    }
+    assert.ok(term in values, term);
+    return values[term] === true;
+  });
+  if (!admitted) return [];
+  const paths = /path: \|\n([\s\S]*?)\n\s+if-no-files-found:/u.exec(step)?.[1];
+  assert.ok(paths);
+  return paths
+    .trim()
+    .split('\n')
+    .map((line) => {
+      const prefix = '${{ steps.diagnostics.outputs.logs_directory }}/';
+      const path = line.trim();
+      assert.ok(path.startsWith(prefix));
+      const name = path.slice(prefix.length);
+      assert.ok(
+        [
+          'manifest.json',
+          'producer.stdout.txt',
+          'producer.stderr.txt',
+          'release.stdout.txt',
+          'release.stderr.txt',
+        ].includes(name),
+      );
+      return { name, path: join(directory, name) };
+    })
+    .filter((file) => existsSync(file.path));
+}
+
 // Test-only reader of the fixed observation format; qualification never consumes it.
 function decodeDiagnostic(wire: Json, source: string, sourceRoot: string, inventory = laneChecks.RELEASE_CASES): Json {
   assert.match(source, /^[a-f0-9]{40}$/u);
@@ -150,6 +201,7 @@ function decodeDiagnostic(wire: Json, source: string, sourceRoot: string, invent
   assert.deepEqual(Object.keys(wire).sort(), [
     'consumer',
     'inputs',
+    'logs',
     'observationOnly',
     'overall',
     'pack',
@@ -165,6 +217,27 @@ function decodeDiagnostic(wire: Json, source: string, sourceRoot: string, invent
   assert.equal(wire['observationOnly'], true);
   assert.equal(wire['qualified'], false);
   assert.equal(wire['promotionEligible'], false);
+  const logs = wire['logs'] as Json;
+  assert.deepEqual(Object.keys(logs).sort(), [
+    'bytes',
+    ...(Object.hasOwn(logs, 'cleanupConfirmed') ? ['cleanupConfirmed'] : []),
+    'files',
+    'status',
+  ]);
+  assert.ok(['unavailable', 'staged', 'refused'].includes(logs['status'] as string));
+  assert.ok(
+    Number.isSafeInteger(logs['bytes']) && Number(logs['bytes']) >= 0 && Number(logs['bytes']) <= 64 * 1024 * 1024,
+  );
+  if (Object.hasOwn(logs, 'cleanupConfirmed')) assert.equal(typeof logs['cleanupConfirmed'], 'boolean');
+  const logFiles = logs['files'];
+  assert.ok(Array.isArray(logFiles) && logFiles.length <= 4);
+  const logNames = ['producer.stdout.txt', 'producer.stderr.txt', 'release.stdout.txt', 'release.stderr.txt'];
+  for (const [index, value] of logFiles.entries()) {
+    const entry = value as Json;
+    assert.deepEqual(Object.keys(entry).sort(), ['name', 'status']);
+    assert.equal(entry['name'], logNames[index]);
+    assert.ok(['unavailable', 'missing', 'read', 'unsafe', 'oversized', 'changed'].includes(entry['status'] as string));
+  }
   const release = wire['release'] as Json;
   assert.deepEqual(Object.keys(release).sort(), [
     'caseEncoding',
@@ -344,10 +417,12 @@ function diagnosticFixture() {
   });
   save(`release-tests-${runId}/temporary/.npmrc`, sensitive);
   save('producer/command/stderr.txt', sensitive);
+  let outputs: Record<string, string> = {};
   const raw = (
     outcome = 'failure',
     env: Record<string, string | undefined> = {},
     inventory = laneChecks.RELEASE_CASES,
+    overrides: DiagnosticReads = {},
   ) => {
     const step = diagnosticStep('Prepare failed qualification diagnostics');
     const script = /node --input-type=module <<'JS'\n([\s\S]*?)\n\s+JS/u.exec(step)?.[1];
@@ -367,7 +442,9 @@ function diagnosticFixture() {
       readFileSync,
       readSync,
       realpathSync,
+      rmSync,
       writeFileSync,
+      ...overrides,
       appendFileSync: (path: string, value: string) => {
         assert.equal(path, output);
         writeFileSync(path, value, { flag: 'a' });
@@ -395,7 +472,16 @@ function diagnosticFixture() {
         },
       },
     });
-    const path = /^file=(.+)\n$/u.exec(readFileSync(output, 'utf8'))?.[1];
+    outputs = Object.fromEntries(
+      readFileSync(output, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const equal = line.indexOf('=');
+          return [line.slice(0, equal), line.slice(equal + 1)];
+        }),
+    );
+    const path = outputs['file'];
     assert.ok(path);
     assert.equal(dirname(dirname(path)), root);
     const bytes = readFileSync(path, 'utf8');
@@ -404,7 +490,8 @@ function diagnosticFixture() {
     assert.ok(!bytes.includes(root), 'runtime paths must not cross the public projection');
     return JSON.parse(bytes) as Json;
   };
-  const execute = (outcome = 'failure') => decodeDiagnostic(raw(outcome), 'a'.repeat(40), sourceRoot);
+  const execute = (outcome = 'failure', overrides: DiagnosticReads = {}) =>
+    decodeDiagnostic(raw(outcome, {}, laneChecks.RELEASE_CASES, overrides), 'a'.repeat(40), sourceRoot);
   const failures = (failureMessages: unknown, status = 'failed') =>
     save(`release-tests-${runId}/vitest.json`, {
       testResults: [
@@ -418,6 +505,12 @@ function diagnosticFixture() {
     const cases = (execute()['release'] as Json)['cases'] as Json[];
     return cases[0]!['failureFrames'];
   };
+  const log = (relative: string, bytes: string) => {
+    const path = join(qualificationRoot, relative);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes, { mode: 0o600 });
+    return path;
+  };
   return {
     root,
     sourceRoot,
@@ -430,8 +523,398 @@ function diagnosticFixture() {
     sensitive,
     failures,
     frames,
+    log,
+    logs: () => outputs['logs_directory'],
   };
 }
+
+test.each(['producer', 'release', 'both'] as const)(
+  'failed qualification stages exact fixed %s test output including the actual synthetic receipt',
+  (scope) => {
+    const f = diagnosticFixture();
+    try {
+      const receipt = 'SETUP_CLI_PHASE_RECEIPT {"scenario":"budget","nativeIdle":true}\n';
+      const expected: Record<string, string> = {};
+      for (const stage of ['producer', 'release'] as const) {
+        if (scope !== 'both' && scope !== stage) continue;
+        const directory = stage === 'producer' ? 'producer' : `release-tests-${f.runId}`;
+        for (const stream of ['stdout', 'stderr']) {
+          const bytes = stream === 'stdout' ? receipt : 'Synthetic test failure\n';
+          f.log(`${directory}/tests/${stream}.txt`, bytes);
+          expected[`${stage}.${stream}.txt`] = bytes;
+        }
+      }
+      if (scope === 'producer') rmSync(join(f.qualificationRoot, 'release-tests-attempt.json'));
+      const projection = f.execute();
+      const directory = f.logs();
+      assert.ok(directory, 'Fixed failed test logs must be staged for scanning.');
+      assert.equal(dirname(directory), f.root);
+      assert.equal(lstatSync(directory).mode & 0o777, 0o700);
+      const manifest = JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as Json;
+      assert.equal(manifest['observationOnly'], true);
+      assert.equal(manifest['qualified'], false);
+      assert.equal(manifest['promotionEligible'], false);
+      const files = manifest['files'] as { name: string; bytes: number; sha256: string }[];
+      assert.deepEqual(
+        files.map((file) => file.name),
+        Object.keys(expected),
+      );
+      for (const file of files) {
+        assert.equal(readFileSync(join(directory, file.name), 'utf8'), expected[file.name]);
+        assert.equal(file.bytes, Buffer.byteLength(expected[file.name]!));
+        assert.equal(file.sha256, canonical.sha256(expected[file.name]!));
+        assert.equal(lstatSync(join(directory, file.name)).mode & 0o777, 0o600);
+      }
+      assert.equal(JSON.stringify(projection).includes('SETUP_CLI_PHASE_RECEIPT'), false);
+      assert.equal(JSON.stringify(manifest).includes(f.sensitive), false);
+      assert.equal(JSON.stringify(manifest).includes(f.root), false);
+      const upload = failureLogUpload(directory, 'success', 'true');
+      assert.deepEqual(upload.map((file) => file.name).sort(), ['manifest.json', ...Object.keys(expected)].sort());
+      assert.ok(upload.some((file) => readFileSync(file.path, 'utf8').includes(receipt)));
+      assert.deepEqual(failureLogUpload(directory, 'failure', 'true'), []);
+      assert.deepEqual(failureLogUpload(directory, 'success'), []);
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const fault of [
+  'leaf-link',
+  'parent-link',
+  'hardlink',
+  'fifo',
+  'oversized',
+  'combined-limit',
+  'changed',
+  'deleted',
+  'parent-changed',
+  'parent-deleted',
+  'before-open',
+  'before-leaf',
+] as const) {
+  test(
+    `failed qualification refuses ${fault} test logs while retaining the safe projection`,
+    { tags: fault === 'fifo' ? ['release'] : [] },
+    () => {
+      const f = diagnosticFixture();
+      try {
+        const path = f.log('producer/tests/stdout.txt', 'SETUP_CLI_PHASE_RECEIPT {}\n');
+        if (fault === 'leaf-link' || fault === 'hardlink') {
+          const outside = join(f.root, 'private-unrelated');
+          writeFileSync(outside, f.sensitive);
+          rmSync(path);
+          if (fault === 'leaf-link') symlinkSync(outside, path);
+          else linkSync(outside, path);
+        }
+        if (fault === 'parent-link') {
+          const outside = join(f.root, 'private-tests');
+          renameSync(dirname(path), outside);
+          symlinkSync(outside, dirname(path));
+        }
+        if (fault === 'fifo') {
+          rmSync(path);
+          execFileSync('mkfifo', [path]);
+        }
+        if (fault === 'oversized' || fault === 'combined-limit') {
+          truncateSync(path, 32 * 1024 * 1024 + (fault === 'oversized' ? 1 : 0));
+          if (fault === 'combined-limit') f.log('producer/tests/stderr.txt', 'x');
+        }
+        const changing = ['changed', 'deleted', 'parent-changed', 'parent-deleted'].includes(fault);
+        const inode = changing ? lstatSync(path).ino : undefined;
+        const overrides: DiagnosticReads = {};
+        if (changing)
+          overrides.readSync = ((...args: Parameters<typeof readSync>) => {
+            const count = readSync(...args);
+            if (fstatSync(args[0]).ino === inode) {
+              if (fault === 'deleted') rmSync(path);
+              else if (fault === 'parent-changed' || fault === 'parent-deleted') {
+                renameSync(dirname(path), join(f.root, 'former-tests'));
+                if (fault === 'parent-changed') {
+                  mkdirSync(dirname(path));
+                  writeFileSync(path, 'replacement parent');
+                }
+              } else writeFileSync(path, 'changed after read');
+            }
+            return count;
+          }) as typeof readSync;
+        if (fault === 'before-open' || fault === 'before-leaf') {
+          f.log('producer/tests/stderr.txt', 'Other available log must not authorize changed input.');
+          if (fault === 'before-open')
+            overrides.openSync = ((...args: Parameters<typeof openSync>) => {
+              if (args[0] === path) rmSync(path);
+              return openSync(...args);
+            }) as typeof openSync;
+          else
+            overrides.lstatSync = ((...args: Parameters<typeof lstatSync>) => {
+              if (args[0] === path) renameSync(dirname(path), join(f.root, 'former-tests'));
+              return lstatSync(...args);
+            }) as typeof lstatSync;
+        }
+        const projection = f.execute('failure', overrides);
+        assert.equal(f.logs(), undefined, 'Unsafe or oversized bytes must never be offered for upload.');
+        assert.equal(projection['observationOnly'], true);
+        assert.ok(projection['logs'], 'The safe projection must report fixed log availability states.');
+        assert.equal((projection['logs'] as Json)['status'], 'refused');
+      } finally {
+        rmSync(f.root, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test('missing failure logs retain explicit availability without inventing raw output', () => {
+  const f = diagnosticFixture();
+  try {
+    const projection = f.execute();
+    assert.equal(f.logs(), undefined);
+    assert.equal((projection['logs'] as Json)['status'], 'unavailable');
+    assert.equal(((projection['logs'] as Json)['files'] as Json[]).length, 4);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+async function scanFixture(scenario: string) {
+  const f = diagnosticFixture();
+  const receipt = 'SETUP_CLI_PHASE_RECEIPT {"scenario":"budget","nativeIdle":true}\n';
+  f.log('producer/tests/stdout.txt', receipt);
+  f.log('producer/tests/stderr.txt', 'Synthetic test failure\n');
+  f.execute();
+  const directory = f.logs();
+  assert.ok(directory);
+  if (scenario === 'extra-staged') writeFileSync(join(directory, 'unrelated-config'), f.sensitive);
+  if (scenario === 'unsafe-staged') {
+    rmSync(join(directory, 'producer.stdout.txt'));
+    symlinkSync(join(f.qualificationRoot, 'producer/tests/stdout.txt'), join(directory, 'producer.stdout.txt'));
+  }
+  if (scenario === 'manifest-fields') {
+    const path = join(directory, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(path, 'utf8')) as Json;
+    manifest['unreviewed'] = f.sensitive;
+    writeFileSync(path, JSON.stringify(manifest));
+  }
+  const statePath = join(f.root, 'docker-state.json');
+  const image = 'sha256:' + '1'.repeat(64);
+  const owned = 'c'.repeat(64);
+  const unrelated = 'f'.repeat(64);
+  const initial = {
+    image,
+    scannedFiles: [] as string[],
+    imagePresent: scenario !== 'image-pull',
+    containers: [{ Id: unrelated, Name: '/unrelated', Image: image, Config: { Labels: {} }, State: { Running: true } }],
+  };
+  writeFileSync(statePath, JSON.stringify(initial));
+  const bin = join(f.root, 'bin');
+  mkdirSync(bin);
+  const cli = join(bin, 'docker');
+  // Substitute only the external daemon boundary; real workflow supervision, capture and cancellation run.
+  writeFileSync(
+    cli,
+    `#!${process.execPath}
+const fs = require('node:fs');
+const path = ${JSON.stringify(statePath)}, directory = ${JSON.stringify(directory)}, scenario = ${JSON.stringify(scenario)};
+const args = process.argv.slice(2), state = JSON.parse(fs.readFileSync(path, 'utf8'));
+const save = () => { fs.writeFileSync(path + '.next', JSON.stringify(state)); fs.renameSync(path + '.next', path); };
+const out = value => process.stdout.write(JSON.stringify(value) + '\\n');
+const option = name => args[args.indexOf(name) + 1];
+if (process.env.GH_TOKEN || process.env.SECRET_VALUE) process.exit(96);
+if (args[0] === 'image' && args[1] === 'inspect') {
+  if (!state.imagePresent) process.exit(1);
+  out({ Id: state.image, RepoDigests: ['ghcr.io/trufflesecurity/trufflehog@sha256:' + '2'.repeat(64)] });
+} else if (args[0] === 'pull') { state.imagePresent = true; save(); process.stdout.write('synthetic pinned image ready\\n'); }
+else if (args[0] === 'create') {
+  const labels = {};
+  args.forEach((value, index) => { if (value === '--label') { const [key, ...rest] = args[index + 1].split('='); labels[key] = rest.join('='); } });
+  const container = { Id: '${owned}', Name: '/' + option('--name'), Image: state.image, Config: { Labels: labels, User: args.includes('--user') ? option('--user') : '', Cmd: args.slice(args.indexOf(state.image) + 1) }, Mounts: [{ Type: 'bind', Source: directory, Destination: '/logs', RW: false }], HostConfig: { Memory: Number(option('--memory')), MemorySwap: Number(option('--memory-swap')), NetworkMode: option('--network'), ReadonlyRootfs: args.includes('--read-only'), CapDrop: [option('--cap-drop')], SecurityOpt: [option('--security-opt')], LogConfig: { Type: option('--log-driver') }, PidsLimit: Number(option('--pids-limit')) }, State: { Running: false, ExitCode: 0, OOMKilled: false } };
+  if (scenario === 'resource') container.HostConfig.Memory = 0;
+  if (scenario === 'inaccessible') container.Config.User = '999:999';
+  state.containers.push(container); save();
+  if (scenario === 'create-ack') process.exit(7);
+  if (scenario === 'malformed-ack') { process.stdout.write('created ' + container.Id + '\\n'); process.exit(0); }
+  process.stdout.write(container.Id + '\\n');
+} else if (args[0] === 'start') {
+  const container = state.containers.find(value => value.Id === args.at(-1));
+  if (!container) process.exit(3);
+  container.State.Running = true; save();
+  if (scenario === 'cancel') setInterval(() => {}, 1000);
+  else if (scenario === 'overflow') process.stdout.write(Buffer.alloc(33 * 1024 * 1024, 120));
+  else {
+    container.State.Running = false;
+    container.State.ExitCode = scenario === 'findings' ? 183 : 0;
+    const user = fs.lstatSync(directory), canRead = container.Config.User === user.uid + ':' + user.gid;
+    const paths = container.Config.Cmd.slice(1).filter(value => value.startsWith('/logs'));
+    const explicit = paths.length > 0 && paths.every(value => value.startsWith('/logs/'));
+    const error = !canRead || scenario === 'scan-error' || scenario === 'directory-error';
+    state.scannedFiles = error ? [] : (explicit ? paths.map(value => value.slice(6)) : fs.readdirSync(directory));
+    // Pinned TruffleHog directory walking can log an error yet return zero; exact file-unit errors propagate.
+    if (error && container.Config.Cmd.includes('--fail-on-scan-errors') && (scenario === 'scan-error' || explicit)) container.State.ExitCode = 1;
+    if (scenario === 'foreign') container.Config.Labels = {};
+    if (scenario === 'drift') fs.writeFileSync(directory + '/producer.stdout.txt', 'changed after scan');
+    save();
+    if (scenario === 'findings') { process.stdout.write('SENSITIVE_SCANNER_FINDING\\n'); process.exit(183); }
+    if (container.State.ExitCode) { process.stderr.write('SENSITIVE_SCANNER_FINDING file read error\\n'); process.exit(container.State.ExitCode); }
+  }
+} else if (args[0] === 'container' && args[1] === 'inspect') {
+  const selector = args.at(-1), container = state.containers.find(value => value.Id === selector || value.Name === '/' + selector);
+  if (!container) process.exit(1);
+  out(container);
+} else if (args[0] === 'container' && args[1] === 'ls') {
+  const filters = args.flatMap((value, index) => value === '--filter' ? [args[index + 1]] : []);
+  for (const container of state.containers) {
+    const matches = filters.every(filter => {
+      if (filter.startsWith('name=')) return new RegExp(filter.slice(5)).test(container.Name);
+      if (filter.startsWith('label=')) { const [key, ...rest] = filter.slice(6).split('='); return container.Config.Labels[key] === rest.join('='); }
+      return false;
+    });
+    if (matches) process.stdout.write(container.Id + '\\n');
+  }
+} else if (args[0] === 'container' && args[1] === 'rm') {
+  if (scenario === 'cleanup') process.exit(8);
+  state.containers = state.containers.filter(value => value.Id !== args.at(-1)); save();
+} else process.exit(88);
+`,
+    { mode: 0o755 },
+  );
+  const output = join(f.root, 'scan-output');
+  writeFileSync(output, '');
+  let visibleError = '';
+  const host = Object.assign(new EventEmitter(), {
+    env: {
+      PATH: bin + ':' + (process.env.PATH ?? ''),
+      RUNNER_TEMP: f.root,
+      LOGS_DIRECTORY: directory,
+      GITHUB_WORKSPACE: process.cwd(),
+      GITHUB_OUTPUT: output,
+      GITHUB_RUN_ID: '101',
+      GITHUB_RUN_ATTEMPT: '1',
+      REVIEWED_SOURCE_SHA: 'a'.repeat(40),
+      GH_TOKEN: f.sensitive,
+      SECRET_VALUE: f.sensitive,
+    },
+    exitCode: 0,
+    stderr: {
+      write: (bytes: string) => {
+        visibleError += bytes;
+      },
+    },
+  });
+  let timer: ReturnType<typeof setInterval> | undefined;
+  try {
+    const script = /node --input-type=module <<'JS'\n([\s\S]*?)\n\s+JS/u.exec(
+      diagnosticStep('Scan failed qualification logs'),
+    )?.[1];
+    assert.ok(script);
+    const program = script.replace(/^\s*import .+;\n/gmu, '');
+    if (scenario === 'cancel')
+      timer = setInterval(() => {
+        const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
+          containers: { Id: string; State: { Running: boolean } }[];
+        };
+        if (state.containers.some((value) => value.Id === owned && value.State.Running)) host.emit('SIGTERM');
+      }, 50);
+    await new Script('(async () => {\n' + program + '\n})()').runInNewContext({
+      constants,
+      closeSync,
+      fstatSync,
+      lstatSync,
+      mkdirSync,
+      mkdtempSync,
+      openSync,
+      readFileSync,
+      readdirSync,
+      readSync,
+      realpathSync,
+      writeFileSync,
+      createHash,
+      randomUUID,
+      appendFileSync: (path: string, bytes: string) => writeFileSync(path, bytes, { flag: 'a' }),
+      basename,
+      dirname,
+      join,
+      resolve,
+      Buffer,
+      AbortController,
+      process: host,
+      executeCommand: laneChecks.executeCommand,
+    });
+    const values = Object.fromEntries(
+      readFileSync(output, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const equal = line.indexOf('=');
+          return [line.slice(0, equal), line.slice(equal + 1)];
+        }),
+    );
+    const resultPath = values['receipt'];
+    assert.ok(resultPath, 'Scanner must retain its custody and cleanup result.');
+    const result = JSON.parse(readFileSync(resultPath, 'utf8')) as Json;
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as typeof initial;
+    assert.deepEqual(
+      state.containers.find((value) => value.Id === unrelated),
+      initial.containers[0],
+    );
+    assert.equal(state.image, image, 'Reusable pinned scanner image must remain available.');
+    assert.equal(visibleError.includes('SENSITIVE_SCANNER_FINDING'), false);
+    assert.equal(visibleError.includes(f.sensitive), false);
+    for (const command of result['commands'] as Json[]) {
+      assert.ok(
+        lstatSync(command['stdoutPath'] as string).size + lstatSync(command['stderrPath'] as string).size <=
+          32 * 1024 * 1024,
+      );
+      assert.equal(command['cleanupConfirmed'], true);
+    }
+    if (scenario === 'success' || scenario === 'image-pull') {
+      assert.equal(values['scanned'], 'true');
+      assert.equal(host.exitCode, 0);
+      assert.deepEqual(
+        state.scannedFiles.sort(),
+        ['manifest.json', 'producer.stdout.txt', 'producer.stderr.txt'].sort(),
+      );
+      assert.equal(readFileSync(join(directory, 'producer.stdout.txt'), 'utf8'), receipt);
+      assert.ok(
+        failureLogUpload(directory, 'success', values['scanned']).some((file) =>
+          readFileSync(file.path, 'utf8').includes(receipt),
+        ),
+      );
+    } else {
+      assert.equal(values['scanned'], undefined, 'Unscanned or uncertain bytes cannot become upload-eligible.');
+      assert.equal(host.exitCode, 1);
+      assert.deepEqual(failureLogUpload(directory, 'failure', values['scanned']), []);
+    }
+    const retained = state.containers.some((value) => value.Id === owned);
+    assert.equal(retained, scenario === 'cleanup' || scenario === 'foreign');
+    assert.equal(result['cleanupConfirmed'], !retained);
+  } finally {
+    if (timer !== undefined) clearInterval(timer);
+    rmSync(f.root, { recursive: true, force: true });
+  }
+}
+
+test.each([
+  'success',
+  'image-pull',
+  'findings',
+  'overflow',
+  'cancel',
+  'resource',
+  'drift',
+  'create-ack',
+  'cleanup',
+  'foreign',
+  'extra-staged',
+  'unsafe-staged',
+  'manifest-fields',
+  'inaccessible',
+  'scan-error',
+  'directory-error',
+  'malformed-ack',
+])(
+  'failure-log scanner gates upload and preserves unrelated resources after %s',
+  { tags: ['release'] },
+  async (scenario) => scanFixture(scenario),
+);
 
 test.each([1110, 1114, 1122])('diagnostic frames preserve the public closure helper and caller at %s', (caller) => {
   const f = diagnosticFixture();
@@ -548,6 +1031,11 @@ test.each([
   'matched-empty',
   'no-match-frames',
   'message-order',
+  'logs-status',
+  'logs-extra',
+  'logs-path',
+  'logs-bytes',
+  'logs-duplicate',
 ])('diagnostic reader refuses malformed %s observations without guessing identities', (failure) => {
   const f = diagnosticFixture();
   try {
@@ -597,6 +1085,12 @@ test.each([
         [...coordinates[0]!.slice(0, 3), 2],
         [...coordinates[0]!.slice(0, 3), 1],
       ];
+    const logs = wire['logs'] as Json;
+    if (failure === 'logs-status') logs['status'] = 'invented';
+    if (failure === 'logs-extra') logs['path'] = f.root;
+    if (failure === 'logs-path') (logs['files'] as Json[])[0]!['name'] = f.root;
+    if (failure === 'logs-bytes') logs['bytes'] = 64 * 1024 * 1024 + 1;
+    if (failure === 'logs-duplicate') (logs['files'] as Json[])[1] = (logs['files'] as Json[])[0]!;
     assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot));
   } finally {
     rmSync(f.root, { recursive: true, force: true });
@@ -697,6 +1191,10 @@ test('diagnostics retain the complete release inventory with four seven-digit fr
       command,
     });
     f.save(`consumer-${f.runId}/result.json`, { status: 'incomplete', cleanup: { removed: false, quiescent: false } });
+    // Include the complete bounded #199 raw-log availability envelope.
+    const logBytes = 'x'.repeat(16 * 1024 * 1024);
+    for (const directory of ['producer', `release-tests-${f.runId}`])
+      for (const stream of ['stdout', 'stderr']) f.log(`${directory}/tests/${stream}.txt`, logBytes);
     f.save(`release-tests-${f.runId}/vitest.json`, {
       numTotalTests: Number.MAX_SAFE_INTEGER,
       numPassedTests: Number.MAX_SAFE_INTEGER,
@@ -868,6 +1366,8 @@ test('failed qualification diagnostics have an isolated nonpromotable workflow b
   assert.doesNotMatch(prepare + upload, /continue-on-error|overwrite:|id-token:|npm run|npm pack/u);
   const fixture = originFixture();
   fixture.metadata.artifact['name'] = 'npm-qualification-diagnostics-2';
+  assert.throws(() => api.validateQualificationOrigin(fixture.metadata, fixture.inputs));
+  fixture.metadata.artifact['name'] = 'npm-qualification-failure-logs-2';
   assert.throws(() => api.validateQualificationOrigin(fixture.metadata, fixture.inputs));
 });
 

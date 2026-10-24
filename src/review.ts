@@ -203,7 +203,7 @@ export interface RequiredReviewState {
 
 /** GitHub's PR decision is the live requirement state, not the state of one submitted review. */
 export async function readRequiredReviewState(
-  context: DeliveryContext,
+  context: Pick<DeliveryContext, 'clients' | 'repo'>,
   prNumber: number,
   expectedHead: string,
   submittedReview?: { id: number; login: string; state?: 'APPROVED' | 'CHANGES_REQUESTED' },
