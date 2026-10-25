@@ -745,6 +745,126 @@ export const RELEASE_CASES = [
     title: "actual CLI output flags [ '--json', '--verbose' ]",
     kind: 'mandatory',
   },
+  {
+    file: 'dist/issueIntake.test.js',
+    title: 'CLI typed field files reach status privacy validation before configuration',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issueIntake.test.js',
+    title:
+      'actual compiled stdio MCP returns every Ready diagnostic before credentials and refuses a foreign caller repo',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issueIntake.test.js',
+    title: 'intake skill example is Ready and every CLI line has actual required options and an explicit identity',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'actual CLI serializes incomplete native update evidence and exits nonzero',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-plan@1","scopeComplete":true,"summary":{"unresolved":4}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-plan@1","scopeComplete":false})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"failed":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"drifted":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"refused":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"unknown":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"unresolved":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":2,"satisfied":1,"failed":0,"drifted":0,"refused":0,"unknown":0,"unresolved":0}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'actual board CLI advertises bounded data-only files and validates them before credentials',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI version agrees with its adjacent package independently of caller cwd',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI preserves recoverable start JSON and exits nonzero after creation failure',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI known-issue incomplete start preserves recovery JSON and exits nonzero',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'the extracted real CLI error renderer preserves ordinary refusal, exit and stdout',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'the real CLI renderer bounds diagnostics and leaves the unchanged refusal line last',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI batch partial failure prints every result before returning nonzero',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'actual CLI batch input validates before configuration or native access',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/dependencyCompatibility.test.js',
+    title: 'SDK stdio starts a synthetic server, discovers a tool, validates input and closes',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/prAssociation.test.js',
+    title:
+      'directory-independent exact-PR contract documents explicit issue/PR selection in actual CLI help without credentials or a checkout',
+    kind: 'mandatory',
+  },
 ];
 
 export const SKIP_ALLOWLIST = [
