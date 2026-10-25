@@ -47,6 +47,8 @@ Use `~/.config/aviaratech-ai/ai-delivery.json`, or an absolute `AI_DELIVERY_CONF
 
 Keep credentials outside source control. An absent conventional `GH_TOKEN` selects the existing active `gh` personal session; an empty/invalid value fails without switching accounts. Custom token references require their exact value. The reviewer uses its distinct configured App, with no personal fallback. Read [credentials and readiness](plugins/ai-delivery/README.md#credentials-and-readiness), including GUI environment limits, legacy App references and selected key sources.
 
+The illustrated reviewer profile reads unencrypted RSA PEM from `GH_PRIVATE_KEY_DELIVERY_REVIEWER` when `credentialSource` is omitted. Supply it through your existing secret mechanism. Optional env/file/command sources follow the [configuration schema](src/config/deliveryConfig.ts); a failed source never selects another.
+
 ## Five-minute reviewer setup
 
 Configure a distinct installed App with `contents:read` and `pull_requests:write`, its actual identity/provider, and one supported credential source. Authentication does not prove counted approval. Follow the [independent reviewer command](plugins/ai-delivery/README.md#independent-reviewer-command) and [review schemas](src/review.ts). Strict `review submit` requires requested/effective model metadata and provider compatibility; never fabricate unexposed metadata. Established integrations retain the `pr:review --artifact` route.
