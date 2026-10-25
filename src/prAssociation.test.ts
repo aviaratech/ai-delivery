@@ -1355,40 +1355,44 @@ describe('directory-independent exact-PR contract', () => {
     }
   });
 
-  it('documents explicit issue/PR selection in actual CLI help without credentials or a checkout', () => {
-    const root = mkdtempSync(join(tmpdir(), 'delivery-pr-help-'));
-    try {
-      const help = execFileSync(process.execPath, [resolve('dist/cli.js'), 'pr:info', '--help'], {
-        cwd: root,
-        env: { HOME: root, PATH: process.env.PATH },
-        encoding: 'utf8',
-      });
-      assert.match(help, /combine --issue and --pr/u);
-      assert.match(help, /issue-only lookup requires a GitHub-linked\s+branch/u);
-      const creationHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), 'pr:create', '--help'], {
-        cwd: root,
-        env: { HOME: root, PATH: process.env.PATH },
-        encoding: 'utf8',
-      }).replace(/\s+/gu, ' ');
-      assert.match(creationHelp, /Create or reuse an issue-closing PR from a pushed --head, from any directory/u);
-      assert.match(creationHelp, /--base <branch>/u);
-      assert.match(creationHelp, /Pushed remote head/u);
-      assert.match(creationHelp, /--pr <number>/u);
-      assert.match(creationHelp, /--reconcile-non-closing-reference/u);
-      assert.match(creationHelp, /--expected-head <sha>/u);
-      assert.match(creationHelp, /--expected-base <sha>/u);
-      for (const command of ['pr:create', 'pr:info', 'pr:review', 'pr:merge', 'finish']) {
-        const modeHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), command, '--help'], {
+  it(
+    'documents explicit issue/PR selection in actual CLI help without credentials or a checkout',
+    { tags: ['release'] },
+    () => {
+      const root = mkdtempSync(join(tmpdir(), 'delivery-pr-help-'));
+      try {
+        const help = execFileSync(process.execPath, [resolve('dist/cli.js'), 'pr:info', '--help'], {
           cwd: root,
           env: { HOME: root, PATH: process.env.PATH },
           encoding: 'utf8',
         });
-        assert.match(modeHelp, /--non-closing/u);
+        assert.match(help, /combine --issue and --pr/u);
+        assert.match(help, /issue-only lookup requires a GitHub-linked\s+branch/u);
+        const creationHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), 'pr:create', '--help'], {
+          cwd: root,
+          env: { HOME: root, PATH: process.env.PATH },
+          encoding: 'utf8',
+        }).replace(/\s+/gu, ' ');
+        assert.match(creationHelp, /Create or reuse an issue-closing PR from a pushed --head, from any directory/u);
+        assert.match(creationHelp, /--base <branch>/u);
+        assert.match(creationHelp, /Pushed remote head/u);
+        assert.match(creationHelp, /--pr <number>/u);
+        assert.match(creationHelp, /--reconcile-non-closing-reference/u);
+        assert.match(creationHelp, /--expected-head <sha>/u);
+        assert.match(creationHelp, /--expected-base <sha>/u);
+        for (const command of ['pr:create', 'pr:info', 'pr:review', 'pr:merge', 'finish']) {
+          const modeHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), command, '--help'], {
+            cwd: root,
+            env: { HOME: root, PATH: process.env.PATH },
+            encoding: 'utf8',
+          });
+          assert.match(modeHelp, /--non-closing/u);
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
       }
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 });
 
 describe('explicit native non-closing reference delivery', () => {
