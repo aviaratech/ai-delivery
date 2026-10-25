@@ -1,16 +1,45 @@
 ---
-name: 'ai-delivery:pr-handoff'
-description: Use when publishing, independently reviewing or merging a GitHub-linked ai-delivery change.
+name: "ai-delivery:pr-handoff"
+description: Open a PR for a GitHub issue, get it independently reviewed through a reviewer App, and merge it.
 ---
 
-# Pull request handoff
+# PR handoff
 
-**Required before mutations:** Read [authority/recovery](../../README.md#authority-and-recovery) and [independent review](../../README.md#independent-review). For partial delivery, also read the complete [nonclosing contract](../../README.md#nonclosing-pull-requests); its exact-grant and uncertain-attempt rules are mandatory.
+Use this after your change is committed and pushed on the issue branch. The
+target repo's own rules (its `AGENTS.md` or `CONTRIBUTING.md`) decide which
+checks run and whether review is required.
 
-Identify operation/side effects, canonical repo/issue/PR, branch, exact head/current base and configured author/reviewer. Preserve original human authority separately from communication, access, admission, review, counted approval and execution. Inspect original scope when needed; label relays honestly. Reuse verified authority without redundant approval. Flags, START and dry runs add no authority. Preserve holds/refusals; do not reroute denied actions or blindly retry uncertain writes.
+```sh
+# Open the PR as a draft.
+ai-delivery --repo <owner/name> pr:create --issue <n> --body-file pr-body.md
 
-Run repository-owned proportionate checks; record selection and omitted proof. Hosts own commits/pushes/worktrees. Dry-run `issue_pr_create` with explicit repo, issue and body; inspect actors/rules before authorized draft publication. New nonclosing publication additionally requires the concrete head/base/author/body grant and bounded reference action from the required contract. Do not infer removal authority or create replacement drafts.
+# The reviewer reads the exact head and diff, writes verdict.json, then submits it.
+ai-delivery review submit --pr <pr> --head <sha> --identity <reviewer-profile> \
+  --verdict verdict.json --repo <owner/name>
 
-Obtain independent exact-commit/tree/diff review. Submit the reviewer's completed artifact through `issue_pr_review`/`pr:review`, or its strict verdict through the compatible explicit-profile `review submit` route. Record actual model metadata honestly. Reconcile uncertain submission; verify exact review readback and required approval counts. A profile mismatch grants no configuration/credential workaround.
+# Mark it ready, check it, and merge.
+ai-delivery --repo <owner/name> pr:create --issue <n> --ready
+ai-delivery --repo <owner/name> pr:checks --pr <pr>
+ai-delivery --repo <owner/name> finish --issue <n> --pr <pr> --reviewed-head <sha>
+```
 
-Promote unchanged source only within authority. Merge requires fresh current-base native eligibility, required green CI and reviewed SHA. Changed source requires refreshed checks/review. `finish` closes only complete issues; nonclosing delivery uses guarded `pr:merge` and keeps the issue OPEN. Hosts verify owned cleanup.
+## Rules
+
+- **Review.** The builder never submits its own review. A separate reviewer
+  agent writes the `ai-delivery.review-verdict@1` file, which holds:
+  - the verdict, approve or request-changes;
+  - its findings, each marked blocking or non-blocking.
+
+  The reviewer submits that file itself.
+- **New head.** If the head changes after review, the reviewer reviews the new
+  head before merge.
+- **Merging.** `finish` merges only when GitHub says the PR can merge at the
+  reviewed head with its required checks green. If it refuses, fix the reason
+  it gives. Don't merge another way.
+- **Unclear results.** If a command times out or its result is unclear, run
+  `pr:info` before retrying, so you don't create a duplicate.
+- **Reviewer setup.** To check a reviewer App's setup without posting
+  anything, run `ai-delivery review doctor --identity <profile>`.
+- **Credentials.** Never print them.
+- **Partial fixes.** For a fix that should leave the issue open, see the
+  README's `--non-closing` notes. This is rare.

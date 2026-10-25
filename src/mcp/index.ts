@@ -12,14 +12,8 @@ import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
 
 export { AI_DELIVERY_MCP_CONTRACT_VERSION, AI_DELIVERY_MCP_TOOLS } from './tools.js';
 
-const SERVER_INSTRUCTIONS = [
-  'Use these ai-delivery GitHub issue and pull request tools for ordinary requests, including "Use the ai-delivery MCP issue_info tool to read owner/name issue N".',
-  'Carry the repository named by the user into the repo argument (owner/name). Ordinary remote issue/PR tools work outside Git with an explicit repo; do not move into a checkout to read an issue.',
-  'In Claude Code, when bare and plugin-qualified ai-delivery tools coexist, discover the installed plugin provider and inspect its schema before calling. The observed plugin example is mcp__plugin_ai-delivery_ai-delivery__issue_info with {"repo":"example/widget","issueNumber":17}; use the requested repository and issue instead. This Claude namespace is not a universal tool name for other hosts.',
-  'A different issue_info accepting issueNumber/cached but no repo cannot receive that repository argument. Do not add unsupported fields or select a provider by name similarity alone. Honor an explicitly requested provider; if it is unavailable or incompatible, report that limitation rather than silently substituting.',
-  'Preserve read-only and MCP-only intent: do not create/update/start, use another GitHub provider or fall back to a CLI for such a read. Do not alter registrations, permissions, actors, credentials or host settings to make it work.',
-  'Retained local runtime, transition and investigation modes keep their separate checkout and authority requirements.',
-].join('\n');
+const SERVER_INSTRUCTIONS =
+  'Use issue_info with an explicit repo; follow repository policy for checks and authorization, and respect requested providers and read-only intent.';
 
 export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls?: Set<Promise<unknown>>): McpServer {
   const server = new McpServer(

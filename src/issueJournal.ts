@@ -110,21 +110,6 @@ export const JournalInputSchema = z
         ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });
   });
 
-/** A bounded plain-text preview cannot introduce journal labels, fences or HTML. */
-function journalPreview(value: string, limit: number): string {
-  const tokens = Array.from(value.replace(/[\p{Cc}\p{Cf}\s]+/gu, ' ').trim(), (character) =>
-    '&<>*_`~\\[]'.includes(character) ? `&#${character.codePointAt(0)};` : character,
-  );
-  const complete = tokens.join('');
-  if (complete.length <= limit) return complete;
-  let preview = '';
-  for (const token of tokens) {
-    if (preview.length + token.length > limit - 1) break;
-    preview += token;
-  }
-  return `${preview}…`;
-}
-
 export function renderJournal(raw: JournalInput, marker?: string): string {
   const input = JournalVariants.parse(raw);
   const field = (label: string, value: string): string =>
@@ -157,7 +142,7 @@ export function renderJournal(raw: JournalInput, marker?: string): string {
     `**Evidence:** ${input.evidence.length ? input.evidence.join(' · ') : 'None yet.'}`,
   );
   if (input.details) sections.push(input.details);
-  let body = `Status: ${journalPreview(input.status, 20)}. Next: ${journalPreview(input.nextStep, 48)}. ${input.summary}`;
+  let body = input.summary;
   let overflow = '';
   for (const section of sections) {
     if (overflow || body.length + section.length + 2 > (input.lengthCap ?? 1800)) overflow += `\n\n${section}`;
