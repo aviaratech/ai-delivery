@@ -1,22 +1,21 @@
 ---
-name: "ai-delivery:worktree-lifecycle"
-description: Start a GitHub-linked issue branch, prepare a host-owned worktree and verify its change through repository contributor checks.
+name: 'ai-delivery:worktree-lifecycle'
+description: Start a GitHub-linked issue branch and prepare a host-owned worktree.
 ---
 
-# Host-owned worktree lifecycle
+# Worktree lifecycle
 
-Read user configuration and inspect `ai-delivery --repo <owner/name> config:resolve`. Confirm configured author and independent reviewer actors and repository access. Unknown GitHub rule visibility remains unknown.
+Read the target repository's `AGENTS.md` and `CONTRIBUTING.md` before changing it.
+Use `issue_info` and `issue_ready_check` with an explicit `repo`, then
+`issue_start` to create or reuse the existing issue's GitHub-linked branch.
 
-Use `issue_info` and `issue_ready_check` with an explicit `repo`, then `issue_start` with the existing issue number to create or reuse its GitHub-linked branch. Prepare the local worktree using the host's supported worktree tools. Follow the target repository's contributor policy. When it specifies fast local checks plus focused tests and a CI merge gate, run that fast path with an explicit test selection for changed contracts and only the necessary build; do not implicitly run the full suite, install dependencies or qualify an archive. For this repository, use `npm run checks:fast -- --test-file dist/path.test.js`; other repositories retain their own commands. Record the selected tests, omitted proof and results honestly: fast/focused success does not prove a full suite or release package. Preserve older full-local failures as diagnostic history without inventing an extra merge prerequisite. Commit and push through the normal workflow. The ai-delivery runtime never executes repository policy modules or checks, or creates local worktrees. Continue to pull request handoff at the unchanged remote head.
+Prepare one isolated worktree with the host's supported tools. ai-delivery
+manages GitHub state; the host owns local files, checks and cleanup.
 
-```sh
-ai-delivery --repo <owner/name> ready:check --issue <number>
-ai-delivery --repo <owner/name> start --issue <number>
-# Prepare a host-owned worktree, implement, run contributor checks, commit and push.
-```
+Implement the smallest change and run the checks required by that repository.
+Commit and push through the normal host workflow, then use the PR handoff skill.
 
-Parking an issue with `issue_update({repo, issueNumber, park: true})` retains its remote tracking presentation. Worktree cleanup remains with the host owner.
-
-Legacy `issue_worktree_transition_inspect` and `issue_worktree_transition_apply` preserve their separate custody contract. Preserve original bytes and accounting; unsupported configuration or closure bindings fail closed. Apply only an exact independently accepted plan with native personal-operator relinquishment, distinct reviewer-App acceptance, complete immutable inventory, runtime admission and quiescent writer proof. This skill grants no private adoption, hold release, launcher change, shared admission or protocol retirement authority.
-
-This runtime's CLI/MCP cannot reconstruct the historical repository-policy binding, so those transition commands refuse. Use the original controller for their successful execution; retained engine tests do not imply compatibility of the new public entrypoint.
+If a call fails or its result is unclear, read the current issue and branch
+state before retrying. Report refusals without changing actors or permissions.
+Parking an issue preserves its remote tracking; clean up only your own local
+resources.

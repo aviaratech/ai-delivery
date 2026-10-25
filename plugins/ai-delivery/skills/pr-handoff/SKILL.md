@@ -1,52 +1,45 @@
 ---
 name: "ai-delivery:pr-handoff"
-description: Publish a GitHub-linked change, submit exact-head independent App review and complete guarded delivery.
+description: Open a PR for a GitHub issue, get it independently reviewed through a reviewer App, and merge it.
 ---
 
-# Pull request handoff
+# PR handoff
 
-## Before delegated PR mutations
-
-Identify the intended operation and side effects, repository, issue/PR, branch, reviewed head, current base, and configured author/reviewer route before sending its mutation instruction. Keep original operator authorization, communication permission, technical admission, configured access, independent review, counted approval, and actual execution receipts separate.
-
-Preserve the original native operator instruction and its scope. Reuse a verified grant that already covers the action; ordinary phase admission does not require another operator approval. Label quotations and cross-task relays honestly, including whether the original was inspected directly or verified by another task. A relay, registry match, START, role flag, successful checks, App permissions or dry-run adds no operator authorization. Inspect the original through an authorized route when needed to resolve origin or scope. Use the existing orchestration workflow for provenance and recipient binding; this skill adds no coordination or permission mechanism.
-
-Missing or ambiguous authority leaves the affected mutation pending while independent authorized work continues. Request only the concrete missing scope through the appropriate authorized native user context, naming the operation, repository/PR/head/actor route and any hold or rejection. Already authorized actions need no redundant request. A host refusal remains a refusal even when standing authority exists; these instructions do not guarantee platform acceptance.
-
-Preserve each attempted, delivered and executed state, exact rejection reason and actually admitted retry. A denied delegation delivers no instruction and stops its dependent mutations; do not switch actors, use indirect execution or another route to evade it. After an admitted retry is refused, make one concise action-specific native-user request identifying the refusal and its source. The request itself admits no retry: reconcile the concrete cause and current authority before any permitted continuation. Retain earlier failed attempts as failed. Do not repeat successful preflight merely to restate evidence; refresh the live safeguards required by the pending action.
-
-A failed or uncertain mutation acknowledgement can follow server success. Reconcile the original operation through supported read-only receipts and the same PR's native state before deciding what remains pending. Record confirmed success once; unknown state admits no duplicate mutation. A read-only network failure alone establishes neither an authorization refusal nor invalid credentials.
-
-Fictional `example/widget` PR23 at reviewed head H and base B illustrates these boundaries; these are decisions, not platform tests:
-
-- A lead quotes approval with a source ID: retain it as relayed evidence and resolve original scope when needed; the quote is neither local authentication nor an execution receipt.
-- Checks, App access and review dry-run pass with no verified operator grant: submission remains pending and no approval has counted.
-- Delegation and its admitted retry are refused: preserve both undelivered attempts, stop dependent writes and make the single precise native-user request without changing actor or route.
-- The original operator grant covers App submission and promotion: resume only pending admitted operations, read back the exact review and counted approval before promotion, and reconcile an uncertain acknowledgement before retrying. Merge needs its own coverage within the grant and the existing exact-head, current-base, protection, checks, association, serial-lane and native GitHub eligibility guards. Changed source requires fresh verification/review and reconciliation of authority scope.
-
-
-Run contributor checks through the target repository's own policy. Under a fast-local/focused-test and CI-gated policy, record the explicit changed-contract test selection, only the necessary build, and omitted full-suite/package proof; do not implicitly install dependencies or repeat full local qualification. This repository's example is `npm run checks:fast -- --test-file dist/path.test.js`, not an unconditional command for other repositories. Preserve historical full-local failures as diagnostic evidence, without adding a blanket merge gate. Keep the resulting commit unchanged through publication and independent review; a changed head requires fresh proportionate checks and review.
-
-Call `issue_pr_create` with explicit `repo`, issue number, a non-empty body and `dryRun: true`. Inspect configured actor and rule evidence, then create a draft from the GitHub-linked branch. Hosts own commits and pushes. Resolve missing credentials or same-actor routes; unknown approval eligibility is not approval.
-
-For NEW non-closing publication, bare `nonClosing` refuses before creation. The existing tool accepts explicit `reconcileNonClosingReference: true`, exact `expectedHeadSha`/`expectedBaseSha`, `nonClosing: true` and a safe explicit body. Before invoking it, verify a human grant for the canonical repository/OPEN issue, exact native linked branch/head, default base, configured author and title/body, prospectively limited to the one draft returned by that invocation. This flag requests a native action; it does not establish that grant. The runtime creates at most one draft and removes at most one exact intended manual closing pair per invocation, only after complete all/manual and authorized cross-reference proof. A graph already safe requires no removal. Strict non-closing verification must pass afterward. It never unlinks the branch, rewrites the body, promotes, reviews, merges or closes the issue as part of this action. Dry-run is pending scope, not verified publication.
-
-The caller owns original grant/source/intent and attempt receipts; runtime reads no receipt history and makes no cross-invocation deduplication promise. Preserve receipts before any continuation. Use explicit `prNumber` only for the exact caller-admitted existing draft with unchanged head/base/body. Unique matches identify resources, not request provenance. A proven terminal pre-action non-attempt may permit admitted continuation; an arbitrary crash does not. Uncertain creation permits read-only identity reconciliation only, never duplicate creation or automatic cleanup. After uncertain removal, reuse a strictly safe exact graph without mutation. A remaining/reappeared edge or missing history blocks another removal unless authoritative non-execution proof supports admitted continuation, or fresh human authority names the exact current pair and acknowledges the unresolved old attempt. Flags cannot replenish a spent or unresolved grant.
-
-Explain the non-atomic boundary in the concrete grant: a published draft/closing edge can remain after failure; GitHub supplies no expected-head CAS for removal, and external edits can race pre/post reads. Preserve unresolved identity/attempt state, reconcile read-only, and never automatically retry, roll back or reopen the issue. Implementation or source-delivery approval alone is not approval for a real reference-removal call.
-
-Obtain a read-only independent review of the exact remote commit, tree and complete diff. Have that independent reviewer write a strict `ai-delivery.review-verdict@1` file and submit it using `ai-delivery review submit --pr N --head SHA --identity <configured-profile> --verdict FILE [--repo owner/name]`. Its requested/effective model provider must match the selected profile and actual App actor. The runtime constructs the existing artifact and visibly binds the exact verdict-file SHA256; the lower-level `issue_pr_review` artifact API remains available for existing integrations. A matching review is reused. Inspect GitHub's live required-review decision and checks; submission alone does not prove the approval counted. Required CI must be successful for the current reviewed candidate and current base under the existing native merge contract. Failed, missing or stale required CI cannot be replaced by fast/focused local results or an old package qualification. Resolve stale/dismissed reviews, blockers, failed required checks and moved heads or bases without relaxing protection.
-
-Promote the unchanged PR using `issue_pr_create` with `draft: false`. Finish only with fresh native GitHub eligibility at the exact head and current base. GitHub owns required checks, review counts, stale-review dismissal and configured up-to-date rules. `pr:checks` reports native required check names/statuses; resolve BLOCKED, BEHIND, conflicts, unknown or incomplete evidence before mutation. A zero-review rule does not require an extra App approval; an optional failed check does not become required. The merge mutation uses the independently reviewed SHA; finish confirms the intended PR merged before closing its issue. Hosts retain responsibility for local worktree cleanup.
+Use this after your change is committed and pushed on the issue branch. The
+target repo's own rules (its `AGENTS.md` or `CONTRIBUTING.md`) decide which
+checks run and whether review is required.
 
 ```sh
-ai-delivery --repo <owner/name> pr:create --issue <number> --body-file ./pr-body.md --dry-run
-ai-delivery --repo <owner/name> pr:create --issue <number> --body-file ./pr-body.md
-# Obtain independent exact-head review.
-ai-delivery review submit --pr <number> --head <reviewed-sha> --identity <configured-profile> --verdict ./verdict.json --repo <owner/name>
-ai-delivery --repo <owner/name> pr:create --issue <number> --ready
-ai-delivery --repo <owner/name> pr:checks --pr <number>
-ai-delivery --repo <owner/name> finish --issue <number> --pr <number> --reviewed-head <reviewed-sha>
+# Open the PR as a draft.
+ai-delivery --repo <owner/name> pr:create --issue <n> --body-file pr-body.md
+
+# The reviewer reads the exact head and diff, writes verdict.json, then submits it.
+ai-delivery review submit --pr <pr> --head <sha> --identity <reviewer-profile> \
+  --verdict verdict.json --repo <owner/name>
+
+# Mark it ready, check it, and merge.
+ai-delivery --repo <owner/name> pr:create --issue <n> --ready
+ai-delivery --repo <owner/name> pr:checks --pr <pr>
+ai-delivery --repo <owner/name> finish --issue <n> --pr <pr> --reviewed-head <sha>
 ```
 
-Use `ai-delivery review doctor --identity <configured-profile>` to check a configured App without posting or Project discovery. Reviewer profiles use only the selected env/default, protected-file or configured-argv credential source; no dotenvx or separate artifact-builder step is needed. The optional Claude permission pattern is exactly `Bash(ai-delivery review submit *)`, subject to native host policy; do not install it or bypass a refusal. A request-changes verdict posts REQUEST_CHANGES and never grants approval. An ambiguous submission preserves known review identity; reconcile it before retrying. Legacy CLI `--artifact` is a UTF-8 JSON file path; MCP takes JSON content. Never fabricate effective model metadata or historical policy/evidence receipts. Validate the supplied artifact against the exact remote commit/tree/diff before App submission and verify its review readback. Merge then follows GitHub’s current eligibility without rechecking historical embedded artifact identities or publication lineage. Repository-specific independent review requirements still apply.
+## Rules
+
+- **Review.** The builder never submits its own review. A separate reviewer
+  agent writes the `ai-delivery.review-verdict@1` file, which holds:
+  - the verdict, approve or request-changes;
+  - its findings, each marked blocking or non-blocking.
+
+  The reviewer submits that file itself.
+- **New head.** If the head changes after review, the reviewer reviews the new
+  head before merge.
+- **Merging.** `finish` merges only when GitHub says the PR can merge at the
+  reviewed head with its required checks green. If it refuses, fix the reason
+  it gives. Don't merge another way.
+- **Unclear results.** If a command times out or its result is unclear, run
+  `pr:info` before retrying, so you don't create a duplicate.
+- **Reviewer setup.** To check a reviewer App's setup without posting
+  anything, run `ai-delivery review doctor --identity <profile>`.
+- **Credentials.** Never print them.
+- **Partial fixes.** For a fix that should leave the issue open, see the
+  README's `--non-closing` notes. This is rare.
