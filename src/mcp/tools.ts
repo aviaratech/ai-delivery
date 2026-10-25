@@ -11,6 +11,7 @@ import {
   issueInputSchema,
   CreateIssueStatus,
   IssueStatusPatch,
+  ProjectStatusPatch,
   IssueDeferralPatch,
 } from '../issueContract.js';
 
@@ -31,6 +32,7 @@ const IssueUpdateInput = issueInputSchema(
       ...IssueWriteFields,
       ...NativeIssueDateFields,
       status: IssueStatusPatch.optional(),
+      projectStatus: ProjectStatusPatch.optional(),
       repo: Repo,
       blockedBy: z.array(Positive).optional(),
       blocks: z.array(Positive).optional(),
