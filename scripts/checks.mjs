@@ -720,6 +720,31 @@ export const RELEASE_CASES = [
     title: 'CLI mcp:serve initializes and serves a real stdio request without target code execution',
     kind: 'mandatory',
   },
+  {
+    file: 'dist/genericCompatibility.test.js',
+    title: 'legacy CLI emits an offline plan without modifying its input',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: 'actual CLI output flags []',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: "actual CLI output flags [ '--json' ]",
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: "actual CLI output flags [ '--verbose' ]",
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: "actual CLI output flags [ '--json', '--verbose' ]",
+    kind: 'mandatory',
+  },
 ];
 
 export const SKIP_ALLOWLIST = [
@@ -1585,7 +1610,7 @@ export async function runChecks({
     } else {
       if (install) await run('dependency-provisioning', [...npm, 'ci', '--no-audit', '--no-fund']);
       await run('format', [...npm, 'run', 'format:check']);
-      await run('lint', [...npm, 'run', 'lint']);
+      await run('lint', [process.execPath, join(cwd, 'node_modules/oxlint/bin/oxlint')]);
       // Native declaration analysis runs once in the producer; fast mode stays noEmit.
       if (!fast || report.selectedTestFiles) rmSync(join(cwd, 'dist'), { recursive: true, force: true });
       await run('types', [
