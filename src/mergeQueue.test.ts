@@ -19,32 +19,36 @@ function barrier() {
   return { promise, resolve };
 }
 
-test('uncovered queue entry waits for approval without publishing or merging', async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 1);
-  f.comments.length = 0;
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
-  const stop = new AbortController();
-  await runQueue(context, {
-    root: f.root,
-    signal: stop.signal,
-    onProgress: async () => {
-      stop.abort();
-    },
-  }).catch((error: unknown) => {
-    if (!stop.signal.aborted) throw error;
-  });
-  const status = await queueStatus(context, { root: f.root });
-  assert.equal(status.entries[0]!.state, 'needs-approval');
-  assert.equal(s.prs[0]!.merged, false);
-  assert.equal(s.events.includes('git.push'), false);
-  assert.equal(f.comments.filter((c) => /needs approval/iu.test(c.body) && /maintainer/u.test(c.body)).length, 1);
-  f.assertInert();
-});
+test(
+  'uncovered queue entry waits for approval without publishing or merging',
+  { tags: ['release'] },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    f.comments.length = 0;
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    const stop = new AbortController();
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    const status = await queueStatus(context, { root: f.root });
+    assert.equal(status.entries[0]!.state, 'needs-approval');
+    assert.equal(s.prs[0]!.merged, false);
+    assert.equal(s.events.includes('git.push'), false);
+    assert.equal(f.comments.filter((c) => /needs approval/iu.test(c.body) && /maintainer/u.test(c.body)).length, 1);
+    f.assertInert();
+  },
+);
 
 for (const { kind, reason } of syntheticStandingApprovalRefusals) {
-  test(`standing approval refuses ${kind} with one explanation`, async ({ signal }) => {
+  test(`standing approval refuses ${kind} with one explanation`, { tags: ['release'] }, async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 1),
       a = s.approval;
@@ -85,7 +89,7 @@ for (const { kind, reason } of syntheticStandingApprovalRefusals) {
 }
 
 for (const mode of ['pagination', 'wrong-target', 'ambiguous', 'no-config', 'read-error'] as const) {
-  test(`standing approval refuses ${mode} evidence`, async ({ signal }) => {
+  test(`standing approval refuses ${mode} evidence`, { tags: ['release'] }, async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 1);
     if (mode === 'pagination' || mode === 'wrong-target' || mode === 'read-error') s.controls.approvalFault = mode;
@@ -117,44 +121,48 @@ for (const mode of ['pagination', 'wrong-target', 'ambiguous', 'no-config', 'rea
 }
 
 for (const phase of ['discovery', 'final-merge-gate', 'missing-metadata'] as const) {
-  test(`unreadable competing approval refuses authority at ${phase}`, { timeout: 0 }, async ({ signal }) => {
-    const f = inertTarget(signal),
-      s = queueScenario(f, 1);
-    const addUnavailable = () => {
-      const competing = s.approve();
-      if (phase === 'missing-metadata') Reflect.deleteProperty(competing, 'lastEditedAt');
-      else s.controls.unreadableApprovalIds.add(competing.node_id);
-    };
-    if (phase !== 'final-merge-gate') addUnavailable();
-    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
-    const stop = new AbortController();
-    let armed = phase !== 'final-merge-gate';
-    await runQueue(context, {
-      root: f.root,
-      signal: stop.signal,
-      onProgress: async () => {
-        if (!armed) {
-          addUnavailable();
-          armed = true;
-        } else stop.abort();
-      },
-    }).catch((error: unknown) => {
-      if (!stop.signal.aborted) throw error;
-    });
-    const status = await queueStatus(context, { root: f.root });
-    assert.equal(status.entries[0]!.state, 'needs-approval');
-    assert.match(status.entries[0]!.reason!, /unavailable/u);
-    assert.equal(s.prs[0]!.merged, false);
-    if (phase !== 'final-merge-gate') assert.equal(s.events.includes('git.push'), false);
-    f.assertInert();
-  });
+  test(
+    `unreadable competing approval refuses authority at ${phase}`,
+    { tags: ['release'], timeout: 0 },
+    async ({ signal }) => {
+      const f = inertTarget(signal),
+        s = queueScenario(f, 1);
+      const addUnavailable = () => {
+        const competing = s.approve();
+        if (phase === 'missing-metadata') Reflect.deleteProperty(competing, 'lastEditedAt');
+        else s.controls.unreadableApprovalIds.add(competing.node_id);
+      };
+      if (phase !== 'final-merge-gate') addUnavailable();
+      const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+      await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+      const stop = new AbortController();
+      let armed = phase !== 'final-merge-gate';
+      await runQueue(context, {
+        root: f.root,
+        signal: stop.signal,
+        onProgress: async () => {
+          if (!armed) {
+            addUnavailable();
+            armed = true;
+          } else stop.abort();
+        },
+      }).catch((error: unknown) => {
+        if (!stop.signal.aborted) throw error;
+      });
+      const status = await queueStatus(context, { root: f.root });
+      assert.equal(status.entries[0]!.state, 'needs-approval');
+      assert.match(status.entries[0]!.reason!, /unavailable/u);
+      assert.equal(s.prs[0]!.merged, false);
+      if (phase !== 'final-merge-gate') assert.equal(s.events.includes('git.push'), false);
+      f.assertInert();
+    },
+  );
 }
 
 for (const kind of ['non-approver', 'bot'] as const) {
   test(
     `a conclusively invalid ${kind} approval does not suppress a valid grant`,
-    { timeout: 0 },
+    { tags: ['release'], timeout: 0 },
     async ({ signal }) => {
       const f = inertTarget(signal),
         s = queueScenario(f, 1),
@@ -175,7 +183,7 @@ for (const kind of ['non-approver', 'bot'] as const) {
 for (const outcome of ['present', 'absent', 'duplicate', 'spoofed', 'edited', 'same-second-restored'] as const) {
   test(
     `queue reconciles comment loss without duplicate POST, outcome=${outcome}`,
-    { timeout: 0 },
+    { tags: ['release'], timeout: 0 },
     async ({ signal }) => {
       const f = inertTarget(signal),
         s = queueScenario(f, 1);
@@ -216,7 +224,7 @@ for (const outcome of ['present', 'absent', 'duplicate', 'spoofed', 'edited', 's
 
 test(
   'standing approval merges only its ordered prefix and mentions each native author',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 3);
@@ -253,32 +261,37 @@ test(
   },
 );
 
-test('unchanged native eligibility waits do not repeat ready notices', { timeout: 0 }, async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 1);
-  s.controls.reviewDecision = 'REVIEW_REQUIRED';
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
-  const stop = new AbortController();
-  let waits = 0;
-  await runQueue(context, {
-    root: f.root,
-    signal: stop.signal,
-    onProgress: async () => {
-      if ((await queueStatus(context, { root: f.root })).entries[0]!.state === 'waiting' && ++waits === 3) stop.abort();
-    },
-  }).catch((error: unknown) => {
-    if (!stop.signal.aborted) throw error;
-  });
-  assert.equal(waits, 3);
-  assert.equal(s.prs[0]!.merged, false);
-  assert.equal(f.comments.filter((c) => c.body.includes('PR #23 ready.')).length, 1);
-  f.assertInert();
-});
+test(
+  'unchanged native eligibility waits do not repeat ready notices',
+  { tags: ['release'], timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    s.controls.reviewDecision = 'REVIEW_REQUIRED';
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    const stop = new AbortController();
+    let waits = 0;
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        if ((await queueStatus(context, { root: f.root })).entries[0]!.state === 'waiting' && ++waits === 3)
+          stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    assert.equal(waits, 3);
+    assert.equal(s.prs[0]!.merged, false);
+    assert.equal(f.comments.filter((c) => c.body.includes('PR #23 ready.')).length, 1);
+    f.assertInert();
+  },
+);
 
 test(
   'standing approval retains the same native approver across login casing changes',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 1);
@@ -304,52 +317,60 @@ test(
   },
 );
 
-test('removed and re-enqueued entry cannot reuse an unconsumed old grant', { timeout: 0 }, async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 1);
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
-  s.failed.add(23);
-  await runQueue(context, { root: f.root, signal: f.signal });
-  assert.equal((await queueStatus(context, { root: f.root })).entries[0]!.state, 'removed');
-  s.failed.clear();
-  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
-  const stop = new AbortController();
-  await runQueue(context, {
-    root: f.root,
-    signal: stop.signal,
-    onProgress: async () => {
-      stop.abort();
-    },
-  }).catch((error: unknown) => {
-    if (!stop.signal.aborted) throw error;
-  });
-  assert.equal(s.prs[0]!.merged, false);
-  assert.equal((await queueStatus(context, { root: f.root })).entries[1]!.state, 'needs-approval');
-  s.approve();
-  await runQueue(context, { root: f.root, signal: f.signal });
-  assert.equal(s.prs[0]!.merged, true);
-  assert.equal(s.events.filter((e) => e === 'native.merge:23').length, 1);
-  f.assertInert();
-});
+test(
+  'removed and re-enqueued entry cannot reuse an unconsumed old grant',
+  { tags: ['release'], timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    s.failed.add(23);
+    await runQueue(context, { root: f.root, signal: f.signal });
+    assert.equal((await queueStatus(context, { root: f.root })).entries[0]!.state, 'removed');
+    s.failed.clear();
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    const stop = new AbortController();
+    await runQueue(context, {
+      root: f.root,
+      signal: stop.signal,
+      onProgress: async () => {
+        stop.abort();
+      },
+    }).catch((error: unknown) => {
+      if (!stop.signal.aborted) throw error;
+    });
+    assert.equal(s.prs[0]!.merged, false);
+    assert.equal((await queueStatus(context, { root: f.root })).entries[1]!.state, 'needs-approval');
+    s.approve();
+    await runQueue(context, { root: f.root, signal: f.signal });
+    assert.equal(s.prs[0]!.merged, true);
+    assert.equal(s.events.filter((e) => e === 'native.merge:23').length, 1);
+    f.assertInert();
+  },
+);
 
-test('standing approval discovery completes later native comment pages', { timeout: 0 }, async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 1);
-  f.comments.length = 0;
-  for (let i = 0; i < 100; i++) f.addComment(900000 + i, 'ordinary discussion', false, 23);
-  f.comments.push(s.approval);
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: f.root });
-  await runQueue(context, { root: f.root, signal: f.signal });
-  assert.equal(s.prs[0]!.merged, true);
-  f.assertInert();
-});
+test(
+  'standing approval discovery completes later native comment pages',
+  { tags: ['release'], timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 1);
+    f.comments.length = 0;
+    for (let i = 0; i < 100; i++) f.addComment(900000 + i, 'ordinary discussion', false, 23);
+    f.comments.push(s.approval);
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: f.root });
+    await runQueue(context, { root: f.root, signal: f.signal });
+    assert.equal(s.prs[0]!.merged, true);
+    f.assertInert();
+  },
+);
 
 for (const mode of ['expired', 'deleted', 'edited'] as const) {
   test(
     `standing approval ${mode} after first merge stops suffix and retains original receipt`,
-    { timeout: 0 },
+    { tags: ['release'], timeout: 0 },
     async ({ signal }) => {
       const f = inertTarget(signal),
         s = queueScenario(f, 2);
@@ -400,86 +421,94 @@ for (const mode of ['expired', 'deleted', 'edited'] as const) {
   );
 }
 
-test('queue refuses rebinding while the drained writer is still held', { timeout: 0 }, async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 2),
-    linked = f.worktree();
-  s.approval.body = s.approval.body.replace('23,24', '23');
-  s.approve([24]);
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: linked });
-  const held = barrier(),
-    release = barrier();
-  const original = vi.mocked(verification.withRuntimeSetupWriter).getMockImplementation()!;
-  vi.mocked(verification.withRuntimeSetupWriter).mockImplementation((root, operation, scope) =>
-    original(
-      root,
-      async (runner) => {
-        const result = await operation(runner);
+test(
+  'queue refuses rebinding while the drained writer is still held',
+  { tags: ['release'], timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 2),
+      linked = f.worktree();
+    s.approval.body = s.approval.body.replace('23,24', '23');
+    s.approve([24]);
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: linked });
+    const held = barrier(),
+      release = barrier();
+    const original = vi.mocked(verification.withRuntimeSetupWriter).getMockImplementation()!;
+    vi.mocked(verification.withRuntimeSetupWriter).mockImplementation((root, operation, scope) =>
+      original(
+        root,
+        async (runner) => {
+          const result = await operation(runner);
+          held.resolve();
+          await release.promise;
+          return result;
+        },
+        scope,
+      ),
+    );
+    const running = runQueue(context, { root: f.root, signal: f.signal });
+    try {
+      await held.promise;
+      await assert.rejects(enqueuePr(context, { prNumber: 24 }, { root: f.root }), /lock|writer absence/iu);
+      assert.equal((await queueStatus(context, { root: f.root })).leaseRoot, linked);
+    } finally {
+      release.resolve();
+      await running;
+      vi.mocked(verification.withRuntimeSetupWriter).mockImplementation(original);
+    }
+    await enqueuePr(context, { prNumber: 24 }, { root: f.root });
+    assert.equal((await queueStatus(context, { root: f.root })).leaseRoot, f.root);
+    await runQueue(context, { root: f.root, signal: f.signal });
+    assert.deepEqual(
+      s.events.filter((e) => e.startsWith('native.merge')),
+      ['native.merge:23', 'native.merge:24'],
+    );
+    f.assertInert();
+  },
+);
+
+test(
+  'queue chooses the current lease after delayed authentication',
+  { tags: ['release'], timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 2),
+      linked = f.worktree();
+    s.approval.body = s.approval.body.replace('23,24', '23');
+    s.approve([24]);
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: linked });
+    await runQueue(context, { root: f.root, signal: f.signal });
+    const held = barrier(),
+      release = barrier();
+    const original = context.clients.authenticatedAuthor!;
+    Object.assign(context.clients, {
+      authenticatedAuthor: async () => {
         held.resolve();
         await release.promise;
-        return result;
+        return original();
       },
-      scope,
-    ),
-  );
-  const running = runQueue(context, { root: f.root, signal: f.signal });
-  try {
-    await held.promise;
-    await assert.rejects(enqueuePr(context, { prNumber: 24 }, { root: f.root }), /lock|writer absence/iu);
-    assert.equal((await queueStatus(context, { root: f.root })).leaseRoot, linked);
-  } finally {
-    release.resolve();
+    });
+    const running = runQueue(context, { root: f.root, signal: f.signal });
+    // The historical drained queue must still authenticate and recover its writer.
+    await Promise.race([held.promise, running.then(() => assert.fail('drained queue skipped writer recovery'))]);
+    Object.assign(context.clients, { authenticatedAuthor: original });
+    try {
+      await enqueuePr(context, { prNumber: 24 }, { root: f.root });
+    } finally {
+      release.resolve();
+    }
     await running;
-    vi.mocked(verification.withRuntimeSetupWriter).mockImplementation(original);
-  }
-  await enqueuePr(context, { prNumber: 24 }, { root: f.root });
-  assert.equal((await queueStatus(context, { root: f.root })).leaseRoot, f.root);
-  await runQueue(context, { root: f.root, signal: f.signal });
-  assert.deepEqual(
-    s.events.filter((e) => e.startsWith('native.merge')),
-    ['native.merge:23', 'native.merge:24'],
-  );
-  f.assertInert();
-});
-
-test('queue chooses the current lease after delayed authentication', { timeout: 0 }, async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 2),
-    linked = f.worktree();
-  s.approval.body = s.approval.body.replace('23,24', '23');
-  s.approve([24]);
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: linked });
-  await runQueue(context, { root: f.root, signal: f.signal });
-  const held = barrier(),
-    release = barrier();
-  const original = context.clients.authenticatedAuthor!;
-  Object.assign(context.clients, {
-    authenticatedAuthor: async () => {
-      held.resolve();
-      await release.promise;
-      return original();
-    },
-  });
-  const running = runQueue(context, { root: f.root, signal: f.signal });
-  // The historical drained queue must still authenticate and recover its writer.
-  await Promise.race([held.promise, running.then(() => assert.fail('drained queue skipped writer recovery'))]);
-  Object.assign(context.clients, { authenticatedAuthor: original });
-  try {
-    await enqueuePr(context, { prNumber: 24 }, { root: f.root });
-  } finally {
-    release.resolve();
-  }
-  await running;
-  assert.equal(s.events.filter((e) => e.startsWith('writer:')).at(-1), `writer:${f.root}`);
-  assert.equal(s.prs[1]!.merged, true);
-  f.assertInert();
-});
+    assert.equal(s.events.filter((e) => e.startsWith('writer:')).at(-1), `writer:${f.root}`);
+    assert.equal(s.prs[1]!.merged, true);
+    f.assertInert();
+  },
+);
 
 test(
   'queue refuses a lease changed before the runtime writer claim without touching queue state',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 2),
@@ -517,7 +546,7 @@ test(
 
 test(
   'queue recovers an orphaned writer even when its historical entries are drained',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal);
     queueScenario(f, 1);
@@ -545,64 +574,72 @@ test(
   },
 );
 
-test('queue keeps its process lease root across linked worktrees', { timeout: 0 }, async ({ signal }) => {
-  const f = inertTarget(signal),
-    s = queueScenario(f, 2),
-    linked = f.worktree();
-  s.approval.body = s.approval.body.replace('23,24', '23');
-  s.approve([24]);
-  const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
-  await enqueuePr(context, { prNumber: 23 }, { root: linked, signal: f.signal });
-  assert.equal(
-    ((await queueStatus(context, { root: f.root })) as unknown as Record<string, unknown>).leaseRoot,
-    linked,
-  );
-  await runQueue(context, { root: f.root, signal: f.signal });
-  assert.ok(s.events.includes(`writer:${linked}`));
-  fixtureGit(f.root, 'worktree', 'remove', linked);
-  await enqueuePr(context, { prNumber: 24 }, { root: f.root, signal: f.signal });
-  assert.equal(
-    ((await queueStatus(context, { root: f.root })) as unknown as Record<string, unknown>).leaseRoot,
-    f.root,
-  );
-  await runQueue(context, { root: f.root, signal: f.signal });
-  assert.ok(s.events.includes(`writer:${f.root}`));
-  assert.deepEqual(
-    s.events.filter((e) => e.startsWith('native.merge')),
-    ['native.merge:23', 'native.merge:24'],
-  );
-  f.assertInert();
-});
-
-test('queue enqueue is durable and idempotent while status never advances it', async ({ signal }) => {
-  const f = inertTarget(signal);
-  const connection = await f.connect();
-  try {
-    const empty = await connection.call('issue_pr_merge_queue_status', {});
-    assert.notEqual(empty.response.isError, true, empty.text);
-    assert.deepEqual(empty.value?.entries, []);
-    assert.equal(existsSync(join(f.root, '.git', 'ai-delivery', 'merge-queue')), false);
-    const first = await connection.call('issue_pr_merge', { issueNumber: 17, prNumber: 23, queue: true });
-    assert.notEqual(first.response.isError, true, first.text);
-    assert.equal(first.value?.position, 1);
-    const again = await connection.call('issue_pr_merge', { issueNumber: 17, prNumber: 23, queue: true });
-    assert.equal(again.value?.position, 1);
-    const status = await connection.call('issue_pr_merge_queue_status', {});
-    assert.ok(status.value);
-    assert.equal((status.value.entries as { head: string }[])[0]?.head, f.head);
+test(
+  'queue keeps its process lease root across linked worktrees',
+  { tags: ['release'], timeout: 0 },
+  async ({ signal }) => {
+    const f = inertTarget(signal),
+      s = queueScenario(f, 2),
+      linked = f.worktree();
+    s.approval.body = s.approval.body.replace('23,24', '23');
+    s.approve([24]);
+    const context = await contextFor({ repoRoot: f.root, repo: 'example/widget', identity: 'author' }, 'pr:merge');
+    await enqueuePr(context, { prNumber: 23 }, { root: linked, signal: f.signal });
     assert.equal(
-      f.calls.some((c) => c.name === 'pulls.merge'),
-      false,
+      ((await queueStatus(context, { root: f.root })) as unknown as Record<string, unknown>).leaseRoot,
+      linked,
+    );
+    await runQueue(context, { root: f.root, signal: f.signal });
+    assert.ok(s.events.includes(`writer:${linked}`));
+    fixtureGit(f.root, 'worktree', 'remove', linked);
+    await enqueuePr(context, { prNumber: 24 }, { root: f.root, signal: f.signal });
+    assert.equal(
+      ((await queueStatus(context, { root: f.root })) as unknown as Record<string, unknown>).leaseRoot,
+      f.root,
+    );
+    await runQueue(context, { root: f.root, signal: f.signal });
+    assert.ok(s.events.includes(`writer:${f.root}`));
+    assert.deepEqual(
+      s.events.filter((e) => e.startsWith('native.merge')),
+      ['native.merge:23', 'native.merge:24'],
     );
     f.assertInert();
-  } finally {
-    await f.dispose(connection);
-  }
-});
+  },
+);
+
+test(
+  'queue enqueue is durable and idempotent while status never advances it',
+  { tags: ['release'] },
+  async ({ signal }) => {
+    const f = inertTarget(signal);
+    const connection = await f.connect();
+    try {
+      const empty = await connection.call('issue_pr_merge_queue_status', {});
+      assert.notEqual(empty.response.isError, true, empty.text);
+      assert.deepEqual(empty.value?.entries, []);
+      assert.equal(existsSync(join(f.root, '.git', 'ai-delivery', 'merge-queue')), false);
+      const first = await connection.call('issue_pr_merge', { issueNumber: 17, prNumber: 23, queue: true });
+      assert.notEqual(first.response.isError, true, first.text);
+      assert.equal(first.value?.position, 1);
+      const again = await connection.call('issue_pr_merge', { issueNumber: 17, prNumber: 23, queue: true });
+      assert.equal(again.value?.position, 1);
+      const status = await connection.call('issue_pr_merge_queue_status', {});
+      assert.ok(status.value);
+      assert.equal((status.value.entries as { head: string }[])[0]?.head, f.head);
+      assert.equal(
+        f.calls.some((c) => c.name === 'pulls.merge'),
+        false,
+      );
+      f.assertInert();
+    } finally {
+      await f.dispose(connection);
+    }
+  },
+);
 
 test(
   'foreground queue squashes three real Git trees in order and waits for native owner refresh',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal);
     const s = queueScenario(f);
@@ -666,7 +703,7 @@ test(
 
 test(
   'queue waits for complete current checks and native review, invalidating head/base predictions',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 2),
@@ -731,7 +768,7 @@ test(
 
 test(
   'refreshed prediction checkpoint resumes with the uninterrupted transition notices',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 2);
@@ -824,7 +861,7 @@ test(
 
 test(
   'cancel/resume skips completed merges and rejects corrupt or incompatible state',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 2),
@@ -891,7 +928,7 @@ test(
 
 test(
   'a conflicting PR is removed with file diagnostics while its successor is rebuilt',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async ({ signal }) => {
     const f = inertTarget(signal),
       s = queueScenario(f, 3),
@@ -933,58 +970,66 @@ test(
 );
 
 for (const mode of ['failed-check', 'lost-merge-ack', 'lost-push-ack', 'outside-race'] as const) {
-  test(`queue reconciles ${mode} without stale proof or duplicate merge`, { timeout: 0 }, async ({ signal }) => {
-    const f = inertTarget(signal);
-    const s = queueScenario(f, 2);
-    const c = await f.connect();
-    if (mode === 'failed-check') s.failed.add(23);
-    if (mode === 'lost-merge-ack') s.controls.loseMergeAck = true;
-    if (mode === 'lost-push-ack') s.controls.losePushAck = true;
-    if (mode === 'outside-race') s.controls.outsideAtMerge = true;
-    for (const pr of s.prs)
-      await c.call('issue_pr_merge', { issueNumber: pr.issueNumber, prNumber: pr.number, queue: true });
-    const running = c.call('issue_pr_merge_queue_run', {});
-    if (mode === 'failed-check') {
-      await vi.waitFor(
-        async () => {
-          const status = await c.call('issue_pr_merge_queue_status', {});
-          assert.equal((status.value!.entries as { state: string }[])[0]!.state, 'removed');
-        },
-        { timeout: 60000, interval: 1000 },
-      );
-      s.approve([24]);
-    }
-    const first = await running;
-    if (mode === 'outside-race') {
-      assert.match(first.text, /mismatch|unexpected|parent/iu);
-      assert.deepEqual(
-        s.events.filter((e) => e.startsWith('native.merge')),
-        ['native.merge:23'],
-      );
-    } else {
-      if (mode !== 'failed-check') {
-        const resumed = await c.call('issue_pr_merge_queue_run', {});
-        assert.notEqual(resumed.response.isError, true, resumed.text);
+  test(
+    `queue reconciles ${mode} without stale proof or duplicate merge`,
+    { tags: ['release'], timeout: 0 },
+    async ({ signal }) => {
+      const f = inertTarget(signal);
+      const s = queueScenario(f, 2);
+      const c = await f.connect();
+      if (mode === 'failed-check') s.failed.add(23);
+      if (mode === 'lost-merge-ack') s.controls.loseMergeAck = true;
+      if (mode === 'lost-push-ack') s.controls.losePushAck = true;
+      if (mode === 'outside-race') s.controls.outsideAtMerge = true;
+      for (const pr of s.prs)
+        await c.call('issue_pr_merge', { issueNumber: pr.issueNumber, prNumber: pr.number, queue: true });
+      const running = c.call('issue_pr_merge_queue_run', {});
+      if (mode === 'failed-check') {
+        await vi.waitFor(
+          async () => {
+            const status = await c.call('issue_pr_merge_queue_status', {});
+            assert.equal((status.value!.entries as { state: string }[])[0]!.state, 'removed');
+          },
+          { timeout: 60000, interval: 1000 },
+        );
+        s.approve([24]);
       }
-      assert.equal(s.events.filter((e) => e === 'native.merge:24').length, 1);
-      assert.equal(s.events.filter((e) => e === 'native.merge:23').length, mode === 'failed-check' ? 0 : 1);
-      if (mode === 'failed-check') assert.ok(f.comments.some((comment) => /checks/u.test(comment.body)));
-      assert.equal(fixtureGit(s.remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/ai-delivery/queue/'), '');
-    }
-    f.assertInert();
-  });
+      const first = await running;
+      if (mode === 'outside-race') {
+        assert.match(first.text, /mismatch|unexpected|parent/iu);
+        assert.deepEqual(
+          s.events.filter((e) => e.startsWith('native.merge')),
+          ['native.merge:23'],
+        );
+      } else {
+        if (mode !== 'failed-check') {
+          const resumed = await c.call('issue_pr_merge_queue_run', {});
+          assert.notEqual(resumed.response.isError, true, resumed.text);
+        }
+        assert.equal(s.events.filter((e) => e === 'native.merge:24').length, 1);
+        assert.equal(s.events.filter((e) => e === 'native.merge:23').length, mode === 'failed-check' ? 0 : 1);
+        if (mode === 'failed-check') assert.ok(f.comments.some((comment) => /checks/u.test(comment.body)));
+        assert.equal(fixtureGit(s.remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/ai-delivery/queue/'), '');
+      }
+      f.assertInert();
+    },
+  );
 }
 
-test('canonical queue selection refuses independent configured clones even in a matching cwd', async ({ signal }) => {
-  const f = inertTarget(signal);
-  const other = join(f.base, 'other');
-  fixtureGit(f.base, 'clone', '--no-hardlinks', f.root, other);
-  fixtureGit(other, 'remote', 'set-url', 'origin', 'https://github.com/example/widget.git');
-  const input = {
-    repository: 'example/widget',
-    launchDirectory: f.root,
-    checkoutRoots: [f.root, other],
-    canonical: true,
-  };
-  assert.throws(() => resolveCheckout(input), /ambiguous|canonical/iu);
-});
+test(
+  'canonical queue selection refuses independent configured clones even in a matching cwd',
+  { tags: ['release'] },
+  async ({ signal }) => {
+    const f = inertTarget(signal);
+    const other = join(f.base, 'other');
+    fixtureGit(f.base, 'clone', '--no-hardlinks', f.root, other);
+    fixtureGit(other, 'remote', 'set-url', 'origin', 'https://github.com/example/widget.git');
+    const input = {
+      repository: 'example/widget',
+      launchDirectory: f.root,
+      checkoutRoots: [f.root, other],
+      canonical: true,
+    };
+    assert.throws(() => resolveCheckout(input), /ambiguous|canonical/iu);
+  },
+);

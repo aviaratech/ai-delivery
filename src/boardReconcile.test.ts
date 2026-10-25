@@ -519,36 +519,40 @@ test('executing package identity ignores cwd', () => {
   assert.match(identity.packageDistDigest, /^sha256:[a-f0-9]{64}$/u);
 });
 
-test('copied executing artifact changes identity with same-version bytes and refuses links', () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'reconcile-artifact-')));
-  try {
-    cpSync(fileURLToPath(new URL('.', import.meta.url)), join(root, 'dist'), { recursive: true });
-    cpSync(fileURLToPath(new URL('../package.json', import.meta.url)), join(root, 'package.json'));
-    symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(root, 'node_modules'), 'dir');
-    const read = () =>
-      JSON.parse(
-        execFileSync(
-          process.execPath,
-          [
-            '--input-type=module',
-            '-e',
-            'const m = await import(process.argv[1]); process.stdout.write(JSON.stringify(m.readPackageArtifactIdentity()));',
-            join(root, 'dist/version.js'),
-          ],
-          { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 },
-        ),
-      ) as ReturnType<typeof version.readPackageArtifactIdentity>;
-    assert.deepEqual(read(), version.readPackageArtifactIdentity());
-    writeFileSync(join(root, 'dist/changed-bytes'), 'different bytes, same package version\n');
-    const changed = read();
-    assert.equal(changed.packageVersion, version.readPackageArtifactIdentity().packageVersion);
-    assert.notEqual(changed.packageDistDigest, version.readPackageArtifactIdentity().packageDistDigest);
-    symlinkSync(join(root, 'package.json'), join(root, 'dist/unsupported-link'));
-    assert.throws(read);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+test(
+  'copied executing artifact changes identity with same-version bytes and refuses links',
+  { tags: ['release'] },
+  () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'reconcile-artifact-')));
+    try {
+      cpSync(fileURLToPath(new URL('.', import.meta.url)), join(root, 'dist'), { recursive: true });
+      cpSync(fileURLToPath(new URL('../package.json', import.meta.url)), join(root, 'package.json'));
+      symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(root, 'node_modules'), 'dir');
+      const read = () =>
+        JSON.parse(
+          execFileSync(
+            process.execPath,
+            [
+              '--input-type=module',
+              '-e',
+              'const m = await import(process.argv[1]); process.stdout.write(JSON.stringify(m.readPackageArtifactIdentity()));',
+              join(root, 'dist/version.js'),
+            ],
+            { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 },
+          ),
+        ) as ReturnType<typeof version.readPackageArtifactIdentity>;
+      assert.deepEqual(read(), version.readPackageArtifactIdentity());
+      writeFileSync(join(root, 'dist/changed-bytes'), 'different bytes, same package version\n');
+      const changed = read();
+      assert.equal(changed.packageVersion, version.readPackageArtifactIdentity().packageVersion);
+      assert.notEqual(changed.packageDistDigest, version.readPackageArtifactIdentity().packageDistDigest);
+      symlinkSync(join(root, 'package.json'), join(root, 'dist/unsupported-link'));
+      assert.throws(read);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('request bounds and conflicting selectors refuse before collection', () => {
   for (const input of [

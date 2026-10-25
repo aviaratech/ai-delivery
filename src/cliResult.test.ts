@@ -7,7 +7,7 @@ import { test } from 'vitest';
 import { pathToFileURL } from 'node:url';
 import { DeliveryError, getMachineRequestDiagnostics, setMachineRequestDiagnostics } from './errors.js';
 
-test('actual CLI serializes incomplete native update evidence and exits nonzero', () => {
+test('actual CLI serializes incomplete native update evidence and exits nonzero', { tags: ['release'] }, () => {
   const cli = pathToFileURL(join(process.cwd(), 'dist', 'cli.js')).href;
   const dispatch = pathToFileURL(join(process.cwd(), 'dist', 'dispatch.js')).href;
   const owner = pathToFileURL(join(process.cwd(), 'dist', 'issue.js')).href;
@@ -54,60 +54,68 @@ test.each<[unknown, number]>([
     },
     0,
   ],
-])('CLI prints the complete reconciliation result before selecting its exit status (%j)', (value, exit) => {
-  const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
-  const result = spawnSync(
-    process.execPath,
-    [
-      '--input-type=module',
-      '-e',
-      `import { printCommandResult } from ${JSON.stringify(helper)}; printCommandResult('board_reconcile', ${JSON.stringify(value)});`,
-    ],
-    { encoding: 'utf8' },
-  );
-  assert.equal(result.status, exit);
-  assert.deepEqual(JSON.parse(result.stdout), value);
-  assert.equal(result.stderr, '');
-});
-
-test('actual board CLI advertises bounded data-only files and validates them before credentials', () => {
-  const root = mkdtempSync(join(tmpdir(), 'board-cli-input-'));
-  const cli = join(process.cwd(), 'dist', 'cli.js');
-  try {
-    const help = spawnSync(process.execPath, [cli, 'board:reconcile', '--help'], { cwd: root, encoding: 'utf8' });
-    assert.equal(help.status, 0);
-    for (const option of [
-      '--repositories',
-      '--checkouts-file',
-      '--dry-run',
-      '--apply',
-      '--plan-file',
-      '--prior-result-file',
-    ])
-      assert.ok(help.stdout.includes(option));
-    const huge = join(root, 'huge.json');
-    writeFileSync(huge, ' '.repeat(16 * 1024 * 1024 + 1));
-    const invalid = spawnSync(
+])(
+  'CLI prints the complete reconciliation result before selecting its exit status (%j)',
+  { tags: ['release'] },
+  (value, exit) => {
+    const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
+    const result = spawnSync(
       process.execPath,
-      [cli, 'board:reconcile', '--repositories', 'example/widget', '--apply', '--plan-file', huge],
-      { cwd: root, env: { ...process.env, AI_DELIVERY_CONFIG: join(root, 'missing-settings') }, encoding: 'utf8' },
+      [
+        '--input-type=module',
+        '-e',
+        `import { printCommandResult } from ${JSON.stringify(helper)}; printCommandResult('board_reconcile', ${JSON.stringify(value)});`,
+      ],
+      { encoding: 'utf8' },
     );
-    assert.equal(invalid.status, 1);
-    assert.match(invalid.stderr, /16 MiB/u);
-    assert.doesNotMatch(invalid.stderr, /missing-settings|credential/u);
-    const exclusive = spawnSync(
-      process.execPath,
-      [cli, 'board:reconcile', '--repositories', 'example/widget', '--dry-run', '--apply'],
-      { cwd: root, encoding: 'utf8' },
-    );
-    assert.equal(exclusive.status, 1);
-    assert.match(exclusive.stderr, /dry-run.*apply|apply.*dry-run/u);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+    assert.equal(result.status, exit);
+    assert.deepEqual(JSON.parse(result.stdout), value);
+    assert.equal(result.stderr, '');
+  },
+);
 
-test('CLI version agrees with its adjacent package independently of caller cwd', () => {
+test(
+  'actual board CLI advertises bounded data-only files and validates them before credentials',
+  { tags: ['release'] },
+  () => {
+    const root = mkdtempSync(join(tmpdir(), 'board-cli-input-'));
+    const cli = join(process.cwd(), 'dist', 'cli.js');
+    try {
+      const help = spawnSync(process.execPath, [cli, 'board:reconcile', '--help'], { cwd: root, encoding: 'utf8' });
+      assert.equal(help.status, 0);
+      for (const option of [
+        '--repositories',
+        '--checkouts-file',
+        '--dry-run',
+        '--apply',
+        '--plan-file',
+        '--prior-result-file',
+      ])
+        assert.ok(help.stdout.includes(option));
+      const huge = join(root, 'huge.json');
+      writeFileSync(huge, ' '.repeat(16 * 1024 * 1024 + 1));
+      const invalid = spawnSync(
+        process.execPath,
+        [cli, 'board:reconcile', '--repositories', 'example/widget', '--apply', '--plan-file', huge],
+        { cwd: root, env: { ...process.env, AI_DELIVERY_CONFIG: join(root, 'missing-settings') }, encoding: 'utf8' },
+      );
+      assert.equal(invalid.status, 1);
+      assert.match(invalid.stderr, /16 MiB/u);
+      assert.doesNotMatch(invalid.stderr, /missing-settings|credential/u);
+      const exclusive = spawnSync(
+        process.execPath,
+        [cli, 'board:reconcile', '--repositories', 'example/widget', '--dry-run', '--apply'],
+        { cwd: root, encoding: 'utf8' },
+      );
+      assert.equal(exclusive.status, 1);
+      assert.match(exclusive.stderr, /dry-run.*apply|apply.*dry-run/u);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('CLI version agrees with its adjacent package independently of caller cwd', { tags: ['release'] }, () => {
   const metadata: unknown = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(typeof metadata === 'object' && metadata !== null && 'version' in metadata);
   assert.equal(typeof metadata.version, 'string');
@@ -137,7 +145,7 @@ test('CLI version agrees with its adjacent package independently of caller cwd',
   }
 });
 
-test('CLI preserves recoverable start JSON and exits nonzero after creation failure', () => {
+test('CLI preserves recoverable start JSON and exits nonzero after creation failure', { tags: ['release'] }, () => {
   const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
   const failure = {
     schemaVersion: 'ai-delivery.issue-start-registration@1',
@@ -168,7 +176,7 @@ test('CLI preserves recoverable start JSON and exits nonzero after creation fail
   assert.equal(parsed.status, 'started');
 });
 
-test('CLI known-issue incomplete start preserves recovery JSON and exits nonzero', () => {
+test('CLI known-issue incomplete start preserves recovery JSON and exits nonzero', { tags: ['release'] }, () => {
   const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
   const failure = {
     status: 'start-incomplete',
@@ -191,7 +199,7 @@ test('CLI known-issue incomplete start preserves recovery JSON and exits nonzero
   assert.equal(result.stderr, '');
 });
 
-test('the extracted real CLI error renderer preserves ordinary refusal, exit and stdout', () => {
+test('the extracted real CLI error renderer preserves ordinary refusal, exit and stdout', { tags: ['release'] }, () => {
   const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
   const result = spawnSync(
     process.execPath,
@@ -361,21 +369,25 @@ test('request identifiers and transport codes reject oversized, control and priv
   }
 });
 
-test('the real CLI renderer bounds diagnostics and leaves the unchanged refusal line last', () => {
-  const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
-  const errors = pathToFileURL(join(process.cwd(), 'dist', 'errors.js')).href;
-  const requestId = `ABCD:${'A'.repeat(30)}:${'B'.repeat(30)}:${'C'.repeat(30)}:${'D'.repeat(30)}`;
-  assert.equal(requestId.length, 128);
-  const code = `import { DeliveryError,setMachineRequestDiagnostics } from ${JSON.stringify(errors)}; import { printCommandError } from ${JSON.stringify(helper)}; const error=new DeliveryError('safe refusal','fictional_private_hint'); setMachineRequestDiagnostics(error,${JSON.stringify({ phase: 'rest.request', endpoint: 'pulls.merge', status: 500, code: 'UND_ERR_CONNECT_TIMEOUT', requestId })}); printCommandError(error);`;
-  const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8' });
-  assert.equal(result.status, 1);
-  assert.equal(result.stdout, '');
-  assert.equal(result.stderr.includes('fictional_private_hint'), false);
-  assert.ok(Buffer.byteLength(result.stderr.split('\n')[0]! + '\n') <= 512);
-  assert.equal(result.stderr.trimEnd().split('\n').at(-1), 'ai-delivery: safe refusal');
-});
+test(
+  'the real CLI renderer bounds diagnostics and leaves the unchanged refusal line last',
+  { tags: ['release'] },
+  () => {
+    const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
+    const errors = pathToFileURL(join(process.cwd(), 'dist', 'errors.js')).href;
+    const requestId = `ABCD:${'A'.repeat(30)}:${'B'.repeat(30)}:${'C'.repeat(30)}:${'D'.repeat(30)}`;
+    assert.equal(requestId.length, 128);
+    const code = `import { DeliveryError,setMachineRequestDiagnostics } from ${JSON.stringify(errors)}; import { printCommandError } from ${JSON.stringify(helper)}; const error=new DeliveryError('safe refusal','fictional_private_hint'); setMachineRequestDiagnostics(error,${JSON.stringify({ phase: 'rest.request', endpoint: 'pulls.merge', status: 500, code: 'UND_ERR_CONNECT_TIMEOUT', requestId })}); printCommandError(error);`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.includes('fictional_private_hint'), false);
+    assert.ok(Buffer.byteLength(result.stderr.split('\n')[0]! + '\n') <= 512);
+    assert.equal(result.stderr.trimEnd().split('\n').at(-1), 'ai-delivery: safe refusal');
+  },
+);
 
-test('CLI batch partial failure prints every result before returning nonzero', () => {
+test('CLI batch partial failure prints every result before returning nonzero', { tags: ['release'] }, () => {
   const helper = pathToFileURL(join(process.cwd(), 'dist', 'cliResult.js')).href;
   const partial = {
     results: [
@@ -408,7 +420,7 @@ test('CLI batch partial failure prints every result before returning nonzero', (
   assert.equal(success.status, 0);
 });
 
-test('actual CLI batch input validates before configuration or native access', () => {
+test('actual CLI batch input validates before configuration or native access', { tags: ['release'] }, () => {
   const root = mkdtempSync(join(tmpdir(), 'batch-cli-refusal-'));
   try {
     const file = join(root, 'items.json');

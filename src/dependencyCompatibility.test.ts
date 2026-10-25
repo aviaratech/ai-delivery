@@ -55,8 +55,11 @@ function consume(map: RawSourceMap | IndexedMap): SourceMapConsumer {
   return new SourceMapConsumer(map as RawSourceMap);
 }
 
-test('SDK stdio starts a synthetic server, discovers a tool, validates input and closes', async () => {
-  const server = `
+test(
+  'SDK stdio starts a synthetic server, discovers a tool, validates input and closes',
+  { tags: ['release'] },
+  async () => {
+    const server = `
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -67,52 +70,53 @@ server.registerTool('synthetic_echo', {
 }, ({ message }) => ({ content: [{ type: 'text', text: message }] }));
 await server.connect(new StdioServerTransport());
 `;
-  const environment: Record<string, string> = {};
-  for (const key of ['HOME', 'PATH', 'LANG', 'LC_ALL', 'TMPDIR']) {
-    const value = process.env[key];
-    if (value !== undefined) environment[key] = value;
-  }
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: ['--max-old-space-size=96', '--input-type=module', '-e', server],
-    cwd: packageRoot,
-    env: environment,
-    stderr: 'pipe',
-    maxBufferSize: 64 * 1024,
-  });
-  const client = new Client({ name: 'synthetic-dependency-client', version: '1.0.0' });
-  let stderr = '';
-  transport.stderr?.on('data', (bytes: Buffer) => {
-    stderr = (stderr + bytes.toString()).slice(0, 4096);
-  });
-  try {
-    await client.connect(transport, { timeout: 3000 });
-    assert.deepEqual(client.getServerVersion(), { name: 'synthetic-dependency-compatibility', version: '1.0.0' });
-    assert.ok(transport.pid !== null, 'The stdio transport must start its own synthetic child.');
-    const discovery = await client.listTools({}, { timeout: 3000 });
-    assert.deepEqual(
-      discovery.tools.map((tool) => tool.name),
-      ['synthetic_echo'],
-    );
-    assert.deepEqual(discovery.tools[0]?.inputSchema.required, ['message']);
-    const response = await client.callTool(
-      { name: 'synthetic_echo', arguments: { message: 'synthetic value' } },
-      undefined,
-      { timeout: 3000 },
-    );
-    assert.equal(response.isError, undefined);
-    assert.deepEqual(response.content, [{ type: 'text', text: 'synthetic value' }]);
-    const rejected = await client.callTool({ name: 'synthetic_echo', arguments: { message: 7 } }, undefined, {
-      timeout: 3000,
+    const environment: Record<string, string> = {};
+    for (const key of ['HOME', 'PATH', 'LANG', 'LC_ALL', 'TMPDIR']) {
+      const value = process.env[key];
+      if (value !== undefined) environment[key] = value;
+    }
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--max-old-space-size=96', '--input-type=module', '-e', server],
+      cwd: packageRoot,
+      env: environment,
+      stderr: 'pipe',
+      maxBufferSize: 64 * 1024,
     });
-    assert.equal(rejected.isError, true);
-    assert.equal(stderr, '', `Synthetic server stderr: ${stderr}`);
-  } finally {
-    await client.close();
-    await transport.close();
-  }
-  assert.equal(transport.pid, null);
-});
+    const client = new Client({ name: 'synthetic-dependency-client', version: '1.0.0' });
+    let stderr = '';
+    transport.stderr?.on('data', (bytes: Buffer) => {
+      stderr = (stderr + bytes.toString()).slice(0, 4096);
+    });
+    try {
+      await client.connect(transport, { timeout: 3000 });
+      assert.deepEqual(client.getServerVersion(), { name: 'synthetic-dependency-compatibility', version: '1.0.0' });
+      assert.ok(transport.pid !== null, 'The stdio transport must start its own synthetic child.');
+      const discovery = await client.listTools({}, { timeout: 3000 });
+      assert.deepEqual(
+        discovery.tools.map((tool) => tool.name),
+        ['synthetic_echo'],
+      );
+      assert.deepEqual(discovery.tools[0]?.inputSchema.required, ['message']);
+      const response = await client.callTool(
+        { name: 'synthetic_echo', arguments: { message: 'synthetic value' } },
+        undefined,
+        { timeout: 3000 },
+      );
+      assert.equal(response.isError, undefined);
+      assert.deepEqual(response.content, [{ type: 'text', text: 'synthetic value' }]);
+      const rejected = await client.callTool({ name: 'synthetic_echo', arguments: { message: 7 } }, undefined, {
+        timeout: 3000,
+      });
+      assert.equal(rejected.isError, true);
+      assert.equal(stderr, '', `Synthetic server stderr: ${stderr}`);
+    } finally {
+      await client.close();
+      await transport.close();
+    }
+    assert.equal(transport.pid, null);
+  },
+);
 
 test('SourceNode preserves bounded valid indexed-map code, positions and source content', () => {
   const code = 'prefix\nprefix\n    run();\n';

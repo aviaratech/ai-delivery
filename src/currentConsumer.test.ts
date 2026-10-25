@@ -112,6 +112,7 @@ const failure =
 
 test.each([false, true])(
   'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=%s',
+  { tags: ['release'] },
   (frozen) => {
     const f = fixture();
     let confirmedQuiescence = false;
@@ -383,7 +384,7 @@ function producerFixture(): {
     status: 'passed',
     fullSuccess: true,
     exitCode: 0,
-    selectedTestFiles: ['dist/fictional.test.js'],
+    selectedTestFiles: ['src/fictional.test.ts'],
     tests: { files: 1, total: 1, passed: 1, skips: [] },
     gates,
     omitted: [],
@@ -651,45 +652,53 @@ test('synthetic environment never borrows ambient author/reviewer/preload or npm
   }
 });
 
-test('synthetic resolver demonstrates a borrowing false positive, then rejects external and undeclared hoisted dependencies', async () => {
-  const f = fixture();
-  try {
-    const consumer = join(f.directory, 'consumer');
-    mkdirSync(consumer);
-    writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module', dependencies: {} }));
-    const borrowed = join(f.directory, 'node_modules', 'borrowed-only');
-    mkdirSync(borrowed, { recursive: true });
-    writeFileSync(
-      join(borrowed, 'package.json'),
-      JSON.stringify({ name: 'borrowed-only', type: 'module', exports: './index.js' }),
-    );
-    writeFileSync(join(borrowed, 'index.js'), 'export const borrowed=true;');
-    const env = helper.consumerEnvironment(f.directory, process.execPath);
-    const probe = join(consumer, 'owned-probe.mjs');
-    writeFileSync(probe, "console.log((await import('borrowed-only')).borrowed)");
-    const args = [probe];
-    assert.equal((await helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env })).stdout.trim(), 'true');
-    const guard = join(consumer, 'owned-guard.mjs');
-    writeFileSync(guard, helper.resolutionGuard(consumer));
-    await assert.rejects(
-      helper.runOwnedProcess(process.execPath, ['--import', guard, ...args], { cwd: consumer, env }),
-      failure('isolation'),
-    );
-    const hoisted = join(consumer, 'node_modules', 'borrowed-only');
-    mkdirSync(hoisted, { recursive: true });
-    writeFileSync(join(hoisted, 'package.json'), readFileSync(join(borrowed, 'package.json')));
-    writeFileSync(join(hoisted, 'index.js'), 'export const borrowed=true;');
-    await assert.rejects(
-      helper.runOwnedProcess(process.execPath, ['--import', guard, ...args], { cwd: consumer, env }),
-      failure('dependency'),
-    );
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'synthetic resolver demonstrates a borrowing false positive, then rejects external and undeclared hoisted dependencies',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    try {
+      const consumer = join(f.directory, 'consumer');
+      mkdirSync(consumer);
+      writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module', dependencies: {} }));
+      const borrowed = join(f.directory, 'node_modules', 'borrowed-only');
+      mkdirSync(borrowed, { recursive: true });
+      writeFileSync(
+        join(borrowed, 'package.json'),
+        JSON.stringify({ name: 'borrowed-only', type: 'module', exports: './index.js' }),
+      );
+      writeFileSync(join(borrowed, 'index.js'), 'export const borrowed=true;');
+      const env = helper.consumerEnvironment(f.directory, process.execPath);
+      const probe = join(consumer, 'owned-probe.mjs');
+      writeFileSync(probe, "console.log((await import('borrowed-only')).borrowed)");
+      const args = [probe];
+      assert.equal(
+        (await helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env })).stdout.trim(),
+        'true',
+      );
+      const guard = join(consumer, 'owned-guard.mjs');
+      writeFileSync(guard, helper.resolutionGuard(consumer));
+      await assert.rejects(
+        helper.runOwnedProcess(process.execPath, ['--import', guard, ...args], { cwd: consumer, env }),
+        failure('isolation'),
+      );
+      const hoisted = join(consumer, 'node_modules', 'borrowed-only');
+      mkdirSync(hoisted, { recursive: true });
+      writeFileSync(join(hoisted, 'package.json'), readFileSync(join(borrowed, 'package.json')));
+      writeFileSync(join(hoisted, 'index.js'), 'export const borrowed=true;');
+      await assert.rejects(
+        helper.runOwnedProcess(process.execPath, ['--import', guard, ...args], { cwd: consumer, env }),
+        failure('dependency'),
+      );
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test.each(['network', 'permission', 'process'])(
   'synthetic external %s failure retains bounded quiescent evidence',
+  { tags: ['release'] },
   async (kind) => {
     const f = fixture();
     try {
@@ -710,45 +719,53 @@ test.each(['network', 'permission', 'process'])(
   },
 );
 
-test('synthetic interrupted owned child is quiescent before disposable fixture cleanup', async () => {
-  const f = fixture();
-  const cancellation = new AbortController();
-  try {
-    const env = helper.consumerEnvironment(f.directory, process.execPath);
-    await assert.rejects(
-      helper.runOwnedProcess(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {
-        cwd: f.directory,
-        env,
-        signal: cancellation.signal,
-        onSpawn: () => setTimeout(() => cancellation.abort(), 50),
-      }),
-      (error: unknown) => {
-        assert.equal((error as Failure).code, 'cancelled');
-        assert.equal((error as Failure).evidence.quiescent, true);
-        assert.ok((error as Failure).evidence.birth);
-        return true;
-      },
-    );
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'synthetic interrupted owned child is quiescent before disposable fixture cleanup',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    const cancellation = new AbortController();
+    try {
+      const env = helper.consumerEnvironment(f.directory, process.execPath);
+      await assert.rejects(
+        helper.runOwnedProcess(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {
+          cwd: f.directory,
+          env,
+          signal: cancellation.signal,
+          onSpawn: () => setTimeout(() => cancellation.abort(), 50),
+        }),
+        (error: unknown) => {
+          assert.equal((error as Failure).code, 'cancelled');
+          assert.equal((error as Failure).evidence.quiescent, true);
+          assert.ok((error as Failure).evidence.birth);
+          return true;
+        },
+      );
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
-test('synthetic bounded-output failure never becomes successful stdout/schema proof', async () => {
-  const f = fixture();
-  try {
-    await assert.rejects(
-      helper.runOwnedProcess(process.execPath, ['-e', "process.stdout.write('x'.repeat(10000))"], {
-        cwd: f.directory,
-        env: helper.consumerEnvironment(f.directory, process.execPath),
-        maxOutputBytes: 128,
-      }),
-      failure('output-bound'),
-    );
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'synthetic bounded-output failure never becomes successful stdout/schema proof',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    try {
+      await assert.rejects(
+        helper.runOwnedProcess(process.execPath, ['-e', "process.stdout.write('x'.repeat(10000))"], {
+          cwd: f.directory,
+          env: helper.consumerEnvironment(f.directory, process.execPath),
+          maxOutputBytes: 128,
+        }),
+        failure('output-bound'),
+      );
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test.each([
   '---\nname: "ai-delivery:intake-create"\ndescription: Synthetic fixture only\n',
@@ -764,103 +781,120 @@ test.each([
   }
 });
 
-test('synthetic nested type-only manifest uses the installed package declaration owner', async () => {
-  const f = fixture();
-  try {
-    const consumer = join(f.directory, 'consumer');
-    mkdirSync(consumer);
-    writeFileSync(
-      join(consumer, 'package.json'),
-      JSON.stringify({ name: 'fictional-consumer', type: 'module', dependencies: { '@fictional/sdk': '0' } }),
-    );
-    const sdk = join(consumer, 'node_modules', '@fictional', 'sdk');
-    const esm = join(sdk, 'dist', 'esm');
-    mkdirSync(esm, { recursive: true });
-    writeFileSync(
-      join(sdk, 'package.json'),
-      JSON.stringify({
-        name: '@fictional/sdk',
-        type: 'module',
-        exports: './dist/esm/index.js',
-        dependencies: { 'declared-only': '0' },
-      }),
-    );
-    writeFileSync(join(esm, 'package.json'), '{"type":"module"}');
-    const dep = join(sdk, 'node_modules', 'declared-only');
-    mkdirSync(dep, { recursive: true });
-    writeFileSync(
-      join(dep, 'package.json'),
-      JSON.stringify({ name: 'declared-only', type: 'module', exports: './index.js' }),
-    );
-    writeFileSync(join(dep, 'index.js'), 'export const value=true;');
-    writeFileSync(join(esm, 'index.js'), "import {value} from 'declared-only';console.log(value);");
-    const guard = join(consumer, 'owned-guard.mjs');
-    writeFileSync(guard, helper.resolutionGuard(consumer));
-    const env = helper.consumerEnvironment(f.directory, process.execPath);
-    const probe = join(consumer, 'owned-probe.mjs');
-    writeFileSync(probe, "await import('@fictional/sdk')");
-    const args = ['--import', guard, probe];
-    assert.equal((await helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env })).stdout.trim(), 'true');
-    writeFileSync(join(esm, 'index.js'), "await import('missing-only');");
-    await assert.rejects(helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env }), failure('dependency'));
-    const hoisted = join(consumer, 'node_modules', 'undeclared-only');
-    mkdirSync(hoisted, { recursive: true });
-    writeFileSync(
-      join(hoisted, 'package.json'),
-      JSON.stringify({ name: 'undeclared-only', type: 'module', exports: './index.js' }),
-    );
-    writeFileSync(join(hoisted, 'index.js'), 'export const value=true;');
-    writeFileSync(join(esm, 'index.js'), "await import('undeclared-only');");
-    await assert.rejects(helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env }), failure('dependency'));
-  } finally {
-    f.cleanup();
-  }
-});
-
-test('synthetic cancellation kills an observed resistant descendant after its parent exits', async () => {
-  const f = fixture();
-  const cancellation = new AbortController();
-  let quiescent = false;
-  try {
-    const env = helper.consumerEnvironment(f.directory, process.execPath);
-    const descendant = join(f.directory, 'descendant.cjs');
-    writeFileSync(
-      descendant,
-      "process.on('SIGTERM',()=>{});require('node:fs').writeFileSync('ready',String(process.pid));setInterval(()=>{},1000);",
-    );
-    const parent = join(f.directory, 'parent.cjs');
-    writeFileSync(
-      parent,
-      "require('node:child_process').spawn(process.execPath,[process.argv[2]],{stdio:['ignore',process.stdout,process.stderr]});setInterval(()=>{},1000);",
-    );
-    const running = helper.runOwnedProcess(process.execPath, [parent, descendant], {
-      cwd: f.directory,
-      env,
-      signal: cancellation.signal,
-    });
-    // Synchronize to the child's ready marker; allow one 50ms identity sample.
-    for (let i = 0; i < 100; i++) {
-      try {
-        readFileSync(join(f.directory, 'ready'));
-        break;
-      } catch {
-        await delay(10);
-      }
+test(
+  'synthetic nested type-only manifest uses the installed package declaration owner',
+  { tags: ['release'] },
+  async () => {
+    const f = fixture();
+    try {
+      const consumer = join(f.directory, 'consumer');
+      mkdirSync(consumer);
+      writeFileSync(
+        join(consumer, 'package.json'),
+        JSON.stringify({ name: 'fictional-consumer', type: 'module', dependencies: { '@fictional/sdk': '0' } }),
+      );
+      const sdk = join(consumer, 'node_modules', '@fictional', 'sdk');
+      const esm = join(sdk, 'dist', 'esm');
+      mkdirSync(esm, { recursive: true });
+      writeFileSync(
+        join(sdk, 'package.json'),
+        JSON.stringify({
+          name: '@fictional/sdk',
+          type: 'module',
+          exports: './dist/esm/index.js',
+          dependencies: { 'declared-only': '0' },
+        }),
+      );
+      writeFileSync(join(esm, 'package.json'), '{"type":"module"}');
+      const dep = join(sdk, 'node_modules', 'declared-only');
+      mkdirSync(dep, { recursive: true });
+      writeFileSync(
+        join(dep, 'package.json'),
+        JSON.stringify({ name: 'declared-only', type: 'module', exports: './index.js' }),
+      );
+      writeFileSync(join(dep, 'index.js'), 'export const value=true;');
+      writeFileSync(join(esm, 'index.js'), "import {value} from 'declared-only';console.log(value);");
+      const guard = join(consumer, 'owned-guard.mjs');
+      writeFileSync(guard, helper.resolutionGuard(consumer));
+      const env = helper.consumerEnvironment(f.directory, process.execPath);
+      const probe = join(consumer, 'owned-probe.mjs');
+      writeFileSync(probe, "await import('@fictional/sdk')");
+      const args = ['--import', guard, probe];
+      assert.equal(
+        (await helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env })).stdout.trim(),
+        'true',
+      );
+      writeFileSync(join(esm, 'index.js'), "await import('missing-only');");
+      await assert.rejects(
+        helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env }),
+        failure('dependency'),
+      );
+      const hoisted = join(consumer, 'node_modules', 'undeclared-only');
+      mkdirSync(hoisted, { recursive: true });
+      writeFileSync(
+        join(hoisted, 'package.json'),
+        JSON.stringify({ name: 'undeclared-only', type: 'module', exports: './index.js' }),
+      );
+      writeFileSync(join(hoisted, 'index.js'), 'export const value=true;');
+      writeFileSync(join(esm, 'index.js'), "await import('undeclared-only');");
+      await assert.rejects(
+        helper.runOwnedProcess(process.execPath, args, { cwd: consumer, env }),
+        failure('dependency'),
+      );
+    } finally {
+      f.cleanup();
     }
-    await delay(150);
-    cancellation.abort();
-    await assert.rejects(running, (error: unknown) => {
-      const e = error as Failure;
-      quiescent = e.evidence.quiescent === true;
-      assert.equal(e.code, 'cancelled');
-      assert.equal(quiescent, true);
-      assert.ok((e.evidence.observed?.length ?? 0) >= 2);
-      return true;
-    });
-  } finally {
-    if (quiescent) f.cleanup();
-  }
-}, 5000);
+  },
+);
+
+test(
+  'synthetic cancellation kills an observed resistant descendant after its parent exits',
+  { tags: ['release'], timeout: 5000 },
+  async () => {
+    const f = fixture();
+    const cancellation = new AbortController();
+    let quiescent = false;
+    try {
+      const env = helper.consumerEnvironment(f.directory, process.execPath);
+      const descendant = join(f.directory, 'descendant.cjs');
+      writeFileSync(
+        descendant,
+        "process.on('SIGTERM',()=>{});require('node:fs').writeFileSync('ready',String(process.pid));setInterval(()=>{},1000);",
+      );
+      const parent = join(f.directory, 'parent.cjs');
+      writeFileSync(
+        parent,
+        "require('node:child_process').spawn(process.execPath,[process.argv[2]],{stdio:['ignore',process.stdout,process.stderr]});setInterval(()=>{},1000);",
+      );
+      const running = helper.runOwnedProcess(process.execPath, [parent, descendant], {
+        cwd: f.directory,
+        env,
+        signal: cancellation.signal,
+      });
+      // Synchronize to the child's ready marker; allow one 50ms identity sample.
+      for (let i = 0; i < 100; i++) {
+        try {
+          readFileSync(join(f.directory, 'ready'));
+          break;
+        } catch {
+          await delay(10);
+        }
+      }
+      await delay(150);
+      cancellation.abort();
+      await assert.rejects(running, (error: unknown) => {
+        const e = error as Failure;
+        quiescent = e.evidence.quiescent === true;
+        assert.equal(e.code, 'cancelled');
+        assert.equal(quiescent, true);
+        assert.ok((e.evidence.observed?.length ?? 0) >= 2);
+        return true;
+      });
+    } finally {
+      if (quiescent) f.cleanup();
+    }
+  },
+);
 
 test('synthetic unknown or reused process identity is refused rather than signaled', () => {
   const known = [{ pid: 1, birth: 'first', rssBytes: 0 }];
@@ -923,70 +957,74 @@ test.each([
   'resistant-startup',
   'resistant-schema',
   'resistant-matching-schema',
-])('synthetic packaged stdio MCP %s exercises its explicit mocked schema and shutdown boundary', async (kind) => {
-  const f = fixture();
-  let quiescent = true;
-  try {
-    const consumer = join(f.directory, 'consumer');
-    mkdirSync(consumer);
-    writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
-    const pkg = join(consumer, 'node_modules', '@aviaratech', 'ai-delivery');
-    mkdirSync(pkg, { recursive: true });
-    writeFileSync(
-      join(pkg, 'package.json'),
-      JSON.stringify({ name: '@aviaratech/ai-delivery', type: 'module', exports: { './mcp': './mcp.js' } }),
-    );
-    writeFileSync(join(pkg, 'mcp.js'), 'export const AI_DELIVERY_MCP_TOOLS=[];');
-    const zod = join(pkg, 'node_modules', 'zod');
-    mkdirSync(zod, { recursive: true });
-    writeFileSync(join(zod, 'package.json'), JSON.stringify({ name: 'zod', main: 'index.cjs' }));
-    writeFileSync(join(zod, 'index.cjs'), 'exports.toJSONSchema=()=>({});');
-    const launcher = join(consumer, 'fictional-packaged-launcher.cjs');
-    const startup = kind === 'startup';
-    const resistant = kind.startsWith('resistant-');
-    const tools = ['matching-schema', 'resistant-matching-schema'].includes(kind)
-      ? []
-      : [{ name: 'unexpected', inputSchema: {} }];
-    const server = `process.on('SIGTERM',${resistant ? '()=>{}' : '()=>process.exit(0)'});
+])(
+  'synthetic packaged stdio MCP %s exercises its explicit mocked schema and shutdown boundary',
+  { tags: ['release'] },
+  async (kind) => {
+    const f = fixture();
+    let quiescent = true;
+    try {
+      const consumer = join(f.directory, 'consumer');
+      mkdirSync(consumer);
+      writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
+      const pkg = join(consumer, 'node_modules', '@aviaratech', 'ai-delivery');
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(
+        join(pkg, 'package.json'),
+        JSON.stringify({ name: '@aviaratech/ai-delivery', type: 'module', exports: { './mcp': './mcp.js' } }),
+      );
+      writeFileSync(join(pkg, 'mcp.js'), 'export const AI_DELIVERY_MCP_TOOLS=[];');
+      const zod = join(pkg, 'node_modules', 'zod');
+      mkdirSync(zod, { recursive: true });
+      writeFileSync(join(zod, 'package.json'), JSON.stringify({ name: 'zod', main: 'index.cjs' }));
+      writeFileSync(join(zod, 'index.cjs'), 'exports.toJSONSchema=()=>({});');
+      const launcher = join(consumer, 'fictional-packaged-launcher.cjs');
+      const startup = kind === 'startup';
+      const resistant = kind.startsWith('resistant-');
+      const tools = ['matching-schema', 'resistant-matching-schema'].includes(kind)
+        ? []
+        : [{ name: 'unexpected', inputSchema: {} }];
+      const server = `process.on('SIGTERM',${resistant ? '()=>{}' : '()=>process.exit(0)'});
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line);if(m.id===1)console.log(JSON.stringify({jsonrpc:'2.0',id:1,result:{serverInfo:{version:'0.0.0'}}}));
  if(m.id===2)console.log(JSON.stringify({jsonrpc:'2.0',id:2,result:{tools:${JSON.stringify(tools)}}}));
 });`;
-    writeFileSync(
-      launcher,
-      startup
-        ? 'process.exit(1);'
-        : kind === 'resistant-startup'
-          ? "process.on('SIGTERM',()=>{});console.log('fictional startup banner');setInterval(()=>{},1000);"
-          : server,
-    );
-    const probe = join(consumer, 'owned-mcp.mjs');
-    writeFileSync(probe, helper.MCP_PROBE);
-    quiescent = false;
-    const running = helper.runOwnedProcess(process.execPath, [probe, launcher, '0.0.0'], {
-      cwd: consumer,
-      env: helper.consumerEnvironment(f.directory, process.execPath),
-    });
-    if (kind === 'matching-schema') {
-      const result = await running;
-      quiescent = result.evidence.quiescent;
-      assert.deepEqual(helper.parseJsonOutput(result.stdout), {
-        toolCount: 0,
-        schemas: [],
-        protocol: 'stdio initialize/tools/list',
-        version: '0.0.0',
+      writeFileSync(
+        launcher,
+        startup
+          ? 'process.exit(1);'
+          : kind === 'resistant-startup'
+            ? "process.on('SIGTERM',()=>{});console.log('fictional startup banner');setInterval(()=>{},1000);"
+            : server,
+      );
+      const probe = join(consumer, 'owned-mcp.mjs');
+      writeFileSync(probe, helper.MCP_PROBE);
+      quiescent = false;
+      const running = helper.runOwnedProcess(process.execPath, [probe, launcher, '0.0.0'], {
+        cwd: consumer,
+        env: helper.consumerEnvironment(f.directory, process.execPath),
       });
-      assert.equal(result.evidence.quiescent, true);
-    } else
-      await assert.rejects(running, (error: unknown) => {
-        quiescent = (error as Failure).evidence.quiescent === true;
-        return failure(kind === 'resistant-matching-schema' ? 'cleanup' : 'schema')(error) && quiescent;
-      });
-  } finally {
-    if (quiescent) f.cleanup();
-    else recordSynthetic({ kind: 'fixture-retained', directory: f.directory, quiescent: false });
-  }
-});
+      if (kind === 'matching-schema') {
+        const result = await running;
+        quiescent = result.evidence.quiescent;
+        assert.deepEqual(helper.parseJsonOutput(result.stdout), {
+          toolCount: 0,
+          schemas: [],
+          protocol: 'stdio initialize/tools/list',
+          version: '0.0.0',
+        });
+        assert.equal(result.evidence.quiescent, true);
+      } else
+        await assert.rejects(running, (error: unknown) => {
+          quiescent = (error as Failure).evidence.quiescent === true;
+          return failure(kind === 'resistant-matching-schema' ? 'cleanup' : 'schema')(error) && quiescent;
+        });
+    } finally {
+      if (quiescent) f.cleanup();
+      else recordSynthetic({ kind: 'fixture-retained', directory: f.directory, quiescent: false });
+    }
+  },
+);
 
 test.each(['sourceManifestSha256', 'sourceLockSha256'] as const)(
   'synthetic integrated %s digest drift cannot reuse an older archive as candidate proof',

@@ -306,118 +306,130 @@ globalThis.fetch=async(input,init={})=>{
   };
 }
 
-test('stable package bin submits both provider verdicts with clean PATH and refreshes counted status', () => {
-  const fixture = commandFixture();
-  try {
-    for (const provider of ['gpt', 'claude'] as const)
-      for (const decision of ['approve', 'request-changes'] as const) {
-        const result = fixture.run({ provider, verdict: decision });
-        assert.equal(result.status, 0, result.stderr);
-        const receipt = JSON.parse(result.stdout) as {
-          state: string;
-          login: string;
-          requiredReview: { status: string };
-          artifact: { requestedModel: string; reviewerIdentity: string; verdictFileSha256: string; checks: string[] };
+test(
+  'stable package bin submits both provider verdicts with clean PATH and refreshes counted status',
+  { tags: ['release'] },
+  () => {
+    const fixture = commandFixture();
+    try {
+      for (const provider of ['gpt', 'claude'] as const)
+        for (const decision of ['approve', 'request-changes'] as const) {
+          const result = fixture.run({ provider, verdict: decision });
+          assert.equal(result.status, 0, result.stderr);
+          const receipt = JSON.parse(result.stdout) as {
+            state: string;
+            login: string;
+            requiredReview: { status: string };
+            artifact: { requestedModel: string; reviewerIdentity: string; verdictFileSha256: string; checks: string[] };
+          };
+          assert.equal(receipt.state, decision === 'approve' ? 'APPROVED' : 'CHANGES_REQUESTED');
+          assert.equal(receipt.login, `fixture-${provider}-reviewer[bot]`);
+          assert.equal(receipt.artifact.reviewerIdentity, `${provider}-reviewer`);
+          assert.equal(receipt.requiredReview.status, decision === 'approve' ? 'satisfied' : 'changes-requested');
+          assert.equal(result.posts.length, 1);
+          assert.equal(result.resolutions.length, 1);
+          assert.deepEqual(result.resolutions[0]!.args, [`${provider}-reviewer`]);
+          assert.equal(result.resolutions[0]!.names.includes('AUTHOR_TOKEN'), false);
+          assert.equal(result.resolutions[0]!.names.includes('UNUSED_APP_KEY'), false);
+          assert.equal(result.resolutions[0]!.names.includes('NODE_OPTIONS'), false);
+          assert.equal(
+            receipt.artifact.verdictFileSha256,
+            'sha256:' + createHash('sha256').update(readFileSync(fixture.input)).digest('hex'),
+          );
+          const body = (JSON.parse(readFileSync(fixture.history, 'utf8')) as { body: string }[])[0]!.body;
+          for (const text of [
+            'Verdict-file SHA256: ' + receipt.artifact.verdictFileSha256,
+            'Requested model/effort:',
+            'Effective model/effort:',
+            'Elapsed milliseconds: 100',
+            'Findings: none',
+          ])
+            assert.ok(body.includes(text), text);
+          assert.equal(body.includes('PRIVATE KEY'), false);
+          assert.equal(result.posts[0]!.event, decision === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES');
+          const retry = fixture.run({ provider, verdict: decision, repeat: true });
+          assert.equal(retry.status, 0, retry.stderr);
+          assert.equal(retry.posts.length, 1, 'Retry must reuse the original review without a second POST.');
+        }
+      const inherited = fixture.run({ scenario: 'still-required' });
+      assert.equal(inherited.status, 0, inherited.stderr);
+      assert.equal(
+        (JSON.parse(inherited.stdout) as { requiredReview: { status: string } }).requiredReview.status,
+        'still-required',
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  },
+);
+
+test(
+  'actual command refuses stale scope/head/actor and invalid metadata without a review mutation',
+  { tags: ['release'] },
+  () => {
+    const fixture = commandFixture();
+    try {
+      for (const scenario of [
+        'head-moved',
+        'mid-head-moved',
+        'scope-mismatch',
+        'foreign-app',
+        'wrong-actor',
+        'self-review',
+      ]) {
+        const result = fixture.run({ scenario });
+        assert.notEqual(result.status, 0, scenario);
+        assert.equal(result.posts.length, 0, scenario);
+        if (['head-moved', 'mid-head-moved', 'scope-mismatch'].includes(scenario) && scenario !== 'mid-head-moved')
+          assert.equal(result.resolutions.length, 0, scenario);
+      }
+      for (const options of [
+        { identity: 'builder' },
+        { identity: 'personal' },
+        { identity: 'claude-reviewer' },
+        { patch: { effectiveModel: 'claude-opus-4-6' } },
+        { patch: { elapsedMs: -1 } },
+        { patch: { requestedEffort: '' } },
+      ]) {
+        const result = fixture.run(options);
+        assert.notEqual(result.status, 0);
+        assert.equal(result.requests.length, 0, 'Malformed verdict/identity must fail before any authentication.');
+        assert.equal(result.resolutions.length, 0);
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  },
+);
+
+test(
+  'actual command preserves known or ambiguous mutation and reconciles acknowledgement loss',
+  { tags: ['release'] },
+  () => {
+    const fixture = commandFixture();
+    try {
+      for (const scenario of ['post-head-moved', 'readback-failed', 'ack-lost']) {
+        const result = fixture.run({ scenario });
+        assert.notEqual(result.status, 0, result.stderr);
+        const pending = JSON.parse(result.stdout) as {
+          status: string;
+          submission: { prNumber: number; githubReviewId?: number };
         };
-        assert.equal(receipt.state, decision === 'approve' ? 'APPROVED' : 'CHANGES_REQUESTED');
-        assert.equal(receipt.login, `fixture-${provider}-reviewer[bot]`);
-        assert.equal(receipt.artifact.reviewerIdentity, `${provider}-reviewer`);
-        assert.equal(receipt.requiredReview.status, decision === 'approve' ? 'satisfied' : 'changes-requested');
+        assert.equal(pending.status, 'submission-unverified');
+        assert.equal(pending.submission.prNumber, 19);
         assert.equal(result.posts.length, 1);
-        assert.equal(result.resolutions.length, 1);
-        assert.deepEqual(result.resolutions[0]!.args, [`${provider}-reviewer`]);
-        assert.equal(result.resolutions[0]!.names.includes('AUTHOR_TOKEN'), false);
-        assert.equal(result.resolutions[0]!.names.includes('UNUSED_APP_KEY'), false);
-        assert.equal(result.resolutions[0]!.names.includes('NODE_OPTIONS'), false);
-        assert.equal(
-          receipt.artifact.verdictFileSha256,
-          'sha256:' + createHash('sha256').update(readFileSync(fixture.input)).digest('hex'),
-        );
-        const body = (JSON.parse(readFileSync(fixture.history, 'utf8')) as { body: string }[])[0]!.body;
-        for (const text of [
-          'Verdict-file SHA256: ' + receipt.artifact.verdictFileSha256,
-          'Requested model/effort:',
-          'Effective model/effort:',
-          'Elapsed milliseconds: 100',
-          'Findings: none',
-        ])
-          assert.ok(body.includes(text), text);
-        assert.equal(body.includes('PRIVATE KEY'), false);
-        assert.equal(result.posts[0]!.event, decision === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES');
-        const retry = fixture.run({ provider, verdict: decision, repeat: true });
-        assert.equal(retry.status, 0, retry.stderr);
-        assert.equal(retry.posts.length, 1, 'Retry must reuse the original review without a second POST.');
+        if (scenario !== 'ack-lost') assert.equal(pending.submission.githubReviewId, 41);
+        if (scenario === 'ack-lost') {
+          const retry = fixture.run({ repeat: true });
+          assert.equal(retry.status, 0, retry.stderr);
+          assert.equal(retry.posts.length, 1);
+        }
       }
-    const inherited = fixture.run({ scenario: 'still-required' });
-    assert.equal(inherited.status, 0, inherited.stderr);
-    assert.equal(
-      (JSON.parse(inherited.stdout) as { requiredReview: { status: string } }).requiredReview.status,
-      'still-required',
-    );
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test('actual command refuses stale scope/head/actor and invalid metadata without a review mutation', () => {
-  const fixture = commandFixture();
-  try {
-    for (const scenario of [
-      'head-moved',
-      'mid-head-moved',
-      'scope-mismatch',
-      'foreign-app',
-      'wrong-actor',
-      'self-review',
-    ]) {
-      const result = fixture.run({ scenario });
-      assert.notEqual(result.status, 0, scenario);
-      assert.equal(result.posts.length, 0, scenario);
-      if (['head-moved', 'mid-head-moved', 'scope-mismatch'].includes(scenario) && scenario !== 'mid-head-moved')
-        assert.equal(result.resolutions.length, 0, scenario);
+    } finally {
+      fixture.cleanup();
     }
-    for (const options of [
-      { identity: 'builder' },
-      { identity: 'personal' },
-      { identity: 'claude-reviewer' },
-      { patch: { effectiveModel: 'claude-opus-4-6' } },
-      { patch: { elapsedMs: -1 } },
-      { patch: { requestedEffort: '' } },
-    ]) {
-      const result = fixture.run(options);
-      assert.notEqual(result.status, 0);
-      assert.equal(result.requests.length, 0, 'Malformed verdict/identity must fail before any authentication.');
-      assert.equal(result.resolutions.length, 0);
-    }
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test('actual command preserves known or ambiguous mutation and reconciles acknowledgement loss', () => {
-  const fixture = commandFixture();
-  try {
-    for (const scenario of ['post-head-moved', 'readback-failed', 'ack-lost']) {
-      const result = fixture.run({ scenario });
-      assert.notEqual(result.status, 0, result.stderr);
-      const pending = JSON.parse(result.stdout) as {
-        status: string;
-        submission: { prNumber: number; githubReviewId?: number };
-      };
-      assert.equal(pending.status, 'submission-unverified');
-      assert.equal(pending.submission.prNumber, 19);
-      assert.equal(result.posts.length, 1);
-      if (scenario !== 'ack-lost') assert.equal(pending.submission.githubReviewId, 41);
-      if (scenario === 'ack-lost') {
-        const retry = fixture.run({ repeat: true });
-        assert.equal(retry.status, 0, retry.stderr);
-        assert.equal(retry.posts.length, 1);
-      }
-    }
-  } finally {
-    fixture.cleanup();
-  }
-});
+  },
+);
 
 test('explicit provider binding supports consumer names and rejects mismatched models or heads before auth', () => {
   const build: unknown = Reflect.get(reviews, 'buildReviewArtifact');
@@ -528,159 +540,179 @@ test('selected profile environment preserves machine selectors and excludes unus
   }
 });
 
-test('command denial, malformed output and overflow refuse without output leakage or writes', () => {
-  const fixture = commandFixture();
-  try {
-    for (const scenario of ['command-denied', 'command-malformed', 'command-overflow', 'command-empty']) {
-      const result = fixture.run({ scenario });
-      assert.notEqual(result.status, 0);
-      assert.equal(result.posts.length, 0);
-      assert.equal(result.resolutions.length, 1);
-      assert.equal((result.stdout + result.stderr).includes('FICTIONAL_PRIVATE_HELPER_ERROR'), false);
-      assert.equal((result.stdout + result.stderr).includes('fixture_helper_auth'), false);
-    }
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test('read-only doctor uses the selected source and actual App actor outside Git without review or project mutations', () => {
-  const fixture = commandFixture();
-  try {
-    const result = fixture.run({ identity: 'custom-checker', doctor: true });
-    assert.equal(result.status, 0, result.stderr);
-    const output = JSON.parse(result.stdout) as { identity: string; actorLogin: string };
-    assert.equal(output.identity, 'custom-checker');
-    assert.equal(output.actorLogin, 'fixture-gpt-reviewer[bot]');
-    assert.equal(result.resolutions.length, 1);
-    assert.deepEqual(result.resolutions[0]!.args, ['custom-checker']);
-    assert.equal(
-      result.requests.some((r) => r.path === '/app'),
-      true,
-    );
-    assert.equal(
-      result.requests.every((r) => r.path === '/app' || r.path.includes('/access_tokens')),
-      true,
-    );
-    assert.equal(result.posts.length, 0);
-    const submit = fixture.run({ identity: 'custom-checker' });
-    assert.equal(submit.status, 0, submit.stderr);
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test('credential process observation excludes ambient credentials and executable injection selectors', async () => {
-  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
-  let observedEnv: NodeJS.ProcessEnv | undefined;
-  vi.mocked(spawnSync).mockImplementationOnce((command, args, options) => {
-    // Node may add NODE_V8_COVERAGE to this object while normalizing the spawn.
-    observedEnv = { ...options?.env };
-    return actual.spawnSync(command, args, options);
-  });
-  vi.stubEnv('GH_PRIVATE_KEY_UNSELECTED', 'FICTIONAL_UNUSED_PRIVATE_KEY');
-  vi.stubEnv('AUTHOR_TOKEN', 'FICTIONAL_AUTHOR_TOKEN');
-  try {
-    const calls = vi.mocked(spawnSync).mock.calls.length;
-    assert.ok(processSnapshot().has(process.pid));
-    const observed = vi.mocked(spawnSync).mock.calls.slice(calls);
-    assert.equal(observed.length, 1);
-    assert.deepEqual(observedEnv, { LC_ALL: 'C' });
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
-
-test('selected env default, explicit env, protected file and command PEM all use the same stable bin', () => {
-  const fixture = commandFixture();
-  try {
-    for (const source of [
-      undefined,
-      { type: 'env', variable: 'SELECTED_KEY' },
-      { type: 'file', path: fixture.key },
-      { type: 'command', argv: [fixture.helper, 'gpt-reviewer'], encoding: 'pem' },
-    ]) {
-      fixture.setSource(source);
-      const result = fixture.run({
-        scenario: typeof source === 'object' && source.type === 'command' ? 'command-pem' : 'normal',
-      });
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.posts.length, 1);
-      assert.equal(result.resolutions.length, typeof source === 'object' && source.type === 'command' ? 1 : 0);
-    }
-    fixture.setSource({ type: 'file', path: fixture.key });
-    chmodSync(fixture.key, 0o644);
-    const refused = fixture.run();
-    assert.notEqual(refused.status, 0);
-    assert.equal(refused.posts.length, 0);
-    assert.match(refused.stderr, /0600/u);
-    chmodSync(fixture.key, 0o600);
-    const link = join(fixture.root, 'linked-key.pem');
-    symlinkSync(fixture.key, link);
-    fixture.setSource({ type: 'file', path: link });
-    const symlink = fixture.run();
-    assert.notEqual(symlink.status, 0);
-    assert.equal(symlink.posts.length, 0);
-    fixture.setSource({ type: 'command', argv: [join(fixture.root, 'missing-helper')] });
-    const missing = fixture.run();
-    assert.notEqual(missing.status, 0);
-    assert.equal(missing.posts.length, 0);
-    assert.equal(missing.resolutions.length, 0, 'An available env key must not become a fallback.');
-  } finally {
-    fixture.cleanup();
-  }
-});
-
-test('credential cancellation and response timeout await owned helper and descendant absence', async () => {
-  const fixture = commandFixture();
-  const pidFile = join(fixture.root, 'owned-pids.json');
-  const helper = join(fixture.root, 'blocking-helper.cjs');
-  writeFileSync(
-    helper,
-    `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});writeFileSync(${JSON.stringify(pidFile)},JSON.stringify([process.pid,child.pid]));setInterval(()=>{},1000);`,
-  );
-  fixture.setSource({ type: 'command', argv: [process.execPath, helper] });
-  vi.stubEnv('AI_DELIVERY_CONFIG', fixture.settings);
-  try {
-    for (const cancel of [true, false]) {
-      rmSync(pidFile, { force: true });
-      const settings = await loadDeliverySettings(undefined, {
-        reviewerIdentity: 'gpt-reviewer',
-        prepareEnvironment: true,
-        env: {
-          AI_DELIVERY_CONFIG: fixture.settings,
-          HOME: fixture.root,
-          PATH: '/usr/bin:/bin',
-          AUTHOR_TOKEN: 'fixture_author',
-          LOGNAME: 'fixture-user',
-        },
-      });
-      const controller = new AbortController();
-      const pending = createDeliveryGitHubClients({
-        config: settings,
-        identity: 'gpt-reviewer',
-        role: 'reviewer',
-        env: settings.environment!,
-        signal: controller.signal,
-      });
-      const rejected = assert.rejects(pending, cancel ? /cancelled/u : /timed out/u);
-      while (!existsSync(pidFile)) await new Promise((resolve) => setTimeout(resolve, 20));
-      if (cancel) {
-        await new Promise((resolve) => setTimeout(resolve, 1100));
-        controller.abort();
+test(
+  'command denial, malformed output and overflow refuse without output leakage or writes',
+  { tags: ['release'] },
+  () => {
+    const fixture = commandFixture();
+    try {
+      for (const scenario of ['command-denied', 'command-malformed', 'command-overflow', 'command-empty']) {
+        const result = fixture.run({ scenario });
+        assert.notEqual(result.status, 0);
+        assert.equal(result.posts.length, 0);
+        assert.equal(result.resolutions.length, 1);
+        assert.equal((result.stdout + result.stderr).includes('FICTIONAL_PRIVATE_HELPER_ERROR'), false);
+        assert.equal((result.stdout + result.stderr).includes('fixture_helper_auth'), false);
       }
-      await rejected;
-      const snapshot = processSnapshot();
-      for (const pid of JSON.parse(readFileSync(pidFile, 'utf8')) as number[])
-        assert.ok(!snapshot.has(pid) || snapshot.get(pid)!.status.startsWith('Z'), String(pid));
+    } finally {
+      fixture.cleanup();
     }
-  } finally {
-    vi.unstubAllEnvs();
-    fixture.cleanup();
-  }
-});
+  },
+);
 
-test('ambiguous or reserved reviewer profiles fail closed before source selection', async () => {
+test(
+  'read-only doctor uses the selected source and actual App actor outside Git without review or project mutations',
+  { tags: ['release'] },
+  () => {
+    const fixture = commandFixture();
+    try {
+      const result = fixture.run({ identity: 'custom-checker', doctor: true });
+      assert.equal(result.status, 0, result.stderr);
+      const output = JSON.parse(result.stdout) as { identity: string; actorLogin: string };
+      assert.equal(output.identity, 'custom-checker');
+      assert.equal(output.actorLogin, 'fixture-gpt-reviewer[bot]');
+      assert.equal(result.resolutions.length, 1);
+      assert.deepEqual(result.resolutions[0]!.args, ['custom-checker']);
+      assert.equal(
+        result.requests.some((r) => r.path === '/app'),
+        true,
+      );
+      assert.equal(
+        result.requests.every((r) => r.path === '/app' || r.path.includes('/access_tokens')),
+        true,
+      );
+      assert.equal(result.posts.length, 0);
+      const submit = fixture.run({ identity: 'custom-checker' });
+      assert.equal(submit.status, 0, submit.stderr);
+    } finally {
+      fixture.cleanup();
+    }
+  },
+);
+
+test(
+  'credential process observation excludes ambient credentials and executable injection selectors',
+  { tags: ['release'] },
+  async () => {
+    const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    let observedEnv: NodeJS.ProcessEnv | undefined;
+    vi.mocked(spawnSync).mockImplementationOnce((command, args, options) => {
+      // Node may add NODE_V8_COVERAGE to this object while normalizing the spawn.
+      observedEnv = { ...options?.env };
+      return actual.spawnSync(command, args, options);
+    });
+    vi.stubEnv('GH_PRIVATE_KEY_UNSELECTED', 'FICTIONAL_UNUSED_PRIVATE_KEY');
+    vi.stubEnv('AUTHOR_TOKEN', 'FICTIONAL_AUTHOR_TOKEN');
+    try {
+      const calls = vi.mocked(spawnSync).mock.calls.length;
+      assert.ok(processSnapshot().has(process.pid));
+      const observed = vi.mocked(spawnSync).mock.calls.slice(calls);
+      assert.equal(observed.length, 1);
+      assert.deepEqual(observedEnv, { LC_ALL: 'C' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  },
+);
+
+test(
+  'selected env default, explicit env, protected file and command PEM all use the same stable bin',
+  { tags: ['release'] },
+  () => {
+    const fixture = commandFixture();
+    try {
+      for (const source of [
+        undefined,
+        { type: 'env', variable: 'SELECTED_KEY' },
+        { type: 'file', path: fixture.key },
+        { type: 'command', argv: [fixture.helper, 'gpt-reviewer'], encoding: 'pem' },
+      ]) {
+        fixture.setSource(source);
+        const result = fixture.run({
+          scenario: typeof source === 'object' && source.type === 'command' ? 'command-pem' : 'normal',
+        });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.posts.length, 1);
+        assert.equal(result.resolutions.length, typeof source === 'object' && source.type === 'command' ? 1 : 0);
+      }
+      fixture.setSource({ type: 'file', path: fixture.key });
+      chmodSync(fixture.key, 0o644);
+      const refused = fixture.run();
+      assert.notEqual(refused.status, 0);
+      assert.equal(refused.posts.length, 0);
+      assert.match(refused.stderr, /0600/u);
+      chmodSync(fixture.key, 0o600);
+      const link = join(fixture.root, 'linked-key.pem');
+      symlinkSync(fixture.key, link);
+      fixture.setSource({ type: 'file', path: link });
+      const symlink = fixture.run();
+      assert.notEqual(symlink.status, 0);
+      assert.equal(symlink.posts.length, 0);
+      fixture.setSource({ type: 'command', argv: [join(fixture.root, 'missing-helper')] });
+      const missing = fixture.run();
+      assert.notEqual(missing.status, 0);
+      assert.equal(missing.posts.length, 0);
+      assert.equal(missing.resolutions.length, 0, 'An available env key must not become a fallback.');
+    } finally {
+      fixture.cleanup();
+    }
+  },
+);
+
+test(
+  'credential cancellation and response timeout await owned helper and descendant absence',
+  { tags: ['release'] },
+  async () => {
+    const fixture = commandFixture();
+    const pidFile = join(fixture.root, 'owned-pids.json');
+    const helper = join(fixture.root, 'blocking-helper.cjs');
+    writeFileSync(
+      helper,
+      `const {spawn}=require('node:child_process');const {writeFileSync}=require('node:fs');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});writeFileSync(${JSON.stringify(pidFile)},JSON.stringify([process.pid,child.pid]));setInterval(()=>{},1000);`,
+    );
+    fixture.setSource({ type: 'command', argv: [process.execPath, helper] });
+    vi.stubEnv('AI_DELIVERY_CONFIG', fixture.settings);
+    try {
+      for (const cancel of [true, false]) {
+        rmSync(pidFile, { force: true });
+        const settings = await loadDeliverySettings(undefined, {
+          reviewerIdentity: 'gpt-reviewer',
+          prepareEnvironment: true,
+          env: {
+            AI_DELIVERY_CONFIG: fixture.settings,
+            HOME: fixture.root,
+            PATH: '/usr/bin:/bin',
+            AUTHOR_TOKEN: 'fixture_author',
+            LOGNAME: 'fixture-user',
+          },
+        });
+        const controller = new AbortController();
+        const pending = createDeliveryGitHubClients({
+          config: settings,
+          identity: 'gpt-reviewer',
+          role: 'reviewer',
+          env: settings.environment!,
+          signal: controller.signal,
+        });
+        const rejected = assert.rejects(pending, cancel ? /cancelled/u : /timed out/u);
+        while (!existsSync(pidFile)) await new Promise((resolve) => setTimeout(resolve, 20));
+        if (cancel) {
+          await new Promise((resolve) => setTimeout(resolve, 1100));
+          controller.abort();
+        }
+        await rejected;
+        const snapshot = processSnapshot();
+        for (const pid of JSON.parse(readFileSync(pidFile, 'utf8')) as number[])
+          assert.ok(!snapshot.has(pid) || snapshot.get(pid)!.status.startsWith('Z'), String(pid));
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      fixture.cleanup();
+    }
+  },
+);
+
+test('ambiguous or reserved reviewer profiles fail closed before source selection', { tags: ['release'] }, async () => {
   const fixture = commandFixture();
   const original = readFileSync(fixture.settings, 'utf8');
   try {
@@ -703,6 +735,7 @@ test('ambiguous or reserved reviewer profiles fail closed before source selectio
 
 test.each(['unselected-profile-key', 'implicit-author-selector'] as const)(
   'credential reference collisions refuse before helper launch: %s',
+  { tags: ['release'] },
   (collision) => {
     const fixture = commandFixture();
     try {

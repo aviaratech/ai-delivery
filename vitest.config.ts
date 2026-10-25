@@ -1,3 +1,4 @@
+import { availableParallelism } from 'node:os';
 import { defineConfig } from 'vitest/config';
 
 const lane = process.env.AI_DELIVERY_TEST_LANE ?? 'pr';
@@ -13,46 +14,15 @@ if (lane === 'release') {
   }
 }
 
-// These fixtures assert process ownership, interruption or shared checkout state.
-const serialFiles = [
-  'dist/contributorChecks.test.js',
-  'dist/currentConsumer.test.js',
-  'dist/delivery/delivery.test.js',
-  'dist/lifecycle.test.js',
-  'dist/pluginAuthProbe.test.js',
-  'dist/pluginInstaller.test.js',
-  'dist/pluginPackaging.test.js',
-  'dist/setup.test.js',
-  'dist/stagedChecks.test.js',
-  'dist/targetPolicyLocal.test.js',
-  'dist/worktreeTransition.test.js',
-];
-
-export default defineConfig({
+// Files own disjoint temporary roots. Forks isolate mutable test ports; the
+// producer finishes before source/archive readers, with existing RSS/cleanup guards.
+export default defineConfig(({ mode }) => ({
   test: {
-    tags: [{ name: 'release', description: 'Owned archive/install qualification', skip: lane !== 'release' }],
+    tags: [{ name: 'release', description: 'Owned process/archive/install qualification', skip: lane !== 'release' }],
     pool: 'forks',
     testTimeout: 60_000,
-    projects: [
-      {
-        test: {
-          name: 'parallel',
-          include: ['dist/**/*.test.js'],
-          exclude: serialFiles,
-          fileParallelism: true,
-          maxWorkers: 2,
-          sequence: { groupOrder: 0 },
-        },
-      },
-      {
-        test: {
-          name: 'serial',
-          include: serialFiles,
-          fileParallelism: false,
-          maxWorkers: 1,
-          sequence: { groupOrder: 1 },
-        },
-      },
-    ],
+    include: [mode === 'compiled' || lane === 'release' ? 'dist/**/*.test.js' : 'src/**/*.test.ts'],
+    fileParallelism: true,
+    maxWorkers: availableParallelism(),
   },
-});
+}));

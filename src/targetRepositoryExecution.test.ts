@@ -490,64 +490,68 @@ for (const route of cliOnly) {
   });
 }
 
-test('CLI mcp:serve initializes and serves a real stdio request without target code execution', async () => {
-  const f = inertTarget();
-  const request = inputFile(f, 'stdio-request.json', {
-    mode: 'cli',
-    root: f.root,
-    head: f.head,
-    report: join(f.base, 'stdio-report.json'),
-    args: [],
-  });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [
-      '--max-old-space-size=96',
-      '--experimental-test-module-mocks',
-      '--import',
-      fileURLToPath(new URL('./fixtures/inertEntrypointChild.js', import.meta.url)),
-      fileURLToPath(new URL('./cli.js', import.meta.url)),
-      '--repo-root',
-      f.root,
-      'mcp:serve',
-    ],
-    env: {
-      PATH: process.env.PATH!,
-      HOME: f.base,
-      AI_DELIVERY_CONFIG: process.env.AI_DELIVERY_CONFIG!,
-      AI_DELIVERY_ENTRYPOINT_REQUEST: request,
-    },
-    stderr: 'pipe',
-  });
-  let childClosed = false;
-  let childStderr = '';
-  transport.stderr?.on('data', (bytes: Buffer) => {
-    childStderr = (childStderr + bytes.toString('utf8')).slice(-64 * 1024);
-  });
-  transport.onclose = () => {
-    childClosed = true;
-  };
-  const client = new Client({ name: 'hostile-stdio-fixture', version: '1' });
-  try {
-    f.policy('tracked');
-    await client.connect(transport);
-    const result = await client.callTool({
-      name: 'issue_info',
-      arguments: { repo: 'example/widget', issueNumber: 17 },
+test(
+  'CLI mcp:serve initializes and serves a real stdio request without target code execution',
+  { tags: ['release'] },
+  async () => {
+    const f = inertTarget();
+    const request = inputFile(f, 'stdio-request.json', {
+      mode: 'cli',
+      root: f.root,
+      head: f.head,
+      report: join(f.base, 'stdio-report.json'),
+      args: [],
     });
-    assert.notEqual(result.isError, true, JSON.stringify(result));
-    const value = JSON.parse((result.content as { text: string }[])[0]!.text) as { issueNumber: number };
-    assert.equal(value.issueNumber, 17);
-    f.assertInert();
-  } catch (cause) {
-    throw new Error(`Real stdio MCP failed. Child stderr: ${childStderr}`, { cause });
-  } finally {
-    await client.close();
-    await transport.close();
-    assert.equal(childClosed, true, 'The stdio child must exit before removing its fixture');
-    await f.dispose(undefined);
-  }
-});
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [
+        '--max-old-space-size=96',
+        '--experimental-test-module-mocks',
+        '--import',
+        fileURLToPath(new URL('./fixtures/inertEntrypointChild.js', import.meta.url)),
+        fileURLToPath(new URL('./cli.js', import.meta.url)),
+        '--repo-root',
+        f.root,
+        'mcp:serve',
+      ],
+      env: {
+        PATH: process.env.PATH!,
+        HOME: f.base,
+        AI_DELIVERY_CONFIG: process.env.AI_DELIVERY_CONFIG!,
+        AI_DELIVERY_ENTRYPOINT_REQUEST: request,
+      },
+      stderr: 'pipe',
+    });
+    let childClosed = false;
+    let childStderr = '';
+    transport.stderr?.on('data', (bytes: Buffer) => {
+      childStderr = (childStderr + bytes.toString('utf8')).slice(-64 * 1024);
+    });
+    transport.onclose = () => {
+      childClosed = true;
+    };
+    const client = new Client({ name: 'hostile-stdio-fixture', version: '1' });
+    try {
+      f.policy('tracked');
+      await client.connect(transport);
+      const result = await client.callTool({
+        name: 'issue_info',
+        arguments: { repo: 'example/widget', issueNumber: 17 },
+      });
+      assert.notEqual(result.isError, true, JSON.stringify(result));
+      const value = JSON.parse((result.content as { text: string }[])[0]!.text) as { issueNumber: number };
+      assert.equal(value.issueNumber, 17);
+      f.assertInert();
+    } catch (cause) {
+      throw new Error(`Real stdio MCP failed. Child stderr: ${childStderr}`, { cause });
+    } finally {
+      await client.close();
+      await transport.close();
+      assert.equal(childClosed, true, 'The stdio child must exit before removing its fixture');
+      await f.dispose(undefined);
+    }
+  },
+);
 
 test('hostile repository arms policy, executable configs, package scripts and Git hooks', async () => {
   const f = inertTarget();

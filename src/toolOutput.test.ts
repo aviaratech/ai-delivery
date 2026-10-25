@@ -188,6 +188,7 @@ test('compact output preserves recovery inputs, fields and diagnostics without m
 
 test.each([[], ['--json'], ['--verbose'], ['--json', '--verbose']].map((flags) => ({ flags })))(
   'actual CLI output flags $flags',
+  { tags: ['release'] },
   async ({ flags }) => {
     const cli = pathToFileURL(join(process.cwd(), 'dist/cli.js')).href;
     const module = pathToFileURL(join(process.cwd(), 'dist/dispatch.js')).href;

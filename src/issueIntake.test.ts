@@ -233,7 +233,7 @@ test('status-only patches refuse concurrent native body drift before overwriting
   assert.equal(f.writes.length, 0);
 });
 
-test('CLI typed field files reach status privacy validation before configuration', () => {
+test('CLI typed field files reach status privacy validation before configuration', { tags: ['release'] }, () => {
   const root = mkdtempSync(join(tmpdir(), 'delivery130-status-'));
   try {
     const file = join(root, 'fields.json');
@@ -1526,189 +1526,197 @@ test('created readiness refusal returns exact retry markers through safe resume 
   assert.equal(f.comments.length, 1);
 });
 
-test('actual compiled stdio MCP returns every Ready diagnostic before credentials and refuses a foreign caller repo', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'issue-contract-stdio-'));
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [resolve('dist/cli.js'), '--identity', 'host-author', '--repo', 'example/widget', 'mcp:serve'],
-    cwd: root,
-    stderr: 'pipe',
-    env: {
-      HOME: root,
-      PATH: process.env.PATH ?? '',
-      AI_DELIVERY_CONFIG: join(root, 'missing-config.json'),
-      LANG: 'en_US.UTF-8',
-    },
-  });
-  const client = new Client({ name: 'issue68-synthetic-client', version: '1.0.0' });
-  let spawnedPid: number | null = null;
-  let closeObserved = false;
-  try {
-    await client.connect(transport);
-    spawnedPid = transport.pid;
-    assert.ok(spawnedPid);
-    const original = transport.onclose;
-    transport.onclose = () => {
-      closeObserved = true;
-      original?.();
-    };
-    const listing = await client.listTools();
-    assert.ok(listing.tools.find((t) => t.name === 'issue_create')?.inputSchema.properties?.acceptanceCriteria);
-    const result = await client.callTool({
-      name: 'issue_create',
-      arguments: { ...ready(), points: 13, openQuestions: ['Select behavior.'] },
+test(
+  'actual compiled stdio MCP returns every Ready diagnostic before credentials and refuses a foreign caller repo',
+  { tags: ['release'] },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), 'issue-contract-stdio-'));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [resolve('dist/cli.js'), '--identity', 'host-author', '--repo', 'example/widget', 'mcp:serve'],
+      cwd: root,
+      stderr: 'pipe',
+      env: {
+        HOME: root,
+        PATH: process.env.PATH ?? '',
+        AI_DELIVERY_CONFIG: join(root, 'missing-config.json'),
+        LANG: 'en_US.UTF-8',
+      },
     });
-    assert.equal(result.isError, true);
-    const content = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(result.content);
-    const diagnostic = z
-      .object({
-        contract: z.literal('ai-delivery.issue@1'),
-        failures: z.array(z.object({ code: z.string(), field: z.string(), fixHint: z.string() })),
-      })
-      .parse(JSON.parse(content[0]!.text) as unknown);
-    assert.deepEqual(diagnostic.failures.map((f) => f.code).sort(), ['open-questions', 'points']);
-    assert.ok(diagnostic.failures.every((f) => f.field && f.fixHint));
-    for (const name of ['issue_create', 'issue_update']) {
-      const malformed = await client.callTool({
-        name,
-        arguments: {
-          ...ready(),
-          ...(name === 'issue_update' ? { issueNumber: 17 } : {}),
-          acceptanceCriteria: [{ behavior: ready().acceptanceCriteria[0]!.behavior }],
-          context: { components: 9 },
-        },
+    const client = new Client({ name: 'issue68-synthetic-client', version: '1.0.0' });
+    let spawnedPid: number | null = null;
+    let closeObserved = false;
+    try {
+      await client.connect(transport);
+      spawnedPid = transport.pid;
+      assert.ok(spawnedPid);
+      const original = transport.onclose;
+      transport.onclose = () => {
+        closeObserved = true;
+        original?.();
+      };
+      const listing = await client.listTools();
+      assert.ok(listing.tools.find((t) => t.name === 'issue_create')?.inputSchema.properties?.acceptanceCriteria);
+      const result = await client.callTool({
+        name: 'issue_create',
+        arguments: { ...ready(), points: 13, openQuestions: ['Select behavior.'] },
       });
-      assert.equal(malformed.isError, true);
-      const blocks = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(malformed.content);
-      const failure = z
+      assert.equal(result.isError, true);
+      const content = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(result.content);
+      const diagnostic = z
         .object({
           contract: z.literal('ai-delivery.issue@1'),
           failures: z.array(z.object({ code: z.string(), field: z.string(), fixHint: z.string() })),
         })
-        .parse(JSON.parse(blocks[0]!.text) as unknown);
-      assert.deepEqual(failure.failures.map((f) => f.field).sort(), [
-        'acceptanceCriteria.0.verifiedBy',
-        'context.components',
-      ]);
-      assert.ok(failure.failures.every((f) => f.code && f.fixHint));
-      assert.doesNotMatch(blocks[0]!.text, /missing-config/u);
-      const unknown = await client.callTool({
-        name,
-        arguments: {
-          ...ready(),
-          ...(name === 'issue_update' ? { issueNumber: 17 } : {}),
-          unexpectedField: 'Root field must be refused.',
-          context: { ...ready().context, unexpectedField: 'Nested field must be refused.' },
-          acceptanceCriteria: [{ ...ready().acceptanceCriteria[0]!, unexpectedField: 'Unknown criterion field.' }],
-        },
-      });
-      assert.equal(unknown.isError, true);
-      const unknownBlocks = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(unknown.content);
-      const unknownFailure = z
-        .object({
-          contract: z.literal('ai-delivery.issue@1'),
-          failures: z.array(z.object({ code: z.literal('field.unknown'), field: z.string(), fixHint: z.string() })),
-        })
-        .parse(JSON.parse(unknownBlocks[0]!.text) as unknown);
-      assert.deepEqual(unknownFailure.failures.map((f) => f.field).sort(), [
-        'acceptanceCriteria.0',
-        'context',
-        'issue',
-      ]);
-      assert.ok(unknownFailure.failures.every((f) => f.fixHint.length > 10));
-      assert.doesNotMatch(
-        unknownBlocks[0]!.text,
-        /unexpectedField|Nested field|Unknown criterion/u,
-        'Diagnostics do not echo untrusted keys or values.',
+        .parse(JSON.parse(content[0]!.text) as unknown);
+      assert.deepEqual(diagnostic.failures.map((f) => f.code).sort(), ['open-questions', 'points']);
+      assert.ok(diagnostic.failures.every((f) => f.field && f.fixHint));
+      for (const name of ['issue_create', 'issue_update']) {
+        const malformed = await client.callTool({
+          name,
+          arguments: {
+            ...ready(),
+            ...(name === 'issue_update' ? { issueNumber: 17 } : {}),
+            acceptanceCriteria: [{ behavior: ready().acceptanceCriteria[0]!.behavior }],
+            context: { components: 9 },
+          },
+        });
+        assert.equal(malformed.isError, true);
+        const blocks = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(malformed.content);
+        const failure = z
+          .object({
+            contract: z.literal('ai-delivery.issue@1'),
+            failures: z.array(z.object({ code: z.string(), field: z.string(), fixHint: z.string() })),
+          })
+          .parse(JSON.parse(blocks[0]!.text) as unknown);
+        assert.deepEqual(failure.failures.map((f) => f.field).sort(), [
+          'acceptanceCriteria.0.verifiedBy',
+          'context.components',
+        ]);
+        assert.ok(failure.failures.every((f) => f.code && f.fixHint));
+        assert.doesNotMatch(blocks[0]!.text, /missing-config/u);
+        const unknown = await client.callTool({
+          name,
+          arguments: {
+            ...ready(),
+            ...(name === 'issue_update' ? { issueNumber: 17 } : {}),
+            unexpectedField: 'Root field must be refused.',
+            context: { ...ready().context, unexpectedField: 'Nested field must be refused.' },
+            acceptanceCriteria: [{ ...ready().acceptanceCriteria[0]!, unexpectedField: 'Unknown criterion field.' }],
+          },
+        });
+        assert.equal(unknown.isError, true);
+        const unknownBlocks = z.array(z.object({ type: z.literal('text'), text: z.string() })).parse(unknown.content);
+        const unknownFailure = z
+          .object({
+            contract: z.literal('ai-delivery.issue@1'),
+            failures: z.array(z.object({ code: z.literal('field.unknown'), field: z.string(), fixHint: z.string() })),
+          })
+          .parse(JSON.parse(unknownBlocks[0]!.text) as unknown);
+        assert.deepEqual(unknownFailure.failures.map((f) => f.field).sort(), [
+          'acceptanceCriteria.0',
+          'context',
+          'issue',
+        ]);
+        assert.ok(unknownFailure.failures.every((f) => f.fixHint.length > 10));
+        assert.doesNotMatch(
+          unknownBlocks[0]!.text,
+          /unexpectedField|Nested field|Unknown criterion/u,
+          'Diagnostics do not echo untrusted keys or values.',
+        );
+      }
+      const foreign = await client.callTool({ name: 'issue_create', arguments: { ...ready(), repo: 'other/widget' } });
+      assert.equal(foreign.isError, true);
+      assert.match(JSON.stringify(foreign.content), /repository selectors disagree/u);
+    } finally {
+      await client.close();
+      assert.equal(closeObserved, true, 'SDK spawned-child close event was actually observed');
+      rmSync(root, { recursive: true, force: true });
+      console.info(
+        JSON.stringify({
+          fixture: 'issue68-compiled-stdio',
+          spawnedPid,
+          childCloseObserved: closeObserved,
+          syntheticRootRemoved: true,
+        }),
       );
     }
-    const foreign = await client.callTool({ name: 'issue_create', arguments: { ...ready(), repo: 'other/widget' } });
-    assert.equal(foreign.isError, true);
-    assert.match(JSON.stringify(foreign.content), /repository selectors disagree/u);
-  } finally {
-    await client.close();
-    assert.equal(closeObserved, true, 'SDK spawned-child close event was actually observed');
-    rmSync(root, { recursive: true, force: true });
-    console.info(
-      JSON.stringify({
-        fixture: 'issue68-compiled-stdio',
-        spawnedPid,
-        childCloseObserved: closeObserved,
-        syntheticRootRemoved: true,
-      }),
-    );
-  }
-});
+  },
+);
 
-test('intake skill example is Ready and every CLI line has actual required options and an explicit identity', () => {
-  const skill = readFileSync(resolve('plugins/ai-delivery/skills/intake-create/SKILL.md'), 'utf8');
-  const examples = [...skill.matchAll(/```json\n([\s\S]*?)\n```/gu)].map((match) => {
-    const json = match[1] ?? '';
-    return { json, value: JSON.parse(json) as unknown };
-  });
-  const readTool = getAiDeliveryMcpTool('issue_info');
-  assert.ok(readTool?.name === 'issue_info');
-  const readSchema = readTool.inputSchema;
-  for (const example of examples) {
-    assert.ok(
-      ReadyIssue.safeParse(example.value).success || readSchema.safeParse(example.value).success,
-      'each documented JSON example must satisfy its supported contract',
-    );
-  }
-  const readExample = examples.find((example) => readSchema.safeParse(example.value).success);
-  assert.ok(readExample, 'the read-first example must use the actual MCP schema');
-  const readArguments = readSchema.parse(readExample.value);
-  assert.equal(readArguments.repo, 'example/widget');
-  assert.equal(readArguments.issueNumber, 17);
-  const createExample = examples.find((example) => ReadyIssue.safeParse(example.value).success);
-  assert.ok(createExample, 'the creation example must remain Ready');
-  const json = createExample.json;
-  const root = mkdtempSync(join(tmpdir(), 'intake-cli-'));
-  try {
-    const fields = join(root, 'issue.json');
-    writeFileSync(fields, json);
-    for (const line of skill.split('\n').filter((line) => line.startsWith('ai-delivery '))) {
-      assert.match(line, /--identity host-author/u);
-      assert.match(line, /--repo example\/widget/u);
-      const argv = (line.match(/'[^']*'|[^\s]+/gu) ?? [])
-        .slice(1)
-        .map((token) => token.replace(/^'|'$/gu, ''))
-        .map((token) => token.replace('/owned/issue.json', fields));
-      const command = argv.find((token) => ['create', 'update', 'info', 'ready:check', 'start'].includes(token));
-      assert.ok(command);
-      assert.ok(argv.includes(command === 'create' ? '--title' : '--issue'));
-      const result = spawnSync(process.execPath, [resolve('dist/cli.js'), ...argv], {
-        cwd: root,
-        env: {
-          PATH: process.env.PATH ?? '',
-          HOME: root,
-          AI_DELIVERY_CONFIG: join(root, 'missing-config.json'),
-          LANG: 'en_US.UTF-8',
-        },
-        encoding: 'utf8',
-      });
-      assert.notEqual(result.status, 0);
-      assert.doesNotMatch(result.stderr, /unknown option|unknown command|required option/u);
-      assert.match(result.stderr, /missing-config|ENOENT|identity|configuration|config/iu);
+test(
+  'intake skill example is Ready and every CLI line has actual required options and an explicit identity',
+  { tags: ['release'] },
+  () => {
+    const skill = readFileSync(resolve('plugins/ai-delivery/skills/intake-create/SKILL.md'), 'utf8');
+    const examples = [...skill.matchAll(/```json\n([\s\S]*?)\n```/gu)].map((match) => {
+      const json = match[1] ?? '';
+      return { json, value: JSON.parse(json) as unknown };
+    });
+    const readTool = getAiDeliveryMcpTool('issue_info');
+    assert.ok(readTool?.name === 'issue_info');
+    const readSchema = readTool.inputSchema;
+    for (const example of examples) {
+      assert.ok(
+        ReadyIssue.safeParse(example.value).success || readSchema.safeParse(example.value).success,
+        'each documented JSON example must satisfy its supported contract',
+      );
     }
-    const missing = spawnSync(
-      process.execPath,
-      [resolve('dist/cli.js'), '--identity', 'host-author', '--repo', 'example/widget', 'create'],
-      { cwd: root, env: { HOME: root, PATH: process.env.PATH ?? '' }, encoding: 'utf8' },
-    );
-    assert.match(missing.stderr, /required option.*--title/u);
-    assert.ok(
-      execFileSync(process.execPath, [resolve('dist/cli.js'), '--help'], {
-        env: { HOME: root, PATH: process.env.PATH ?? '' },
-        encoding: 'utf8',
-      }).includes('create'),
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-  assert.ok(skill.includes(ISSUE_BODY_MARKER));
-  assert.ok(!skill.includes('ai-delivery develop'));
-});
+    const readExample = examples.find((example) => readSchema.safeParse(example.value).success);
+    assert.ok(readExample, 'the read-first example must use the actual MCP schema');
+    const readArguments = readSchema.parse(readExample.value);
+    assert.equal(readArguments.repo, 'example/widget');
+    assert.equal(readArguments.issueNumber, 17);
+    const createExample = examples.find((example) => ReadyIssue.safeParse(example.value).success);
+    assert.ok(createExample, 'the creation example must remain Ready');
+    const json = createExample.json;
+    const root = mkdtempSync(join(tmpdir(), 'intake-cli-'));
+    try {
+      const fields = join(root, 'issue.json');
+      writeFileSync(fields, json);
+      for (const line of skill.split('\n').filter((line) => line.startsWith('ai-delivery '))) {
+        assert.match(line, /--identity host-author/u);
+        assert.match(line, /--repo example\/widget/u);
+        const argv = (line.match(/'[^']*'|[^\s]+/gu) ?? [])
+          .slice(1)
+          .map((token) => token.replace(/^'|'$/gu, ''))
+          .map((token) => token.replace('/owned/issue.json', fields));
+        const command = argv.find((token) => ['create', 'update', 'info', 'ready:check', 'start'].includes(token));
+        assert.ok(command);
+        assert.ok(argv.includes(command === 'create' ? '--title' : '--issue'));
+        const result = spawnSync(process.execPath, [resolve('dist/cli.js'), ...argv], {
+          cwd: root,
+          env: {
+            PATH: process.env.PATH ?? '',
+            HOME: root,
+            AI_DELIVERY_CONFIG: join(root, 'missing-config.json'),
+            LANG: 'en_US.UTF-8',
+          },
+          encoding: 'utf8',
+        });
+        assert.notEqual(result.status, 0);
+        assert.doesNotMatch(result.stderr, /unknown option|unknown command|required option/u);
+        assert.match(result.stderr, /missing-config|ENOENT|identity|configuration|config/iu);
+      }
+      const missing = spawnSync(
+        process.execPath,
+        [resolve('dist/cli.js'), '--identity', 'host-author', '--repo', 'example/widget', 'create'],
+        { cwd: root, env: { HOME: root, PATH: process.env.PATH ?? '' }, encoding: 'utf8' },
+      );
+      assert.match(missing.stderr, /required option.*--title/u);
+      assert.ok(
+        execFileSync(process.execPath, [resolve('dist/cli.js'), '--help'], {
+          env: { HOME: root, PATH: process.env.PATH ?? '' },
+          encoding: 'utf8',
+        }).includes('create'),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    assert.ok(skill.includes(ISSUE_BODY_MARKER));
+    assert.ok(!skill.includes('ai-delivery develop'));
+  },
+);
 
 test('explicit start changes Todo to the configured In Progress option and preserves unrelated items', async () => {
   const f = fixture();

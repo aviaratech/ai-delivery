@@ -115,14 +115,17 @@ const readinessPublisher = `async function publishReadiness(file, bytes, pause) 
 }`;
 
 for (const name of ['capability', 'pids'])
-  test(`readiness record ${name} is unavailable during a controlled partial publication`, async ({ signal }) => {
-    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-readiness-')));
-    const file = join(output, name);
-    const child = spawn(
-      process.execPath,
-      [
-        '-e',
-        `
+  test(
+    `readiness record ${name} is unavailable during a controlled partial publication`,
+    { tags: ['release'] },
+    async ({ signal }) => {
+      const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-readiness-')));
+      const file = join(output, name);
+      const child = spawn(
+        process.execPath,
+        [
+          '-e',
+          `
       const fs = require('node:fs');
       ${readinessPublisher}
       publishReadiness(${JSON.stringify(file)}, '{"root":17,"descendant":23}', async () => {
@@ -131,30 +134,31 @@ for (const name of ['capability', 'pids'])
         await resumed;
       }).then(() => process.disconnect());
     `,
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], timeout: 5_000 },
-    );
-    const closed = once(child, 'close');
-    try {
-      const [message] = (await once(child, 'message', {
-        signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
-      })) as unknown[];
-      assert.equal(message, 'partial');
-      assert.equal(existsSync(file), false, 'Existence must mean a completely closed readiness record');
-    } finally {
-      if (child.connected) child.send('complete');
-      const [code] = (await closed) as unknown[];
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], timeout: 5_000 },
+      );
+      const closed = once(child, 'close');
       try {
-        assert.equal(code, 0);
-        assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { root: 17, descendant: 23 });
-        // A fully published malformed record is an immediate failure, never retried.
-        writeFileSync(file, '{');
-        assert.throws(() => JSON.parse(readFileSync(file, 'utf8')), SyntaxError);
+        const [message] = (await once(child, 'message', {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        })) as unknown[];
+        assert.equal(message, 'partial');
+        assert.equal(existsSync(file), false, 'Existence must mean a completely closed readiness record');
       } finally {
-        rmSync(output, { recursive: true, force: true });
+        if (child.connected) child.send('complete');
+        const [code] = (await closed) as unknown[];
+        try {
+          assert.equal(code, 0);
+          assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { root: 17, descendant: 23 });
+          // A fully published malformed record is an immediate failure, never retried.
+          writeFileSync(file, '{');
+          assert.throws(() => JSON.parse(readFileSync(file, 'utf8')), SyntaxError);
+        } finally {
+          rmSync(output, { recursive: true, force: true });
+        }
       }
-    }
-  });
+    },
+  );
 
 function filesystemFixtureScript(
   output: string,
@@ -205,7 +209,7 @@ function filesystemFixtureScript(
 for (const runtime of ['node24', 'node26'] as const) {
   test.each(['pass', 'assertion'] as const)(
     `filesystem fixture gate deterministically queues a scan through reader rejection and %s teardown on ${runtime}`,
-    { tags: runtime === 'node26' ? ['release'] : [] },
+    { tags: ['release'] },
     async (mode) => {
       const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-gate-')));
       const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, mode, runtime) });
@@ -250,7 +254,7 @@ for (const runtime of ['node24', 'node26'] as const) {
 for (const runtime of ['node24', 'node26'] as const) {
   test.each(['abrupt', 'block', 'cancel'] as const)(
     `filesystem fixture gate preserves leaked FIFO and unrelated files after %s on ${runtime}`,
-    { tags: runtime === 'node26' ? ['release'] : [] },
+    { tags: ['release'] },
     async (mode) => {
       const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-failure-')));
       writeFileSync(join(output, 'unrelated'), 'preserved');
@@ -319,7 +323,7 @@ for (const runtime of ['node24', 'node26'] as const) {
 for (const runtime of ['node24', 'node26'] as const) {
   test(
     `filesystem fixture gate still enforces positive byte limits after deterministic contention on ${runtime}`,
-    { tags: runtime === 'node26' ? ['release'] : [] },
+    { tags: ['release'] },
     async () => {
       const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-limit-')));
       const { root } = await fixture({ firstStageScript: filesystemFixtureScript(output, 'pass', runtime) });
@@ -355,6 +359,7 @@ for (const runtime of ['node24', 'node26'] as const) {
 
 test.each(['verification', 'runtime'] as const)(
   'filesystem fixture gate preserves observation and cancellation after direct %s command closure',
+  { tags: ['release'] },
   async (mode) => {
     const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-fixture-close-')));
     writeFileSync(join(output, 'unrelated'), 'preserved');
@@ -508,32 +513,39 @@ test(
   },
 );
 
-test('filesystem fixture helper runs standalone and fails closed on malformed capability', async () => {
-  const { withVerificationFilesystemFixture } = await import('./agent.js');
-  assert.equal(await withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
-  const prior = process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
-  try {
-    process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = '{}';
-    let executed = false;
-    await assert.rejects(
-      withVerificationFilesystemFixture(() => {
-        executed = true;
-      }),
-      /invalid or stale/u,
-    );
-    assert.equal(executed, false);
-  } finally {
-    if (prior === undefined) delete process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
-    else process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = prior;
-  }
-});
+test(
+  'filesystem fixture helper runs standalone and fails closed on malformed capability',
+  { tags: ['release'] },
+  async () => {
+    const { withVerificationFilesystemFixture } = await import('./agent.js');
+    assert.equal(await withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
+    const prior = process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
+    try {
+      process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = '{}';
+      let executed = false;
+      await assert.rejects(
+        withVerificationFilesystemFixture(() => {
+          executed = true;
+        }),
+        /invalid or stale/u,
+      );
+      assert.equal(executed, false);
+    } finally {
+      if (prior === undefined) delete process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
+      else process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = prior;
+    }
+  },
+);
 
-test('nested runtime setup inherits the outer gate for its baseline and child command', async () => {
-  const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-nested-fixture-')));
-  const inner = await fixture();
-  const worker = filesystemFixtureScript(output, 'pass');
-  const { root } = await fixture({
-    firstStageScript: `
+test(
+  'nested runtime setup inherits the outer gate for its baseline and child command',
+  { tags: ['release'] },
+  async () => {
+    const output = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-nested-fixture-')));
+    const inner = await fixture();
+    const worker = filesystemFixtureScript(output, 'pass');
+    const { root } = await fixture({
+      firstStageScript: `
 (async () => {
   const fs = require('node:fs'), cp = require('node:child_process'), assert = require('node:assert/strict');
   const { withRuntimeSetupWriter } = await import(${JSON.stringify(new URL('./verification.js', import.meta.url).href)});
@@ -547,35 +559,36 @@ test('nested runtime setup inherits the outer gate for its baseline and child co
   });
   await closed;
 })().catch(error => { console.error(error.message); process.exitCode = 1; });`,
-  });
-  try {
-    const row = await hostFixtureCheckout({
-      baseRef: 'main',
-      identity: 'synthetic-author',
-      issueNumber: 17,
-      repoRoot: root,
     });
-    await runRuntimeFixture({
-      issueNumber: 17,
-      repoRoot: row.path,
-      resourceBounds: {
-        maxAggregateRssBytes: 1_000_000_000,
-        minFreeDiskBytes: 1,
-        maxNewOutputBytes: 2048,
-        outputRoots: [output],
-      },
-    });
-    assert.deepEqual(readFileSync(join(output, 'events'), 'utf8').trim().split('\n'), [
-      'created',
-      'scan-queued',
-      'reader-rejected',
-      'cleaned',
-      'released',
-    ]);
-    assert.equal(existsSync(join(inner.root, '.git', 'ai-delivery', 'output-observation')), false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(inner.root, { recursive: true, force: true });
-    rmSync(output, { recursive: true, force: true });
-  }
-});
+    try {
+      const row = await hostFixtureCheckout({
+        baseRef: 'main',
+        identity: 'synthetic-author',
+        issueNumber: 17,
+        repoRoot: root,
+      });
+      await runRuntimeFixture({
+        issueNumber: 17,
+        repoRoot: row.path,
+        resourceBounds: {
+          maxAggregateRssBytes: 1_000_000_000,
+          minFreeDiskBytes: 1,
+          maxNewOutputBytes: 2048,
+          outputRoots: [output],
+        },
+      });
+      assert.deepEqual(readFileSync(join(output, 'events'), 'utf8').trim().split('\n'), [
+        'created',
+        'scan-queued',
+        'reader-rejected',
+        'cleaned',
+        'released',
+      ]);
+      assert.equal(existsSync(join(inner.root, '.git', 'ai-delivery', 'output-observation')), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(inner.root, { recursive: true, force: true });
+      rmSync(output, { recursive: true, force: true });
+    }
+  },
+);

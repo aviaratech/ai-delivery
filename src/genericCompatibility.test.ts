@@ -48,7 +48,7 @@ test('offline legacy normalization preserves native blockers and refuses an unpr
   );
 });
 
-test('legacy CLI emits an offline plan without modifying its input', () => {
+test('legacy CLI emits an offline plan without modifying its input', { tags: ['release'] }, () => {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-migration-'));
   try {
     const path = join(root, 'issues.json');

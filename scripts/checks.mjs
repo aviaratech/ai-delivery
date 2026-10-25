@@ -44,7 +44,7 @@ export function errorMessage(error) {
 
 export const FULL_GATES = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
 export const FAST_GATES = ['format', 'lint', 'types'];
-/** @type {(CaseIdentity & {kind:"mandatory"|"external-historical-qualification"})[]} */
+/** @type {(CaseIdentity & {kind:"mandatory"|"external-historical-qualification"|"parent-launched-helper"})[]} */
 export const RELEASE_CASES = [
   {
     file: 'dist/setup.test.js',
@@ -67,28 +67,13 @@ export const RELEASE_CASES = [
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
-    title: 'CLI stage/admit separates preparation from substantive command progress',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/setup.test.js',
-    title: 'CLI prepared handoff rejects a mismatched stage identity without reinstall or admission',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI preparation failure retains owned evidence through native drain',
     kind: 'mandatory',
   },
   {
-    file: 'dist/setup.test.js',
+    file: 'dist/setupCli.test.js',
     title: 'CLI preparation cancel retains owned evidence through native drain',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/setup.test.js',
-    title: 'CLI stage/admit keeps a stalled admission response owned until native quiescence',
     kind: 'mandatory',
   },
   {
@@ -176,9 +161,721 @@ export const RELEASE_CASES = [
       'the packed launcher creates, updates and journals repository B from a non-Git directory without an identity environment',
     kind: 'mandatory',
   },
+  ...[
+    {
+      file: 'dist/delivery/delivery.test.js',
+      titles: [
+        'explicit component policy reuses compatible stages across heads and invalidates dependencies',
+        'missing policy, wrong repository, changed config and stale head fail closed',
+        'missing stage, corrupt artifact/output and blocked merge or wrong approval fail closed',
+        'separate processes can read and reuse shared output during publication and after publisher interruption',
+        'separate processes durably create shared writer directories and reject a raced non-directory',
+        'synthetic exact delivery, private checkpoint resume and phase evidence',
+      ],
+    },
+    {
+      file: 'dist/investigationCompletion.test.js',
+      titles: [
+        'CLI finish refuses mixed modes before authentication and preserves fixture source',
+        'CLI start refuses mixed modes before authentication and preserves fixture source',
+        'MCP investigation lifecycle resolves the selected checkout and completes through the shared owner',
+        'a clean tracked result under a ..-prefixed child is not external durable evidence',
+        'an explicit repo-root cannot hide an empty ..-prefixed physical current-worktree child',
+        'an explicit repo-root cannot hide the physical current worktree',
+        'completion consumes closed native authority and App acceptance, preserving branch, result and unrelated custody',
+        'completion refuses --assume-unchanged and preserves hidden bytes, administration and registry',
+        'completion refuses --skip-worktree and preserves hidden bytes, administration and registry',
+        'corrupt preserved result prevents interruption recovery from deleting or retiring more data',
+        'existing writer custody refuses prospective registration without attempting legacy recovery',
+        'inspection explains missing native acceptance without granting removal',
+        'interrupted intent resumes the same durable intent and seals exact disk/Git/registry state',
+        'interrupted registry resumes the same durable intent and seals exact disk/Git/registry state',
+        'interrupted resume refuses --assume-unchanged without retiring hidden bytes or changing its intent',
+        'interrupted resume refuses --skip-worktree without retiring hidden bytes or changing its intent',
+        'interrupted seal resumes the same durable intent and seals exact disk/Git/registry state',
+        'legacy rows or absent preparation cannot be retrospectively adopted',
+        'missing ownership witness or registry row refuses cleanup rather than reconstructing custody',
+        'primary worktree registration is refused without touching its source',
+        'prospective registration is exact, acknowledged, idempotent and does not manufacture merged custody',
+        'recreated worktree refuses terminal replay even with identical Git source',
+        'refuses PR association without removal or intent',
+        'refuses acceptance predates preparation and preserves custody',
+        'refuses ambiguous native branches without removal or intent',
+        'refuses author quotation of App body and preserves custody',
+        'refuses changed durable result and preserves custody',
+        'refuses changed whole App body and preserves custody',
+        'refuses current worktree without removal or intent',
+        'refuses dirty without removal or intent',
+        'refuses duplicate closure and preserves custody',
+        'refuses foreign App and preserves custody',
+        'refuses foreign repository without removal or intent',
+        'refuses foreign subject and preserves custody',
+        'refuses ignored without removal or intent',
+        'refuses locked worktree without removal or intent',
+        'refuses missing App evidence and preserves custody',
+        'refuses native branch drift without removal or intent',
+        'refuses not-planned closure and preserves custody',
+        'refuses open issue and preserves custody',
+        'refuses operator identity drift and preserves custody',
+        'refuses preparation acknowledgement changed and preserves custody',
+        'refuses registry ambiguity without removal or intent',
+        'refuses registry identity drift without removal or intent',
+        'refuses same-tree new commit without removal or intent',
+        'refuses untracked without removal or intent',
+        'registration refuses --assume-unchanged without recording prospective custody',
+        'registration refuses --skip-worktree without recording prospective custody',
+        'registration requires exact canonical path and authoritative initial default head',
+        'result inside worktree is preserved and refused before removal',
+        'resume requires the original evidence digest and revalidates current native acceptance',
+        'revoked operator authority cannot be resumed or replaced by local review assertions',
+        'row absence without durable removal intent refuses cleanup',
+        'terminal replay still requires current authentic App acceptance',
+        'unexplained absence cannot create removal authority, and recreated paths cannot replay a sealed completion',
+      ],
+    },
+    {
+      file: 'dist/mergeQueue.test.js',
+      titles: [
+        'a conclusively invalid bot approval does not suppress a valid grant',
+        'a conclusively invalid non-approver approval does not suppress a valid grant',
+        'a conflicting PR is removed with file diagnostics while its successor is rebuilt',
+        'cancel/resume skips completed merges and rejects corrupt or incompatible state',
+        'canonical queue selection refuses independent configured clones even in a matching cwd',
+        'foreground queue squashes three real Git trees in order and waits for native owner refresh',
+        'queue chooses the current lease after delayed authentication',
+        'queue enqueue is durable and idempotent while status never advances it',
+        'queue keeps its process lease root across linked worktrees',
+        'queue reconciles comment loss without duplicate POST, outcome=absent',
+        'queue reconciles comment loss without duplicate POST, outcome=duplicate',
+        'queue reconciles comment loss without duplicate POST, outcome=edited',
+        'queue reconciles comment loss without duplicate POST, outcome=present',
+        'queue reconciles comment loss without duplicate POST, outcome=same-second-restored',
+        'queue reconciles comment loss without duplicate POST, outcome=spoofed',
+        'queue reconciles failed-check without stale proof or duplicate merge',
+        'queue reconciles lost-merge-ack without stale proof or duplicate merge',
+        'queue reconciles lost-push-ack without stale proof or duplicate merge',
+        'queue reconciles outside-race without stale proof or duplicate merge',
+        'queue recovers an orphaned writer even when its historical entries are drained',
+        'queue refuses a lease changed before the runtime writer claim without touching queue state',
+        'queue refuses rebinding while the drained writer is still held',
+        'queue waits for complete current checks and native review, invalidating head/base predictions',
+        'refreshed prediction checkpoint resumes with the uninterrupted transition notices',
+        'removed and re-enqueued entry cannot reuse an unconsumed old grant',
+        'standing approval deleted after first merge stops suffix and retains original receipt',
+        'standing approval discovery completes later native comment pages',
+        'standing approval edited after first merge stops suffix and retains original receipt',
+        'standing approval expired after first merge stops suffix and retains original receipt',
+        'standing approval merges only its ordered prefix and mentions each native author',
+        'standing approval refuses ambiguous evidence',
+        'standing approval refuses duplicate-pr with one explanation',
+        'standing approval refuses expired with one explanation',
+        'standing approval refuses minimized with one explanation',
+        'standing approval refuses missing-edit-proof with one explanation',
+        'standing approval refuses missing-predecessor with one explanation',
+        'standing approval refuses no-config evidence',
+        'standing approval refuses non-approver with one explanation',
+        'standing approval refuses pagination evidence',
+        'standing approval refuses read-error evidence',
+        'standing approval refuses same-second-edit with one explanation',
+        'standing approval refuses unknown-condition with one explanation',
+        'standing approval refuses wrong-repository with one explanation',
+        'standing approval refuses wrong-target evidence',
+        'standing approval retains the same native approver across login casing changes',
+        'unchanged native eligibility waits do not repeat ready notices',
+        'uncovered queue entry waits for approval without publishing or merging',
+        'unreadable competing approval refuses authority at discovery',
+        'unreadable competing approval refuses authority at final-merge-gate',
+        'unreadable competing approval refuses authority at missing-metadata',
+      ],
+    },
+    {
+      file: 'dist/pluginAuthProbe.test.js',
+      titles: [
+        'authentication cancellation confirms cleanup of a hanging gh descendant and withholds output',
+        'authentication timeout confirms cleanup of a hanging gh descendant and withholds output',
+        'successful authentication capture returns stdout only after owned cleanup',
+        'the production error renderer preserves the owned authentication probe final-line classification',
+      ],
+    },
+    {
+      file: 'dist/pluginInstaller.test.js',
+      titles: [
+        'Claude lost update acknowledgement resumes the exact target without selecting twice',
+        'Claude prior selection with a published target catalog refuses an ambiguous retry',
+        'Claude same-version replacement reuses its verified cache without a native update',
+        'a failed managed-state commit retains selection and resumes without selecting again',
+        'a partial catalog publication resumes with reused units and matches an uninterrupted update',
+        'a target catalog with prior native selection and an idle pending command refuses ambiguous replay',
+        'an exact same-version owned selection is reused without invoking native add',
+        'an unsupported version archive leaves selection intact and permits a valid version request',
+        'cancellation kills recorded detached descendants and preserves an unrelated process',
+        'catalog custody changed during preparation refuses before selection without repairing it',
+        'compiled doctor CLI requires explicit repository for auth and keeps dry-run credential-free',
+        'compiled plugin CLI consumes its local version and emits the promised JSON dry-run',
+        'compiled preview never invokes native tools or creates installer state',
+        'failure after catalog selection retains pending recovery before another version',
+        'filtered installation refuses disabled native selection and retains its interrupted intent',
+        'filtered installation refuses duplicate native selection and retains its interrupted intent',
+        'filtered installation refuses missing registration and retains its interrupted intent',
+        'filtered installation refuses wrong marketplace source and retains its interrupted intent',
+        'filtered installation refuses wrong version source and retains its interrupted intent',
+        'filtered readback refuses changed native bytes without adopting the selected version',
+        'install reads back its managed version without capturing an unrelated catalogue over 1 MiB',
+        'installing a different owned version cannot bypass the preserving replacement path',
+        'interrupted filtered readback resumes the original install without fetching or losing native data',
+        'lost native acknowledgement remains a failure, then exact target postimage resumes without selecting twice',
+        'qualified Codex rollback uses the retained immutable unit and preserves later unrelated edits',
+        'recovery rejects a corrupted completed unit before reusing the selected target',
+        'rollback of a removed managed selection refuses rather than reinstalling it',
+        'rollback refuses a target superseded by the managed writer ahead of its lock',
+        'update reads back its managed version without capturing an unrelated catalogue over 1 MiB',
+      ],
+    },
+    {
+      file: 'dist/worktreeTransition.test.js',
+      titles: [
+        'absent-row admission refuses valid JSON with a non-issue or mismatched embedded row',
+        'actual retained public bytes support one explicit independently accepted active resume',
+        'an earlier released attempt cannot authorize absence after a later acknowledged claim',
+        'apply revalidates the exact operational run inventory despite native acceptance of local JSON',
+        'closure check refuses live owners, reused root PIDs and live process groups without signaling',
+        'completed replay checks original attempt bytes, actual writer absence, row and owner witness',
+        'direct tracking admission refuses pending intent after its canonical row is absent',
+        'failed claim evidence cannot replace the preserved writer',
+        'failed intent preservation cannot overwrite the original writer',
+        'historical inventory preserves unknown schemas and failed diagnostics byte for byte',
+        'inspection and accepted apply refuse dirty source, wrong repository and changed canonical row without writing intent',
+        'inspection reports unsupported operative v2 and missing or corrupt required historical originals',
+        'inventory preserves worktree-local original receipts and accounting before terminal removal',
+        'native acceptance cannot bypass terminal or active purpose and complete PR-set predicates',
+        'only authenticated exact relinquishment revocations invalidate native acceptance',
+        'ordinary ownership and resume refuse an interrupted transition even after the owner witness exists',
+        'ordinary ownership still refuses a legacy row without a witness',
+        'preservation rejects drift without replacing an already preserved original',
+        'real process interruption resumes original capture, claim, witness, row and release without losing originals',
+        'registration cannot reactivate a merged issue through an interrupted transition',
+        'removed-worktree replay uses the original subject writer slot without recreating source',
+        'supported closure requires a run for the exact retained head and tree',
+        'terminal inspection and accepted apply reject wrong native repository and PR lineage drift',
+        'terminal inspection rejects held removal and configured reviewer matching the native PR author',
+        'terminal interruption resumes removal intent, physical absence and row removal without recreating source',
+        'terminal transition retains source, holds and original PR identity and permanently rejects ordinary resume',
+        'transition authority requires exact native personal and configured App identities and whole bodies',
+        'transition cannot delete its writer when durable release evidence fails',
+        'transition lease preserves original bytes before claim and records release before deletion',
+        'transition refuses an interrupted unknown launch without changing its state',
+        'transition registry rejects a foreign issue row sharing its exact path or branch',
+        'transition seals completion only after recorded writer deletion while the lease remains held',
+        'unheld terminal removal checks native remote refs and completed replay rejects recreated source',
+      ],
+    },
+  ].flatMap(({ file, titles }) => titles.map((title) => ({ file, title, kind: /** @type {const} */ ('mandatory') }))),
+  ...[
+    {
+      file: 'dist/contributorChecks.test.js',
+      titles: [
+        'consumer cancellation retains actual PID/birth and logs, and resume cannot duplicate it',
+        'external consumer join never installs twice and rejects unconfirmed owned removal',
+        'interrupted release retry preserves prior evidence and skips completed producer and pack',
+        'lost consumer completion retains a reservation, blocks duplicate launch and reconciles without producer or pack replay',
+        'reservation before launch survives an uncertain spawn and refuses automatic retry',
+        'two competing resumes release at most one checkpoint-owned test child',
+      ],
+    },
+    {
+      file: 'dist/currentConsumer.test.js',
+      titles: [
+        'synthetic bounded-output failure never becomes successful stdout/schema proof',
+        'synthetic cancellation kills an observed resistant descendant after its parent exits',
+        'synthetic external network failure retains bounded quiescent evidence',
+        'synthetic external permission failure retains bounded quiescent evidence',
+        'synthetic external process failure retains bounded quiescent evidence',
+        'synthetic interrupted owned child is quiescent before disposable fixture cleanup',
+        'synthetic nested type-only manifest uses the installed package declaration owner',
+        'synthetic packaged stdio MCP matching-schema exercises its explicit mocked schema and shutdown boundary',
+        'synthetic packaged stdio MCP resistant-matching-schema exercises its explicit mocked schema and shutdown boundary',
+        'synthetic packaged stdio MCP resistant-schema exercises its explicit mocked schema and shutdown boundary',
+        'synthetic packaged stdio MCP resistant-startup exercises its explicit mocked schema and shutdown boundary',
+        'synthetic packaged stdio MCP schema exercises its explicit mocked schema and shutdown boundary',
+        'synthetic packaged stdio MCP startup exercises its explicit mocked schema and shutdown boundary',
+        'synthetic resolver demonstrates a borrowing false positive, then rejects external and undeclared hoisted dependencies',
+      ],
+    },
+    {
+      file: 'dist/lifecycle.test.js',
+      titles: [
+        'filesystem fixture gate deterministically queues a scan through reader rejection and assertion teardown on node24',
+        'filesystem fixture gate deterministically queues a scan through reader rejection and pass teardown on node24',
+        'filesystem fixture gate preserves leaked FIFO and unrelated files after abrupt on node24',
+        'filesystem fixture gate preserves leaked FIFO and unrelated files after block on node24',
+        'filesystem fixture gate preserves leaked FIFO and unrelated files after cancel on node24',
+        'filesystem fixture gate preserves observation and cancellation after direct runtime command closure',
+        'filesystem fixture gate preserves observation and cancellation after direct verification command closure',
+        'filesystem fixture gate still enforces positive byte limits after deterministic contention on node24',
+        'filesystem fixture helper runs standalone and fails closed on malformed capability',
+        'nested runtime setup inherits the outer gate for its baseline and child command',
+        'readiness record capability is unavailable during a controlled partial publication',
+        'readiness record pids is unavailable during a controlled partial publication',
+      ],
+    },
+    {
+      file: 'dist/pluginPackaging.test.js',
+      titles: [
+        'CLI reports the selected package version',
+        'README and delivery skill CLI examples name supported commands and required options',
+        'a copied plugin has a real CLI and producer identity that existing admission can bind',
+        'a copied plugin root starts its exact MCP contract without a parent runtime installation',
+        'the bundled launcher creates, updates and journals repository B from checkout A without an identity environment',
+      ],
+    },
+    {
+      file: 'dist/reviewSubmit.test.js',
+      titles: [
+        'actual command preserves known or ambiguous mutation and reconciles acknowledgement loss',
+        'actual command refuses stale scope/head/actor and invalid metadata without a review mutation',
+        'ambiguous or reserved reviewer profiles fail closed before source selection',
+        'command denial, malformed output and overflow refuse without output leakage or writes',
+        'credential cancellation and response timeout await owned helper and descendant absence',
+        'credential process observation excludes ambient credentials and executable injection selectors',
+        'credential reference collisions refuse before helper launch: implicit-author-selector',
+        'credential reference collisions refuse before helper launch: unselected-profile-key',
+        'read-only doctor uses the selected source and actual App actor outside Git without review or project mutations',
+        'selected env default, explicit env, protected file and command PEM all use the same stable bin',
+        'stable package bin submits both provider verdicts with clean PATH and refreshes counted status',
+      ],
+    },
+    {
+      file: 'dist/stagedChecks.test.js',
+      titles: [
+        'caller relative alternate index supplies the exact tree and preserves both indexes and unstaged bytes',
+        'exact staged tree isolates partial edits, additions, deletions and lockfile changes without index/unstaged writes',
+        'fast-only or missing staged runner cannot become focused hook success; unrelated source survives failure',
+        'missing explicit hook selection refuses before validation without provisioning dependencies',
+        'observable installed dependency metadata drift cannot become successful hook evidence',
+        'staged dependency incompatibility refuses instead of installing or accepting different package versions',
+        'staged graph cancellation preserves source and partial evidence after owned child cleanup',
+        'synthetic commit -a and path-limited hooks validate the Git-supplied temporary commit index',
+        'tracked entry reuses transitive dependencies with staged code and cleans only owned snapshot',
+        'unconfirmed child completion preserves the owned snapshot and marks cleanup unproved',
+        'unsafe staged symlink is refused before commands and cleanup preserves the source index',
+      ],
+    },
+    {
+      file: 'dist/targetPolicyEntrypoints.test.js',
+      titles: [
+        'CLI blocker wrapper leaves edited consumer policy inert in a fresh native process',
+        'CLI blocker wrapper leaves tracked consumer policy inert in a fresh native process',
+        'CLI direct PR selector leaves edited consumer policy inert in a fresh native process',
+        'CLI direct PR selector leaves tracked consumer policy inert in a fresh native process',
+        'CLI info leaves edited consumer policy inert in a fresh native process',
+        'CLI info leaves tracked consumer policy inert in a fresh native process',
+        'CLI offline migration leaves edited consumer policy inert in a fresh native process',
+        'CLI offline migration leaves tracked consumer policy inert in a fresh native process',
+        'CLI parent wrapper leaves edited consumer policy inert in a fresh native process',
+        'CLI parent wrapper leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin doctor dry-run leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin doctor dry-run leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin install dry-run leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin install dry-run leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin remove dry-run leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin remove dry-run leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin rollback dry-run leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin rollback dry-run leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin uninstalled doctor auth disposition leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin uninstalled doctor auth disposition leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin uninstalled doctor leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin uninstalled doctor leaves tracked consumer policy inert in a fresh native process',
+        'CLI plugin update dry-run leaves edited consumer policy inert in a fresh native process',
+        'CLI plugin update dry-run leaves tracked consumer policy inert in a fresh native process',
+        'CLI-only PR list leaves edited consumer policy inert in a fresh native process',
+        'CLI-only PR list leaves tracked consumer policy inert in a fresh native process',
+        'CLI-only checks leaves edited consumer policy inert in a fresh native process',
+        'CLI-only checks leaves tracked consumer policy inert in a fresh native process',
+        'CLI-only routing preflight leaves edited consumer policy inert in a fresh native process',
+        'CLI-only routing preflight leaves tracked consumer policy inert in a fresh native process',
+        'CLI-only subissues leaves edited consumer policy inert in a fresh native process',
+        'CLI-only subissues leaves tracked consumer policy inert in a fresh native process',
+        'fresh public MCP leaves edited consumer policy inert in a fresh native process',
+        'fresh public MCP leaves tracked consumer policy inert in a fresh native process',
+        'public agent export leaves edited consumer policy inert in a fresh native process',
+        'public agent export leaves tracked consumer policy inert in a fresh native process',
+      ],
+    },
+    {
+      file: 'dist/targetPolicyLocal.test.js',
+      titles: [
+        'an individual asserted body stall aborts without dropping unsettled work',
+        'an individual setup stall aborts without dropping unsettled work',
+        'edited runtime_admit preparation forwarded cancellation retains its real stage handler through drain stall and late settlement',
+        'edited runtime_admit preparation operation deadline retains its real stage handler through drain stall and late settlement',
+        'fixture cancellation and reuse keep bounded preparation outside asserted-work budgets',
+        'fixture cancellation drains the real MCP handler before releasing global ownership',
+        'fixture disposal closes a cancelled MCP connection',
+        'held real handler reports a finite drain stall, retains ownership and permits cleanup only after late settlement',
+        'never-released real handler fails in a supervised native test process and is reaped before cleanup',
+        'public MCP investigation finish refuses selected worktree edits with edited policy',
+        'public MCP investigation finish removes only acknowledged selected custody with tracked policy',
+        'public MCP investigation start refuses selected worktree edits with edited policy',
+        'public MCP investigation start registers exact selected source with tracked policy',
+        'public MCP runtime_stage refuses primary source edits and leaves edited policy inert',
+        'public MCP transition inspect inventories legacy custody and names reached guard with edited policy',
+        'public MCP transition inspect inventories legacy custody and names reached guard with tracked policy',
+        'scoped runtime setup failure after connection acquisition drains and restores only owned globals',
+        'scoped runtime setup hook signal aborts and drains a real handler before releasing globals',
+        'scoped runtime setup owned setup deadline aborts and drains a real handler before releasing globals',
+        'sequential setup operations may exceed the former aggregate budget while each operation stays bounded',
+      ],
+    },
+  ].flatMap(({ file, titles }) => titles.map((title) => ({ file, title, kind: /** @type {const} */ ('mandatory') }))),
+  ...[
+    'native stage binds exact copied runtime paths and bytes, reuses and admits only that completed stage',
+    'native stage refuses unreviewed cache bytes without completing or mutating the cache',
+    'native stage rejects aliased or overlapping cache paths before installing',
+    'runtime-stage controller memory is bounded before authenticated preflight',
+    'runtime-stage controller growth during preflight fails before installing',
+    'runtime-stage unavailable initial controller observation refuses preflight and installer release',
+    'runtime-stage resource breach aborts a delayed preflight request and releases ownership before continuation',
+    'runtime-stage caller cancellation aborts a delayed preflight request and releases ownership before continuation',
+    'runtime-stage failure logs honor the caller retained-output cap outside the stage',
+    'runtime-stage retries share the retained-output allowance and preserve earlier failure evidence',
+    'runtime-stage first publication bounds oversized shared output absent from its ledger',
+    'runtime-stage first publication bounds corrupt shared output absent from its ledger',
+    'runtime-stage first publication bounds valid shared output absent from its ledger',
+    'runtime-stage first publication bounds empty shared output absent from its ledger',
+    'runtime-stage retained-output corrupt ledger refuses another installer without resetting its allowance',
+    'runtime-stage retained-output incompatible controller refuses another installer without resetting its allowance',
+    'runtime-stage retained-output missing evidence refuses another installer without resetting its allowance',
+    'runtime-stage retained-output corrupt evidence refuses another installer without resetting its allowance',
+    'runtime-stage retained-output oversized evidence refuses another installer without resetting its allowance',
+    'runtime-stage explicitly isolates npm cache, logs, configuration and temporary destinations',
+    'runtime-stage cancellation shares prior failure charges and identical evidence is reused',
+    'runtime-stage post-install preflight growth cannot publish completion',
+    'runtime-stage bounds actual controller and npm memory and preserves an unrelated live peer',
+    'runtime-stage changed resource intent preserves compatible completed bytes without reinstalling',
+    'completed stages refuse missing, corrupt or incompatible package.json dependency metadata without reinstalling or rewriting',
+    'completed stages refuse missing, corrupt or incompatible package-lock.json dependency metadata without reinstalling or rewriting',
+    'lost completion response refuses package.json drift during final preflight without reinstalling',
+    'lost completion response refuses package-lock.json drift during final preflight without reinstalling',
+    'public producer stages exact bytes, explicitly admits and reuses completed work without installing again',
+    'archive replacement and restoration during install cannot admit alternate bytes under the reviewed digest',
+    'completed snapshot missing rejects reuse and admission while preserving current admission',
+    'completed snapshot corrupt rejects reuse and admission while preserving current admission',
+    'completed snapshot symlink rejects reuse and admission while preserving current admission',
+    'completed snapshot hardlink rejects reuse and admission while preserving current admission',
+    'archive snapshot consumes the bounded stage output allowance before running npm',
+    'snapshot durability failure removes the owned partial copy and preserves the original and unrelated files',
+    'stage rejects authority before adopting or publishing a runtime',
+    'stage rejects archive before adopting or publishing a runtime',
+    'stage rejects version before adopting or publishing a runtime',
+    'stage rejects source before adopting or publishing a runtime',
+    'stage rejects config before adopting or publishing a runtime',
+    'stage rejects identity before adopting or publishing a runtime',
+    'stage rejects same-actor before adopting or publishing a runtime',
+    'stage rejects reviewer-access before adopting or publishing a runtime',
+    'stage rejects unowned before adopting or publishing a runtime',
+    'admission rejects CAS and actual byte or actor drift while preserving the prior record',
+    'post-rename errors reconcile desired bytes and never overwrite third-party replacement',
+    'failure and cancellation remove only the owned incomplete stage and preserve unrelated output',
+    'native failure and cancellation remove only the owned incomplete stage and preserve unrelated output',
+    'native cancellation fixture waits for delayed installer readiness',
+    'native cancellation fixture preserves an early staging rejection',
+    'native cancellation fixture settles a real installer before assertion-failure cleanup',
+    'output retirement retains a bounded operation cause without exposing installer failure data',
+    'output retirement retains a bounded operation cause without exposing accessors failure data',
+    'output retirement retains a bounded operation cause without exposing cycle failure data',
+    'output retirement retains a bounded operation cause without exposing proxy failure data',
+    'output retirement retains a bounded operation cause without exposing observer failure data',
+    'output retirement retains a bounded operation cause without exposing observer-zero failure data',
+    'output retirement retains a bounded operation cause without exposing observer-retired failure data',
+    'output retirement retains a bounded operation cause without exposing observer-missing failure data',
+    'output retirement retains a bounded operation cause without exposing observer-negative failure data',
+    'output retirement retains a bounded operation cause without exposing observer-fractional failure data',
+    'output retirement retains a bounded operation cause without exposing observer-unsafe failure data',
+    'output retirement retains a bounded operation cause without exposing observer-nonfinite failure data',
+    'output retirement retains a bounded operation cause without exposing observer-string failure data',
+    'output retirement retains a bounded operation cause without exposing observer-array failure data',
+    'output retirement retains a bounded operation cause without exposing observer-malformed failure data',
+    'output retirement retains a bounded operation cause without exposing observer-trailing failure data',
+    'output retirement retains a bounded operation cause without exposing inherited-message failure data',
+    'output retirement retains a bounded operation cause without exposing proxy-root failure data',
+    'output retirement preserves primary cause descriptors for nonextensible errors',
+    'output retirement preserves primary cause descriptors for readonly errors',
+    'output retirement preserves primary cause descriptors for accessor errors',
+    'output retirement preserves primary cause descriptors for mutable-nonextensible errors',
+    'output retirement preserves an operation failure when native retirement succeeds',
+    'output retirement preserves its existing cause after a successful real stage',
+    'admission reports unknown durability with exact same-stage reconciliation and preserves desired bytes',
+    'setup preserves completed output and admission on candidate',
+    'setup preserves completed output and admission on symlink',
+    'setup preserves completed output and admission on capability',
+    'setup preserves completed output and admission on complete-corrupt',
+    'setup preserves completed output and admission on archive-drift',
+    'setup preserves completed output and admission on source-drift',
+    'setup preserves completed output and admission on config-drift',
+    'runtime-stage retained-output recovery preserves charges after hard interruption at reservation',
+    'runtime-stage retained-output recovery preserves charges after hard interruption at publication',
+    'stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
+    'native stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
+    'live routing and reviewer access drift cannot replace an already admitted stage',
+  ].map((title) => ({ file: 'dist/setup.test.js', title, kind: /** @type {const} */ ('mandatory') })),
+  ...[
+    'CLI stage and admit execute the same public producer with explicit authority and prior absence',
+    'CLI stage/admit completes substantive work beyond the former aggregate command limit',
+    'CLI stage/admit keeps an unfinished real installer owned until native quiescence',
+    'CLI stage/admit joins a failed real installer before restoring its fixture',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: missing',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: oversized',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: records',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: write',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-duplicate',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-unmatched',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-rejected',
+    'CLI stage/admit preserves owned recovery evidence when its trace fails: completion-malformed',
+  ].map((title) => ({ file: 'dist/setupCli.test.js', title, kind: /** @type {const} */ ('mandatory') })),
+  ...[
+    {
+      file: 'dist/setup.test.js',
+      title: 'setup interruption child',
+      kind: 'parent-launched-helper',
+    },
+    {
+      file: 'dist/setupCli.test.js',
+      title: 'setup CLI preparation child',
+      kind: 'parent-launched-helper',
+    },
+  ].map((entry) => ({ ...entry, kind: /** @type {const} */ ('parent-launched-helper') })),
+  ...[
+    {
+      file: 'dist/contributorChecks.test.js',
+      titles: [
+        'Vitest source and compiled inputs are unique and use isolated core-aware fork workers',
+        'runtime-expanded tags match every reviewed mandatory identity without executing cases',
+        'direct-focus npm interception reaches the pinned worker before real-case selection',
+        'historical archive input cannot override direct-focus PR exclusion',
+        'direct release focus rejects invalid contracts before any npm launch',
+        'qualification CLI finishes module loading before its owned graph reuses the validator',
+        'real failed and explicitly timed-out commands preserve logs and prove owned cleanup',
+        'cancellation reaps observed detached descendants and preserves an unrelated peer',
+        'cancellation discovers children born from a detached owner after the root exits and preserves a peer',
+      ],
+    },
+    {
+      file: 'dist/build.test.js',
+      titles: [
+        'JavaScript emit preserves nested ESM imports, source maps, executable CLI and prepared declarations',
+        'explicit clean emit removes stale outputs without retaining deleted test files',
+        'plugin emit retains standalone CLI identity and full bundled package license text',
+      ],
+    },
+    {
+      file: 'dist/currentConsumer.test.js',
+      titles: [
+        'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=false',
+        'synthetic actual Node24 coverage parent preserves reused explicit env; frozen=true',
+      ],
+    },
+  ].flatMap(({ file, titles }) => titles.map((title) => ({ file, title, kind: /** @type {const} */ ('mandatory') }))),
+  ...[
+    'failure-log scanner gates upload and preserves unrelated resources after success',
+    'failure-log scanner gates upload and preserves unrelated resources after image-pull',
+    'failure-log scanner gates upload and preserves unrelated resources after findings',
+    'failure-log scanner gates upload and preserves unrelated resources after overflow',
+    'failure-log scanner gates upload and preserves unrelated resources after cancel',
+    'failure-log scanner gates upload and preserves unrelated resources after resource',
+    'failure-log scanner gates upload and preserves unrelated resources after drift',
+    'failure-log scanner gates upload and preserves unrelated resources after create-ack',
+    'failure-log scanner gates upload and preserves unrelated resources after cleanup',
+    'failure-log scanner gates upload and preserves unrelated resources after foreign',
+    'failure-log scanner gates upload and preserves unrelated resources after extra-staged',
+    'failure-log scanner gates upload and preserves unrelated resources after unsafe-staged',
+    'failure-log scanner gates upload and preserves unrelated resources after manifest-fields',
+    'failure-log scanner gates upload and preserves unrelated resources after inaccessible',
+    'failure-log scanner gates upload and preserves unrelated resources after scan-error',
+    'failure-log scanner gates upload and preserves unrelated resources after directory-error',
+    'failure-log scanner gates upload and preserves unrelated resources after malformed-ack',
+    'failed qualification refuses fifo test logs while retaining the safe projection',
+  ].map((title) => ({ file: 'dist/releaseWorkflow.test.js', title, kind: /** @type {const} */ ('mandatory') })),
+  {
+    file: 'dist/boardReconcile.test.js',
+    title: 'copied executing artifact changes identity with same-version bytes and refuses links',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issue63Routes.test.js',
+    title: 'actual CLI declares guard fields on every alias and the bounded health command',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/pluginInstaller.test.js',
+    title: 'preview refuses a FIFO configuration without blocking in codex',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/pluginInstaller.test.js',
+    title: 'preview refuses a FIFO configuration without blocking in claude-code',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetRepositoryExecution.test.js',
+    title: 'CLI mcp:serve initializes and serves a real stdio request without target code execution',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/genericCompatibility.test.js',
+    title: 'legacy CLI emits an offline plan without modifying its input',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: 'actual CLI output flags []',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: "actual CLI output flags [ '--json' ]",
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: "actual CLI output flags [ '--verbose' ]",
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/toolOutput.test.js',
+    title: "actual CLI output flags [ '--json', '--verbose' ]",
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issueIntake.test.js',
+    title: 'CLI typed field files reach status privacy validation before configuration',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issueIntake.test.js',
+    title:
+      'actual compiled stdio MCP returns every Ready diagnostic before credentials and refuses a foreign caller repo',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issueIntake.test.js',
+    title: 'intake skill example is Ready and every CLI line has actual required options and an explicit identity',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'actual CLI serializes incomplete native update evidence and exits nonzero',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-plan@1","scopeComplete":true,"summary":{"unresolved":4}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-plan@1","scopeComplete":false})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"failed":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"drifted":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"refused":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"unknown":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"unresolved":1}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title:
+      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":2,"satisfied":1,"failed":0,"drifted":0,"refused":0,"unknown":0,"unresolved":0}})',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'actual board CLI advertises bounded data-only files and validates them before credentials',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI version agrees with its adjacent package independently of caller cwd',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI preserves recoverable start JSON and exits nonzero after creation failure',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI known-issue incomplete start preserves recovery JSON and exits nonzero',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'the extracted real CLI error renderer preserves ordinary refusal, exit and stdout',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'the real CLI renderer bounds diagnostics and leaves the unchanged refusal line last',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'CLI batch partial failure prints every result before returning nonzero',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/cliResult.test.js',
+    title: 'actual CLI batch input validates before configuration or native access',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/dependencyCompatibility.test.js',
+    title: 'SDK stdio starts a synthetic server, discovers a tool, validates input and closes',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/prAssociation.test.js',
+    title:
+      'directory-independent exact-PR contract documents explicit issue/PR selection in actual CLI help without credentials or a checkout',
+    kind: 'mandatory',
+  },
 ];
 
 export const SKIP_ALLOWLIST = [
+  {
+    file: 'dist/setupCli.test.js',
+    title: 'setup CLI preparation child',
+    reason:
+      'Top-level CLI preparation helper lacks its owned preparation input; passing CLI parents launch it separately.',
+    kind: 'parent-launched-helper',
+  },
+
   {
     file: 'dist/setup.test.js',
     title: 'setup interruption child',
@@ -283,11 +980,17 @@ function walk(root, path = '') {
     .sort();
 }
 
-/** @param {string} cwd */
-export function expectedTests(cwd) {
+/** @param {string} file */
+export function compiledTestFile(file) {
+  return file.replace(/^src\/(.*)\.test\.ts$/u, 'dist/$1.test.js');
+}
+
+/** @param {string} cwd @param {'source'|'compiled'} [mode] */
+export function expectedTests(cwd, mode = 'compiled') {
+  assert.ok(mode === 'source' || mode === 'compiled', 'Unknown test input mode.');
   const sources = walk(join(cwd, 'src')).filter((path) => path.endsWith('.test.ts'));
   assert.ok(sources.length, 'No intended source tests selected.');
-  return sources.map((path) => `dist/${path.slice(0, -3)}.js`);
+  return sources.map((path) => (mode === 'source' ? `src/${path}` : `dist/${path.slice(0, -3)}.js`));
 }
 
 /** @param {string} cwd @param {string[]} requested */
@@ -567,17 +1270,26 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
   const key = (file, title) => JSON.stringify([file, title]);
   const inventory = new Map(RELEASE_CASES.map((test) => [key(test.file, test.title), test]));
   /** @param {{file:string,fullName:string}} test */
-  const releaseCase = (test) => inventory.has(key(test.file, test.fullName));
+  const releaseCase = (test) => inventory.has(key(compiledTestFile(test.file), test.fullName));
   for (const test of cases) {
     if (test.tags !== undefined)
       assert.equal(test.tags.includes('release'), releaseCase(test), 'Tags differ from reviewed release inventory.');
     if ((lane === 'pr' && releaseCase(test)) || (lane === 'release' && !releaseCase(test)))
       assert.notEqual(test.status, 'passed', 'A case executed outside its owned lane.');
   }
-  for (const expected of RELEASE_CASES.filter((test) => selected.includes(test.file))) {
-    const observed = cases.filter((test) => key(test.file, test.fullName) === key(expected.file, expected.title));
+  for (const expected of RELEASE_CASES.filter((test) =>
+    selected.some((file) => compiledTestFile(file) === test.file),
+  )) {
+    const observed = cases.filter(
+      (test) => key(compiledTestFile(test.file), test.fullName) === key(expected.file, expected.title),
+    );
     assert.ok(observed.length <= 1, 'A release identity executed more than once.');
-    if (lane === 'release' && (expected.kind === 'mandatory' || env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE)) {
+    if (lane === 'release') assert.equal(observed.length, 1, 'Required release identity is missing.');
+    if (
+      lane === 'release' &&
+      (expected.kind === 'mandatory' ||
+        (expected.kind === 'external-historical-qualification' && env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE))
+    ) {
       assert.equal(observed.length, 1, 'Required release case is missing.');
       assert.equal(observed[0].status, 'passed', 'Required release case did not pass.');
     }
@@ -597,30 +1309,37 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
   const skips = owned
     .filter((test) => ['pending', 'skipped'].includes(test.status))
     .map((test) => {
-      const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
+      const allowed = SKIP_ALLOWLIST.find(
+        (entry) => entry.file === compiledTestFile(test.file) && entry.title === test.fullName,
+      );
       assert.ok(allowed, `Unexpected skip: ${test.file}: ${test.fullName}`);
       assert.ok(
         allowed.kind !== 'external-historical-qualification' || !env.AI_DELIVERY_REAL_PACKAGE_ARCHIVE,
         'Historical archive qualification skipped despite explicit AI_DELIVERY_REAL_PACKAGE_ARCHIVE input.',
       );
-      return allowed;
+      return { ...allowed, file: test.file };
     });
-  if (skips.some((entry) => entry.kind === 'parent-launched-helper')) {
-    assert.ok(
-      passed.some(
-        (test) =>
-          test.fullName ===
+  for (const helper of skips.filter((entry) => entry.kind === 'parent-launched-helper')) {
+    const cli = compiledTestFile(helper.file) === 'dist/setupCli.test.js';
+    const parents = cli
+      ? [
+          'CLI stage and admit execute the same public producer with explicit authority and prior absence',
+          'CLI preparation failure retains owned evidence through native drain',
+          'CLI preparation cancel retains owned evidence through native drain',
+        ]
+      : [
           'stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-      ),
-    );
-    assert.ok(
-      passed.some(
-        (test) =>
-          test.fullName ===
           'native stopped setup owners stay busy and orphan recovery confirms cleanup before retrying the incomplete install',
-      ),
+        ];
+    for (const title of parents)
+      assert.ok(
+        passed.some((test) => compiledTestFile(test.file) === compiledTestFile(helper.file) && test.fullName === title),
+        'Parent-launched helper parent did not pass.',
+      );
+    assert.ok(
+      output.includes(cli ? 'SETUP_CLI_PHASE_RECEIPT' : 'SETUP_INTERRUPTION_RECEIPT'),
+      'Parent-launched helper proof is missing.',
     );
-    assert.ok(output.includes('SETUP_INTERRUPTION_RECEIPT'), 'Parent-launched helper proof is missing.');
   }
   return {
     files: selected.length,
@@ -632,7 +1351,14 @@ export function analyzeTests(report, expected, cwd, output, env = {}, lane = 'pr
     selectedCases: owned.map((test) => ({ file: test.file, title: test.fullName })),
     laneExcluded:
       lane === 'pr'
-        ? RELEASE_CASES.filter((test) => selected.includes(test.file)).map(({ file, title }) => ({ file, title }))
+        ? RELEASE_CASES.filter((test) => selected.some((file) => compiledTestFile(file) === test.file)).map(
+            ({ file, title }) => ({
+              file: selected.some((name) => name.startsWith('src/'))
+                ? file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts')
+                : file,
+              title,
+            }),
+          )
         : cases.filter((test) => !releaseCase(test)).map((test) => ({ file: test.file, title: test.fullName })),
   };
 }
@@ -750,7 +1476,7 @@ function persist(directory, report) {
       (step) => `${step.stage}: ${step.status}; exit=${step.exitCode}; signal=${step.signal}; log=${step.directory}`,
     ),
   ];
-  if (report.selectedTestFiles) lines.push(`Selected compiled test files: ${report.selectedTestFiles.length}`);
+  if (report.selectedTestFiles) lines.push(`Selected test files: ${report.selectedTestFiles.length}`);
   if (report.observedTests)
     lines.push(
       `Observed test results (full success still requires validated proof): ${report.observedTests.files} files; ${report.observedTests.passed}/${report.observedTests.total} passed; ${report.observedTests.failed} failed`,
@@ -894,7 +1620,10 @@ export async function runChecks({
       notify(`START ${stage}`);
       const result = await execute(command, {
         cwd,
-        env: fast || release ? environment : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
+        env:
+          fast || release || stage === 'lint'
+            ? environment
+            : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
         directory: entry.directory,
         signal,
         timeoutMs,
@@ -919,7 +1648,9 @@ export async function runChecks({
           skips: cases
             .filter((test) => ['pending', 'skipped'].includes(test.status))
             .map((test) => {
-              const allowed = SKIP_ALLOWLIST.find((entry) => entry.file === test.file && entry.title === test.fullName);
+              const allowed = SKIP_ALLOWLIST.find(
+                (entry) => entry.file === compiledTestFile(test.file) && entry.title === test.fullName,
+              );
               return {
                 file: test.file,
                 title: test.fullName,
@@ -948,6 +1679,7 @@ export async function runChecks({
         process.execPath,
         join(cwd, 'node_modules/vitest/vitest.mjs'),
         'run',
+        `--mode=${fast || release ? 'compiled' : 'source'}`,
         `--tags-filter=${release ? 'release' : '!release'}`,
         '--reporter=default',
         '--reporter=json',
@@ -1001,20 +1733,20 @@ export async function runChecks({
     } else {
       if (install) await run('dependency-provisioning', [...npm, 'ci', '--no-audit', '--no-fund']);
       await run('format', [...npm, 'run', 'format:check']);
-      await run('lint', [...npm, 'run', 'lint']);
-      await run('types', [...npm, 'run', 'typecheck']);
+      await run('lint', [process.execPath, join(cwd, 'node_modules/oxlint/bin/oxlint')]);
+      // Native declaration analysis runs once in the producer; fast mode stays noEmit.
+      if (!fast || report.selectedTestFiles) rmSync(join(cwd, 'dist'), { recursive: true, force: true });
+      await run('types', [
+        ...npm,
+        'run',
+        'typecheck',
+        ...(!fast ? ['--', '--noEmit', 'false', '--emitDeclarationOnly'] : []),
+      ]);
       if (!fast || report.selectedTestFiles) {
-        // Clean output once, immediately before the only compiled build in this graph.
-        rmSync(join(cwd, 'dist'), { recursive: true, force: true });
-        await run(
-          'build',
-          fast
-            ? [process.execPath, join(cwd, 'node_modules/typescript/lib/tsc.js'), '-p', 'tsconfig.build.json']
-            : [...npm, 'run', 'build'],
-        );
+        await run('build', [process.execPath, join(cwd, 'scripts/build.mjs'), ...(!fast ? ['--plugin'] : [])]);
         if (fast && buildPlugin) await run('plugin-build', [process.execPath, join(cwd, 'scripts/build-plugin.mjs')]);
         const allTests = assertCleanSelection(cwd);
-        report.selectedTestFiles ??= allTests;
+        report.selectedTestFiles ??= expectedTests(cwd, 'source');
         await testSelected(allTests);
         if (!fast) {
           const inventory = await run('inventory', [...npm, 'pack', '--dry-run', '--ignore-scripts', '--json']);
