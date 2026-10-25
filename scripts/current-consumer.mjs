@@ -22,8 +22,8 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 // Consume the reviewed runner's public evidence ABI without changing its
 // independent JavaScript type-check policy in this focused helper check.
-const { FULL_GATES, SKIP_ALLOWLIST, treeIdentity } =
-  /** @type {{FULL_GATES:string[],SKIP_ALLOWLIST:{file:string,title:string,kind:string}[],treeIdentity:(cwd:string)=>{kind:string,sha256:string,fileCount:number}}} */ (
+const { FULL_GATES, SKIP_ALLOWLIST, treeIdentity, compiledTestFile } =
+  /** @type {{compiledTestFile:(file:string)=>string,FULL_GATES:string[],SKIP_ALLOWLIST:{file:string,title:string,kind:string}[],treeIdentity:(cwd:string)=>{kind:string,sha256:string,fileCount:number}}} */ (
     await import(new URL('./checks.mjs', import.meta.url).href)
   );
 
@@ -434,11 +434,14 @@ export function verifyProducerJoin(contract, candidate) {
       Number(tests.passed) > 0 &&
       tests.total === Number(tests.passed) + tests.skips.length &&
       new Set(checks.selectedTestFiles).size === checks.selectedTestFiles.length &&
-      checks.selectedTestFiles.every((value) => typeof value === 'string' && /^dist\/.*\.test\.js$/u.test(value)) &&
+      checks.selectedTestFiles.every((value) => typeof value === 'string' && /^src\/.*\.test\.ts$/u.test(value)) &&
       tests.skips.every((value) => {
         const skip = record(value, 'producer');
         return SKIP_ALLOWLIST.some(
-          (allowed) => allowed.file === skip.file && allowed.title === skip.title && allowed.kind === skip.kind,
+          (allowed) =>
+            allowed.file === compiledTestFile(string(skip.file, 'producer')) &&
+            allowed.title === skip.title &&
+            allowed.kind === skip.kind,
         );
       }),
     'producer',

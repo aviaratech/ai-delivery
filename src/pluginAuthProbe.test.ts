@@ -51,24 +51,32 @@ function assertQuiescent(): void {
 }
 const environment = (): NodeJS.ProcessEnv => ({ HOME: root, PATH: process.env.PATH, LANG: 'C', LC_ALL: 'C' });
 
-test('authentication timeout confirms cleanup of a hanging gh descendant and withholds output', async () => {
-  const result = await captureAuthenticationProbe(root, command(), environment(), 2000);
-  assert.deepEqual(result, { failed: true, stdout: '', diagnostic: '', cleanupConfirmed: true });
-  assertQuiescent();
-});
+test(
+  'authentication timeout confirms cleanup of a hanging gh descendant and withholds output',
+  { tags: ['release'] },
+  async () => {
+    const result = await captureAuthenticationProbe(root, command(), environment(), 2000);
+    assert.deepEqual(result, { failed: true, stdout: '', diagnostic: '', cleanupConfirmed: true });
+    assertQuiescent();
+  },
+);
 
-test('authentication cancellation confirms cleanup of a hanging gh descendant and withholds output', async () => {
-  const cancellation = new AbortController();
-  const result = captureAuthenticationProbe(root, command(), environment(), 5000, cancellation.signal);
-  const deadline = Date.now() + 4000;
-  while (!existsSync(join(root, 'gh-pid.json')) && Date.now() < deadline)
-    await new Promise<void>((resolve) => setTimeout(resolve, 25));
-  cancellation.abort();
-  assert.deepEqual(await result, { failed: true, stdout: '', diagnostic: '', cleanupConfirmed: true });
-  assertQuiescent();
-});
+test(
+  'authentication cancellation confirms cleanup of a hanging gh descendant and withholds output',
+  { tags: ['release'] },
+  async () => {
+    const cancellation = new AbortController();
+    const result = captureAuthenticationProbe(root, command(), environment(), 5000, cancellation.signal);
+    const deadline = Date.now() + 4000;
+    while (!existsSync(join(root, 'gh-pid.json')) && Date.now() < deadline)
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    cancellation.abort();
+    assert.deepEqual(await result, { failed: true, stdout: '', diagnostic: '', cleanupConfirmed: true });
+    assertQuiescent();
+  },
+);
 
-test('successful authentication capture returns stdout only after owned cleanup', async () => {
+test('successful authentication capture returns stdout only after owned cleanup', { tags: ['release'] }, async () => {
   const result = await captureAuthenticationProbe(
     root,
     [process.execPath, '-e', "process.stdout.write('fictional-readback');process.stderr.write('fictional-secret');"],
@@ -78,11 +86,14 @@ test('successful authentication capture returns stdout only after owned cleanup'
   assert.deepEqual(readdirSync(root), []);
 });
 
-test('the production error renderer preserves the owned authentication probe final-line classification', async () => {
-  const cli = join(root, 'renderer.mjs');
-  writeFileSync(
-    cli,
-    `import { writeFileSync } from 'node:fs';
+test(
+  'the production error renderer preserves the owned authentication probe final-line classification',
+  { tags: ['release'] },
+  async () => {
+    const cli = join(root, 'renderer.mjs');
+    writeFileSync(
+      cli,
+      `import { writeFileSync } from 'node:fs';
 import { DeliveryError,setMachineRequestDiagnostics } from ${JSON.stringify(new URL('./errors.js', import.meta.url).href)};
 import { printCommandError } from ${JSON.stringify(new URL('./cliResult.js', import.meta.url).href)};
 writeFileSync(${JSON.stringify(join(root, 'renderer-pid.json'))},JSON.stringify({pid:process.pid}));
@@ -91,18 +102,19 @@ const error=new DeliveryError('Machine GitHub session is invalid or expired; ver
 setMachineRequestDiagnostics(error,{phase:'rest.request',endpoint:'issues.get',status:401,code:'UNKNOWN',requestId:'ABCD:1234:5678:9ABC:DEF0'});
 printCommandError(error);
 `,
-  );
-  const result = await captureAuthenticationProbe(root, [process.execPath, cli], environment());
-  assert.deepEqual(result, {
-    failed: true,
-    stdout: '',
-    diagnostic: 'ai-delivery: Machine GitHub session is invalid or expired; verify the selected github.com account.',
-    cleanupConfirmed: true,
-  });
-  assert.equal(JSON.stringify(result).includes('fictional_private'), false);
-  assert.equal(JSON.stringify(result).includes('ABCD:'), false);
-  const pid = (JSON.parse(readFileSync(join(root, 'renderer-pid.json'), 'utf8')) as { pid: number }).pid;
-  const observed = processSnapshot().get(pid);
-  assert.ok(observed === undefined || /^[ZX]/u.test(observed.status));
-  assert.deepEqual(readdirSync(root).sort(), ['renderer-pid.json', 'renderer.mjs']);
-});
+    );
+    const result = await captureAuthenticationProbe(root, [process.execPath, cli], environment());
+    assert.deepEqual(result, {
+      failed: true,
+      stdout: '',
+      diagnostic: 'ai-delivery: Machine GitHub session is invalid or expired; verify the selected github.com account.',
+      cleanupConfirmed: true,
+    });
+    assert.equal(JSON.stringify(result).includes('fictional_private'), false);
+    assert.equal(JSON.stringify(result).includes('ABCD:'), false);
+    const pid = (JSON.parse(readFileSync(join(root, 'renderer-pid.json'), 'utf8')) as { pid: number }).pid;
+    const observed = processSnapshot().get(pid);
+    assert.ok(observed === undefined || /^[ZX]/u.test(observed.status));
+    assert.deepEqual(readdirSync(root).sort(), ['renderer-pid.json', 'renderer.mjs']);
+  },
+);

@@ -209,100 +209,106 @@ async function prepareScope<T>(scope: Scope, prepare: () => Promise<T>) {
   }
 }
 
-test('sequential setup operations may exceed the former aggregate budget while each operation stays bounded', async () => {
-  const scope = runtimeScope([
-    ['first', 10_000],
-    ['second', 10_000],
-  ]);
-  const observed: number[] = [];
-  vi.useFakeTimers();
-  try {
-    const result = prepareScope(scope, async () => {
-      for (const [name, step] of [
-        ['first', 1],
-        ['second', 2],
-      ] as const)
-        await setupStep(scope, name, async () => {
-          await new Promise((resolve) => setTimeout(resolve, 8_000));
-          observed.push(step);
-        });
-      return 'prepared';
-    }).catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(16_000);
-    assert.equal(await result, 'prepared');
-    assert.deepEqual(observed, [1, 2]);
-    assert.deepEqual(
-      scope.phases.map(({ name, outcome }) => ({ name, outcome })),
-      [
-        { name: 'setup:first', outcome: 'passed' },
-        { name: 'setup:second', outcome: 'passed' },
-      ],
-    );
-  } finally {
-    vi.useRealTimers();
-    await scope.join();
-  }
-});
-
-test('held real handler reports a finite drain stall, retains ownership and permits cleanup only after late settlement', async ({
-  signal,
-}) => {
-  const scope = runtimeScope();
-  scope.forward(signal);
-  const f = scope.acquire();
-  let release!: () => void;
-  let entered!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const reached = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  const get = f.rest.issues.get;
-  let handlerSettled = false;
-  f.rest.issues.get = async (input) => {
-    entered();
-    await held;
-    handlerSettled = true;
-    return get(input);
-  };
-  try {
-    const c = await f.connect();
-    const call = c.call('issue_info', { issueNumber: 17 }).catch((error: unknown) => error);
-    await reached;
+test(
+  'sequential setup operations may exceed the former aggregate budget while each operation stays bounded',
+  { tags: ['release'] },
+  async () => {
+    const scope = runtimeScope([
+      ['first', 10_000],
+      ['second', 10_000],
+    ]);
+    const observed: number[] = [];
     vi.useFakeTimers();
-    let outcome: unknown;
-    const joined = scope.join().then(
-      () => {
-        outcome = 'drained';
-      },
-      (error: unknown) => {
-        outcome = error;
-      },
-    );
-    await vi.advanceTimersByTimeAsync(15_000);
-    assert.ok(outcome instanceof Error, 'A held handler must produce a finite drain-stall outcome');
-    assert.match(outcome.message, /drain-stall/u);
-    assert.equal(handlerSettled, false);
-    assert.equal(existsSync(f.root), true);
-    assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
-    await joined;
-    release();
-    await scope.join();
-    await call;
-    assert.equal(handlerSettled, true);
-    assert.equal(existsSync(f.base), false);
-    const next = inertTarget(signal);
-    await next.dispose(undefined);
-  } finally {
-    vi.useRealTimers();
-    release();
-    await scope.join();
-  }
-}, 30_000);
+    try {
+      const result = prepareScope(scope, async () => {
+        for (const [name, step] of [
+          ['first', 1],
+          ['second', 2],
+        ] as const)
+          await setupStep(scope, name, async () => {
+            await new Promise((resolve) => setTimeout(resolve, 8_000));
+            observed.push(step);
+          });
+        return 'prepared';
+      }).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(16_000);
+      assert.equal(await result, 'prepared');
+      assert.deepEqual(observed, [1, 2]);
+      assert.deepEqual(
+        scope.phases.map(({ name, outcome }) => ({ name, outcome })),
+        [
+          { name: 'setup:first', outcome: 'passed' },
+          { name: 'setup:second', outcome: 'passed' },
+        ],
+      );
+    } finally {
+      vi.useRealTimers();
+      await scope.join();
+    }
+  },
+);
+
+test(
+  'held real handler reports a finite drain stall, retains ownership and permits cleanup only after late settlement',
+  { tags: ['release'], timeout: 30_000 },
+  async ({ signal }) => {
+    const scope = runtimeScope();
+    scope.forward(signal);
+    const f = scope.acquire();
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const get = f.rest.issues.get;
+    let handlerSettled = false;
+    f.rest.issues.get = async (input) => {
+      entered();
+      await held;
+      handlerSettled = true;
+      return get(input);
+    };
+    try {
+      const c = await f.connect();
+      const call = c.call('issue_info', { issueNumber: 17 }).catch((error: unknown) => error);
+      await reached;
+      vi.useFakeTimers();
+      let outcome: unknown;
+      const joined = scope.join().then(
+        () => {
+          outcome = 'drained';
+        },
+        (error: unknown) => {
+          outcome = error;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(15_000);
+      assert.ok(outcome instanceof Error, 'A held handler must produce a finite drain-stall outcome');
+      assert.match(outcome.message, /drain-stall/u);
+      assert.equal(handlerSettled, false);
+      assert.equal(existsSync(f.root), true);
+      assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
+      await joined;
+      release();
+      await scope.join();
+      await call;
+      assert.equal(handlerSettled, true);
+      assert.equal(existsSync(f.base), false);
+      const next = inertTarget(signal);
+      await next.dispose(undefined);
+    } finally {
+      vi.useRealTimers();
+      release();
+      await scope.join();
+    }
+  },
+);
 
 for (const phase of ['setup', 'asserted body'])
-  test(`an individual ${phase} stall aborts without dropping unsettled work`, async () => {
+  test(`an individual ${phase} stall aborts without dropping unsettled work`, { tags: ['release'] }, async () => {
     const scope = runtimeScope([['controlled', 1_000]]);
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
@@ -341,141 +347,138 @@ type SupervisedCommand = {
 };
 const neverReleasedCase =
   'never-released real handler fails in a supervised native test process and is reaped before cleanup';
-test(
-  neverReleasedCase,
-  async ({ signal }) => {
-    const recordPath = process.env['AI_DELIVERY_DRAIN_FAULT_RECORD'];
-    if (recordPath) {
-      // Only the supervised child enters this fault. It deliberately never releases
-      // the real handler; an active handle prevents an idle event loop hiding it.
-      const scope = runtimeScope(faultSteps);
-      scope.forward(signal);
-      const f = await setupStep(scope, 'fixture', () => scope.acquire());
-      const owned = lstatSync(f.base);
-      let entered!: () => void;
-      const reached = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      f.rest.issues.get = async () => {
-        setInterval(() => {}, 1_000);
-        entered();
-        await new Promise<never>(() => {});
-        throw new Error('Never released');
-      };
-      const c = await setupStep(scope, 'connect', () => f.connect());
-      void c.call('issue_info', { issueNumber: 17 }).catch(() => {});
-      await reached;
-      try {
-        await scope.join();
-        assert.fail('A never-released real handler cannot drain');
-      } catch (error) {
-        assert.match(String(error), /drain-stall/u);
-        assert.equal(existsSync(f.base), true);
-        assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
-        writeFileSync(
-          recordPath,
-          JSON.stringify({
-            base: f.base,
-            dev: owned.dev,
-            ino: owned.ino,
-            uid: owned.uid,
-            retainedOwnership: true,
-            phases: scope.phases,
-          }),
-          { flag: 'wx', mode: 0o600 },
-        );
-        throw error;
-      }
+test(neverReleasedCase, { tags: ['release'], timeout: faultBudget + 4_000 }, async ({ signal }) => {
+  const recordPath = process.env['AI_DELIVERY_DRAIN_FAULT_RECORD'];
+  if (recordPath) {
+    // Only the supervised child enters this fault. It deliberately never releases
+    // the real handler; an active handle prevents an idle event loop hiding it.
+    const scope = runtimeScope(faultSteps);
+    scope.forward(signal);
+    const f = await setupStep(scope, 'fixture', () => scope.acquire());
+    const owned = lstatSync(f.base);
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    f.rest.issues.get = async () => {
+      setInterval(() => {}, 1_000);
+      entered();
+      await new Promise<never>(() => {});
+      throw new Error('Never released');
+    };
+    const c = await setupStep(scope, 'connect', () => f.connect());
+    void c.call('issue_info', { issueNumber: 17 }).catch(() => {});
+    await reached;
+    try {
+      await scope.join();
+      assert.fail('A never-released real handler cannot drain');
+    } catch (error) {
+      assert.match(String(error), /drain-stall/u);
+      assert.equal(existsSync(f.base), true);
+      assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
+      writeFileSync(
+        recordPath,
+        JSON.stringify({
+          base: f.base,
+          dev: owned.dev,
+          ino: owned.ino,
+          uid: owned.uid,
+          retainedOwnership: true,
+          phases: scope.phases,
+        }),
+        { flag: 'wx', mode: 0o600 },
+      );
+      throw error;
     }
-    const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as {
-      safeEnvironment(input: Record<string, string>): Record<string, string>;
-      executeCommand(
-        command: string[],
-        options: {
-          cwd: string;
-          env: Record<string, string>;
-          directory: string;
-          signal: AbortSignal;
-          timeoutMs: number;
-          maxRssBytes: number;
-          progress: (record: unknown) => void;
-        },
-      ): Promise<SupervisedCommand>;
-      confirmCommandQuiescence(command: SupervisedCommand): { quiescent: boolean };
-    };
-    const evidence = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-drain-fault-evidence-')));
-    const temporary = join(evidence, 'temporary');
-    mkdirSync(temporary);
-    const record = join(evidence, 'retained-handler.json');
-    const unrelated = join(evidence, 'unrelated');
-    writeFileSync(unrelated, 'preserved');
-    const started = performance.now();
-    const command = await checks.executeCommand(
-      [
-        process.execPath,
-        fileURLToPath(new URL('../node_modules/vitest/vitest.mjs', import.meta.url)),
-        'run',
-        fileURLToPath(import.meta.url),
-        '-t',
-        neverReleasedCase,
-        '--reporter=json',
-        '--outputFile=' + join(evidence, 'vitest.json'),
-      ],
-      {
-        cwd: fileURLToPath(new URL('../', import.meta.url)),
-        env: {
-          ...checks.safeEnvironment(process.env as Record<string, string>),
-          TMPDIR: temporary,
-          AI_DELIVERY_DRAIN_FAULT_RECORD: record,
-        },
-        directory: join(evidence, 'command'),
-        signal,
-        timeoutMs: faultBudget,
-        maxRssBytes: 1024 ** 3,
-        progress: (partial) => writeFileSync(join(evidence, 'supervision.json'), JSON.stringify(partial)),
+  }
+  const checks = (await import(new URL('../scripts/checks.mjs', import.meta.url).href)) as {
+    safeEnvironment(input: Record<string, string>): Record<string, string>;
+    executeCommand(
+      command: string[],
+      options: {
+        cwd: string;
+        env: Record<string, string>;
+        directory: string;
+        signal: AbortSignal;
+        timeoutMs: number;
+        maxRssBytes: number;
+        progress: (record: unknown) => void;
       },
-    );
-    assert.ok(['failed', 'command-timeout', 'owned-child-remained-after-command'].includes(command.status));
-    assert.notEqual(command.exitCode, 0);
-    assert.equal(command.cleanupConfirmed, true);
-    assert.equal(checks.confirmCommandQuiescence(command).quiescent, true);
-    assert.ok(
-      performance.now() - started <= faultBudget + 4_000,
-      'Fault supervision must finish within its declared budget and termination grace',
-    );
-    assert.ok(command.observedProcesses.length > 0);
-    const retained = JSON.parse(readFileSync(record, 'utf8')) as {
-      base: string;
-      dev: number;
-      ino: number;
-      uid: number;
-      retainedOwnership: boolean;
-      phases: Phase[];
-    };
-    assert.equal(retained.retainedOwnership, true);
-    assert.ok(retained.phases.some((phase) => phase.name === 'drain' && phase.outcome === 'drain-stall'));
-    assert.ok(retained.base.startsWith(temporary + '/ai-delivery-inert-target-'));
-    const owned = lstatSync(retained.base);
-    assert.equal(owned.isSymbolicLink(), false);
-    assert.deepEqual([owned.dev, owned.ino, owned.uid], [retained.dev, retained.ino, retained.uid]);
-    assert.equal(readFileSync(unrelated, 'utf8'), 'preserved');
-    // Termination/quiescence is the alternative to actual settlement. Only now may
-    // this parent's exact child temporary root be removed. Keep original evidence.
-    rmSync(temporary, { recursive: true });
-    assert.equal(existsSync(temporary), false);
-    const receipt = {
-      elapsedMs: performance.now() - started,
-      faultBudgetMs: faultBudget,
-      command,
-      ownedTemporaryRemoved: true,
-      unrelatedPreserved: true,
-      evidence,
-    };
-    writeFileSync(join(evidence, 'result.json'), JSON.stringify(receipt, null, 2));
-    process.stdout.write('DRAIN_FAULT_SUPERVISION_RECEIPT ' + JSON.stringify(receipt) + '\n');
-  },
-  faultBudget + 4_000,
-); // Existing supervisor: 3s TERM grace + 1s quiescence confirmation.
+    ): Promise<SupervisedCommand>;
+    confirmCommandQuiescence(command: SupervisedCommand): { quiescent: boolean };
+  };
+  const evidence = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-drain-fault-evidence-')));
+  const temporary = join(evidence, 'temporary');
+  mkdirSync(temporary);
+  const record = join(evidence, 'retained-handler.json');
+  const unrelated = join(evidence, 'unrelated');
+  writeFileSync(unrelated, 'preserved');
+  const started = performance.now();
+  const command = await checks.executeCommand(
+    [
+      process.execPath,
+      fileURLToPath(new URL('../node_modules/vitest/vitest.mjs', import.meta.url)),
+      'run',
+      '--mode=compiled',
+      fileURLToPath(import.meta.url),
+      '-t',
+      neverReleasedCase,
+      '--reporter=json',
+      '--outputFile=' + join(evidence, 'vitest.json'),
+    ],
+    {
+      cwd: fileURLToPath(new URL('../', import.meta.url)),
+      env: {
+        ...checks.safeEnvironment(process.env as Record<string, string>),
+        TMPDIR: temporary,
+        AI_DELIVERY_DRAIN_FAULT_RECORD: record,
+      },
+      directory: join(evidence, 'command'),
+      signal,
+      timeoutMs: faultBudget,
+      maxRssBytes: 1024 ** 3,
+      progress: (partial) => writeFileSync(join(evidence, 'supervision.json'), JSON.stringify(partial)),
+    },
+  );
+  assert.ok(['failed', 'command-timeout', 'owned-child-remained-after-command'].includes(command.status));
+  assert.notEqual(command.exitCode, 0);
+  assert.equal(command.cleanupConfirmed, true);
+  assert.equal(checks.confirmCommandQuiescence(command).quiescent, true);
+  assert.ok(
+    performance.now() - started <= faultBudget + 4_000,
+    'Fault supervision must finish within its declared budget and termination grace',
+  );
+  assert.ok(command.observedProcesses.length > 0);
+  const retained = JSON.parse(readFileSync(record, 'utf8')) as {
+    base: string;
+    dev: number;
+    ino: number;
+    uid: number;
+    retainedOwnership: boolean;
+    phases: Phase[];
+  };
+  assert.equal(retained.retainedOwnership, true);
+  assert.ok(retained.phases.some((phase) => phase.name === 'drain' && phase.outcome === 'drain-stall'));
+  assert.ok(retained.base.startsWith(temporary + '/ai-delivery-inert-target-'));
+  const owned = lstatSync(retained.base);
+  assert.equal(owned.isSymbolicLink(), false);
+  assert.deepEqual([owned.dev, owned.ino, owned.uid], [retained.dev, retained.ino, retained.uid]);
+  assert.equal(readFileSync(unrelated, 'utf8'), 'preserved');
+  // Termination/quiescence is the alternative to actual settlement. Only now may
+  // this parent's exact child temporary root be removed. Keep original evidence.
+  rmSync(temporary, { recursive: true });
+  assert.equal(existsSync(temporary), false);
+  const receipt = {
+    elapsedMs: performance.now() - started,
+    faultBudgetMs: faultBudget,
+    command,
+    ownedTemporaryRemoved: true,
+    unrelatedPreserved: true,
+    evidence,
+  };
+  writeFileSync(join(evidence, 'result.json'), JSON.stringify(receipt, null, 2));
+  process.stdout.write('DRAIN_FAULT_SUPERVISION_RECEIPT ' + JSON.stringify(receipt) + '\n');
+}); // Existing supervisor: 3s TERM grace + 1s quiescence confirmation.
 
 function scopedRuntimeCase<T extends object>(
   name: string,
@@ -596,6 +599,10 @@ for (const preparationDelayMs of [0, 3_000])
     preparationDelayMs === 0
       ? 'fixture cancellation drains the real MCP handler before releasing global ownership'
       : 'fixture cancellation and reuse keep bounded preparation outside asserted-work budgets',
+    {
+      tags: ['release'],
+      timeout: 2 * (cancellationSteps.reduce((sum, [, budget]) => sum + budget, 0) + ASSERTED_MS + 2 * DRAIN_MS),
+    },
     async ({ signal }) => {
       const first = runtimeScope(cancellationSteps);
       const reuse = runtimeScope(cancellationSteps);
@@ -693,32 +700,33 @@ for (const preparationDelayMs of [0, 3_000])
         }
       }
     },
-    // Each owner has finite setup/assertion limits and a distinct drain-stall
-    // bound; this framework guard includes failure-path and final cleanup joins.
-    2 * (cancellationSteps.reduce((sum, [, budget]) => sum + budget, 0) + ASSERTED_MS + 2 * DRAIN_MS),
   );
 
-test('fixture disposal closes a cancelled MCP connection', async ({ signal }) => {
-  const f = inertTarget(signal);
-  const cancellation = new AbortController();
-  cancellation.abort(new Error('Controlled connection cancellation'));
-  try {
-    await assert.rejects(f.connect({ signal: cancellation.signal }), /Controlled connection cancellation/u);
-  } finally {
-    await f.dispose(undefined);
-  }
-  assert.equal(existsSync(f.base), false);
-  const next = inertTarget(signal);
-  try {
-    const loaded = await loadDeliveryConfig(next.root, {
-      repository: 'example/widget',
-      clients: { graphql: next.graphql } as never,
-    });
-    assert.ok(loaded.configDigest);
-  } finally {
-    await next.dispose(undefined);
-  }
-}, 5_000);
+test(
+  'fixture disposal closes a cancelled MCP connection',
+  { tags: ['release'], timeout: 5_000 },
+  async ({ signal }) => {
+    const f = inertTarget(signal);
+    const cancellation = new AbortController();
+    cancellation.abort(new Error('Controlled connection cancellation'));
+    try {
+      await assert.rejects(f.connect({ signal: cancellation.signal }), /Controlled connection cancellation/u);
+    } finally {
+      await f.dispose(undefined);
+    }
+    assert.equal(existsSync(f.base), false);
+    const next = inertTarget(signal);
+    try {
+      const loaded = await loadDeliveryConfig(next.root, {
+        repository: 'example/widget',
+        clients: { graphql: next.graphql } as never,
+      });
+      assert.ok(loaded.configDigest);
+    } finally {
+      await next.dispose(undefined);
+    }
+  },
+);
 
 async function stageAndAdmit(f: Fixture, c: Connection, scope: Scope) {
   const runtime = await runtimeFixture(f, scope);
@@ -737,127 +745,131 @@ async function stageAndAdmit(f: Fixture, c: Connection, scope: Scope) {
 }
 
 for (const cancellation of ['hook signal', 'owned setup deadline'] as const) {
-  test(`scoped runtime setup ${cancellation} aborts and drains a real handler before releasing globals`, async ({
-    signal,
-  }) => {
-    const scope = runtimeScope();
-    const hook = new AbortController();
-    scope.forward(signal);
-    scope.forward(hook.signal);
-    const f = scope.acquire();
-    let release!: () => void;
-    let entered!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const reached = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    const get = f.rest.issues.get;
-    let handlerSettled = false;
-    f.rest.issues.get = async (input) => {
-      entered();
-      await held;
-      handlerSettled = true;
-      return get(input);
-    };
-    try {
-      f.policy('tracked');
-      const c = await f.connect();
-      let callOutcome!: Promise<unknown>;
-      const setup = prepareScope(scope, () =>
-        scopedPhase(scope, 'setup', cancellation === 'owned setup deadline' ? 1_000 : REQUEST_MS, async () => {
-          const call = c.call('issue_info', { issueNumber: 17 });
-          callOutcome = call.then(
-            () => undefined,
-            (error: unknown) => error,
-          );
-          return call;
-        }),
-      );
-      // Observe both outcomes immediately; failures before release must not create
-      // an unhandled assertion promise while the held real handler is drained.
-      const setupOutcome = setup.then(
-        () => undefined,
-        (error: unknown) => error,
-      );
-      let setupSettled = false;
-      void setupOutcome.then(() => {
-        setupSettled = true;
+  test(
+    `scoped runtime setup ${cancellation} aborts and drains a real handler before releasing globals`,
+    { tags: ['release'], timeout: 5_000 },
+    async ({ signal }) => {
+      const scope = runtimeScope();
+      const hook = new AbortController();
+      scope.forward(signal);
+      scope.forward(hook.signal);
+      const f = scope.acquire();
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
       });
-      await reached;
-      if (cancellation === 'hook signal') hook.abort(new Error('Controlled hook cancellation'));
-      assert.match(String(await callOutcome), /Controlled hook cancellation|Owned setup deadline exceeded/u);
-      assert.equal(handlerSettled, false);
-      assert.equal(setupSettled, false, 'Rejected transport is not joined setup completion');
-      const disposal = scope.join();
-      assert.equal(scope.join(), disposal, 'All cleanup paths join one owned disposal');
-      let disposed = false;
-      void disposal.then(
-        () => {
-          disposed = true;
-        },
-        () => {},
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const get = f.rest.issues.get;
+      let handlerSettled = false;
+      f.rest.issues.get = async (input) => {
+        entered();
+        await held;
+        handlerSettled = true;
+        return get(input);
+      };
+      try {
+        f.policy('tracked');
+        const c = await f.connect();
+        let callOutcome!: Promise<unknown>;
+        const setup = prepareScope(scope, () =>
+          scopedPhase(scope, 'setup', cancellation === 'owned setup deadline' ? 1_000 : REQUEST_MS, async () => {
+            const call = c.call('issue_info', { issueNumber: 17 });
+            callOutcome = call.then(
+              () => undefined,
+              (error: unknown) => error,
+            );
+            return call;
+          }),
+        );
+        // Observe both outcomes immediately; failures before release must not create
+        // an unhandled assertion promise while the held real handler is drained.
+        const setupOutcome = setup.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        let setupSettled = false;
+        void setupOutcome.then(() => {
+          setupSettled = true;
+        });
+        await reached;
+        if (cancellation === 'hook signal') hook.abort(new Error('Controlled hook cancellation'));
+        assert.match(String(await callOutcome), /Controlled hook cancellation|Owned setup deadline exceeded/u);
+        assert.equal(handlerSettled, false);
+        assert.equal(setupSettled, false, 'Rejected transport is not joined setup completion');
+        const disposal = scope.join();
+        assert.equal(scope.join(), disposal, 'All cleanup paths join one owned disposal');
+        let disposed = false;
+        void disposal.then(
+          () => {
+            disposed = true;
+          },
+          () => {},
+        );
+        await Promise.resolve();
+        assert.equal(disposed, false);
+        assert.equal(existsSync(f.root), true);
+        assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
+        release();
+        assert.match(String(await setupOutcome), /Controlled hook cancellation|Owned setup deadline exceeded/u);
+        await disposal;
+        assert.equal(handlerSettled, true);
+        assert.equal(existsSync(f.base), false);
+        const next = inertTarget(signal);
+        try {
+          next.policy('tracked');
+          const nextConnection = await next.connect();
+          const result = await nextConnection.call('issue_info', { issueNumber: 17 });
+          assert.notEqual(result.response.isError, true, result.text);
+        } finally {
+          await next.dispose(undefined);
+        }
+      } finally {
+        release();
+        await scope.join();
+      }
+    },
+  );
+}
+
+test(
+  'scoped runtime setup failure after connection acquisition drains and restores only owned globals',
+  { tags: ['release'], timeout: 5_000 },
+  async ({ signal }) => {
+    const scope = runtimeScope();
+    scope.forward(signal);
+    let f: Fixture | undefined;
+    try {
+      await assert.rejects(
+        prepareScope(scope, async () => {
+          f = scope.acquire();
+          f.policy('tracked');
+          const c = await f.connect();
+          const result = await c.call('issue_info', { issueNumber: 17 });
+          assert.notEqual(result.response.isError, true, result.text);
+          throw new Error('Controlled failure after owned connection');
+        }),
+        /Controlled failure after owned connection/u,
       );
-      await Promise.resolve();
-      assert.equal(disposed, false);
-      assert.equal(existsSync(f.root), true);
-      assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
-      release();
-      assert.match(String(await setupOutcome), /Controlled hook cancellation|Owned setup deadline exceeded/u);
-      await disposal;
-      assert.equal(handlerSettled, true);
+      assert.ok(f);
       assert.equal(existsSync(f.base), false);
       const next = inertTarget(signal);
       try {
         next.policy('tracked');
-        const nextConnection = await next.connect();
-        const result = await nextConnection.call('issue_info', { issueNumber: 17 });
+        const c = await next.connect();
+        await scope.join();
+        const result = await c.call('issue_info', { issueNumber: 17 });
         assert.notEqual(result.response.isError, true, result.text);
       } finally {
         await next.dispose(undefined);
       }
     } finally {
-      release();
       await scope.join();
     }
-  }, 5_000);
-}
-
-test('scoped runtime setup failure after connection acquisition drains and restores only owned globals', async ({
-  signal,
-}) => {
-  const scope = runtimeScope();
-  scope.forward(signal);
-  let f: Fixture | undefined;
-  try {
-    await assert.rejects(
-      prepareScope(scope, async () => {
-        f = scope.acquire();
-        f.policy('tracked');
-        const c = await f.connect();
-        const result = await c.call('issue_info', { issueNumber: 17 });
-        assert.notEqual(result.response.isError, true, result.text);
-        throw new Error('Controlled failure after owned connection');
-      }),
-      /Controlled failure after owned connection/u,
-    );
-    assert.ok(f);
-    assert.equal(existsSync(f.base), false);
-    const next = inertTarget(signal);
-    try {
-      next.policy('tracked');
-      const c = await next.connect();
-      await scope.join();
-      const result = await c.call('issue_info', { issueNumber: 17 });
-      assert.notEqual(result.response.isError, true, result.text);
-    } finally {
-      await next.dispose(undefined);
-    }
-  } finally {
-    await scope.join();
-  }
-}, 5_000);
+  },
+);
 
 async function lifecycleControl(f: Fixture, runtime: Awaited<ReturnType<typeof runtimeFixture>>) {
   // Same archive, real npm and same environment; explicitly enabled scripts establish the lifecycle control.
@@ -926,6 +938,7 @@ async function observeEditedAdmit({ f, c, runtime, staged }: Awaited<ReturnType<
 for (const cancellation of ['operation deadline', 'forwarded cancellation'] as const)
   test(
     `edited runtime_admit preparation ${cancellation} retains its real stage handler through drain stall and late settlement`,
+    { tags: ['release'], timeout: editedAdmitSteps.reduce((sum, [, budget]) => sum + budget, 0) + 2 * DRAIN_MS },
     async ({ signal }) => {
       const scope = runtimeScope(
         editedAdmitSteps.map(([name, budget]) => [name, name === 'runtime_stage' ? 3_000 : budget] as const),
@@ -1005,7 +1018,6 @@ for (const cancellation of ['operation deadline', 'forwarded cancellation'] as c
         await scope.join();
       }
     },
-    editedAdmitSteps.reduce((sum, [, budget]) => sum + budget, 0) + 2 * DRAIN_MS,
   );
 
 async function prepareTransition(scope: Scope) {
@@ -1126,21 +1138,25 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
       },
     );
   } else {
-    test('public MCP runtime_stage refuses primary source edits and leaves edited policy inert', async ({ signal }) => {
-      const f = inertTarget(signal);
-      let c: Connection | undefined;
-      try {
-        const runtime = await runtimeFixture(f);
-        f.policy('edited');
-        c = await f.connect();
-        const result = await c.call('runtime_stage', runtime.stage);
-        assert.equal(result.response.isError, true);
-        assert.match(result.text, /Delivery requires an exact clean worktree\./u);
-        assert.equal(existsSync(runtime.common.runtimeDirectory), false);
-      } finally {
-        await f.dispose(c);
-      }
-    }, 15_000);
+    test(
+      'public MCP runtime_stage refuses primary source edits and leaves edited policy inert',
+      { tags: ['release'], timeout: 15_000 },
+      async ({ signal }) => {
+        const f = inertTarget(signal);
+        let c: Connection | undefined;
+        try {
+          const runtime = await runtimeFixture(f);
+          f.policy('edited');
+          c = await f.connect();
+          const result = await c.call('runtime_stage', runtime.stage);
+          assert.equal(result.response.isError, true);
+          assert.match(result.text, /Delivery requires an exact clean worktree\./u);
+          assert.equal(existsSync(runtime.common.runtimeDirectory), false);
+        } finally {
+          await f.dispose(c);
+        }
+      },
+    );
     scopedRuntimeCase(
       'public MCP runtime_admit refuses primary source edits and leaves edited policy inert',
       editedAdmitSteps,
@@ -1162,140 +1178,146 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     );
   }
 
-  test(`public MCP investigation start ${kind === 'tracked' ? 'registers exact selected source' : 'refuses selected worktree edits'} with ${kind} policy`, async ({
-    signal,
-  }) => {
-    const f = inertTarget(signal);
-    let c: Connection | undefined;
-    try {
-      f.worktree();
-      f.policy(kind, f.target);
-      assert.equal(fixtureGit(f.root, 'status', '--porcelain'), '');
-      c = await f.connect();
-      const args = { issueNumber: 17, investigationWorktree: f.target, expectedHeadSha: f.head };
-      const result = await c.call('issue_start', args);
-      if (kind === 'edited') {
-        assert.equal(result.response.isError, true);
-        assert.match(result.text, /Delivery requires an exact clean worktree\./u);
-        assert.equal(readInvestigationPreparation(f.root, 17), undefined);
-      } else {
-        assert.notEqual(result.response.isError, true, result.text);
+  test(
+    `public MCP investigation start ${kind === 'tracked' ? 'registers exact selected source' : 'refuses selected worktree edits'} with ${kind} policy`,
+    { tags: ['release'], timeout: 15_000 },
+    async ({ signal }) => {
+      const f = inertTarget(signal);
+      let c: Connection | undefined;
+      try {
+        f.worktree();
+        f.policy(kind, f.target);
+        assert.equal(fixtureGit(f.root, 'status', '--porcelain'), '');
+        c = await f.connect();
+        const args = { issueNumber: 17, investigationWorktree: f.target, expectedHeadSha: f.head };
+        const result = await c.call('issue_start', args);
+        if (kind === 'edited') {
+          assert.equal(result.response.isError, true);
+          assert.match(result.text, /Delivery requires an exact clean worktree\./u);
+          assert.equal(readInvestigationPreparation(f.root, 17), undefined);
+        } else {
+          assert.notEqual(result.response.isError, true, result.text);
+          const preparation = readInvestigationPreparation(f.root, 17)!;
+          assert.equal(preparation.head.sha, f.head);
+          assert.equal(preparation.row.path, f.target);
+          assert.equal(f.comments.length, 1);
+          const again = await c.call('issue_start', args);
+          assert.notEqual(again.response.isError, true, again.text);
+          assert.equal(f.comments.length, 1);
+          assert.deepEqual(again.value!.preparation, result.value!.preparation);
+        }
+      } finally {
+        await f.dispose(c);
+      }
+    },
+  );
+
+  test(
+    `public MCP investigation finish ${kind === 'tracked' ? 'removes only acknowledged selected custody' : 'refuses selected worktree edits'} with ${kind} policy`,
+    { tags: ['release'], timeout: 15_000 },
+    async ({ signal }) => {
+      const f = inertTarget(signal);
+      let c: Connection | undefined;
+      try {
+        f.worktree();
+        f.policy('tracked', f.target);
+        c = await f.connect();
+        const start = await c.call('issue_start', {
+          issueNumber: 17,
+          investigationWorktree: f.target,
+          expectedHeadSha: f.head,
+        });
+        assert.notEqual(start.response.isError, true, start.text);
         const preparation = readInvestigationPreparation(f.root, 17)!;
-        assert.equal(preparation.head.sha, f.head);
-        assert.equal(preparation.row.path, f.target);
-        assert.equal(f.comments.length, 1);
-        const again = await c.call('issue_start', args);
-        assert.notEqual(again.response.isError, true, again.text);
-        assert.equal(f.comments.length, 1);
-        assert.deepEqual(again.value!.preparation, result.value!.preparation);
+        const resultPath = join(f.base, 'durable-result.txt');
+        writeFileSync(resultPath, 'Fictional result: unchanged source; all producers stopped.\n', { mode: 0o600 });
+        const resultDigest = digestBytes(readFileSync(resultPath));
+        f.state.issueState = 'closed';
+        f.addComment(201, investigationAuthorityBody(preparation, resultDigest));
+        f.addComment(202, investigationAcceptanceBody(preparation, resultDigest, 201), true);
+        if (kind === 'edited') f.policy('edited', f.target);
+        assert.equal(fixtureGit(f.root, 'status', '--porcelain'), '');
+        const args = {
+          issueNumber: 17,
+          investigation: true,
+          resultPath,
+          authorityCommentId: 201,
+          acceptanceCommentId: 202,
+        };
+        const result = await c.call('issue_finish', args);
+        if (kind === 'edited') {
+          assert.equal(result.response.isError, true);
+          assert.match(result.text, /Delivery requires an exact clean worktree\./u);
+          assert.equal(existsSync(f.target), true);
+        } else {
+          assert.notEqual(result.response.isError, true, result.text);
+          assert.equal(result.value!.completed, true);
+          assert.equal(existsSync(f.target), false);
+          assert.equal(fixtureGit(f.root, 'rev-parse', 'refs/heads/issue/17'), f.head);
+          assert.equal(existsSync(resultPath), true);
+          const replay = await c.call('issue_finish', args);
+          assert.notEqual(replay.response.isError, true, replay.text);
+          assert.equal(replay.value!.replayed, true);
+        }
+        assert.equal(f.state.closedCount, 0);
+        assert.equal(
+          f.calls.some((value) => value.name === 'pulls.merge'),
+          false,
+        );
+      } finally {
+        await f.dispose(c);
       }
-    } finally {
-      await f.dispose(c);
-    }
-  }, 15_000);
+    },
+  );
 
-  test(`public MCP investigation finish ${kind === 'tracked' ? 'removes only acknowledged selected custody' : 'refuses selected worktree edits'} with ${kind} policy`, async ({
-    signal,
-  }) => {
-    const f = inertTarget(signal);
-    let c: Connection | undefined;
-    try {
-      f.worktree();
-      f.policy('tracked', f.target);
-      c = await f.connect();
-      const start = await c.call('issue_start', {
-        issueNumber: 17,
-        investigationWorktree: f.target,
-        expectedHeadSha: f.head,
-      });
-      assert.notEqual(start.response.isError, true, start.text);
-      const preparation = readInvestigationPreparation(f.root, 17)!;
-      const resultPath = join(f.base, 'durable-result.txt');
-      writeFileSync(resultPath, 'Fictional result: unchanged source; all producers stopped.\n', { mode: 0o600 });
-      const resultDigest = digestBytes(readFileSync(resultPath));
-      f.state.issueState = 'closed';
-      f.addComment(201, investigationAuthorityBody(preparation, resultDigest));
-      f.addComment(202, investigationAcceptanceBody(preparation, resultDigest, 201), true);
-      if (kind === 'edited') f.policy('edited', f.target);
-      assert.equal(fixtureGit(f.root, 'status', '--porcelain'), '');
-      const args = {
-        issueNumber: 17,
-        investigation: true,
-        resultPath,
-        authorityCommentId: 201,
-        acceptanceCommentId: 202,
-      };
-      const result = await c.call('issue_finish', args);
-      if (kind === 'edited') {
-        assert.equal(result.response.isError, true);
-        assert.match(result.text, /Delivery requires an exact clean worktree\./u);
-        assert.equal(existsSync(f.target), true);
-      } else {
+  test(
+    `public MCP transition inspect inventories legacy custody and names reached guard with ${kind} policy`,
+    { tags: ['release'], timeout: 15_000 },
+    async ({ signal }) => {
+      const f = inertTarget(signal);
+      let c: Connection | undefined;
+      try {
+        f.worktree();
+        const row = {
+          branch: 'issue/17',
+          path: f.target,
+          issueNumber: 17,
+          identity: 'author',
+          type: 'issue',
+          status: 'active',
+          createdAt: '2026-01-01',
+          updatedAt: '2026-01-01',
+        };
+        writeFileSync(join(f.root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [row] }));
+        mkdirSync(join(f.root, '.issue-cli/issues/17'), { recursive: true });
+        writeFileSync(join(f.root, '.issue-cli/issues/17', 'fictional.txt'), 'Preserved original evidence.\n');
+        f.policy(kind, f.target);
+        c = await f.connect();
+        const result = await c.call('issue_worktree_transition_inspect', {
+          issueNumber: 17,
+          purpose: 'active-resume',
+          disposition: 'retain',
+        });
         assert.notEqual(result.response.isError, true, result.text);
-        assert.equal(result.value!.completed, true);
-        assert.equal(existsSync(f.target), false);
-        assert.equal(fixtureGit(f.root, 'rev-parse', 'refs/heads/issue/17'), f.head);
-        assert.equal(existsSync(resultPath), true);
-        const replay = await c.call('issue_finish', args);
-        assert.notEqual(replay.response.isError, true, replay.text);
-        assert.equal(replay.value!.replayed, true);
+        assert.equal(result.value!.ready, false);
+        assert.equal(result.value!.plan, null);
+        assert.ok((result.value!.inventory as unknown[]).length > 0, 'Inventory owner must be reached');
+        assert.match(
+          JSON.stringify(result.value!.blockers),
+          kind === 'tracked'
+            ? /Missing retained supported public producer admission\/archive/u
+            : /Delivery requires an exact clean worktree\./u,
+        );
+        assert.equal(existsSync(f.target), true);
+        assert.equal(
+          readFileSync(join(f.root, '.issue-cli/issues/17/fictional.txt'), 'utf8'),
+          'Preserved original evidence.\n',
+        );
+      } finally {
+        await f.dispose(c);
       }
-      assert.equal(f.state.closedCount, 0);
-      assert.equal(
-        f.calls.some((value) => value.name === 'pulls.merge'),
-        false,
-      );
-    } finally {
-      await f.dispose(c);
-    }
-  }, 15_000);
-
-  test(`public MCP transition inspect inventories legacy custody and names reached guard with ${kind} policy`, async ({
-    signal,
-  }) => {
-    const f = inertTarget(signal);
-    let c: Connection | undefined;
-    try {
-      f.worktree();
-      const row = {
-        branch: 'issue/17',
-        path: f.target,
-        issueNumber: 17,
-        identity: 'author',
-        type: 'issue',
-        status: 'active',
-        createdAt: '2026-01-01',
-        updatedAt: '2026-01-01',
-      };
-      writeFileSync(join(f.root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [row] }));
-      mkdirSync(join(f.root, '.issue-cli/issues/17'), { recursive: true });
-      writeFileSync(join(f.root, '.issue-cli/issues/17', 'fictional.txt'), 'Preserved original evidence.\n');
-      f.policy(kind, f.target);
-      c = await f.connect();
-      const result = await c.call('issue_worktree_transition_inspect', {
-        issueNumber: 17,
-        purpose: 'active-resume',
-        disposition: 'retain',
-      });
-      assert.notEqual(result.response.isError, true, result.text);
-      assert.equal(result.value!.ready, false);
-      assert.equal(result.value!.plan, null);
-      assert.ok((result.value!.inventory as unknown[]).length > 0, 'Inventory owner must be reached');
-      assert.match(
-        JSON.stringify(result.value!.blockers),
-        kind === 'tracked'
-          ? /Missing retained supported public producer admission\/archive/u
-          : /Delivery requires an exact clean worktree\./u,
-      );
-      assert.equal(existsSync(f.target), true);
-      assert.equal(
-        readFileSync(join(f.root, '.issue-cli/issues/17/fictional.txt'), 'utf8'),
-        'Preserved original evidence.\n',
-      );
-    } finally {
-      await f.dispose(c);
-    }
-  }, 15_000);
+    },
+  );
 
   scopedRuntimeCase(
     `public MCP transition apply reaches unsupported historical binding after bounded stage/admit/reconnect without loading ${kind} policy`,

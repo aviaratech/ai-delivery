@@ -239,7 +239,7 @@ function interruptedApply(
 
 test(
   'real process interruption resumes original capture, claim, witness, row and release without losing originals',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     for (const event of ['intent', 'authority', 'claim', 'claimed', 'owner', 'row', 'release', 'released']) {
       const f = await transitionFixture();
@@ -265,7 +265,7 @@ test(
 
 test(
   'terminal interruption resumes removal intent, physical absence and row removal without recreating source',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     for (const event of ['removal-intent', 'removed', 'released', 'completion']) {
       const f = await transitionFixture({ purpose: 'merged-cleanup', disposition: 'remove' });
@@ -297,7 +297,7 @@ test(
 
 test(
   'an earlier released attempt cannot authorize absence after a later acknowledged claim',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     const f = await transitionFixture();
     try {
@@ -324,58 +324,67 @@ test(
   },
 );
 
-test('transition authority requires exact native personal and configured App identities and whole bodies', async () => {
-  const root = repository();
-  try {
-    for (const change of [
-      'operator-id',
-      'operator-body',
-      'reviewer-actor',
-      'acceptance-body',
-      'subject',
-      'comment-id',
-    ]) {
+test(
+  'transition authority requires exact native personal and configured App identities and whole bodies',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      for (const change of [
+        'operator-id',
+        'operator-body',
+        'reviewer-actor',
+        'acceptance-body',
+        'subject',
+        'comment-id',
+      ]) {
+        const { plan, context, ids } = authorityFixture(root);
+        const operator = nativeAuthority.comments.get(101)!;
+        const reviewer = nativeAuthority.comments.get(102)!;
+        if (change === 'operator-id') operator.user = { id: 99, login: 'configured-host', type: 'User' };
+        if (change === 'operator-body') operator.body = `${String(operator.body)}\n`;
+        if (change === 'reviewer-actor')
+          reviewer.user = { id: 39, login: 'caller-selected-reviewer[bot]', type: 'Bot' };
+        if (change === 'acceptance-body') reviewer.body = worktreeAcceptanceBody(plan, 999);
+        if (change === 'subject') reviewer.issue_url = 'https://api.github.com/repos/example/widget/issues/99';
+        if (change === 'comment-id') reviewer.id = 999;
+        await assert.rejects(
+          assertWorktreeTransitionNativeAuthority(context, plan, ids),
+          /Native .* (?:missing|changed)/u,
+        );
+      }
       const { plan, context, ids } = authorityFixture(root);
-      const operator = nativeAuthority.comments.get(101)!;
-      const reviewer = nativeAuthority.comments.get(102)!;
-      if (change === 'operator-id') operator.user = { id: 99, login: 'configured-host', type: 'User' };
-      if (change === 'operator-body') operator.body = `${String(operator.body)}\n`;
-      if (change === 'reviewer-actor') reviewer.user = { id: 39, login: 'caller-selected-reviewer[bot]', type: 'Bot' };
-      if (change === 'acceptance-body') reviewer.body = worktreeAcceptanceBody(plan, 999);
-      if (change === 'subject') reviewer.issue_url = 'https://api.github.com/repos/example/widget/issues/99';
-      if (change === 'comment-id') reviewer.id = 999;
-      await assert.rejects(
-        assertWorktreeTransitionNativeAuthority(context, plan, ids),
-        /Native .* (?:missing|changed)/u,
-      );
+      await assertWorktreeTransitionNativeAuthority(context, plan, ids);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
     }
-    const { plan, context, ids } = authorityFixture(root);
-    await assertWorktreeTransitionNativeAuthority(context, plan, ids);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+  },
+);
 
-test('only authenticated exact relinquishment revocations invalidate native acceptance', async () => {
-  const root = repository();
-  try {
-    const { plan, context, ids } = authorityFixture(root);
-    const body = JSON.stringify({
-      schemaVersion: 'ai-delivery.worktree-relinquishment-revocation@1',
-      planId: plan.planId,
-      relinquishmentCommentId: 101,
-    });
-    const stableBody = Object.fromEntries(
-      Object.entries(JSON.parse(body) as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)),
-    );
-    nativeAuthority.revoked = [{ body: JSON.stringify(stableBody), user: { id: 99, login: 'forged-host' } }];
-    await assertWorktreeTransitionNativeAuthority(context, plan, ids);
-    nativeAuthority.revoked[0]!.user = { id: 37, login: 'configured-host' };
-    await assert.rejects(assertWorktreeTransitionNativeAuthority(context, plan, ids), /revoked/u);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+test(
+  'only authenticated exact relinquishment revocations invalidate native acceptance',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const { plan, context, ids } = authorityFixture(root);
+      const body = JSON.stringify({
+        schemaVersion: 'ai-delivery.worktree-relinquishment-revocation@1',
+        planId: plan.planId,
+        relinquishmentCommentId: 101,
+      });
+      const stableBody = Object.fromEntries(
+        Object.entries(JSON.parse(body) as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)),
+      );
+      nativeAuthority.revoked = [{ body: JSON.stringify(stableBody), user: { id: 99, login: 'forged-host' } }];
+      await assertWorktreeTransitionNativeAuthority(context, plan, ids);
+      nativeAuthority.revoked[0]!.user = { id: 37, login: 'configured-host' };
+      await assert.rejects(assertWorktreeTransitionNativeAuthority(context, plan, ids), /revoked/u);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
 function repository(): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-transition-')));
@@ -587,53 +596,57 @@ async function transitionFixture(
   };
 }
 
-test('actual retained public bytes support one explicit independently accepted active resume', async () => {
-  const f = await transitionFixture();
-  try {
-    const inspection = await inspectWorktreeTransition(f.context, f.inspectInput);
-    assert.equal(inspection.ready, true, inspection.blockers.join('; '));
-    const plan = inspection.plan!;
-    assert.ok(
-      worktreeRelinquishmentBody(plan).length < 65_000,
-      'native authority body must fit the comment boundary while binding the full plan',
-    );
-    for (const path of [f.admissionPath, f.archivePath, plan.closure.admission.cliPath])
+test(
+  'actual retained public bytes support one explicit independently accepted active resume',
+  { tags: ['release'] },
+  async () => {
+    const f = await transitionFixture();
+    try {
+      const inspection = await inspectWorktreeTransition(f.context, f.inspectInput);
+      assert.equal(inspection.ready, true, inspection.blockers.join('; '));
+      const plan = inspection.plan!;
       assert.ok(
-        plan.inventory.some((file) => file.source === path),
-        `retained operational producer original omitted: ${path}`,
+        worktreeRelinquishmentBody(plan).length < 65_000,
+        'native authority body must fit the comment boundary while binding the full plan',
       );
-    const planPath = join(f.root, 'approved-plan.json');
-    writeFileSync(planPath, stableJson(plan));
-    nativeAuthority.comments.get(101)!.body = worktreeRelinquishmentBody(plan);
-    nativeAuthority.comments.get(102)!.body = worktreeAcceptanceBody(plan, 101);
-    const applied = await applyWorktreeTransition(f.context, {
-      authority: 'worktree:transition',
-      planPath,
-      expectedPlanId: plan.planId,
-      relinquishmentCommentId: 101,
-      acceptanceCommentId: 102,
-      runtimeEntryPath: f.runtimeEntryPath,
-    });
-    assert.equal(applied.result, 'active-resumed');
-    assert.equal(getIssueWorktreeStrict(17, f.root).identity, f.row.identity);
-    assert.equal(digestBytes(readFileSync(f.admissionPath)), plan.closure.admissionBytesDigest);
-    const replayed = await applyWorktreeTransition(f.context, {
-      authority: 'worktree:transition',
-      planPath,
-      expectedPlanId: plan.planId,
-      relinquishmentCommentId: 101,
-      acceptanceCommentId: 102,
-      runtimeEntryPath: f.runtimeEntryPath,
-    });
-    assert.equal(replayed.replayed, true);
-  } finally {
-    rmSync(f.root, { force: true, recursive: true });
-  }
-});
+      for (const path of [f.admissionPath, f.archivePath, plan.closure.admission.cliPath])
+        assert.ok(
+          plan.inventory.some((file) => file.source === path),
+          `retained operational producer original omitted: ${path}`,
+        );
+      const planPath = join(f.root, 'approved-plan.json');
+      writeFileSync(planPath, stableJson(plan));
+      nativeAuthority.comments.get(101)!.body = worktreeRelinquishmentBody(plan);
+      nativeAuthority.comments.get(102)!.body = worktreeAcceptanceBody(plan, 101);
+      const applied = await applyWorktreeTransition(f.context, {
+        authority: 'worktree:transition',
+        planPath,
+        expectedPlanId: plan.planId,
+        relinquishmentCommentId: 101,
+        acceptanceCommentId: 102,
+        runtimeEntryPath: f.runtimeEntryPath,
+      });
+      assert.equal(applied.result, 'active-resumed');
+      assert.equal(getIssueWorktreeStrict(17, f.root).identity, f.row.identity);
+      assert.equal(digestBytes(readFileSync(f.admissionPath)), plan.closure.admissionBytesDigest);
+      const replayed = await applyWorktreeTransition(f.context, {
+        authority: 'worktree:transition',
+        planPath,
+        expectedPlanId: plan.planId,
+        relinquishmentCommentId: 101,
+        acceptanceCommentId: 102,
+        runtimeEntryPath: f.runtimeEntryPath,
+      });
+      assert.equal(replayed.replayed, true);
+    } finally {
+      rmSync(f.root, { force: true, recursive: true });
+    }
+  },
+);
 
 test(
   'completed replay checks original attempt bytes, actual writer absence, row and owner witness',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     const f = await transitionFixture();
     try {
@@ -677,7 +690,7 @@ test(
 
 test(
   'inspection and accepted apply refuse dirty source, wrong repository and changed canonical row without writing intent',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     const f = await transitionFixture();
     try {
@@ -711,7 +724,7 @@ test(
 
 test(
   'inspection reports unsupported operative v2 and missing or corrupt required historical originals',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     const f = await transitionFixture();
     try {
@@ -748,7 +761,7 @@ test(
 
 test(
   'terminal inspection and accepted apply reject wrong native repository and PR lineage drift',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     const f = await transitionFixture({ purpose: 'merged-cleanup' });
     try {
@@ -786,59 +799,63 @@ test(
   },
 );
 
-test('closure check refuses live owners, reused root PIDs and live process groups without signaling', () => {
-  const root = repository();
-  try {
-    const original = previousWriter(root);
-    const previous = JSON.parse(original.bytes.toString('utf8')) as Record<string, unknown>;
-    const { stateId: _id, ...content } = previous;
-    const identity = execFileSync('/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], {
-      encoding: 'utf8',
-      env: { ...process.env, LC_ALL: 'C' },
-    }).trim();
-    for (const reason of ['owner', 'reused-pid', 'group']) {
-      const state = {
-        ...content,
-        owner: reason === 'owner' ? { pid: process.pid, identity } : content.owner,
-        command:
-          reason === 'owner'
-            ? { phase: 'idle' }
-            : {
-                phase: 'running',
-                root: { pid: reason === 'reused-pid' ? process.pid : 2_000_000_000, identity: 'unrelated old birth' },
-                tracked:
-                  reason === 'group'
-                    ? [
-                        {
-                          pid: 2_000_000_001,
-                          identity: 'old birth',
-                          pgid: Number(
-                            execFileSync('/bin/ps', ['-p', String(process.pid), '-o', 'pgid='], {
-                              encoding: 'utf8',
-                            }).trim(),
-                          ),
-                        },
-                      ]
-                    : [],
-              },
-      };
-      assert.throws(
-        () =>
-          assertWorktreeTransitionWriterQuiescent(
-            entry(root).path,
-            Buffer.from(stableJson({ ...state, stateId: digestValue(state) })),
-          ),
-        /live verification|process-group absence/iu,
-      );
-      process.kill(process.pid, 0);
+test(
+  'closure check refuses live owners, reused root PIDs and live process groups without signaling',
+  { tags: ['release'] },
+  () => {
+    const root = repository();
+    try {
+      const original = previousWriter(root);
+      const previous = JSON.parse(original.bytes.toString('utf8')) as Record<string, unknown>;
+      const { stateId: _id, ...content } = previous;
+      const identity = execFileSync('/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], {
+        encoding: 'utf8',
+        env: { ...process.env, LC_ALL: 'C' },
+      }).trim();
+      for (const reason of ['owner', 'reused-pid', 'group']) {
+        const state = {
+          ...content,
+          owner: reason === 'owner' ? { pid: process.pid, identity } : content.owner,
+          command:
+            reason === 'owner'
+              ? { phase: 'idle' }
+              : {
+                  phase: 'running',
+                  root: { pid: reason === 'reused-pid' ? process.pid : 2_000_000_000, identity: 'unrelated old birth' },
+                  tracked:
+                    reason === 'group'
+                      ? [
+                          {
+                            pid: 2_000_000_001,
+                            identity: 'old birth',
+                            pgid: Number(
+                              execFileSync('/bin/ps', ['-p', String(process.pid), '-o', 'pgid='], {
+                                encoding: 'utf8',
+                              }).trim(),
+                            ),
+                          },
+                        ]
+                      : [],
+                },
+        };
+        assert.throws(
+          () =>
+            assertWorktreeTransitionWriterQuiescent(
+              entry(root).path,
+              Buffer.from(stableJson({ ...state, stateId: digestValue(state) })),
+            ),
+          /live verification|process-group absence/iu,
+        );
+        process.kill(process.pid, 0);
+      }
+      assert.deepEqual(readFileSync(original.path), original.bytes);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
     }
-    assert.deepEqual(readFileSync(original.path), original.bytes);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+  },
+);
 
-test('supported closure requires a run for the exact retained head and tree', async () => {
+test('supported closure requires a run for the exact retained head and tree', { tags: ['release'] }, async () => {
   const f = await transitionFixture();
   try {
     writeFileSync(join(f.row.path, 'new-source.txt'), 'a newer synthetic retained source\n');
@@ -852,63 +869,71 @@ test('supported closure requires a run for the exact retained head and tree', as
   }
 });
 
-test('apply revalidates the exact operational run inventory despite native acceptance of local JSON', async () => {
-  const f = await transitionFixture();
-  try {
-    const inspected = await inspectWorktreeTransition(f.context, f.inspectInput);
-    assert.equal(inspected.ready, true, inspected.blockers.join('; '));
-    const { planId: _originalId, ...content } = inspected.plan!;
-    content.closure = { ...content.closure, runManifestIds: [digestValue('unrelated run')] };
-    const plan = { ...content, planId: digestValue(content) };
-    const planPath = join(f.root, 'changed-plan.json');
-    writeFileSync(planPath, stableJson(plan));
-    nativeAuthority.comments.get(101)!.body = worktreeRelinquishmentBody(plan);
-    nativeAuthority.comments.get(102)!.body = worktreeAcceptanceBody(plan, 101);
-    await assert.rejects(
-      applyWorktreeTransition(f.context, {
-        authority: 'worktree:transition',
-        planPath,
-        expectedPlanId: plan.planId,
-        relinquishmentCommentId: 101,
-        acceptanceCommentId: 102,
-        runtimeEntryPath: f.runtimeEntryPath,
-      }),
-      /run.*inventory|operational.*closure/iu,
-    );
-  } finally {
-    rmSync(f.root, { force: true, recursive: true });
-  }
-});
+test(
+  'apply revalidates the exact operational run inventory despite native acceptance of local JSON',
+  { tags: ['release'] },
+  async () => {
+    const f = await transitionFixture();
+    try {
+      const inspected = await inspectWorktreeTransition(f.context, f.inspectInput);
+      assert.equal(inspected.ready, true, inspected.blockers.join('; '));
+      const { planId: _originalId, ...content } = inspected.plan!;
+      content.closure = { ...content.closure, runManifestIds: [digestValue('unrelated run')] };
+      const plan = { ...content, planId: digestValue(content) };
+      const planPath = join(f.root, 'changed-plan.json');
+      writeFileSync(planPath, stableJson(plan));
+      nativeAuthority.comments.get(101)!.body = worktreeRelinquishmentBody(plan);
+      nativeAuthority.comments.get(102)!.body = worktreeAcceptanceBody(plan, 101);
+      await assert.rejects(
+        applyWorktreeTransition(f.context, {
+          authority: 'worktree:transition',
+          planPath,
+          expectedPlanId: plan.planId,
+          relinquishmentCommentId: 101,
+          acceptanceCommentId: 102,
+          runtimeEntryPath: f.runtimeEntryPath,
+        }),
+        /run.*inventory|operational.*closure/iu,
+      );
+    } finally {
+      rmSync(f.root, { force: true, recursive: true });
+    }
+  },
+);
 
-test('terminal transition retains source, holds and original PR identity and permanently rejects ordinary resume', async () => {
-  const f = await transitionFixture({ purpose: 'merged-cleanup', held: true });
-  try {
-    const inspected = await inspectWorktreeTransition(f.context, f.inspectInput);
-    assert.equal(inspected.ready, true, inspected.blockers.join('; '));
-    const plan = inspected.plan!;
-    const applied = await applyWorktreeTransition(f.context, approvedFixturePlan(f, plan));
-    assert.equal(applied.result, 'retained');
-    assert.equal(existsSync(f.row.path), true);
-    assert.deepEqual(listWorktreesStrict(f.root), [{ ...f.row, status: 'merged' }]);
-    assert.deepEqual(plan.retainedHoldCommentIds, [103]);
-    assert.match(String(nativeAuthority.comments.get(103)!.body), /does not release/);
-    await assert.rejects(
-      prepareIssueWorktree({ repoRoot: f.root, issueNumber: 17, identity: 'configured-host' }),
-      /terminal/iu,
-    );
-    const hold = plan.holdEvidence[0]!;
-    assert.equal(
-      digestBytes(readFileSync(join(dirname(applied.receiptPath), 'bytes', `${hold.digest.slice(7)}.bin`))),
-      hold.digest,
-    );
-  } finally {
-    rmSync(f.root, { force: true, recursive: true });
-  }
-});
+test(
+  'terminal transition retains source, holds and original PR identity and permanently rejects ordinary resume',
+  { tags: ['release'] },
+  async () => {
+    const f = await transitionFixture({ purpose: 'merged-cleanup', held: true });
+    try {
+      const inspected = await inspectWorktreeTransition(f.context, f.inspectInput);
+      assert.equal(inspected.ready, true, inspected.blockers.join('; '));
+      const plan = inspected.plan!;
+      const applied = await applyWorktreeTransition(f.context, approvedFixturePlan(f, plan));
+      assert.equal(applied.result, 'retained');
+      assert.equal(existsSync(f.row.path), true);
+      assert.deepEqual(listWorktreesStrict(f.root), [{ ...f.row, status: 'merged' }]);
+      assert.deepEqual(plan.retainedHoldCommentIds, [103]);
+      assert.match(String(nativeAuthority.comments.get(103)!.body), /does not release/);
+      await assert.rejects(
+        prepareIssueWorktree({ repoRoot: f.root, issueNumber: 17, identity: 'configured-host' }),
+        /terminal/iu,
+      );
+      const hold = plan.holdEvidence[0]!;
+      assert.equal(
+        digestBytes(readFileSync(join(dirname(applied.receiptPath), 'bytes', `${hold.digest.slice(7)}.bin`))),
+        hold.digest,
+      );
+    } finally {
+      rmSync(f.root, { force: true, recursive: true });
+    }
+  },
+);
 
 test(
   'unheld terminal removal checks native remote refs and completed replay rejects recreated source',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     const f = await transitionFixture({ purpose: 'merged-cleanup', disposition: 'remove' });
     try {
@@ -930,23 +955,27 @@ test(
   },
 );
 
-test('terminal inspection rejects held removal and configured reviewer matching the native PR author', async () => {
-  for (const reason of ['held', 'reviewer-author']) {
-    const f = await transitionFixture({ purpose: 'merged-cleanup', disposition: 'remove', held: reason === 'held' });
-    try {
-      if (reason === 'reviewer-author') f.nativePr.user.login = nativeAuthority.reviewer;
-      const inspected = await inspectWorktreeTransition(f.context, f.inspectInput);
-      assert.equal(inspected.ready, false, reason);
-      assert.match(inspected.blockers.join('; '), reason === 'held' ? /disposition/iu : /native PR author/iu);
-      assert.equal(
-        existsSync(join(gitCommonDir(f.root), 'ai-delivery/worktree-owners/issue-17.transition.json')),
-        false,
-      );
-    } finally {
-      rmSync(f.root, { force: true, recursive: true });
+test(
+  'terminal inspection rejects held removal and configured reviewer matching the native PR author',
+  { tags: ['release'] },
+  async () => {
+    for (const reason of ['held', 'reviewer-author']) {
+      const f = await transitionFixture({ purpose: 'merged-cleanup', disposition: 'remove', held: reason === 'held' });
+      try {
+        if (reason === 'reviewer-author') f.nativePr.user.login = nativeAuthority.reviewer;
+        const inspected = await inspectWorktreeTransition(f.context, f.inspectInput);
+        assert.equal(inspected.ready, false, reason);
+        assert.match(inspected.blockers.join('; '), reason === 'held' ? /disposition/iu : /native PR author/iu);
+        assert.equal(
+          existsSync(join(gitCommonDir(f.root), 'ai-delivery/worktree-owners/issue-17.transition.json')),
+          false,
+        );
+      } finally {
+        rmSync(f.root, { force: true, recursive: true });
+      }
     }
-  }
-});
+  },
+);
 
 function entry(root: string, status: WorktreeEntry['status'] = 'active'): WorktreeEntry {
   return {
@@ -972,40 +1001,51 @@ function interruptTransition(root: string, row: WorktreeEntry): void {
   writeFileSync(path, '{', { mode: 0o600 });
 }
 
-test('ordinary ownership and resume refuse an interrupted transition even after the owner witness exists', async () => {
-  const root = repository();
-  try {
-    const row = entry(root);
-    await addWorktreeEntry(row, root);
-    assert.equal(getIssueWorktreeStrict(17, root).path, row.path);
-    interruptTransition(root, row);
-    assert.throws(() => getIssueWorktreeStrict(17, root), /Worktree transition.*(?:pending|incomplete|terminal)/iu);
-    await assert.rejects(
-      prepareIssueWorktree({ identity: row.identity!, issueNumber: 17, repoRoot: root }),
-      /Worktree transition.*(?:pending|incomplete|terminal)/iu,
-    );
-    assert.deepEqual(listWorktreesStrict(root), [row]);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+test(
+  'ordinary ownership and resume refuse an interrupted transition even after the owner witness exists',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const row = entry(root);
+      await addWorktreeEntry(row, root);
+      assert.equal(getIssueWorktreeStrict(17, root).path, row.path);
+      interruptTransition(root, row);
+      assert.throws(() => getIssueWorktreeStrict(17, root), /Worktree transition.*(?:pending|incomplete|terminal)/iu);
+      await assert.rejects(
+        prepareIssueWorktree({ identity: row.identity!, issueNumber: 17, repoRoot: root }),
+        /Worktree transition.*(?:pending|incomplete|terminal)/iu,
+      );
+      assert.deepEqual(listWorktreesStrict(root), [row]);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
-test('registration cannot reactivate a merged issue through an interrupted transition', async () => {
-  const root = repository();
-  try {
-    const row = { ...entry(root, 'merged'), prNumber: 23 };
-    await addWorktreeEntry(row, root);
-    const registry = join(root, '.issue-cli', 'worktrees.json');
-    const original = readFileSync(registry);
-    interruptTransition(root, row);
-    await assert.rejects(addWorktreeEntry(entry(root), root), /Worktree transition.*(?:pending|incomplete|terminal)/iu);
-    assert.deepEqual(readFileSync(registry), original);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+test(
+  'registration cannot reactivate a merged issue through an interrupted transition',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const row = { ...entry(root, 'merged'), prNumber: 23 };
+      await addWorktreeEntry(row, root);
+      const registry = join(root, '.issue-cli', 'worktrees.json');
+      const original = readFileSync(registry);
+      interruptTransition(root, row);
+      await assert.rejects(
+        addWorktreeEntry(entry(root), root),
+        /Worktree transition.*(?:pending|incomplete|terminal)/iu,
+      );
+      assert.deepEqual(readFileSync(registry), original);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
-test('ordinary ownership still refuses a legacy row without a witness', () => {
+test('ordinary ownership still refuses a legacy row without a witness', { tags: ['release'] }, () => {
   const root = repository();
   try {
     mkdirSync(join(root, '.issue-cli'), { mode: 0o700 });
@@ -1018,49 +1058,57 @@ test('ordinary ownership still refuses a legacy row without a witness', () => {
   }
 });
 
-test('direct tracking admission refuses pending intent after its canonical row is absent', async () => {
-  const root = repository();
-  try {
-    const row = entry(root);
-    await addWorktreeEntry(row, root);
-    writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [] }), { mode: 0o600 });
-    interruptTransition(root, row);
-    assert.throws(
-      () => assertNativeIssueTrackingAdmission(17, root),
-      /Worktree transition.*(?:pending|incomplete|terminal)/iu,
-    );
-    await assert.rejects(
-      prepareIssueWorktree({ identity: row.identity!, issueNumber: 17, repoRoot: root }),
-      /Worktree transition.*(?:pending|incomplete|terminal)/iu,
-    );
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
-
-test('absent-row admission refuses valid JSON with a non-issue or mismatched embedded row', async () => {
-  const root = repository();
-  try {
-    const row = entry(root);
-    await addWorktreeEntry(row, root);
-    writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [] }), { mode: 0o600 });
-    const path = join(gitCommonDir(root), 'ai-delivery/worktree-owners/issue-17.transition.json');
-    for (const invalid of [{ type: 'pr' }, { ...row, issueNumber: 18 }, { ...row, issueNumber: undefined }]) {
-      writeFileSync(path, JSON.stringify({ plan: { row: invalid } }), { mode: 0o600 });
-      assert.throws(() => assertNativeIssueTrackingAdmission(17, root), /transition.*(?:incomplete|unreadable)/iu);
+test(
+  'direct tracking admission refuses pending intent after its canonical row is absent',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const row = entry(root);
+      await addWorktreeEntry(row, root);
+      writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [] }), { mode: 0o600 });
+      interruptTransition(root, row);
+      assert.throws(
+        () => assertNativeIssueTrackingAdmission(17, root),
+        /Worktree transition.*(?:pending|incomplete|terminal)/iu,
+      );
       await assert.rejects(
         prepareIssueWorktree({ identity: row.identity!, issueNumber: 17, repoRoot: root }),
-        /transition.*(?:incomplete|unreadable)/iu,
+        /Worktree transition.*(?:pending|incomplete|terminal)/iu,
       );
+    } finally {
+      rmSync(root, { force: true, recursive: true });
     }
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+  },
+);
+
+test(
+  'absent-row admission refuses valid JSON with a non-issue or mismatched embedded row',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const row = entry(root);
+      await addWorktreeEntry(row, root);
+      writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [] }), { mode: 0o600 });
+      const path = join(gitCommonDir(root), 'ai-delivery/worktree-owners/issue-17.transition.json');
+      for (const invalid of [{ type: 'pr' }, { ...row, issueNumber: 18 }, { ...row, issueNumber: undefined }]) {
+        writeFileSync(path, JSON.stringify({ plan: { row: invalid } }), { mode: 0o600 });
+        assert.throws(() => assertNativeIssueTrackingAdmission(17, root), /transition.*(?:incomplete|unreadable)/iu);
+        await assert.rejects(
+          prepareIssueWorktree({ identity: row.identity!, issueNumber: 17, repoRoot: root }),
+          /transition.*(?:incomplete|unreadable)/iu,
+        );
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   'native acceptance cannot bypass terminal or active purpose and complete PR-set predicates',
-  { timeout: 0 },
+  { tags: ['release'], timeout: 0 },
   async () => {
     for (const reason of ['empty-terminal-lineage', 'active-merged-lineage', 'active-merged-row']) {
       const f = await transitionFixture({ purpose: 'merged-cleanup' });
@@ -1102,50 +1150,63 @@ test(
   },
 );
 
-test('transition registry rejects a foreign issue row sharing its exact path or branch', async () => {
-  const root = repository();
-  try {
-    const { plan } = authorityFixture(root);
-    mkdirSync(join(root, '.issue-cli'), { recursive: true });
-    for (const conflict of ['path', 'branch']) {
-      const other = { ...entry(root), issueNumber: 18, path: join(root, '.worktrees', 'issue-18'), branch: 'issue/18' };
-      if (conflict === 'path') other.path = plan.row.path;
-      else other.branch = plan.row.branch;
-      writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [plan.row, other] }), {
-        mode: 0o600,
-      });
-      await assert.rejects(
-        withWorktreeTransitionRegistry(plan, async () => undefined),
-        /colli|conflict/iu,
-      );
+test(
+  'transition registry rejects a foreign issue row sharing its exact path or branch',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const { plan } = authorityFixture(root);
+      mkdirSync(join(root, '.issue-cli'), { recursive: true });
+      for (const conflict of ['path', 'branch']) {
+        const other = {
+          ...entry(root),
+          issueNumber: 18,
+          path: join(root, '.worktrees', 'issue-18'),
+          branch: 'issue/18',
+        };
+        if (conflict === 'path') other.path = plan.row.path;
+        else other.branch = plan.row.branch;
+        writeFileSync(join(root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [plan.row, other] }), {
+          mode: 0o600,
+        });
+        await assert.rejects(
+          withWorktreeTransitionRegistry(plan, async () => undefined),
+          /colli|conflict/iu,
+        );
+      }
+    } finally {
+      rmSync(root, { force: true, recursive: true });
     }
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+  },
+);
 
-test('historical inventory preserves unknown schemas and failed diagnostics byte for byte', () => {
-  const root = repository();
-  try {
-    const historical = join(root, '.issue-cli', 'issues', '17', 'review', 'historical-head');
-    mkdirSync(historical, { recursive: true });
-    const original = Buffer.from(
-      '{"schemaVersion":"historical.unknown@7","failed":true,"accounting":{"elapsed":51}}\n',
-    );
-    writeFileSync(join(historical, 'failed-diagnostic.json'), original);
-    const inventory = inventoryTransitionEvidence(root, entry(root));
-    const item = inventory.find((file) => file.path.endsWith('failed-diagnostic.json'));
-    assert.ok(item);
-    const output = join(gitCommonDir(root), 'ai-delivery', 'worktree-owners', 'preserved');
-    preserveTransitionEvidence(output, inventory);
-    assert.deepEqual(readFileSync(join(output, `${item.digest.slice(7)}.bin`)), original);
-    assert.deepEqual(readFileSync(join(historical, 'failed-diagnostic.json')), original);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+test(
+  'historical inventory preserves unknown schemas and failed diagnostics byte for byte',
+  { tags: ['release'] },
+  () => {
+    const root = repository();
+    try {
+      const historical = join(root, '.issue-cli', 'issues', '17', 'review', 'historical-head');
+      mkdirSync(historical, { recursive: true });
+      const original = Buffer.from(
+        '{"schemaVersion":"historical.unknown@7","failed":true,"accounting":{"elapsed":51}}\n',
+      );
+      writeFileSync(join(historical, 'failed-diagnostic.json'), original);
+      const inventory = inventoryTransitionEvidence(root, entry(root));
+      const item = inventory.find((file) => file.path.endsWith('failed-diagnostic.json'));
+      assert.ok(item);
+      const output = join(gitCommonDir(root), 'ai-delivery', 'worktree-owners', 'preserved');
+      preserveTransitionEvidence(output, inventory);
+      assert.deepEqual(readFileSync(join(output, `${item.digest.slice(7)}.bin`)), original);
+      assert.deepEqual(readFileSync(join(historical, 'failed-diagnostic.json')), original);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
-test('preservation rejects drift without replacing an already preserved original', () => {
+test('preservation rejects drift without replacing an already preserved original', { tags: ['release'] }, () => {
   const root = repository();
   try {
     const historical = join(root, '.issue-cli', 'issues', '17');
@@ -1166,26 +1227,30 @@ test('preservation rejects drift without replacing an already preserved original
   }
 });
 
-test('inventory preserves worktree-local original receipts and accounting before terminal removal', () => {
-  const root = repository();
-  try {
-    const local = join(entry(root).path, '.issue-cli', 'receipts', 'verification');
-    mkdirSync(local, { recursive: true });
-    const path = join(local, 'historical.json');
-    const bytes = Buffer.from(
-      '{"schemaVersion":"legacy.receipt@2","failedDiagnostic":true,"accounting":{"runtimeMs":771}}\n',
-    );
-    writeFileSync(path, bytes);
-    const inventory = inventoryTransitionEvidence(root, entry(root));
-    const selected = inventory.find((file) => file.source === path);
-    assert.ok(selected, 'worktree-local original receipt was omitted');
-    const output = join(gitCommonDir(root), 'ai-delivery', 'worktree-owners', 'preserved');
-    preserveTransitionEvidence(output, inventory);
-    assert.deepEqual(readFileSync(join(output, `${selected.digest.slice(7)}.bin`)), bytes);
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+test(
+  'inventory preserves worktree-local original receipts and accounting before terminal removal',
+  { tags: ['release'] },
+  () => {
+    const root = repository();
+    try {
+      const local = join(entry(root).path, '.issue-cli', 'receipts', 'verification');
+      mkdirSync(local, { recursive: true });
+      const path = join(local, 'historical.json');
+      const bytes = Buffer.from(
+        '{"schemaVersion":"legacy.receipt@2","failedDiagnostic":true,"accounting":{"runtimeMs":771}}\n',
+      );
+      writeFileSync(path, bytes);
+      const inventory = inventoryTransitionEvidence(root, entry(root));
+      const selected = inventory.find((file) => file.source === path);
+      assert.ok(selected, 'worktree-local original receipt was omitted');
+      const output = join(gitCommonDir(root), 'ai-delivery', 'worktree-owners', 'preserved');
+      preserveTransitionEvidence(output, inventory);
+      assert.deepEqual(readFileSync(join(output, `${selected.digest.slice(7)}.bin`)), bytes);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
 function previousWriter(root: string, phase: 'idle' | 'starting' = 'idle'): { path: string; bytes: Buffer } {
   const worktree = join(root, '.worktrees', 'issue-17');
@@ -1204,46 +1269,50 @@ function previousWriter(root: string, phase: 'idle' | 'starting' = 'idle'): { pa
   return { path, bytes };
 }
 
-test('transition lease preserves original bytes before claim and records release before deletion', async () => {
-  const root = repository();
-  try {
-    const original = previousWriter(root);
-    const events: string[] = [];
-    const writerId = '1b75f48b-0746-43a5-bd6d-9ddc17848c9a';
-    await withWorktreeTransitionWriterLease(
-      {
-        repoRoot: entry(root).path,
-        writerId,
-        beforeClaim: ({ previousBytes }: { previousBytes: Buffer | undefined }) => {
-          assert.deepEqual(previousBytes, original.bytes);
-          assert.deepEqual(readFileSync(original.path), original.bytes);
-          events.push('preserved');
+test(
+  'transition lease preserves original bytes before claim and records release before deletion',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const original = previousWriter(root);
+      const events: string[] = [];
+      const writerId = '1b75f48b-0746-43a5-bd6d-9ddc17848c9a';
+      await withWorktreeTransitionWriterLease(
+        {
+          repoRoot: entry(root).path,
+          writerId,
+          beforeClaim: ({ previousBytes }: { previousBytes: Buffer | undefined }) => {
+            assert.deepEqual(previousBytes, original.bytes);
+            assert.deepEqual(readFileSync(original.path), original.bytes);
+            events.push('preserved');
+          },
+          recordClaim: (bytes: Buffer) => {
+            assert.deepEqual(events, ['preserved']);
+            assert.deepEqual(readFileSync(original.path), original.bytes);
+            assert.equal((JSON.parse(bytes.toString()) as { writerId: string }).writerId, writerId);
+            events.push('claimed');
+          },
+          recordRelease: (bytes: Buffer) => {
+            assert.deepEqual(events, ['preserved', 'claimed', 'operation']);
+            assert.deepEqual(readFileSync(original.path), bytes);
+            events.push('released');
+          },
         },
-        recordClaim: (bytes: Buffer) => {
-          assert.deepEqual(events, ['preserved']);
-          assert.deepEqual(readFileSync(original.path), original.bytes);
-          assert.equal((JSON.parse(bytes.toString()) as { writerId: string }).writerId, writerId);
-          events.push('claimed');
+        async () => {
+          assert.equal((JSON.parse(readFileSync(original.path, 'utf8')) as { writerId: string }).writerId, writerId);
+          events.push('operation');
         },
-        recordRelease: (bytes: Buffer) => {
-          assert.deepEqual(events, ['preserved', 'claimed', 'operation']);
-          assert.deepEqual(readFileSync(original.path), bytes);
-          events.push('released');
-        },
-      },
-      async () => {
-        assert.equal((JSON.parse(readFileSync(original.path, 'utf8')) as { writerId: string }).writerId, writerId);
-        events.push('operation');
-      },
-    );
-    assert.deepEqual(events, ['preserved', 'claimed', 'operation', 'released']);
-    assert.throws(() => readFileSync(original.path), { code: 'ENOENT' });
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+      );
+      assert.deepEqual(events, ['preserved', 'claimed', 'operation', 'released']);
+      assert.throws(() => readFileSync(original.path), { code: 'ENOENT' });
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
-test('failed intent preservation cannot overwrite the original writer', async () => {
+test('failed intent preservation cannot overwrite the original writer', { tags: ['release'] }, async () => {
   const root = repository();
   try {
     const original = previousWriter(root);
@@ -1268,7 +1337,7 @@ test('failed intent preservation cannot overwrite the original writer', async ()
   }
 });
 
-test('failed claim evidence cannot replace the preserved writer', async () => {
+test('failed claim evidence cannot replace the preserved writer', { tags: ['release'] }, async () => {
   const root = repository();
   try {
     const original = previousWriter(root);
@@ -1293,7 +1362,7 @@ test('failed claim evidence cannot replace the preserved writer', async () => {
   }
 });
 
-test('transition refuses an interrupted unknown launch without changing its state', async () => {
+test('transition refuses an interrupted unknown launch without changing its state', { tags: ['release'] }, async () => {
   const root = repository();
   try {
     const original = previousWriter(root, 'starting');
@@ -1316,7 +1385,7 @@ test('transition refuses an interrupted unknown launch without changing its stat
   }
 });
 
-test('transition cannot delete its writer when durable release evidence fails', async () => {
+test('transition cannot delete its writer when durable release evidence fails', { tags: ['release'] }, async () => {
   const root = repository();
   try {
     const original = previousWriter(root);
@@ -1344,61 +1413,69 @@ test('transition cannot delete its writer when durable release evidence fails', 
   }
 });
 
-test('transition seals completion only after recorded writer deletion while the lease remains held', async () => {
-  const root = repository();
-  try {
-    const original = previousWriter(root);
-    let releaseRecorded = false;
-    let sealed = false;
-    await withWorktreeTransitionWriterLease(
-      {
-        repoRoot: entry(root).path,
-        writerId: '1b75f48b-0746-43a5-bd6d-9ddc17848c9a',
-        beforeClaim: () => undefined,
-        recordClaim: () => undefined,
-        recordRelease: () => {
-          releaseRecorded = true;
+test(
+  'transition seals completion only after recorded writer deletion while the lease remains held',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const original = previousWriter(root);
+      let releaseRecorded = false;
+      let sealed = false;
+      await withWorktreeTransitionWriterLease(
+        {
+          repoRoot: entry(root).path,
+          writerId: '1b75f48b-0746-43a5-bd6d-9ddc17848c9a',
+          beforeClaim: () => undefined,
+          recordClaim: () => undefined,
+          recordRelease: () => {
+            releaseRecorded = true;
+          },
+          afterRelease: () => {
+            assert.equal(releaseRecorded, true);
+            assert.throws(() => readFileSync(original.path), { code: 'ENOENT' });
+            assert.equal(realpathSync(`${original.path}.lock`), `${original.path}.lock`);
+            sealed = true;
+          },
         },
-        afterRelease: () => {
-          assert.equal(releaseRecorded, true);
-          assert.throws(() => readFileSync(original.path), { code: 'ENOENT' });
-          assert.equal(realpathSync(`${original.path}.lock`), `${original.path}.lock`);
-          sealed = true;
-        },
-      },
-      async () => undefined,
-    );
-    assert.equal(sealed, true);
-    assert.throws(() => realpathSync(`${original.path}.lock`), { code: 'ENOENT' });
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+        async () => undefined,
+      );
+      assert.equal(sealed, true);
+      assert.throws(() => realpathSync(`${original.path}.lock`), { code: 'ENOENT' });
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
-test('removed-worktree replay uses the original subject writer slot without recreating source', async () => {
-  const root = repository();
-  try {
-    const row = entry(root);
-    const original = previousWriter(root);
-    execFileSync('git', ['worktree', 'remove', row.path], { cwd: root, stdio: 'pipe' });
-    let captured = false;
-    await withWorktreeTransitionWriterLease(
-      {
-        repoRoot: root,
-        worktreePath: row.path,
-        writerId: '1b75f48b-0746-43a5-bd6d-9ddc17848c9a',
-        beforeClaim: ({ previousBytes }: { previousBytes: Buffer | undefined }) => {
-          assert.deepEqual(previousBytes, original.bytes);
-          captured = true;
+test(
+  'removed-worktree replay uses the original subject writer slot without recreating source',
+  { tags: ['release'] },
+  async () => {
+    const root = repository();
+    try {
+      const row = entry(root);
+      const original = previousWriter(root);
+      execFileSync('git', ['worktree', 'remove', row.path], { cwd: root, stdio: 'pipe' });
+      let captured = false;
+      await withWorktreeTransitionWriterLease(
+        {
+          repoRoot: root,
+          worktreePath: row.path,
+          writerId: '1b75f48b-0746-43a5-bd6d-9ddc17848c9a',
+          beforeClaim: ({ previousBytes }: { previousBytes: Buffer | undefined }) => {
+            assert.deepEqual(previousBytes, original.bytes);
+            captured = true;
+          },
+          recordClaim: () => undefined,
+          recordRelease: () => undefined,
         },
-        recordClaim: () => undefined,
-        recordRelease: () => undefined,
-      },
-      async () => assert.throws(() => realpathSync(row.path), { code: 'ENOENT' }),
-    );
-    assert.equal(captured, true);
-    assert.throws(() => realpathSync(row.path), { code: 'ENOENT' });
-  } finally {
-    rmSync(root, { force: true, recursive: true });
-  }
-});
+        async () => assert.throws(() => realpathSync(row.path), { code: 'ENOENT' }),
+      );
+      assert.equal(captured, true);
+      assert.throws(() => realpathSync(row.path), { code: 'ENOENT' });
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  },
+);

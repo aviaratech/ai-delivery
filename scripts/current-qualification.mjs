@@ -239,15 +239,22 @@ export function validateReleaseTests(input, checkpoint, checkpointReference, con
   assert.equal(report.tests.lane, 'release');
   assert.equal(report.tests.files, files.length);
   assert.equal(report.tests.total, report.tests.passed + report.tests.skips.length);
-  const expected = RELEASE_CASES.filter((test) => test.kind === 'mandatory' || historicalInputSupplied);
+  const expected = RELEASE_CASES.filter(
+    (test) =>
+      test.kind === 'mandatory' || (test.kind === 'external-historical-qualification' && historicalInputSupplied),
+  );
   assert.equal(report.tests.passed, expected.length, 'Mandatory release pass count differs.');
   const skipped = report.tests.skips;
-  assert.equal(skipped.length, historicalInputSupplied ? 0 : 1);
-  for (const test of skipped)
-    assert.deepEqual(
-      { file: test.file, title: test.title, kind: test.kind },
-      RELEASE_CASES.find((entry) => entry.kind === 'external-historical-qualification'),
-    );
+  const expectedSkips = RELEASE_CASES.filter(
+    (test) =>
+      test.kind === 'parent-launched-helper' ||
+      (test.kind === 'external-historical-qualification' && !historicalInputSupplied),
+  );
+  assert.deepEqual(
+    skipped.map(({ file, title, kind }) => JSON.stringify({ file, title, kind })).sort(),
+    expectedSkips.map(({ file, title, kind }) => JSON.stringify({ file, title, kind })).sort(),
+    'Release skip identities differ from the explicit helper/historical inventory.',
+  );
   /** @param {{file:string,title:string}} test */
   const key = (test) => JSON.stringify([test.file, test.title]);
   assert.deepEqual(

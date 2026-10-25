@@ -150,157 +150,161 @@ function proof(state: ReturnType<typeof setup>, policy = makePolicy(state)) {
   return { classification, stageInput, receipt, aggregate, input };
 }
 
-test('explicit component policy reuses compatible stages across heads and invalidates dependencies', () => {
-  const state = setup();
-  try {
-    const legacy = makePolicy(state);
-    let component = digestValue('component a');
-    const policy = {
-      ...legacy,
-      schemaVersion: 'RepositoryDeliveryPolicy@2',
-      classifyExactRange(input: Parameters<RepositoryDeliveryPolicy['classifyExactRange']>[0]) {
-        const selected = legacy.classifyExactRange(input);
-        const definition = selected.requiredStages[0]!;
-        return {
-          ...selected,
-          requiredStages: [
-            {
-              ...definition,
-              semanticInputKeys: ['B', 'a'],
-              semanticInputs: [
-                { key: 'B', digest: component },
-                { key: 'a', digest: digestValue('mixed-case component') },
-              ],
-            },
-            { ...definition, id: 'independent', semanticInputs: [{ key: 'source', digest: digestValue('b') }] },
-            {
-              ...definition,
-              id: 'downstream',
-              dependsOn: ['check'],
-              semanticInputs: [{ key: 'source', digest: digestValue('c') }],
-            },
-          ],
-        };
-      },
-    } as unknown as RepositoryDeliveryPolicy;
-    const classify = () =>
-      classifyRepositoryExactRange({
-        repoRoot: state.root,
-        repository: 'example/delivery',
-        base: state.base,
-        head: { sha: git(state.root, 'rev-parse', 'HEAD'), tree: git(state.root, 'rev-parse', 'HEAD^{tree}') },
-        changedPaths: git(state.root, 'diff', '--name-only', state.base.sha, 'HEAD').split('\n'),
-        configDigest: state.configDigest,
-        policySourcePath: './policy.mjs',
-        policy,
+test(
+  'explicit component policy reuses compatible stages across heads and invalidates dependencies',
+  { tags: ['release'] },
+  () => {
+    const state = setup();
+    try {
+      const legacy = makePolicy(state);
+      let component = digestValue('component a');
+      const policy = {
+        ...legacy,
+        schemaVersion: 'RepositoryDeliveryPolicy@2',
+        classifyExactRange(input: Parameters<RepositoryDeliveryPolicy['classifyExactRange']>[0]) {
+          const selected = legacy.classifyExactRange(input);
+          const definition = selected.requiredStages[0]!;
+          return {
+            ...selected,
+            requiredStages: [
+              {
+                ...definition,
+                semanticInputKeys: ['B', 'a'],
+                semanticInputs: [
+                  { key: 'B', digest: component },
+                  { key: 'a', digest: digestValue('mixed-case component') },
+                ],
+              },
+              { ...definition, id: 'independent', semanticInputs: [{ key: 'source', digest: digestValue('b') }] },
+              {
+                ...definition,
+                id: 'downstream',
+                dependsOn: ['check'],
+                semanticInputs: [{ key: 'source', digest: digestValue('c') }],
+              },
+            ],
+          };
+        },
+      } as unknown as RepositoryDeliveryPolicy;
+      const classify = () =>
+        classifyRepositoryExactRange({
+          repoRoot: state.root,
+          repository: 'example/delivery',
+          base: state.base,
+          head: { sha: git(state.root, 'rev-parse', 'HEAD'), tree: git(state.root, 'rev-parse', 'HEAD^{tree}') },
+          changedPaths: git(state.root, 'diff', '--name-only', state.base.sha, 'HEAD').split('\n'),
+          configDigest: state.configDigest,
+          policySourcePath: './policy.mjs',
+          policy,
+        });
+      const inputs = (classification: ReturnType<typeof classify>, receipts: RepositoryStageReceipt[] = []) =>
+        classification.requiredStages.map((stage) =>
+          createRepositoryStageInput({
+            classification,
+            environmentDigest: digestValue('producer/worktree/environment'),
+            stageId: stage.id,
+            semanticInputs: (stage as unknown as { semanticInputs: { key: string; digest: string }[] }).semanticInputs,
+            upstream: stage.dependsOn.map((stageId) => ({
+              stageId,
+              receiptId: receipts.find((r) => r.input.stageId === stageId)!.receiptId,
+            })),
+          }),
+        );
+      const first = classify();
+      const outputDigest = writeRepositoryCommandOutput({
+        bytes: Buffer.from('passed'),
+        gitCommonDir: state.gitCommonDir,
       });
-    const inputs = (classification: ReturnType<typeof classify>, receipts: RepositoryStageReceipt[] = []) =>
-      classification.requiredStages.map((stage) =>
-        createRepositoryStageInput({
-          classification,
-          environmentDigest: digestValue('producer/worktree/environment'),
+      const receipts: RepositoryStageReceipt[] = [];
+      for (const stage of first.requiredStages) {
+        const stageInput = createRepositoryStageInput({
+          classification: first,
           stageId: stage.id,
-          semanticInputs: (stage as unknown as { semanticInputs: { key: string; digest: string }[] }).semanticInputs,
+          environmentDigest: digestValue('producer/worktree/environment'),
+          semanticInputs: stage.semanticInputs!,
           upstream: stage.dependsOn.map((stageId) => ({
             stageId,
             receiptId: receipts.find((r) => r.input.stageId === stageId)!.receiptId,
           })),
+        });
+        const receipt = createRepositoryStageReceipt({
+          classification: first,
+          stageInput,
+          artifacts: [],
+          commands: [{ exitCode: 0, label: 'check', outputDigest }],
+          startedAt: '2026-01-01T00:00:00.000Z',
+          completedAt: '2026-01-01T00:00:01.000Z',
+        });
+        receipts.push(receipt);
+        writeRepositoryStageCheckpoint({ gitCommonDir: state.gitCommonDir, receipt, repoRoot: state.root });
+      }
+      writeFileSync(join(state.root, 'unrelated.txt'), 'documentation');
+      git(state.root, 'add', '.');
+      git(state.root, 'commit', '-qm', 'unrelated');
+      const current = classify();
+      assert.notEqual(current.receiptId, first.receiptId);
+      const currentInputs = inputs(current, receipts);
+      for (const [index, stageInput] of currentInputs.entries()) {
+        assert.equal(stageInput.inputId, receipts[index]!.input.inputId);
+        assert.equal(
+          loadRepositoryStageCheckpoint({
+            gitCommonDir: state.gitCommonDir,
+            stageInput,
+            classification: current,
+            repoRoot: state.root,
+            configDigest: state.configDigest,
+            policySourcePath: './policy.mjs',
+          })?.receiptId,
+          receipts[index]!.receiptId,
+        );
+      }
+      assert.equal(
+        createRepositoryStageAggregate({ classification: current, receipts }).classificationReceiptId,
+        current.receiptId,
+      );
+      component = digestValue('changed component a');
+      const changed = classify();
+      const changedInputs = inputs(changed, receipts);
+      assert.notEqual(changedInputs[0]!.inputId, currentInputs[0]!.inputId);
+      assert.equal(changedInputs[1]!.inputId, currentInputs[1]!.inputId);
+      assert.throws(() => createRepositoryStageAggregate({ classification: changed, receipts }));
+      assert.throws(() =>
+        createRepositoryStageInput({
+          classification: changed,
+          stageId: 'check',
+          environmentDigest: digestValue('producer/worktree/environment'),
+          upstream: [],
+          semanticInputs: [{ key: 'source', digest: digestValue('inferred value') }],
         }),
       );
-    const first = classify();
-    const outputDigest = writeRepositoryCommandOutput({
-      bytes: Buffer.from('passed'),
-      gitCommonDir: state.gitCommonDir,
-    });
-    const receipts: RepositoryStageReceipt[] = [];
-    for (const stage of first.requiredStages) {
-      const stageInput = createRepositoryStageInput({
-        classification: first,
-        stageId: stage.id,
-        environmentDigest: digestValue('producer/worktree/environment'),
-        semanticInputs: stage.semanticInputs!,
-        upstream: stage.dependsOn.map((stageId) => ({
-          stageId,
-          receiptId: receipts.find((r) => r.input.stageId === stageId)!.receiptId,
-        })),
-      });
-      const receipt = createRepositoryStageReceipt({
-        classification: first,
-        stageInput,
+      const replacement = createRepositoryStageReceipt({
+        classification: changed,
+        stageInput: changedInputs[0]!,
         artifacts: [],
         commands: [{ exitCode: 0, label: 'check', outputDigest }],
-        startedAt: '2026-01-01T00:00:00.000Z',
-        completedAt: '2026-01-01T00:00:01.000Z',
+        startedAt: '2026-01-02T00:00:00.000Z',
+        completedAt: '2026-01-02T00:00:01.000Z',
       });
-      receipts.push(receipt);
-      writeRepositoryStageCheckpoint({ gitCommonDir: state.gitCommonDir, receipt, repoRoot: state.root });
-    }
-    writeFileSync(join(state.root, 'unrelated.txt'), 'documentation');
-    git(state.root, 'add', '.');
-    git(state.root, 'commit', '-qm', 'unrelated');
-    const current = classify();
-    assert.notEqual(current.receiptId, first.receiptId);
-    const currentInputs = inputs(current, receipts);
-    for (const [index, stageInput] of currentInputs.entries()) {
-      assert.equal(stageInput.inputId, receipts[index]!.input.inputId);
-      assert.equal(
-        loadRepositoryStageCheckpoint({
-          gitCommonDir: state.gitCommonDir,
-          stageInput,
-          classification: current,
+      assert.notEqual(inputs(changed, [replacement])[2]!.inputId, currentInputs[2]!.inputId);
+      assert.throws(() =>
+        classifyRepositoryExactRange({
           repoRoot: state.root,
+          repository: current.repository,
+          base: current.base,
+          head: current.head,
+          changedPaths: current.changedPaths,
           configDigest: state.configDigest,
           policySourcePath: './policy.mjs',
-        })?.receiptId,
-        receipts[index]!.receiptId,
+          policy: { ...policy, schemaVersion: 'RepositoryDeliveryPolicy@1' },
+        }),
       );
+    } finally {
+      state.cleanup();
     }
-    assert.equal(
-      createRepositoryStageAggregate({ classification: current, receipts }).classificationReceiptId,
-      current.receiptId,
-    );
-    component = digestValue('changed component a');
-    const changed = classify();
-    const changedInputs = inputs(changed, receipts);
-    assert.notEqual(changedInputs[0]!.inputId, currentInputs[0]!.inputId);
-    assert.equal(changedInputs[1]!.inputId, currentInputs[1]!.inputId);
-    assert.throws(() => createRepositoryStageAggregate({ classification: changed, receipts }));
-    assert.throws(() =>
-      createRepositoryStageInput({
-        classification: changed,
-        stageId: 'check',
-        environmentDigest: digestValue('producer/worktree/environment'),
-        upstream: [],
-        semanticInputs: [{ key: 'source', digest: digestValue('inferred value') }],
-      }),
-    );
-    const replacement = createRepositoryStageReceipt({
-      classification: changed,
-      stageInput: changedInputs[0]!,
-      artifacts: [],
-      commands: [{ exitCode: 0, label: 'check', outputDigest }],
-      startedAt: '2026-01-02T00:00:00.000Z',
-      completedAt: '2026-01-02T00:00:01.000Z',
-    });
-    assert.notEqual(inputs(changed, [replacement])[2]!.inputId, currentInputs[2]!.inputId);
-    assert.throws(() =>
-      classifyRepositoryExactRange({
-        repoRoot: state.root,
-        repository: current.repository,
-        base: current.base,
-        head: current.head,
-        changedPaths: current.changedPaths,
-        configDigest: state.configDigest,
-        policySourcePath: './policy.mjs',
-        policy: { ...policy, schemaVersion: 'RepositoryDeliveryPolicy@1' },
-      }),
-    );
-  } finally {
-    state.cleanup();
-  }
-});
+  },
+);
 
-test('synthetic exact delivery, private checkpoint resume and phase evidence', async () => {
+test('synthetic exact delivery, private checkpoint resume and phase evidence', { tags: ['release'] }, async () => {
   const state = setup();
   try {
     await assert.rejects(
@@ -331,19 +335,22 @@ test('synthetic exact delivery, private checkpoint resume and phase evidence', a
   }
 });
 
-test('separate processes can read and reuse shared output during publication and after publisher interruption', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-publication-'));
-  const ready = join(directory, 'ready');
-  const release = join(directory, 'release');
-  const moduleUrl = new URL('./stage.js', import.meta.url).href;
-  const input = { gitCommonDir: directory };
-  const publish = `const {writeRepositoryCommandOutput}=await import(${JSON.stringify(moduleUrl)});writeRepositoryCommandOutput({ ...${JSON.stringify(input)}, bytes: Buffer.from('shared immutable output') });`;
-  const worker = spawn(
-    process.execPath,
-    [
-      '--input-type=module',
-      '-e',
-      `
+test(
+  'separate processes can read and reuse shared output during publication and after publisher interruption',
+  { tags: ['release'] },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-publication-'));
+    const ready = join(directory, 'ready');
+    const release = join(directory, 'release');
+    const moduleUrl = new URL('./stage.js', import.meta.url).href;
+    const input = { gitCommonDir: directory };
+    const publish = `const {writeRepositoryCommandOutput}=await import(${JSON.stringify(moduleUrl)});writeRepositoryCommandOutput({ ...${JSON.stringify(input)}, bytes: Buffer.from('shared immutable output') });`;
+    const worker = spawn(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
     import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
     for (const key of ['linkSync','renameSync']) { const original=fs[key]; fs[key]=(...args)=>{
       const result=original(...args); if(String(args[1]).endsWith('.bin')) {
@@ -352,50 +359,54 @@ test('separate processes can read and reuse shared output during publication and
       } return result;
     }; } syncBuiltinESMExports(); ${publish}
   `,
-    ],
-    { stdio: 'ignore' },
-  );
-  const closed = new Promise((resolve) => worker.once('close', resolve));
-  try {
-    for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt++)
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.ok(existsSync(ready));
-    const peer = spawnSync(process.execPath, ['--input-type=module', '-e', publish], {
-      encoding: 'utf8',
-      timeout: 2_000,
-      maxBuffer: 32_768,
-    });
-    assert.equal(peer.status, 0, peer.stderr);
-    worker.kill('SIGKILL');
-    await closed;
-    const output = writeRepositoryCommandOutput({ ...input, bytes: Buffer.from('shared immutable output') });
-    assert.match(output, /^sha256:/u);
-    console.log(
-      'SHARED_OUTPUT_PUBLICATION_RECEIPT',
-      JSON.stringify({ peerSucceeded: true, interruptedPublisherOutputReused: true, digest: output }),
+      ],
+      { stdio: 'ignore' },
     );
-  } finally {
-    writeFileSync(release, 'ready');
-    if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGKILL');
-    await closed;
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
+    const closed = new Promise((resolve) => worker.once('close', resolve));
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(existsSync(ready));
+      const peer = spawnSync(process.execPath, ['--input-type=module', '-e', publish], {
+        encoding: 'utf8',
+        timeout: 2_000,
+        maxBuffer: 32_768,
+      });
+      assert.equal(peer.status, 0, peer.stderr);
+      worker.kill('SIGKILL');
+      await closed;
+      const output = writeRepositoryCommandOutput({ ...input, bytes: Buffer.from('shared immutable output') });
+      assert.match(output, /^sha256:/u);
+      console.log(
+        'SHARED_OUTPUT_PUBLICATION_RECEIPT',
+        JSON.stringify({ peerSucceeded: true, interruptedPublisherOutputReused: true, digest: output }),
+      );
+    } finally {
+      writeFileSync(release, 'ready');
+      if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGKILL');
+      await closed;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
-test('separate processes durably create shared writer directories and reject a raced non-directory', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-directory-'));
-  const shared = join(directory, 'shared');
-  const target = join(shared, 'writers@1');
-  const release = join(directory, 'release');
-  const moduleUrl = new URL('../utils/atomicJson.js', import.meta.url).href;
-  const workers = [0, 1].map((index) => {
-    const ready = join(directory, `ready-${String(index)}`);
-    const child = spawn(
-      process.execPath,
-      [
-        '--input-type=module',
-        '-e',
-        `
+test(
+  'separate processes durably create shared writer directories and reject a raced non-directory',
+  { tags: ['release'] },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-directory-'));
+    const shared = join(directory, 'shared');
+    const target = join(shared, 'writers@1');
+    const release = join(directory, 'release');
+    const moduleUrl = new URL('../utils/atomicJson.js', import.meta.url).href;
+    const workers = [0, 1].map((index) => {
+      const ready = join(directory, `ready-${String(index)}`);
+      const child = spawn(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
       import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
       const original=fs.mkdirSync; fs.mkdirSync=(path, options)=>{
         if(path===${JSON.stringify(shared)}) {
@@ -406,31 +417,31 @@ test('separate processes durably create shared writer directories and reject a r
       const {writePrivateJsonFileAtomically}=await import(${JSON.stringify(moduleUrl)});
       writePrivateJsonFileAtomically(${JSON.stringify(join(target, `${String(index)}.json`))},{peer:${String(index)}});
     `,
-      ],
-      { stdio: ['ignore', 'ignore', 'pipe'] },
-    );
-    let stderr = '';
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
+        ],
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      );
+      let stderr = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      const closed = new Promise<number | null>((resolve) => child.once('close', resolve));
+      return { child, ready, closed, stderr: () => stderr };
     });
-    const closed = new Promise<number | null>((resolve) => child.once('close', resolve));
-    return { child, ready, closed, stderr: () => stderr };
-  });
-  try {
-    for (let attempt = 0; attempt < 100 && !workers.every((worker) => existsSync(worker.ready)); attempt++)
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.ok(workers.every((worker) => existsSync(worker.ready)));
-    writeFileSync(release, 'ready');
-    const statuses = await Promise.all(workers.map((worker) => worker.closed));
-    workers.forEach((worker, index) => assert.equal(statuses[index], 0, worker.stderr()));
-    for (const index of [0, 1])
-      assert.deepEqual(JSON.parse(readFileSync(join(target, `${String(index)}.json`), 'utf8')), { peer: index });
-    const racedFile = spawnSync(
-      process.execPath,
-      [
-        '--input-type=module',
-        '-e',
-        `
+    try {
+      for (let attempt = 0; attempt < 100 && !workers.every((worker) => existsSync(worker.ready)); attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(workers.every((worker) => existsSync(worker.ready)));
+      writeFileSync(release, 'ready');
+      const statuses = await Promise.all(workers.map((worker) => worker.closed));
+      workers.forEach((worker, index) => assert.equal(statuses[index], 0, worker.stderr()));
+      for (const index of [0, 1])
+        assert.deepEqual(JSON.parse(readFileSync(join(target, `${String(index)}.json`), 'utf8')), { peer: index });
+      const racedFile = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
       import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
       const original=fs.mkdirSync; fs.mkdirSync=(path,options)=>{
         if(path===${JSON.stringify(join(directory, 'raced-file'))}) fs.writeFileSync(path,'unsafe');
@@ -439,21 +450,22 @@ test('separate processes durably create shared writer directories and reject a r
       const {ensurePrivateDirectoryDurably}=await import(${JSON.stringify(moduleUrl)});
       ensurePrivateDirectoryDurably(${JSON.stringify(join(directory, 'raced-file'))});
     `,
-      ],
-      { encoding: 'utf8', timeout: 2_000, maxBuffer: 32_768 },
-    );
-    assert.notEqual(racedFile.status, 0);
-    assert.match(racedFile.stderr, /directory/u);
-  } finally {
-    writeFileSync(release, 'ready');
-    for (const worker of workers)
-      if (worker.child.exitCode === null && worker.child.signalCode === null) worker.child.kill('SIGKILL');
-    await Promise.all(workers.map((worker) => worker.closed));
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
+        ],
+        { encoding: 'utf8', timeout: 2_000, maxBuffer: 32_768 },
+      );
+      assert.notEqual(racedFile.status, 0);
+      assert.match(racedFile.stderr, /directory/u);
+    } finally {
+      writeFileSync(release, 'ready');
+      for (const worker of workers)
+        if (worker.child.exitCode === null && worker.child.signalCode === null) worker.child.kill('SIGKILL');
+      await Promise.all(workers.map((worker) => worker.closed));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
-test('missing policy, wrong repository, changed config and stale head fail closed', async () => {
+test('missing policy, wrong repository, changed config and stale head fail closed', { tags: ['release'] }, async () => {
   const state = setup();
   try {
     await assert.rejects(loadSelectedRepositoryPolicy({ repoRoot: state.root, policySourcePath: 'missing.mjs' }));
@@ -491,64 +503,68 @@ test('missing policy, wrong repository, changed config and stale head fail close
   }
 });
 
-test('missing stage, corrupt artifact/output and blocked merge or wrong approval fail closed', () => {
-  const state = setup();
-  try {
-    const p = proof(state);
-    assert.throws(() => createRepositoryStageAggregate({ classification: p.classification, receipts: [] }));
-    const approval = {
-      authorIdentity: 'author',
-      reviewerIdentity: 'author',
-      diffScopeHash: digestValue(['change.txt']),
-      head: state.head,
-      result: 'approved' as const,
-      reviewReceiptId: digestValue('review'),
-    };
-    assert.throws(() => createRepositoryDeliveryEvidence({ ...p.input, phase: 'merge', approval }));
-    const validApproval = { ...approval, reviewerIdentity: 'reviewer' };
-    assert.throws(() =>
-      createRepositoryDeliveryEvidence({
-        ...p.input,
-        phase: 'merge',
-        approval: { ...validApproval, reviewerIdentity: 'outsider' },
-      }),
-    );
-    assert.throws(() =>
-      createRepositoryDeliveryEvidence({
-        ...p.input,
-        phase: 'merge',
-        approval: validApproval,
-        now: () => new Date('2026-01-01T00:00:10.000Z'),
-        mergeReadback: {
-          blockedBy: [17],
-          checksPassed: true,
-          head: state.head,
-          mergeable: true,
-          observedAt: '2026-01-01T00:00:00.000Z',
-        },
-      }),
-    );
-    writeFileSync(join(state.root, 'artifact.txt'), 'tampered');
-    assert.throws(() => createRepositoryDeliveryEvidence(p.input));
-    writeFileSync(join(state.root, 'artifact.txt'), 'proof');
-    writeFileSync(join(state.root, 'output.txt'), 'tampered stage artifact');
-    assert.throws(() => createRepositoryDeliveryEvidence(p.input));
-    writeFileSync(join(state.root, 'output.txt'), 'stage artifact');
-    const outputPath = join(
-      state.gitCommonDir,
-      'ai-delivery',
-      'verification@1',
-      'command-output',
-      `${p.receipt.commands[0]!.outputDigest.slice(7)}.bin`,
-    );
-    writeFileSync(outputPath, 'corrupt command output');
-    assert.throws(() => createRepositoryDeliveryEvidence(p.input));
-    const bad: RepositoryStageReceipt = {
-      ...p.receipt,
-      commands: [{ ...p.receipt.commands[0]!, outputDigest: digestValue('absent') }],
-    };
-    assert.throws(() => createRepositoryDeliveryEvidence({ ...p.input, stageReceipts: [bad] }));
-  } finally {
-    state.cleanup();
-  }
-});
+test(
+  'missing stage, corrupt artifact/output and blocked merge or wrong approval fail closed',
+  { tags: ['release'] },
+  () => {
+    const state = setup();
+    try {
+      const p = proof(state);
+      assert.throws(() => createRepositoryStageAggregate({ classification: p.classification, receipts: [] }));
+      const approval = {
+        authorIdentity: 'author',
+        reviewerIdentity: 'author',
+        diffScopeHash: digestValue(['change.txt']),
+        head: state.head,
+        result: 'approved' as const,
+        reviewReceiptId: digestValue('review'),
+      };
+      assert.throws(() => createRepositoryDeliveryEvidence({ ...p.input, phase: 'merge', approval }));
+      const validApproval = { ...approval, reviewerIdentity: 'reviewer' };
+      assert.throws(() =>
+        createRepositoryDeliveryEvidence({
+          ...p.input,
+          phase: 'merge',
+          approval: { ...validApproval, reviewerIdentity: 'outsider' },
+        }),
+      );
+      assert.throws(() =>
+        createRepositoryDeliveryEvidence({
+          ...p.input,
+          phase: 'merge',
+          approval: validApproval,
+          now: () => new Date('2026-01-01T00:00:10.000Z'),
+          mergeReadback: {
+            blockedBy: [17],
+            checksPassed: true,
+            head: state.head,
+            mergeable: true,
+            observedAt: '2026-01-01T00:00:00.000Z',
+          },
+        }),
+      );
+      writeFileSync(join(state.root, 'artifact.txt'), 'tampered');
+      assert.throws(() => createRepositoryDeliveryEvidence(p.input));
+      writeFileSync(join(state.root, 'artifact.txt'), 'proof');
+      writeFileSync(join(state.root, 'output.txt'), 'tampered stage artifact');
+      assert.throws(() => createRepositoryDeliveryEvidence(p.input));
+      writeFileSync(join(state.root, 'output.txt'), 'stage artifact');
+      const outputPath = join(
+        state.gitCommonDir,
+        'ai-delivery',
+        'verification@1',
+        'command-output',
+        `${p.receipt.commands[0]!.outputDigest.slice(7)}.bin`,
+      );
+      writeFileSync(outputPath, 'corrupt command output');
+      assert.throws(() => createRepositoryDeliveryEvidence(p.input));
+      const bad: RepositoryStageReceipt = {
+        ...p.receipt,
+        commands: [{ ...p.receipt.commands[0]!, outputDigest: digestValue('absent') }],
+      };
+      assert.throws(() => createRepositoryDeliveryEvidence({ ...p.input, stageReceipts: [bad] }));
+    } finally {
+      state.cleanup();
+    }
+  },
+);

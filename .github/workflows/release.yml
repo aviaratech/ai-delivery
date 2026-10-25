@@ -142,6 +142,11 @@ jobs:
           import { fileURLToPath } from 'node:url';
           import { RELEASE_CASES } from './scripts/checks.mjs';
           const env = process.env;
+          if (!/^[a-f0-9]{40}$/.test(env.REVIEWED_SOURCE_SHA ?? '') || env.GITHUB_SHA !== env.REVIEWED_SOURCE_SHA) throw new Error('Diagnostic source differs from the reviewed workflow source.');
+          const inventory = RELEASE_CASES.map(({ file, title, kind }) => ({ file, title, kind }));
+          if (new Set(inventory.map(({ file, title }) => JSON.stringify([file, title]))).size !== inventory.length) throw new Error('Diagnostic inventory contains duplicate identities.');
+          const publicFiles = [...new Set(inventory.flatMap(({ file }) => [file, file.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts')]))];
+          const inventoryBinding = { sha256: createHash('sha256').update(JSON.stringify(inventory)).digest('hex'), caseCount: inventory.length, publicFileCount: publicFiles.length };
           const temporary = realpathSync(env.RUNNER_TEMP);
           const root = join(temporary, 'release-qualification');
           const inputs = {};
@@ -196,7 +201,6 @@ jobs:
           const vitest = read('vitest', releaseDirectory && [releaseDirectory, 'vitest.json']);
           const consumer = read('consumer', consumerDirectory && [consumerDirectory, 'result.json']);
           const workspace = realpathSync(env.GITHUB_WORKSPACE);
-          const publicFiles = ['setup', 'lifecycle', 'targetPolicyLocal', 'pluginPackaging'].flatMap(name => [`src/${name}.test.ts`, `dist/${name}.test.js`]);
           const codeBounds = new Map();
           const bounds = file => {
             if (codeBounds.has(file)) return codeBounds.get(file);
@@ -259,10 +263,11 @@ jobs:
             return { status: unknown ? 'unknown' : frames.length ? 'matched' : truncated ? 'unknown' : 'no-match', truncated, frames };
           };
           const testResults = Array.isArray(vitest?.testResults) ? vitest.testResults : [];
-          const cases = RELEASE_CASES.map(({ file, title }) => {
+          const cases = inventory.map(({ file, title }, ordinal) => {
             const matches = testResults.filter(test => test?.name === join(env.GITHUB_WORKSPACE, file)).flatMap(test => Array.isArray(test.assertionResults) ? test.assertionResults.filter(assertion => assertion?.fullName === title) : []);
             const state = matches.length > 1 ? 'ambiguous' : choice(matches[0]?.status, ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled']);
-            return { file, title, status: state, ...(state === 'failed' ? { failureFrames: failureFrames(matches[0].failureMessages) } : {}) };
+            const failure = state === 'failed' ? failureFrames(matches[0].failureMessages) : null;
+            return [ordinal, state, failure ? [failure.status, failure.truncated, failure.frames.map(({ file, line, column, message }) => [publicFiles.indexOf(file), line, column, message])] : null];
           });
           const commands = Array.isArray(producer?.commands) ? producer.commands : [];
           const releaseCommands = Array.isArray(release?.commands) ? release.commands : [];
@@ -352,16 +357,17 @@ jobs:
           const diagnostic = {
             observationOnly: true, qualified: false, promotionEligible: false,
             qualificationOutcome: choice(env.QUALIFICATION_OUTCOME, ['failure', 'cancelled']),
-            source: /^[a-f0-9]{40}$/.test(env.REVIEWED_SOURCE_SHA ?? '') ? env.REVIEWED_SOURCE_SHA : null,
+            source: env.REVIEWED_SOURCE_SHA,
             runId: number(Number(env.GITHUB_RUN_ID), 1), runAttempt: number(Number(env.GITHUB_RUN_ATTEMPT), 1), inputs,
             overall: { status: status(overall?.status) },
             producer: { status: status(producer?.status), fullSuccess: boolean(producer?.fullSuccess), commands: ['format', 'lint', 'types', 'build', 'tests', 'inventory'].map(stage => ({ stage, ...command(commands.filter(value => value?.stage === stage).length === 1 ? commands.find(value => value?.stage === stage) : null) })) },
             pack: command(overall?.pack),
-            release: { status: status(release?.status), command: command(releaseCommands.length === 1 ? releaseCommands[0] : null), cleanup: cleanup(release?.release?.temporary), counts: { total: number(vitest?.numTotalTests), passed: number(vitest?.numPassedTests), failed: number(vitest?.numFailedTests) }, cases },
+            release: { status: status(release?.status), command: command(releaseCommands.length === 1 ? releaseCommands[0] : null), cleanup: cleanup(release?.release?.temporary), counts: { total: number(vitest?.numTotalTests), passed: number(vitest?.numPassedTests), failed: number(vitest?.numFailedTests) }, caseEncoding: 'ai-delivery.release-case-tuples@1', inventory: inventoryBinding, cases },
             consumer: { status: status(consumer?.status), command: command(consumerDirectory ? consumerAttempt?.command : null), cleanup: cleanup(consumer?.cleanup) },
             logs,
           };
-          const bytes = JSON.stringify(diagnostic, null, 2) + '\n';
+          // Keep every mapped case and its bounded frames as the release inventory grows.
+          const bytes = JSON.stringify(diagnostic) + '\n';
           if (Buffer.byteLength(bytes) > 64 * 1024) throw new Error('Diagnostic projection exceeds its bound.');
           const output = join(mkdtempSync(join(temporary, 'release-qualification-diagnostics-')), 'diagnostics.json');
           writeFileSync(output, bytes, { flag: 'wx', mode: 0o600 });

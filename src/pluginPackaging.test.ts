@@ -26,54 +26,58 @@ const qualificationOwner = (await import(new URL('../scripts/current-qualificati
   ): { archivePath: string; archiveSha256: string };
 };
 
-test('README and delivery skill CLI examples name supported commands and required options', () => {
-  const cli = readFileSync(join(packageRoot, 'src', 'cli.ts'), 'utf8');
-  const declarations = [...cli.matchAll(/\.command\('([^']+)'\)/gu)];
-  const required = new Map(
-    declarations.map((match) => {
-      const next = cli.indexOf('.command(', match.index + match[0].length);
-      return [
-        match[1]!,
-        [...cli.slice(match.index, next < 0 ? undefined : next).matchAll(/\.requiredOption\('--([a-z0-9-]+)/gu)].map(
-          (option) => `--${option[1]}`,
-        ),
-      ];
-    }),
-  );
-  const globals = new Set(['--repo', '--repo-root', '--identity']);
-  for (const path of [
-    'README.md',
-    'plugins/ai-delivery/skills/worktree-lifecycle/SKILL.md',
-    'plugins/ai-delivery/skills/pr-handoff/SKILL.md',
-  ]) {
-    const source = readFileSync(join(packageRoot, path), 'utf8').replace(/\\\r?\n\s*/gu, ' ');
-    for (const match of source.matchAll(/^ai-delivery\s+(.+)$/gmu)) {
-      const words = match[1]!.split(/\s+/u);
-      let index = 0;
-      while (globals.has(words[index] ?? '')) index += 2;
-      const command = words[index]!;
-      const commandPath =
-        command === 'merge'
-          ? words.slice(index, index + 3)
-          : command === 'plugin'
-            ? words.slice(index, index + 2)
-            : [command];
-      const help = execFileSync(process.execPath, [join(packageRoot, 'dist', 'cli.js'), ...commandPath, '--help'], {
-        encoding: 'utf8',
-        maxBuffer: 65536,
-      });
-      for (const flag of required.get(command) ?? [])
-        assert.ok(words.includes(flag), `${path}: ${command} requires ${flag}`);
-      for (const flag of words.filter((word) => word.startsWith('--')))
-        assert.ok(globals.has(flag) || help.includes(flag), `${path}: ${command} does not support ${flag}`);
+test(
+  'README and delivery skill CLI examples name supported commands and required options',
+  { tags: ['release'] },
+  () => {
+    const cli = readFileSync(join(packageRoot, 'src', 'cli.ts'), 'utf8');
+    const declarations = [...cli.matchAll(/\.command\('([^']+)'\)/gu)];
+    const required = new Map(
+      declarations.map((match) => {
+        const next = cli.indexOf('.command(', match.index + match[0].length);
+        return [
+          match[1]!,
+          [...cli.slice(match.index, next < 0 ? undefined : next).matchAll(/\.requiredOption\('--([a-z0-9-]+)/gu)].map(
+            (option) => `--${option[1]}`,
+          ),
+        ];
+      }),
+    );
+    const globals = new Set(['--repo', '--repo-root', '--identity']);
+    for (const path of [
+      'README.md',
+      'plugins/ai-delivery/skills/worktree-lifecycle/SKILL.md',
+      'plugins/ai-delivery/skills/pr-handoff/SKILL.md',
+    ]) {
+      const source = readFileSync(join(packageRoot, path), 'utf8').replace(/\\\r?\n\s*/gu, ' ');
+      for (const match of source.matchAll(/^ai-delivery\s+(.+)$/gmu)) {
+        const words = match[1]!.split(/\s+/u);
+        let index = 0;
+        while (globals.has(words[index] ?? '')) index += 2;
+        const command = words[index]!;
+        const commandPath =
+          command === 'merge'
+            ? words.slice(index, index + 3)
+            : command === 'plugin'
+              ? words.slice(index, index + 2)
+              : [command];
+        const help = execFileSync(process.execPath, [join(packageRoot, 'dist', 'cli.js'), ...commandPath, '--help'], {
+          encoding: 'utf8',
+          maxBuffer: 65536,
+        });
+        for (const flag of required.get(command) ?? [])
+          assert.ok(words.includes(flag), `${path}: ${command} requires ${flag}`);
+        for (const flag of words.filter((word) => word.startsWith('--')))
+          assert.ok(globals.has(flag) || help.includes(flag), `${path}: ${command} does not support ${flag}`);
+      }
     }
-  }
-});
+  },
+);
 
 for (const launchCheckout of [false, true]) {
   test(
     `the ${launchCheckout ? 'bundled' : 'packed'} launcher creates, updates and journals repository B from ${launchCheckout ? 'checkout A' : 'a non-Git directory'} without an identity environment`,
-    { tags: launchCheckout ? [] : ['release'] },
+    { tags: ['release'] },
     async () => {
       const directory = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-launch-routing-')));
       let selectedPluginRoot = pluginRoot;
@@ -446,7 +450,7 @@ globalThis.fetch=async(url,init)=>{
   );
 }
 
-test('CLI reports the selected package version', () => {
+test('CLI reports the selected package version', { tags: ['release'] }, () => {
   const displayed = execFileSync(process.execPath, [join(packageRoot, 'dist', 'cli.js'), '--version'], {
     encoding: 'utf8',
     maxBuffer: 65536,
@@ -485,49 +489,53 @@ test('portable and Claude plugin metadata bind the same package and launcher', (
   });
 });
 
-test('a copied plugin root starts its exact MCP contract without a parent runtime installation', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-plugin-cache-'));
-  const copiedRoot = join(directory, 'plugin');
-  cpSync(pluginRoot, copiedRoot, { recursive: true });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [join(copiedRoot, 'dist', 'mcp-launcher.js')],
-    cwd: copiedRoot,
-    env: { PATH: process.env.PATH ?? '', TMPDIR: tmpdir(), NODE_OPTIONS: '--max-old-space-size=2048' },
-    stderr: 'pipe',
-    maxBufferSize: 1024 * 1024,
-  });
-  const client = new Client({ name: 'isolated-plugin-cache-test', version: '1.0.0' });
-  let pid: number | null = null;
-  try {
-    await client.connect(transport, { timeout: 30000 });
-    pid = transport.pid;
-    assert.equal(client.getServerVersion()?.version, pkg.version);
-    const instructions = client.getInstructions();
-    assert.equal(typeof instructions, 'string', 'the copied native plugin must retain initialize guidance');
-    assert.match(instructions ?? '', /\brepo\b/u);
-    assert.match(instructions ?? '', /\bissue_info\b/u);
-    const result = await client.listTools({}, { timeout: 30000 });
-    const issueInfo = result.tools.find((tool) => tool.name === 'issue_info');
-    assert.ok(issueInfo);
-    const properties = issueInfo.inputSchema.properties as Record<string, { description?: string }>;
-    assert.equal(typeof properties.repo?.description, 'string');
-    assert.deepEqual(
-      result.tools.map((tool) => tool.name).sort(),
-      AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name).sort(),
-    );
-    assert.equal(existsSync(join(copiedRoot, '.issue-cli')), false);
-  } finally {
-    await client.close();
-    await transport.close();
-    const ownedPid = pid;
+test(
+  'a copied plugin root starts its exact MCP contract without a parent runtime installation',
+  { tags: ['release'] },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ai-delivery-plugin-cache-'));
+    const copiedRoot = join(directory, 'plugin');
+    cpSync(pluginRoot, copiedRoot, { recursive: true });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [join(copiedRoot, 'dist', 'mcp-launcher.js')],
+      cwd: copiedRoot,
+      env: { PATH: process.env.PATH ?? '', TMPDIR: tmpdir(), NODE_OPTIONS: '--max-old-space-size=2048' },
+      stderr: 'pipe',
+      maxBufferSize: 1024 * 1024,
+    });
+    const client = new Client({ name: 'isolated-plugin-cache-test', version: '1.0.0' });
+    let pid: number | null = null;
     try {
-      if (ownedPid !== null) assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
+      await client.connect(transport, { timeout: 30000 });
+      pid = transport.pid;
+      assert.equal(client.getServerVersion()?.version, pkg.version);
+      const instructions = client.getInstructions();
+      assert.equal(typeof instructions, 'string', 'the copied native plugin must retain initialize guidance');
+      assert.match(instructions ?? '', /\brepo\b/u);
+      assert.match(instructions ?? '', /\bissue_info\b/u);
+      const result = await client.listTools({}, { timeout: 30000 });
+      const issueInfo = result.tools.find((tool) => tool.name === 'issue_info');
+      assert.ok(issueInfo);
+      const properties = issueInfo.inputSchema.properties as Record<string, { description?: string }>;
+      assert.equal(typeof properties.repo?.description, 'string');
+      assert.deepEqual(
+        result.tools.map((tool) => tool.name).sort(),
+        AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name).sort(),
+      );
+      assert.equal(existsSync(join(copiedRoot, '.issue-cli')), false);
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      await client.close();
+      await transport.close();
+      const ownedPid = pid;
+      try {
+        if (ownedPid !== null) assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
     }
-  }
-});
+  },
+);
 
 test('standalone plugin ships application and bundled dependency notices', () => {
   assert.equal(readFileSync(join(pluginRoot, 'LICENSE'), 'utf8'), readFileSync(join(packageRoot, 'LICENSE'), 'utf8'));
@@ -536,44 +544,48 @@ test('standalone plugin ships application and bundled dependency notices', () =>
   assert.match(notices, /commander/u);
 });
 
-test('a copied plugin has a real CLI and producer identity that existing admission can bind', () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-native-identity-')));
-  const copiedRoot = join(directory, 'plugin');
-  cpSync(pluginRoot, copiedRoot, { recursive: true });
-  // The validator only reads repository/configDigest. No repository config,
-  // credentials, admission publication or lifecycle authority exists here.
-  const configuration = {
-    config: { repository: 'example/widget' },
-    configDigest: `sha256:${'a'.repeat(64)}`,
-  } as unknown as LoadedDeliveryConfig;
-  try {
-    const cliPath = join(copiedRoot, 'runtime', 'dist', 'cli.js');
-    assert.equal(
-      execFileSync(process.execPath, [cliPath, '--version'], { encoding: 'utf8', maxBuffer: 65536 }).trim(),
-      pkg.version,
-    );
-    const admission = buildRuntimeAdmission({
-      cliPath,
-      mcpLauncherPath: join(copiedRoot, 'dist', 'mcp-launcher.js'),
-      pluginManifestPath: join(copiedRoot, '.claude-plugin', 'plugin.json'),
-      packageVersion: pkg.version,
-      sourceArchiveSha256: `sha256:${'b'.repeat(64)}`,
-      sourceCommit: '1'.repeat(40),
-      configuration,
-    });
-    assert.equal(validateRuntimeAdmission(admission, configuration, cliPath).admissionId, admission.admissionId);
-    assert.match(
-      retainedWorktreeTransitionProducerDigest(join(copiedRoot, 'runtime', 'dist')),
-      /^sha256:[a-f0-9]{64}$/u,
-    );
-    const otherRoot = join(directory, 'other');
-    cpSync(copiedRoot, otherRoot, { recursive: true });
-    assert.throws(() =>
-      validateRuntimeAdmission(admission, configuration, join(otherRoot, 'runtime', 'dist', 'cli.js')),
-    );
-    writeFileSync(cliPath, `${readFileSync(cliPath, 'utf8')}\n/* altered runtime */\n`);
-    assert.throws(() => validateRuntimeAdmission(admission, configuration, cliPath));
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
+test(
+  'a copied plugin has a real CLI and producer identity that existing admission can bind',
+  { tags: ['release'] },
+  () => {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-native-identity-')));
+    const copiedRoot = join(directory, 'plugin');
+    cpSync(pluginRoot, copiedRoot, { recursive: true });
+    // The validator only reads repository/configDigest. No repository config,
+    // credentials, admission publication or lifecycle authority exists here.
+    const configuration = {
+      config: { repository: 'example/widget' },
+      configDigest: `sha256:${'a'.repeat(64)}`,
+    } as unknown as LoadedDeliveryConfig;
+    try {
+      const cliPath = join(copiedRoot, 'runtime', 'dist', 'cli.js');
+      assert.equal(
+        execFileSync(process.execPath, [cliPath, '--version'], { encoding: 'utf8', maxBuffer: 65536 }).trim(),
+        pkg.version,
+      );
+      const admission = buildRuntimeAdmission({
+        cliPath,
+        mcpLauncherPath: join(copiedRoot, 'dist', 'mcp-launcher.js'),
+        pluginManifestPath: join(copiedRoot, '.claude-plugin', 'plugin.json'),
+        packageVersion: pkg.version,
+        sourceArchiveSha256: `sha256:${'b'.repeat(64)}`,
+        sourceCommit: '1'.repeat(40),
+        configuration,
+      });
+      assert.equal(validateRuntimeAdmission(admission, configuration, cliPath).admissionId, admission.admissionId);
+      assert.match(
+        retainedWorktreeTransitionProducerDigest(join(copiedRoot, 'runtime', 'dist')),
+        /^sha256:[a-f0-9]{64}$/u,
+      );
+      const otherRoot = join(directory, 'other');
+      cpSync(copiedRoot, otherRoot, { recursive: true });
+      assert.throws(() =>
+        validateRuntimeAdmission(admission, configuration, join(otherRoot, 'runtime', 'dist', 'cli.js')),
+      );
+      writeFileSync(cliPath, `${readFileSync(cliPath, 'utf8')}\n/* altered runtime */\n`);
+      assert.throws(() => validateRuntimeAdmission(admission, configuration, cliPath));
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
