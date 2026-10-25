@@ -1620,7 +1620,10 @@ export async function runChecks({
       notify(`START ${stage}`);
       const result = await execute(command, {
         cwd,
-        env: fast || release ? environment : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
+        env:
+          fast || release || stage === 'lint'
+            ? environment
+            : { ...environment, NODE_V8_COVERAGE: join(directory, 'v8') },
         directory: entry.directory,
         signal,
         timeoutMs,
