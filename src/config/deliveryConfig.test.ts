@@ -439,11 +439,13 @@ describe('portable delivery configuration', () => {
       for (const role of ['author', 'reviewer'] as const) {
         const cancellation = new AbortController();
         let observedAbort = false;
+        let requests = 0;
         let started!: () => void;
         const requestStarted = new Promise<void>((resolve) => {
           started = resolve;
         });
         globalThis.fetch = async (_url, init) => {
+          requests++;
           started();
           assert.equal(init?.signal, cancellation.signal);
           return new Promise<Response>((_resolve, reject) => {
@@ -464,11 +466,12 @@ describe('portable delivery configuration', () => {
           role,
           signal: cancellation.signal,
         });
-        const rejected = assert.rejects(request, /GitHub App authentication failed/u);
+        const rejected = assert.rejects(request, (error) => error === cancellation.signal.reason);
         await requestStarted;
         cancellation.abort();
         await rejected;
         assert.equal(observedAbort, true, `${role} installation request must be cancelled`);
+        assert.equal(requests, 1, `${role} installation request must not be retried`);
       }
     } finally {
       globalThis.fetch = originalFetch;
