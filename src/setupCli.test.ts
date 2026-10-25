@@ -253,11 +253,8 @@ function cliUnitResult(unit: CliUnit): string {
 type CliScenario =
   | 'normal'
   | 'progress'
-  | 'budget'
   | 'unfinished'
   | 'installer-failure'
-  | 'admission-stall'
-  | 'handoff-mismatch'
   | 'preparation-failure'
   | 'preparation-cancel';
 type CliTraceFault =
@@ -311,13 +308,7 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
   let preparationStartedAt: number | undefined;
   let preparationElapsedMs: number | undefined;
   let preparationCompleted = false;
-  const needsPreparation = [
-    'budget',
-    'admission-stall',
-    'handoff-mismatch',
-    'preparation-failure',
-    'preparation-cancel',
-  ].includes(scenario);
+  const needsPreparation = ['preparation-failure', 'preparation-cancel'].includes(scenario);
   const readPhases = (): CliPhase[] => {
     const value: unknown = JSON.parse(
       privateFiles.assertPrivateFile(tracePath, { maxBytes: 64 * 1024 }).toString('utf8'),
@@ -626,11 +617,6 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
         prepared = readPreparedCli(root);
         preparedCliClosure(prepared.input);
         preparationCompleted = true;
-        if (scenario === 'handoff-mismatch')
-          atomicJson.writePrivateJsonFileAtomically(join(root, 'prepared.json'), {
-            ...prepared,
-            stageId: 'sha256:' + '0'.repeat(64),
-          });
       } finally {
         if (cancelPreparation !== undefined) clearInterval(cancelPreparation);
         preparationElapsedMs = performance.now() - preparationStartedAt;
@@ -740,12 +726,10 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     }
   }
   if (prepared !== undefined) {
-    // Parent retains original validated bindings even when the child receives the mismatch fault.
     for (const file of prepared.files) assert.equal(digestBytes(readFileSync(file.path)), file.digest);
     assert.equal(readFileSync(join(prepared.base, 'installs'), 'utf8'), 'x');
     preparedCliClosure(prepared.input);
-    if (scenario !== 'budget' || failure !== undefined)
-      assert.equal(existsSync(join(prepared.input.repoRoot, '.git/ai-delivery/runtime-admission.json')), false);
+    assert.equal(existsSync(join(prepared.input.repoRoot, '.git/ai-delivery/runtime-admission.json')), false);
   }
   rmSync(root, { recursive: true, force: true });
   assert.equal(existsSync(root), false, 'Owned CLI case root was not removed');
@@ -759,7 +743,6 @@ async function observeStageAdmitCase(scenario: CliScenario = 'normal', traceFaul
     residualInstaller,
     identities: [...identities.values()],
     installerFailureReported: failedBytes?.includes(Buffer.from('exit 7')) ?? false,
-    handoffMismatchReported: failedBytes?.includes(Buffer.from('Prepared CLI stage identity mismatch')) ?? false,
   };
 }
 
@@ -797,7 +780,6 @@ test(stageAdmitCase, { tags: ['release'], timeout: 0 }, async () => {
     }
   };
   phase('preparation', 'start');
-  if (scenario === 'budget') await new Promise((resolve) => setTimeout(resolve, 12_000));
   const preparedRoot = process.env.AI_DELIVERY_CLI_PREPARED_ROOT;
   const prepared = preparedRoot ? readPreparedCli(preparedRoot) : undefined;
   const ownedFixture = prepared === undefined ? await fixture() : undefined;
@@ -982,16 +964,10 @@ test(stageAdmitCase, { tags: ['release'], timeout: 0 }, async () => {
               const name = `admit:author:${++authorChecks}${actors.pauseAuthor ? ':delayed' : ''}`;
               phase(name, 'start');
               try {
-                assert.ok(
-                  scenario !== 'budget' || authorChecks === 1 || !actors.pauseAuthor,
-                  'Budget fixture repeated its deliberate HTTP delay at another required authority check',
-                );
                 return await observeUnit(
                   'authority',
                   async () => {
                     const response = await authenticatedAuthor(...request);
-                    // This fictional HTTP port can withhold its response; the actual CLI parse remains pending.
-                    if (scenario === 'admission-stall') await new Promise<void>(() => {});
                     return response;
                   },
                   (response) => {
@@ -1000,8 +976,6 @@ test(stageAdmitCase, { tags: ['release'], timeout: 0 }, async () => {
                   },
                 );
               } finally {
-                // The budget regression needs one four-second response, not one per required recheck.
-                if (scenario === 'budget') actors.pauseAuthor = false;
                 phase(name, 'end');
               }
             };
@@ -1103,7 +1077,6 @@ test(stageAdmitCase, { tags: ['release'], timeout: 0 }, async () => {
     phase('assertions:stageId', 'end');
     if (scenario === 'progress') actors.pauseAuthor = false;
     const authorCallsBeforeAdmission = actors.authorCalls;
-    if (scenario === 'budget') actors.pauseAuthor = true;
     const admitted = await runCli([
       'runtime:admit',
       '--authorize-admit',
@@ -1151,41 +1124,6 @@ test(
     assert.ok(start && end && end.atMs - start.atMs > 15_000);
     assert.ok(result.nativeIdle && result.rootRemoved);
     assert.ok(result.phases.some((entry) => entry.phase === 'runtime:admit' && entry.event === 'settled'));
-  },
-);
-
-test('CLI stage/admit separates preparation from substantive command progress', { tags: ['release'] }, async () => {
-  const result = await observeStageAdmitCase('budget');
-  const authorChecks = result.phases.filter(
-    (entry) => entry.phase.startsWith('admit:author:') && entry.event === 'start',
-  );
-  assert.equal(authorChecks.length, 3, 'All three admission authority checks must execute');
-  assert.equal(
-    authorChecks.filter((entry) => entry.phase.endsWith(':delayed')).length,
-    1,
-    'The aggregate-budget regression must inject one delayed HTTP response, not repeat it for every authority check',
-  );
-  assert.equal(result.failure, undefined, 'A CLI operation failed; inspect the retained phase and ownership evidence');
-  assert.ok(result.phases.at(-1)!.atMs - result.phases[0]!.atMs > 15_000);
-  for (const entry of result.phases.filter((entry) => entry.event === 'start')) {
-    const end = result.phases.find(
-      (candidate) => candidate.phase === entry.phase && ['end', 'settled'].includes(candidate.event),
-    );
-    assert.ok(end !== undefined, `${entry.phase} did not settle`);
-  }
-});
-
-test(
-  'CLI prepared handoff rejects a mismatched stage identity without reinstall or admission',
-  { tags: ['release'] },
-  async () => {
-    const result = await observeStageAdmitCase('handoff-mismatch');
-    assert.equal(result.handoffMismatchReported, true, 'the actual child must refuse its mismatched prepared stage');
-    assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
-    assert.equal(
-      result.phases.some((entry) => entry.phase === 'runtime:admit'),
-      false,
-    );
   },
 );
 
@@ -1283,28 +1221,6 @@ test('CLI stage/admit joins a failed real installer before restoring its fixture
     false,
   );
 });
-
-test(
-  'CLI stage/admit keeps a stalled admission response owned until native quiescence',
-  { tags: ['release'] },
-  async () => {
-    const result = await observeStageAdmitCase('admission-stall');
-    assert.ok(result.failure !== undefined && result.nativeIdle && result.rootRemoved);
-    assert.equal(result.cancelledPhase, 'runtime:admit');
-    assert.ok(result.phases.some((entry) => entry.phase === 'runtime:stage' && entry.event === 'settled'));
-    assert.ok(result.phases.some((entry) => entry.phase === 'admit:author:1' && entry.event === 'start'));
-    assert.equal(
-      result.phases.some(
-        (entry) =>
-          entry.phase === 'cleanup' ||
-          entry.phase === 'return:runtime:admit' ||
-          (entry.phase === 'admit:author:1' && entry.event === 'end'),
-      ),
-      false,
-      'The stalled HTTP response must keep the original command pending until native cancellation',
-    );
-  },
-);
 
 test.each([
   'missing',

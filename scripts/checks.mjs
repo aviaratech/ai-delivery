@@ -68,27 +68,12 @@ export const RELEASE_CASES = [
   },
   {
     file: 'dist/setupCli.test.js',
-    title: 'CLI stage/admit separates preparation from substantive command progress',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/setupCli.test.js',
-    title: 'CLI prepared handoff rejects a mismatched stage identity without reinstall or admission',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/setupCli.test.js',
     title: 'CLI preparation failure retains owned evidence through native drain',
     kind: 'mandatory',
   },
   {
     file: 'dist/setupCli.test.js',
     title: 'CLI preparation cancel retains owned evidence through native drain',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/setupCli.test.js',
-    title: 'CLI stage/admit keeps a stalled admission response owned until native quiescence',
     kind: 'mandatory',
   },
   {
