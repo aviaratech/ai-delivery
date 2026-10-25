@@ -295,6 +295,7 @@ export async function createDeliveryGitHubClients(input: {
       input.signal,
     );
   } catch (error) {
+    input.signal?.throwIfAborted();
     if (error instanceof DeliveryError) throw error;
     throw new DeliveryError(`GitHub App authentication failed for ${input.role} role.`);
   }
