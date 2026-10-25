@@ -189,6 +189,46 @@ test('explicit batch Project status waits for requested native closure', async (
   assert.equal(f.getStatus(), 'Shipped');
 });
 
+test('explicit Project activation rechecks blockers after its capacity override comment', async () => {
+  const f = fixture();
+  f.controls.capacityMode = true;
+  f.live.labels = ['critical'];
+  f.context.config = {
+    ...f.context.config,
+    wipLimits: [{ repository: 'example/widget', name: 'Critical work', match: { label: 'critical' }, limit: 0 }],
+  };
+  const create = f.context.clients.rest.issues.createComment;
+  f.context.clients.rest.issues.createComment = (async (...args: Parameters<typeof create>) => {
+    const result = await create(...args);
+    if (args[0]?.body.startsWith('WIP capacity override.')) f.controls.blockers = true;
+    return result;
+  }) as typeof create;
+  await assert.rejects(
+    updateIssue(f.context, {
+      issueNumber: 17,
+      overrideReason: 'Admit capacity exception.',
+      projectStatus: { status: 'In Progress', reason: 'Begin work.' },
+    }),
+  );
+  assert.equal(f.statusWrites.length, 0);
+  assert.equal(f.getStatus(), 'Queued');
+});
+
+test('explicit batch status refuses contradictory Project snapshots before unchanged success', async () => {
+  const f = fixture();
+  const request = { issueNumber: 17, projectStatus: { status: 'Blocked' as const, reason: 'Await review.' } };
+  await updateIssue(f.context, request);
+  const read = f.context.clients.rest.issues.getComment;
+  f.context.clients.rest.issues.getComment = (async (...args: Parameters<typeof read>) => {
+    const result = await read(...args);
+    f.setStatus('Queued');
+    return result;
+  }) as typeof read;
+  const result = await batchUpdateIssues(f.context, { items: [request] });
+  assert.equal(result.results[0]!.status, 'failed');
+  assert.equal(f.statusWrites.length, 1);
+});
+
 test('legacy rendering drops only by explicit retention choice or verified history and does not grow on repeat', async () => {
   const legacy = 'Retired criterion: accept every invalid identifier.\n';
   for (const preserveHistory of [undefined, false, true]) {

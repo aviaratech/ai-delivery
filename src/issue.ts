@@ -1414,6 +1414,10 @@ async function assertProjectTransition(
     if (!ready.ready) throw new IssueValidationError(ready.failures);
     if (target.state !== 'open') throw new DeliveryError('In Progress requires an open issue; inspect native state.');
     await assertIssueStartCapacity(context, plan.input.issueNumber, plan.input.overrideReason, recordOverride);
+    const current = await issueInfo(context, plan.input.issueNumber);
+    if (current.state !== 'open') throw new DeliveryError('In Progress requires an open issue; inspect native state.');
+    const finalReady = await readyCheck(context, plan.input.issueNumber);
+    if (!finalReady.ready) throw new IssueValidationError(finalReady.failures);
   }
 }
 
@@ -2036,6 +2040,8 @@ async function updateProjection(
         org: context.config.native.organization,
         issueNodeId: plan.nativeTarget.nodeId,
       });
+      if ((item?.status ?? null) !== readback.projectStatus)
+        throw new DeliveryError('Project Status changed during readback; reconcile the configured item.');
       if (item !== null)
         await readBackProjectItem({
           graphql: context.clients.graphql,
