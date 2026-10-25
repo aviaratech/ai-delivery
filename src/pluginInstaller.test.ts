@@ -365,30 +365,34 @@ test('preview refuses a symlinked configuration without following its target', a
   assert.equal(existsSync(join(fixture.home, '.cache')), false);
 });
 
-test.each(['codex', 'claude-code'])('preview refuses a FIFO configuration without blocking in %s', (host) => {
-  const profile = join(fixture.home, '.codex');
-  mkdirSync(profile);
-  const config = host === 'codex' ? join(profile, 'config.toml') : join(fixture.home, '.mcp.json');
-  execFileSync('/usr/bin/mkfifo', [config]);
-  const metadata = lstatSync(config);
-  const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
-  // Bound only the known FIFO-open stall and reap this test-owned child.
-  const child = spawnSync(process.execPath, [cli, 'plugin', 'preview', '--host', host, '--json'], {
-    cwd: fixture.home,
-    env: { ...process.env, HOME: fixture.home, CODEX_HOME: profile },
-    encoding: 'utf8',
-    timeout: 3000,
-    killSignal: 'SIGKILL',
-  });
-  assert.equal(child.error, undefined);
-  assert.equal(child.status, 0);
-  const result = JSON.parse(child.stdout) as Awaited<ReturnType<typeof managePlugin>>;
-  assert.ok(result.diagnostics);
-  assert.ok(result.diagnostics.findings.includes('configuration_unavailable'));
-  assert.deepEqual(result.diagnostics.registrations, []);
-  assert.equal(lstatSync(config).ino, metadata.ino);
-  assert.equal(existsSync(join(fixture.home, '.cache')), false);
-});
+test.each(['codex', 'claude-code'])(
+  'preview refuses a FIFO configuration without blocking in %s',
+  { tags: ['release'] },
+  (host) => {
+    const profile = join(fixture.home, '.codex');
+    mkdirSync(profile);
+    const config = host === 'codex' ? join(profile, 'config.toml') : join(fixture.home, '.mcp.json');
+    execFileSync('/usr/bin/mkfifo', [config]);
+    const metadata = lstatSync(config);
+    const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
+    // Bound only the known FIFO-open stall and reap this test-owned child.
+    const child = spawnSync(process.execPath, [cli, 'plugin', 'preview', '--host', host, '--json'], {
+      cwd: fixture.home,
+      env: { ...process.env, HOME: fixture.home, CODEX_HOME: profile },
+      encoding: 'utf8',
+      timeout: 3000,
+      killSignal: 'SIGKILL',
+    });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 0);
+    const result = JSON.parse(child.stdout) as Awaited<ReturnType<typeof managePlugin>>;
+    assert.ok(result.diagnostics);
+    assert.ok(result.diagnostics.findings.includes('configuration_unavailable'));
+    assert.deepEqual(result.diagnostics.registrations, []);
+    assert.equal(lstatSync(config).ino, metadata.ino);
+    assert.equal(existsSync(join(fixture.home, '.cache')), false);
+  },
+);
 
 test.each(['migrate', 'apply', 'retire', 'restore-settings'])(
   'unsupported %s never enables host mutation',

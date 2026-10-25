@@ -695,6 +695,31 @@ export const RELEASE_CASES = [
     'failure-log scanner gates upload and preserves unrelated resources after malformed-ack',
     'failed qualification refuses fifo test logs while retaining the safe projection',
   ].map((title) => ({ file: 'dist/releaseWorkflow.test.js', title, kind: /** @type {const} */ ('mandatory') })),
+  {
+    file: 'dist/boardReconcile.test.js',
+    title: 'copied executing artifact changes identity with same-version bytes and refuses links',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/issue63Routes.test.js',
+    title: 'actual CLI declares guard fields on every alias and the bounded health command',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/pluginInstaller.test.js',
+    title: 'preview refuses a FIFO configuration without blocking in codex',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/pluginInstaller.test.js',
+    title: 'preview refuses a FIFO configuration without blocking in claude-code',
+    kind: 'mandatory',
+  },
+  {
+    file: 'dist/targetRepositoryExecution.test.js',
+    title: 'CLI mcp:serve initializes and serves a real stdio request without target code execution',
+    kind: 'mandatory',
+  },
 ];
 
 export const SKIP_ALLOWLIST = [

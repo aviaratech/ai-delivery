@@ -56,7 +56,7 @@ test('public health dispatch requires explicit repo and validates range before c
   await assert.rejects(executeTool('delivery_health', { ...args, to: args.from }, execution));
   assert.equal(load.mock.calls.length, calls);
 });
-test('actual CLI declares guard fields on every alias and the bounded health command', () => {
+test('actual CLI declares guard fields on every alias and the bounded health command', { tags: ['release'] }, () => {
   const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
   for (const command of ['create', 'start', 'update']) {
     const result = spawnSync(process.execPath, ['--max-old-space-size=96', cli, command, '--help'], {

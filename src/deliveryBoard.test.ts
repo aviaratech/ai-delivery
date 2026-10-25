@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -508,7 +506,7 @@ async function nativeBoardCli(args: string[]) {
   });
   try {
     process.exitCode = undefined;
-    const cli = pathToFileURL(join(process.cwd(), 'dist/cli.js')).href;
+    const cli = new URL('./cli.js', import.meta.url).href;
     process.argv = [process.execPath, cli, '--identity', 'fixture-author', ...args];
     await import(`${cli}?boardReplay=${randomUUID()}`);
     const command = parse.mock.results[0];
