@@ -726,7 +726,7 @@ test('update accepts history and reasoned closure while rejecting incoherent req
   );
   assert.throws(
     () => tool.inputSchema.safeParse({ issueNumber: 17, state: 'open', closeReason: 'completed' }),
-    /Closure details require state closed/u,
+    /"code":"closure.state"/u,
   );
 });
 
