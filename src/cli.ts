@@ -22,7 +22,7 @@ import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
 import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
-import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch } from './issueContract.js';
+import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch, ProjectStatusPatch } from './issueContract.js';
 import { NativeIssueDateFields } from './github/nativeIssueMetadata.js';
 import { DeliveryError } from './errors.js';
 import { parseBoardReconcileRequest } from './services/boardReconcileService.js';
@@ -81,13 +81,14 @@ function body(value: string | undefined, file: string | undefined): string | und
   if (value !== undefined && file !== undefined) throw new Error('Pass either --body or --body-file.');
   return file === undefined ? value : readFileSync(file, 'utf8');
 }
-function fields(file: string | undefined, overrides: Record<string, unknown>): Record<string, unknown> {
+function fields(file: string | undefined, overrides: Record<string, unknown>, update = false): Record<string, unknown> {
   const value: unknown = file === undefined ? {} : JSON.parse(readFileSync(file, 'utf8'));
   return {
     ...IssueWriteSchema.extend({
       ...NativeIssueDateFields,
       ...IssueDeferralPatch,
       status: IssueStatusPatch.optional(),
+      ...(update ? { projectStatus: ProjectStatusPatch.optional() } : {}),
       preserveHistory: z.boolean().optional(),
     }).parse(value),
     ...Object.fromEntries(Object.entries(overrides).filter(([, item]) => item !== undefined)),
@@ -377,6 +378,8 @@ program
   .option('--milestone <number>')
   .option('--parent <number>')
   .option('--state <state>')
+  .option('--project-status <status>', 'Set Todo, In Progress, Blocked or Done with a public reason')
+  .option('--project-status-reason <reason>', 'Required public reason for an explicit Project Status')
   .option('--preserve-history', 'Preserve the previous title and body before a rewrite')
   .option('--close-reason <reason>')
   .option('--superseded-by <number>')
@@ -397,34 +400,42 @@ program
     ) =>
       run(
         'issue_update',
-        fields(o.fieldsFile, {
-          issueNumber: int(o.issue),
-          title: o.title,
-          ...(o.draft === true ? { draft: true } : {}),
-          body: body(o.body, o.bodyFile),
-          issueType: o.type,
-          points: int(o.points),
-          priority: o.priority,
-          labels: list(o.labels),
-          blockedBy: ints(o.blockedBy),
-          blocks: ints(o.blocks),
-          overrideReason: o.overrideReason,
-          milestone: int(o.milestone),
-          parentIssueNumber: int(o.parent),
-          state: o.state,
-          preserveHistory: o.preserveHistory === true ? true : undefined,
-          closeReason: o.closeReason,
-          supersededBy: int(o.supersededBy),
-          park: o.park === true ? true : undefined,
-          defer:
-            o.defer === true || o.deferUntil !== undefined || o.deferTrigger !== undefined
-              ? {
-                  ...(o.deferUntil === undefined ? {} : { until: o.deferUntil }),
-                  ...(o.deferTrigger === undefined ? {} : { trigger: o.deferTrigger }),
-                }
-              : undefined,
-          undefer: o.undefer === true ? true : undefined,
-        }),
+        fields(
+          o.fieldsFile,
+          {
+            issueNumber: int(o.issue),
+            title: o.title,
+            ...(o.draft === true ? { draft: true } : {}),
+            body: body(o.body, o.bodyFile),
+            issueType: o.type,
+            points: int(o.points),
+            priority: o.priority,
+            labels: list(o.labels),
+            blockedBy: ints(o.blockedBy),
+            blocks: ints(o.blocks),
+            overrideReason: o.overrideReason,
+            milestone: int(o.milestone),
+            parentIssueNumber: int(o.parent),
+            state: o.state,
+            projectStatus:
+              o.projectStatus === undefined && o.projectStatusReason === undefined
+                ? undefined
+                : ProjectStatusPatch.parse({ status: o.projectStatus, reason: o.projectStatusReason }),
+            preserveHistory: o.preserveHistory === true ? true : undefined,
+            closeReason: o.closeReason,
+            supersededBy: int(o.supersededBy),
+            park: o.park === true ? true : undefined,
+            defer:
+              o.defer === true || o.deferUntil !== undefined || o.deferTrigger !== undefined
+                ? {
+                    ...(o.deferUntil === undefined ? {} : { until: o.deferUntil }),
+                    ...(o.deferTrigger === undefined ? {} : { trigger: o.deferTrigger }),
+                  }
+                : undefined,
+            undefer: o.undefer === true ? true : undefined,
+          },
+          true,
+        ),
       ),
   );
 

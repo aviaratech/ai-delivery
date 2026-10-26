@@ -65,6 +65,28 @@ export const IssueStatusPatch = CreateIssueStatus.extend({
   blockers: StatusText.optional(),
   latestJournal: StatusText.optional(),
 });
+export const ISSUE_COMMENT_BODY_LIMIT = 65_536;
+export const ProjectStatusPatch = z
+  .strictObject({
+    status: z.enum(['Todo', 'In Progress', 'Blocked', 'Done']),
+    reason: z.string().trim().min(1),
+  })
+  .superRefine((value, ctx) => {
+    if (`Requested Project Status: ${value.status}.\n\n${value.reason}`.length > ISSUE_COMMENT_BODY_LIMIT)
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reason'],
+        message: 'Shorten the public reason to fit the issue comment limit.',
+      });
+    if (secrets(value))
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reason'],
+        message: 'Remove credentials and private keys from the public reason.',
+      });
+  });
+export type ProjectStatusPatchData = z.infer<typeof ProjectStatusPatch>;
+
 const IssueStatus = z.strictObject({
   state: z.enum(['Ready', 'Draft']),
   lastUpdated: z.iso.datetime(),

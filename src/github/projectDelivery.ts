@@ -828,7 +828,7 @@ async function readBackProjectArchiveState(input: {
   }
 }
 
-async function readBackProjectItem(input: {
+export async function readBackProjectItem(input: {
   configuration: ProjectDeliveryConfiguration;
   graphql: typeof GraphQLType;
   issueNodeId: string;

@@ -37,6 +37,7 @@ import {
   type ProjectDeliveryConfiguration,
   projectSettingsFromDeliveryConfig,
   syncIssueProjectStatus,
+  readBackProjectItem,
 } from './github/projectDelivery.js';
 import {
   getNativeBlockerRelationships,
@@ -55,6 +56,9 @@ import {
   IssueWriteFields,
   CreateIssueStatus,
   IssueStatusPatch,
+  ProjectStatusPatch,
+  type ProjectStatusPatchData,
+  ISSUE_COMMENT_BODY_LIMIT,
   requireIssueStatus,
   parseIssueBody,
   requireIssue,
@@ -80,7 +84,7 @@ export interface IssueCommentReadback {
 
 // Matches GitHub's first-party JavaScript comment-length validation:
 // https://github.com/github/gh-aw/blob/3ead8042c7b1edc2128ba1b28b1b80d00b7f4c22/actions/setup/js/comment_limit_helpers.cjs
-export const ISSUE_COMMENT_BODY_LIMIT = 65_536;
+export { ISSUE_COMMENT_BODY_LIMIT } from './issueContract.js';
 export type IssueCommentInput = JournalInput | { issueNumber: number; body: string };
 const RawIssueCommentSchema = z.strictObject({ issueNumber: z.number().int().positive(), body: z.string() });
 
@@ -342,7 +346,7 @@ function prepareIssueWrite(
   const statusOnly =
     patch !== undefined &&
     Object.entries(input).every(
-      ([key, value]) => value === undefined || ['repo', 'issueNumber', 'status'].includes(key),
+      ([key, value]) => value === undefined || ['repo', 'issueNumber', 'status', 'projectStatus'].includes(key),
     );
   const title = input.title ?? current?.title ?? '';
   const source = input.body ?? current?.body;
@@ -1276,6 +1280,7 @@ export interface UpdateIssueInput extends Omit<Partial<IssueFieldsInput>, 'defer
   defer?: IssueDeferralData;
   undefer?: true;
   status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
+  projectStatus?: ProjectStatusPatchData;
   blockedBy?: number[];
   /** Add this issue as a blocker of these dependents without replacing their other blockers. */
   blocks?: number[];
@@ -1300,6 +1305,7 @@ export interface UpdateIssueResult extends IssueInfo {
   warnings: IssueDiagnostic[];
   conversion?: { priorBody: string; canonicalBody: string; diff: string };
   historyComment?: IssueCommentReadback;
+  projectStatusComment?: IssueCommentReadback & ProjectStatusPatchData;
   closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
 }
 
@@ -1314,6 +1320,7 @@ interface IncompleteIssueUpdateResult {
     readbackError?: string;
     closure?: UpdateIssueResult['closure'];
     historyComment?: IssueCommentReadback;
+    projectStatusComment?: IssueCommentReadback & ProjectStatusPatchData;
   };
   project: { status: 'pending' | 'unknown'; desiredStatus: string | null; reason: 'archived' | 'unavailable' };
   recovery: { tool: 'issue_batch_update'; instruction: string };
@@ -1335,18 +1342,93 @@ export function getIncompleteIssueUpdate(error: unknown): IncompleteIssueUpdateR
 }
 
 function updateProjectStatus(info: IssueInfo, input: UpdateIssueInput) {
-  return info.state === 'closed' || info.projectStatus === 'Done'
-    ? 'Done'
-    : info.blockedBy.length > 0
-      ? 'Blocked'
-      : input.park === true || input.blockedBy !== undefined || info.projectStatus === null
-        ? 'Todo'
-        : info.projectStatus === 'In Progress' || (info.projectStatus === 'Blocked' && input.state === undefined)
-          ? info.projectStatus
-          : 'Todo';
+  return (
+    input.projectStatus?.status ??
+    (info.state === 'closed' || info.projectStatus === 'Done'
+      ? 'Done'
+      : info.blockedBy.length > 0
+        ? 'Blocked'
+        : input.park === true || input.blockedBy !== undefined || info.projectStatus === null
+          ? 'Todo'
+          : info.projectStatus === 'In Progress' || (info.projectStatus === 'Blocked' && input.state === undefined)
+            ? info.projectStatus
+            : 'Todo')
+  );
+}
+
+function projectStatusBody(input: UpdateIssueInput): string | undefined {
+  return input.projectStatus === undefined
+    ? undefined
+    : `Requested Project Status: ${input.projectStatus.status}.\n\n${input.projectStatus.reason}`;
+}
+
+async function assertProjectTransition(
+  context: DeliveryContext,
+  plan: PreparedIssueUpdate,
+  recordOverride = false,
+  validateTransition = true,
+): Promise<void> {
+  const request = plan.input.projectStatus;
+  if (request === undefined) return;
+  const { clients, repo } = context;
+  const target = (await clients.rest.issues.get({ ...repo, issue_number: plan.input.issueNumber })).data;
+  if (
+    target.node_id !== plan.nativeTarget.nodeId ||
+    target.html_url !== plan.nativeTarget.url ||
+    target.number !== plan.input.issueNumber ||
+    'pull_request' in target ||
+    !['open', 'closed'].includes(target.state)
+  )
+    throw new DeliveryError('Native Project transition target is inconsistent; reconcile the repository issue.');
+  const native = await getNativeBlockerRelationships({
+    graphql: clients.graphql,
+    repo,
+    issueNumber: plan.input.issueNumber,
+    requireRepositoryIdentity: true,
+    maxPages: context.readPageLimit ?? 20,
+    issueNodeId: plan.nativeTarget.nodeId,
+  });
+  const repository = `${repo.owner}/${repo.repo}`.toLowerCase();
+  const targets = await Promise.all(
+    native.blockers.map(async (edge) => {
+      const issue = (await clients.rest.issues.get({ ...repo, issue_number: edge.number })).data;
+      if (
+        edge.repository?.toLowerCase() !== repository ||
+        issue.number !== edge.number ||
+        issue.node_id !== edge.id ||
+        'pull_request' in issue ||
+        issue.html_url.toLowerCase() !== `https://github.com/${repository}/issues/${edge.number}` ||
+        issue.state.toUpperCase() !== edge.state
+      )
+        throw new DeliveryError('Native blocker evidence conflicts; reconcile the repository relationships.');
+      return issue;
+    }),
+  );
+  if (!validateTransition) return;
+  if (request.status === 'Done' && target.state !== 'closed')
+    throw new DeliveryError('An open issue cannot move to Done; close the issue through its native workflow.');
+  if (request.status === 'Todo' && targets.some((x) => x.state === 'open'))
+    throw new DeliveryError('Unresolved native blockers prevent Todo; resolve the blockers first.');
+  if (request.status === 'In Progress') {
+    const ready = await readyCheck(context, plan.input.issueNumber);
+    if (!ready.ready) throw new IssueValidationError(ready.failures);
+    if (target.state !== 'open') throw new DeliveryError('In Progress requires an open issue; inspect native state.');
+    await assertIssueStartCapacity(context, plan.input.issueNumber, plan.input.overrideReason, recordOverride);
+    const current = await issueInfo(context, plan.input.issueNumber);
+    if (current.state !== 'open') throw new DeliveryError('In Progress requires an open issue; inspect native state.');
+    const finalReady = await readyCheck(context, plan.input.issueNumber);
+    if (!finalReady.ready) throw new IssueValidationError(finalReady.failures);
+  }
 }
 
 async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueInput) {
+  if (input.projectStatus !== undefined)
+    input = { ...input, projectStatus: ProjectStatusPatch.parse(input.projectStatus) };
+  const projectOnly =
+    input.projectStatus !== undefined &&
+    Object.entries(input).every(
+      ([key, value]) => value === undefined || ['repo', 'issueNumber', 'projectStatus', 'overrideReason'].includes(key),
+    );
   requireDeferralPatch({
     ...(input.defer === undefined ? {} : { defer: input.defer }),
     ...(input.undefer === undefined ? {} : { undefer: input.undefer }),
@@ -1381,18 +1463,19 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     : null;
   const legacyNativeEdit =
     archivedItemId !== null && !currentContent.body.trimStart().startsWith('<!-- ai-delivery:issue@1 -->');
-  const prepared: ReturnType<typeof prepareIssueWrite> = legacyNativeEdit
-    ? {
-        issue: IssueFields.parse({ title: input.title ?? currentContent.title, draft: true }),
-        body: currentContent.body,
-        statusOnly: true,
-        preserveHistory: input.preserveHistory ?? false,
-        warnings: [],
-      }
-    : prepareIssueWrite(input, currentContent);
+  const prepared: ReturnType<typeof prepareIssueWrite> =
+    legacyNativeEdit || projectOnly
+      ? {
+          issue: IssueFields.parse({ title: input.title ?? currentContent.title, draft: true }),
+          body: currentContent.body,
+          statusOnly: true,
+          preserveHistory: input.preserveHistory ?? false,
+          warnings: [],
+        }
+      : prepareIssueWrite(input, currentContent);
   input = {
     ...input,
-    body: prepared.body,
+    ...(projectOnly ? {} : { body: prepared.body }),
     ...(prepared.statusOnly
       ? {}
       : {
@@ -1538,6 +1621,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     supersedingIssueId,
     assertClosure,
     currentContent,
+    projectOnly,
     preserveArchived,
     nativeTarget: { nodeId: target.node_id, url: target.html_url },
     dateChanges,
@@ -1571,7 +1655,9 @@ async function applyIssueUpdate(
     historyBody,
     closureBody,
   } = plan;
-  const pending = (key: string) => changes === undefined || key in changes;
+  const pending = (key: string) =>
+    (changes === undefined || key in changes) &&
+    (!plan.projectOnly || key === 'projectStatus' || key === 'projectStatusComment');
   const historyComment =
     historyBody === undefined
       ? undefined
@@ -1680,8 +1766,10 @@ async function applyIssueUpdate(
   );
   let readback: IssueInfo;
   let latestProjectStatus = plan.currentContent.projectStatus;
+  let projectStatusComment: (IssueCommentReadback & ProjectStatusPatchData) | undefined;
   const priorRateObservation = clients.rateLimitObservation?.();
   try {
+    await assertProjectTransition(context, plan);
     const info = await issueInfo(context, input.issueNumber);
     latestProjectStatus = info.projectStatus;
     status = updateProjectStatus(info, input);
@@ -1712,14 +1800,53 @@ async function applyIssueUpdate(
         fixHint: `Archived Project item ${archivedItemId} was preserved.`,
       });
     } else {
-      await syncIssueProjectStatus({
+      const reasonBody = projectStatusBody(input);
+      if (reasonBody !== undefined)
+        projectStatusComment = {
+          ...(await commentIssue(context, { issueNumber: input.issueNumber, body: reasonBody })),
+          ...input.projectStatus!,
+        };
+      const configuration =
+        input.projectStatus === undefined
+          ? context.projectConfiguration
+          : (context.projectConfiguration ??
+            (await getProjectDeliveryConfiguration({
+              graphql: clients.graphql,
+              org: config.native.organization,
+              settings: projectSettingsFromDeliveryConfig(config),
+              requireWritable: true,
+            })));
+      const projected = await syncIssueProjectStatus({
+        ...(input.projectStatus === undefined
+          ? {}
+          : {
+              beforeAdd: () => assertProjectTransition(context, plan),
+              beforeAdvance: () => assertProjectTransition(context, plan, true),
+            }),
         graphql: clients.graphql,
         issueNodeId: target.node_id,
         org: config.native.organization,
-        ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+        ...(configuration ? { configuration } : {}),
         settings: projectSettingsFromDeliveryConfig(config),
         status,
       });
+      if (input.projectStatus !== undefined && configuration !== undefined) {
+        await assertProjectTransition(context, plan);
+        await readBackProjectItem({
+          graphql: clients.graphql,
+          configuration,
+          issueNodeId: target.node_id,
+          itemId: projected.itemId,
+          status,
+        });
+        await readAuthoredIssueComment(
+          context,
+          input.issueNumber,
+          { id: projectStatusComment!.commentId, html_url: projectStatusComment!.url },
+          reasonBody!,
+          (await clients.authenticatedAuthor!()).actorLogin,
+        );
+      }
       readback = await issueInfo(context, input.issueNumber);
       if (readback.projectStatus !== status)
         throw new DeliveryError('Project Status readback disagrees with the requested outcome.');
@@ -1766,18 +1893,24 @@ async function applyIssueUpdate(
         const native = await updateProjection(context, plan, true);
         const desired = await desiredUpdateValues(context, plan);
         delete desired.projectStatus;
+        delete desired.projectStatusReason;
         if (Object.keys(pendingUpdateValues(desired, native.values)).length)
           throw new DeliveryError('Issue update readback disagrees with the requested content or state.');
-        if (historyBody !== undefined && !(await hasUpdateComment(context, input.issueNumber, historyBody)))
+        if (historyBody !== undefined && !(await findUpdateComment(context, input.issueNumber, historyBody)))
           throw new DeliveryError('Issue comment readback disagrees with the authored issue comment.');
         result.project.desiredStatus = updateProjectStatus(
           { ...native.readback, projectStatus: latestProjectStatus },
           input,
         );
+        if (input.projectStatus !== undefined) {
+          const comment = await findUpdateComment(context, input.issueNumber, projectStatusBody(input)!);
+          projectStatusComment = comment === null ? undefined : { ...comment, ...input.projectStatus };
+        }
         result.native = {
           ...result.native,
           status: 'confirmed',
           readback: native.readback,
+          ...(projectStatusComment === undefined ? {} : { projectStatusComment }),
           ...(historyComment === undefined ? {} : { historyComment }),
           ...(closure === undefined || closureComment === undefined
             ? {}
@@ -1808,6 +1941,7 @@ async function applyIssueUpdate(
     ...readback,
     warnings: prepared.warnings,
     ...(prepared.conversion === undefined ? {} : { conversion: prepared.conversion }),
+    ...(projectStatusComment === undefined ? {} : { projectStatusComment }),
     ...(historyComment === undefined ? {} : { historyComment }),
     ...(closure === undefined || closureComment === undefined
       ? {}
@@ -1836,7 +1970,11 @@ interface BatchUpdateItemResult {
 }
 
 /** Read-only inspection of the same authenticated closure journal used by updateIssue. */
-async function hasUpdateComment(context: DeliveryContext, issueNumber: number, body: string): Promise<boolean> {
+async function findUpdateComment(
+  context: DeliveryContext,
+  issueNumber: number,
+  body: string,
+): Promise<IssueCommentReadback | null> {
   if (!context.clients.authenticatedAuthor) throw new DeliveryError('Authenticated update journal author is missing.');
   const actor = (await context.clients.authenticatedAuthor()).actorLogin;
   if (!actor) throw new DeliveryError('Update journal author identity is missing.');
@@ -1863,9 +2001,8 @@ async function hasUpdateComment(context: DeliveryContext, issueNumber: number, b
   }
   if (!complete) throw new DeliveryError('Update journal readback exceeds the bounded history window.');
   if (matches.length > 1) throw new DeliveryError('Issue comment has duplicate authored retry matches.');
-  if (!matches[0]) return false;
-  await readAuthoredIssueComment(context, issueNumber, matches[0], body, actor);
-  return true;
+  if (!matches[0]) return null;
+  return { ...(await readAuthoredIssueComment(context, issueNumber, matches[0], body, actor)), reused: true };
 }
 
 async function updateProjection(
@@ -1881,6 +2018,40 @@ async function updateProjection(
     nativeOnly ? plan.nativeTarget : undefined,
   );
   const values: Record<string, unknown> = { ...readback };
+  if (input.projectStatus !== undefined) {
+    const comment = await findUpdateComment(context, input.issueNumber, projectStatusBody(input)!);
+    values.projectStatusReason = comment === null ? null : input.projectStatus.reason;
+    values.projectStatusComment = comment;
+    if (!nativeOnly) {
+      const nativeChanges = pendingUpdateValues(await desiredUpdateValues(context, plan), values);
+      delete nativeChanges.projectStatus;
+      delete nativeChanges.projectStatusReason;
+      await assertProjectTransition(context, plan, false, Object.keys(nativeChanges).length === 0);
+      const configuration =
+        context.projectConfiguration ??
+        (await getProjectDeliveryConfiguration({
+          graphql: context.clients.graphql,
+          org: context.config.native.organization,
+          settings: projectSettingsFromDeliveryConfig(context.config),
+        }));
+      const item = await getIssueProjectStatus({
+        graphql: context.clients.graphql,
+        configuration,
+        org: context.config.native.organization,
+        issueNodeId: plan.nativeTarget.nodeId,
+      });
+      if ((item?.status ?? null) !== readback.projectStatus)
+        throw new DeliveryError('Project Status changed during readback; reconcile the configured item.');
+      if (item !== null)
+        await readBackProjectItem({
+          graphql: context.clients.graphql,
+          configuration,
+          issueNodeId: plan.nativeTarget.nodeId,
+          itemId: item.itemId,
+          status: item.status,
+        });
+    }
+  }
   const relationships = async (issueNumber: number) => {
     const native = await getNativeBlockerRelationships({
       graphql: context.clients.graphql,
@@ -1936,7 +2107,7 @@ async function updateProjection(
     values.closeReason = closure.closeReason;
     if (plan.closeReason === 'duplicate' && input.supersededBy !== undefined)
       values.supersededBy = closure.duplicateOf?.number ?? null;
-    values.closureComment = await hasUpdateComment(context, input.issueNumber, plan.closureBody!);
+    values.closureComment = Boolean(await findUpdateComment(context, input.issueNumber, plan.closureBody!));
   }
   return { readback, values };
 }
@@ -1959,8 +2130,9 @@ async function desiredUpdateValues(
     'state',
     'parentIssueNumber',
   ] as const) {
-    if (input[key] !== undefined) values[key] = input[key];
+    if (!plan.projectOnly && input[key] !== undefined) values[key] = input[key];
   }
+  if (input.projectStatus !== undefined) values.projectStatusReason = input.projectStatus.reason;
   if (plan.acceptedLabels !== undefined) values.labels = [...plan.acceptedLabels].sort();
   let openBlockers = plan.currentContent.blockedBy;
   if (input.blockedBy !== undefined) {

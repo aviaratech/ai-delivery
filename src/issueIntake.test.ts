@@ -11,6 +11,8 @@ import { z } from 'zod';
 import {
   createIssue,
   updateIssue,
+  batchUpdateIssues,
+  getIncompleteIssueUpdate,
   canonicalIssueBody,
   renderIssueHistory,
   readyCheck,
@@ -63,6 +65,168 @@ test('status-only patches preserve every outside-Status byte including canonical
   assert.equal(outside(result.body), outside(before));
   assert.equal((await updateIssue(f.context, patch)).body, result.body);
   assert.equal(f.comments.length, 0);
+});
+
+test('explicit Project status records its reason without rewriting native issue fields', async () => {
+  const f = fixture();
+  const before = f.live.body;
+  const input = { issueNumber: 17, projectStatus: { status: 'Blocked' as const, reason: '  Waiting for review.  ' } };
+  const result = await updateIssue(f.context, input);
+  assert.equal(result.projectStatus, 'Blocked');
+  assert.equal(f.live.body, before);
+  assert.deepEqual(f.writes, []);
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.comments[0]!.body, 'Requested Project Status: Blocked.\n\nWaiting for review.');
+  await updateIssue(f.context, input);
+  assert.equal(f.comments.length, 1);
+});
+
+test('explicit Project status validates public input and native truth before Project writes', async () => {
+  const schema = getAiDeliveryMcpTool('issue_update')!.inputSchema;
+  for (const projectStatus of [
+    { status: 'Todo', reason: ' ' },
+    { status: 'Queued', reason: 'Review' },
+    { status: 'Blocked', reason: 'x'.repeat(65_536) },
+    { status: 'Blocked', reason: 'api_key=abcdefghijk12345' },
+  ]) {
+    assert.throws(() => schema.parse({ issueNumber: 17, projectStatus }));
+    const f = fixture();
+    await assert.rejects(updateIssue(f.context, { issueNumber: 17, projectStatus } as never));
+    assert.equal(f.comments.length + f.statusWrites.length + f.writes.length, 0);
+  }
+  for (const mode of ['openDone', 'blockedTodo', 'conflict', 'missing'] as const) {
+    const f = fixture();
+    f.controls.blockers = mode === 'blockedTodo' || mode === 'conflict';
+    f.controls.blockerClosed = mode === 'conflict';
+    f.controls.blockerConflict = mode === 'conflict';
+    f.controls.missingNative = mode === 'missing';
+    await assert.rejects(
+      updateIssue(f.context, {
+        issueNumber: 17,
+        projectStatus: { status: mode === 'openDone' ? 'Done' : 'Todo', reason: 'Inspect native state.' },
+      }),
+    );
+    assert.equal(f.statusWrites.length + f.membershipWrites.length + f.comments.length, 0);
+  }
+  const f = fixture();
+  f.controls.blockers = true;
+  f.controls.blockerClosed = true;
+  assert.equal(
+    (
+      await updateIssue(f.context, {
+        issueNumber: 17,
+        projectStatus: { status: 'Todo', reason: 'Prerequisite closed.' },
+      })
+    ).projectStatus,
+    'Todo',
+  );
+});
+
+test('explicit Project status rechecks native state after the reason and retains pending recovery', async () => {
+  const f = fixture();
+  const create = f.context.clients.rest.issues.createComment;
+  f.context.clients.rest.issues.createComment = (async (...args: Parameters<typeof create>) => {
+    const result = await create(...args);
+    f.live.state = 'closed';
+    return result;
+  }) as typeof create;
+  await assert.rejects(
+    updateIssue(f.context, { issueNumber: 17, projectStatus: { status: 'In Progress', reason: 'Begin work.' } }),
+  );
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.statusWrites.length, 0);
+  assert.equal(f.writes.length, 0);
+});
+
+test('explicit Project partial recovery preserves reason and retries only pending work', async () => {
+  const f = fixture();
+  f.controls.projectFailure = 'before';
+  const request = {
+    issueNumber: 17,
+    projectStatus: { status: 'In Progress' as const, reason: 'Begin implementation.' },
+  };
+  try {
+    await updateIssue(f.context, request);
+    assert.fail('Expected an incomplete Project update.');
+  } catch (error) {
+    const result = getIncompleteIssueUpdate(error)!;
+    assert.equal(result.native.status, 'confirmed');
+    assert.equal(
+      result.native.projectStatusComment?.body,
+      'Requested Project Status: In Progress.\n\nBegin implementation.',
+    );
+  }
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.writes.length, 0);
+  f.controls.projectFailure = '';
+  const resumed = await batchUpdateIssues(f.context, { items: [request] });
+  assert.equal(resumed.results[0]!.status, 'applied');
+  assert.deepEqual(Object.keys(resumed.results[0]!.changes!), ['projectStatus']);
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.writes.length, 0);
+  assert.equal((await batchUpdateIssues(f.context, { items: [request] })).results[0]!.status, 'unchanged');
+  f.controls.projectFailure = 'readback';
+  assert.equal((await batchUpdateIssues(f.context, { items: [request] })).results[0]!.status, 'failed');
+  assert.equal(f.comments.length, 1);
+  assert.equal(f.writes.length, 0);
+});
+
+test('explicit batch Project status waits for requested native closure', async () => {
+  const f = fixture();
+  const update = f.context.clients.rest.issues.update;
+  f.context.clients.rest.issues.update = (async (...args: Parameters<typeof update>) => {
+    const result = await update(...args);
+    if (args[0]?.state === 'closed') f.live.state = 'closed';
+    return result;
+  }) as typeof update;
+  const result = await batchUpdateIssues(f.context, {
+    items: [
+      { issueNumber: 17, state: 'closed', projectStatus: { status: 'Done', reason: 'Implementation complete.' } },
+    ],
+  });
+  assert.equal(result.results[0]!.status, 'applied');
+  assert.equal(result.results[0]!.relatedReadback!.projectStatusReason, 'Implementation complete.');
+  assert.equal(f.getStatus(), 'Shipped');
+});
+
+test('explicit Project activation rechecks blockers after its capacity override comment', async () => {
+  const f = fixture();
+  f.controls.capacityMode = true;
+  f.live.labels = ['critical'];
+  f.context.config = {
+    ...f.context.config,
+    wipLimits: [{ repository: 'example/widget', name: 'Critical work', match: { label: 'critical' }, limit: 0 }],
+  };
+  const create = f.context.clients.rest.issues.createComment;
+  f.context.clients.rest.issues.createComment = (async (...args: Parameters<typeof create>) => {
+    const result = await create(...args);
+    if (args[0]?.body.startsWith('WIP capacity override.')) f.controls.blockers = true;
+    return result;
+  }) as typeof create;
+  await assert.rejects(
+    updateIssue(f.context, {
+      issueNumber: 17,
+      overrideReason: 'Admit capacity exception.',
+      projectStatus: { status: 'In Progress', reason: 'Begin work.' },
+    }),
+  );
+  assert.equal(f.statusWrites.length, 0);
+  assert.equal(f.getStatus(), 'Queued');
+});
+
+test('explicit batch status refuses contradictory Project snapshots before unchanged success', async () => {
+  const f = fixture();
+  const request = { issueNumber: 17, projectStatus: { status: 'Blocked' as const, reason: 'Await review.' } };
+  await updateIssue(f.context, request);
+  const read = f.context.clients.rest.issues.getComment;
+  f.context.clients.rest.issues.getComment = (async (...args: Parameters<typeof read>) => {
+    const result = await read(...args);
+    f.setStatus('Queued');
+    return result;
+  }) as typeof read;
+  const result = await batchUpdateIssues(f.context, { items: [request] });
+  assert.equal(result.results[0]!.status, 'failed');
+  assert.equal(f.statusWrites.length, 1);
 });
 
 test('legacy rendering drops only by explicit retention choice or verified history and does not grow on repeat', async () => {
@@ -310,6 +474,10 @@ function fixture() {
     driftBeforeUpdate: false,
     created: true,
     blockers: false,
+    blockerClosed: false,
+    blockerConflict: false,
+    missingNative: false,
+    closeAfterReason: false,
     trackingParent: false,
     livePoints: 2,
     projectMember: true,
@@ -405,6 +573,16 @@ function fixture() {
           }),
           get: async (input: { issue_number: number }) => {
             if (controls.driftBeforeUpdate && ++issueReads > 1) live.body = 'Concurrent operator edit';
+            if (input.issue_number === 18 && controls.blockers)
+              return {
+                data: {
+                  ...live,
+                  number: 18,
+                  node_id: 'ISSUE18',
+                  state: controls.blockerClosed ? 'closed' : 'open',
+                  html_url: 'https://github.com/example/widget/issues/18',
+                },
+              };
             if (controls.capacityMode && input.issue_number !== 17) {
               const row = capacity.find((x) => x.number === input.issue_number)!;
               return {
@@ -551,6 +729,9 @@ function fixture() {
           return {
             repository: {
               issue: {
+                id: controls.missingNative ? undefined : 'ISSUE17',
+                number: 17,
+                repository: { nameWithOwner: 'example/widget' },
                 parent: null,
                 blockedBy: {
                   nodes: controls.blockers
@@ -559,7 +740,7 @@ function fixture() {
                           id: 'ISSUE18',
                           number: 18,
                           title: 'Resolve prerequisite',
-                          state: 'OPEN',
+                          state: controls.blockerClosed && !controls.blockerConflict ? 'CLOSED' : 'OPEN',
                           repository: { nameWithOwner: 'example/widget' },
                         },
                       ]
@@ -624,7 +805,14 @@ function fixture() {
           assert.equal(input.fieldId, 'STATUS');
           if (input.optionId === 'ACTIVE' && controls.projectFailure === 'before')
             throw new Error('Project write failed');
-          status = input.optionId === 'TODO' ? 'Queued' : input.optionId === 'DONE' ? 'Shipped' : 'Active';
+          status =
+            input.optionId === 'TODO'
+              ? 'Queued'
+              : input.optionId === 'DONE'
+                ? 'Shipped'
+                : input.optionId === 'BLOCKED'
+                  ? 'Waiting'
+                  : 'Active';
           if (input.optionId === 'ACTIVE' && controls.projectFailure === 'after')
             throw new Error('Lost Project response');
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
