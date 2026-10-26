@@ -60,7 +60,7 @@ const IssueUpdateInput = issueInputSchema(
         ctx.addIssue({
           code: 'custom',
           path: ['state'],
-          message: 'Closure details require state closed',
+          message: 'Closure details require a closed issue; set state to closed.',
           params: { issueCode: 'closure.state' },
         });
     }),
@@ -83,7 +83,11 @@ const Tracking = {
     .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)
     .optional()
     .describe(REPO_HELP),
-  title: z.string().trim().min(1).max(256),
+  title: z
+    .string()
+    .trim()
+    .min(1, 'Issue title is empty; enter a title.')
+    .max(256, 'Issue title exceeds 256 characters; shorten the title.'),
 };
 const InvestigationStart = z.strictObject({
   repo: Repo,
@@ -352,17 +356,17 @@ export const AI_DELIVERY_MCP_TOOLS = [
           .string()
           .regex(/^[a-f0-9]{40}$/u)
           .optional(),
-        body: z.string().min(1).optional(),
+        body: z.string().min(1, 'PR body is empty; enter a body or omit it to use the default body.').optional(),
         draft: z.boolean().optional(),
         dryRun: z.boolean().optional(),
-        title: z.string().min(1).optional(),
+        title: z.string().min(1, 'PR title is empty; enter a title or omit it to use the issue title.').optional(),
         headBranch: z.string().min(1).optional(),
         head: z.string().min(1).optional(),
         base: z.string().min(1).optional(),
       })
       .refine(
         (input) => input.head === undefined || input.headBranch === undefined || input.head === input.headBranch,
-        'head and headBranch must identify the same branch.',
+        'PR head selectors disagree; use the same branch for head and headBranch.',
       )
       .refine(
         (input) =>
@@ -398,7 +402,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
       issueNumber: Positive,
       prNumber: Positive,
       nonClosing: z.boolean().optional(),
-      artifact: z.string().min(1),
+      artifact: z.string().min(1, 'Review artifact is empty; provide the independent review artifact JSON.'),
       identity: z.string().min(1).optional(),
       dryRun: z.boolean().optional(),
     }),
@@ -417,7 +421,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
         nonClosing: z.boolean().optional(),
         reviewedHeadSha: z
           .string()
-          .regex(/^[a-f0-9]{40}$/u)
+          .regex(/^[a-f0-9]{40}$/u, 'Reviewed head is invalid; provide the exact 40-character lowercase commit SHA.')
           .optional(),
         strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
         dryRun: z.boolean().optional(),
@@ -427,9 +431,16 @@ export const AI_DELIVERY_MCP_TOOLS = [
           input.queue === true &&
           [input.nonClosing, input.reviewedHeadSha, input.strategy, input.dryRun].some((v) => v !== undefined)
         )
-          ctx.addIssue({ code: 'custom', message: 'Queue requests cannot include direct-merge options.' });
+          ctx.addIssue({
+            code: 'custom',
+            message: 'Queue requests cannot include direct-merge options; remove those options or omit queue.',
+          });
         if (input.queue !== true && input.issueNumber === undefined)
-          ctx.addIssue({ code: 'custom', path: ['issueNumber'], message: 'Direct merge requires issueNumber.' });
+          ctx.addIssue({
+            code: 'custom',
+            path: ['issueNumber'],
+            message: 'Direct merge is missing its issue number; provide issueNumber.',
+          });
       }),
   },
   {
