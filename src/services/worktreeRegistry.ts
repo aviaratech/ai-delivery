@@ -617,6 +617,7 @@ export function assertTransitionOwnerWitness(plan: WorktreeTransitionPlan): void
  * from GitHub and immutable receipts before invoking this locked transition.
  */
 export interface CompletedIssueWorktreeReconciliation {
+  removeSource?: (entry: WorktreeEntry) => void;
   branch: string;
   issueNumber: number;
   path: string;
@@ -819,12 +820,21 @@ export async function reconcileCompletedIssueWorktreeDelivery(
         );
       }
       assertAiDeliveryWorktreeOwner(entry, root);
-      if (entry.status === 'merged' && entry.prNumber === options.prNumber) {
+      if (
+        options.removeSource !== undefined &&
+        registry.worktrees.some(
+          (other, index) =>
+            index !== matchingIndex && registryIdentitiesOverlap(other, { ...entry, prNumber: options.prNumber }),
+        )
+      )
+        throw new Error('Another registry owner claims this source; preserve both registrations before cleanup.');
+      if (entry.status === 'merged' && entry.prNumber === options.prNumber && options.removeSource === undefined) {
         return 'already-reconciled';
       }
       if (
         !(entry.status === 'active' && entry.prNumber === undefined) &&
-        !(entry.status === 'pr-published' && entry.prNumber === options.prNumber)
+        !(entry.status === 'pr-published' && entry.prNumber === options.prNumber) &&
+        !(entry.status === 'merged' && entry.prNumber === options.prNumber)
       ) {
         throw new Error(
           `Invalid completed-delivery reconciliation for #${String(options.issueNumber)}: ${entry.status}.`,
@@ -836,11 +846,16 @@ export async function reconcileCompletedIssueWorktreeDelivery(
         status: 'merged',
         updatedAt: new Date().toISOString(),
       });
+      if (options.removeSource !== undefined) {
+        options.removeSource(registry.worktrees[matchingIndex]!);
+        registry.worktrees.splice(matchingIndex, 1);
+      }
       saveRegistryStrict(root, registry);
-      assertIssueDeliveryReadback({
-        options: { ...options, status: 'merged' },
-        registry: loadRegistryStrict(root),
-      });
+      if (options.removeSource === undefined)
+        assertIssueDeliveryReadback({
+          options: { ...options, status: 'merged' },
+          registry: loadRegistryStrict(root),
+        });
       return 'reconciled';
     },
     projectRoot: root,

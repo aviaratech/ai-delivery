@@ -70,6 +70,8 @@ ai-delivery --repo example/widget finish --issue 17 --pr 23 --reviewed-head <sha
 
 GitHub's current required checks, counted reviews, blockers and merge eligibility govern the exact head/current base. The builder never approves its own work. Read back uncertain writes before retrying; a dry run grants no authority. Respect explicit provider/read-only requests and actual host refusals.
 
+After verified `finish`, cleanup removes only the exact clean registered worktree and local branch with retained-source proof. Run outside that worktree; unregistered or unsafe source stays in place with a reason.
+
 For partial delivery, `--non-closing` requires a canonical `References owner/repo#number` body and complete native evidence; a new linked-branch draft requires a separately authorized exact reference action. `finish` refuses nonclosing delivery. A complete executable child can close normally while its parent stays open.
 
 ## Command and tool map

@@ -482,7 +482,9 @@ export async function executeTool(
         ...(input.reviewedHeadSha === undefined ? {} : { reviewedHeadSha: requireString(input, 'reviewedHeadSha') }),
         dryRun: input.dryRun === true,
       };
-      return name === 'issue_finish' ? finishIssue(context, merge) : mergePr(context, merge);
+      return name === 'issue_finish'
+        ? finishIssue({ ...context, root: execution.repoRoot }, merge)
+        : mergePr(context, merge);
     }
     case 'issue_worktree_transition_inspect':
       return inspectWorktreeTransition(context, {

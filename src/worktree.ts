@@ -256,3 +256,62 @@ export function removeMergedSourceForTransition(plan: WorktreeTransitionPlan, re
     true,
   );
 }
+
+/** Remove only a finished, retained source and its exact local branch; never force Git removal. */
+export function removeFinishedIssueSource(
+  row: WorktreeEntry,
+  root: string,
+  headSha: string,
+  attestation?: MergeCleanupAttestation,
+): void {
+  assertIssueNumber(row.issueNumber ?? 0);
+  if (
+    row.branch !== `issue/${String(row.issueNumber)}` ||
+    row.path !== join(root, '.worktrees', `issue-${String(row.issueNumber)}`)
+  )
+    throw new DeliveryError('Registered path or branch differs from the finished issue; preserve the source.');
+  if (gitExitCode(root, 'symbolic-ref', '--quiet', `refs/heads/${row.branch}`) === 0)
+    throw new DeliveryError('Registered branch is symbolic; preserve its target and restore direct branch ownership.');
+  if (investigationPathPresent(row.path) && realpathSync(row.path) !== row.path)
+    throw new DeliveryError('Registered source has a symlinked path; preserve its physical worktree.');
+  const current = relative(row.path, realpathSync(process.cwd()));
+  if (row.path === primaryGitRoot(root) || !(current === '..' || current.startsWith(`..${sep}`) || isAbsolute(current)))
+    throw new DeliveryError('Cleanup targets the current or primary worktree; run finish from outside that worktree.');
+  const rows = investigationGitRows(root).filter(
+    (lines) => lines.includes(`worktree ${row.path}`) || lines.includes(`branch refs/heads/${row.branch}`),
+  );
+  if (investigationPathPresent(row.path)) {
+    if (lstatSync(row.path).isSymbolicLink())
+      throw new DeliveryError('Registered source is a symlink; preserve the source.');
+    assertIssueWorktreeLocation(row, root);
+    try {
+      assertClean(row.path);
+    } catch {
+      throw new DeliveryError('Worktree contains local changes; preserve them before cleanup.');
+    }
+    if (rows.length !== 1 || rows[0]!.some((line) => /^(?:locked|prunable)(?: |$)/u.test(line)))
+      throw new DeliveryError('Worktree custody is ambiguous or locked; preserve the source.');
+    if (
+      git(row.path, 'ls-files', '-v', '-z')
+        .split('\0')
+        .some((entry) => /^(?:[a-z]|S) /u.test(entry))
+    )
+      throw new DeliveryError('Worktree has hidden index entries; preserve local data before cleanup.');
+    if (git(row.path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z') !== '')
+      throw new DeliveryError('Worktree contains ignored files; preserve local data before cleanup.');
+  } else if (rows.length !== 0)
+    throw new DeliveryError('Missing worktree still has Git custody; reconcile it without forced cleanup.');
+  if (gitExitCode(root, 'show-ref', '--verify', '--quiet', `refs/heads/${row.branch}`) !== 0) {
+    if (!investigationPathPresent(row.path)) return;
+    throw new DeliveryError('Registered branch is absent; preserve the source.');
+  }
+  if (git(root, 'rev-parse', `refs/heads/${row.branch}`) !== headSha)
+    throw new DeliveryError('Local branch differs from the finished PR head; preserve its commits.');
+  removeMergedIssueSource(row, root, undefined, attestation, true);
+  git(root, 'update-ref', '--no-deref', '-d', `refs/heads/${row.branch}`, headSha);
+  if (
+    investigationPathPresent(row.path) ||
+    gitExitCode(root, 'show-ref', '--verify', '--quiet', `refs/heads/${row.branch}`) === 0
+  )
+    throw new DeliveryError('Cleanup readback is incomplete; inspect the retained source without retrying removal.');
+}
