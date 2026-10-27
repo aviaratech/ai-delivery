@@ -1,4 +1,9 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { addWorktreeEntry, listWorktreesStrict } from './services/worktreeRegistry.js';
 import { describe, it } from 'vitest';
 import { publishPr, mergePr, finishIssue, prChecks, queueChecks, queuePr } from './pr.js';
 import type { DeliveryContext } from './issue.js';
@@ -626,6 +631,9 @@ function fixture(
   state: string | null = 'clean',
   option: {
     headSha?: string;
+    headTree?: string;
+    mergeSha?: string;
+    remoteBaseSha?: string;
     baseSha?: string;
     configuredRequiredChecks?: string[];
     requirementsViaClassic?: boolean;
@@ -660,6 +668,7 @@ function fixture(
   } = {},
 ) {
   const head = option.headSha ?? 'a'.repeat(40);
+  const merge = option.mergeSha ?? 'b'.repeat(40);
   const base = option.baseSha ?? 'c'.repeat(40);
   let merged = false;
   let decisionRead = false;
@@ -677,7 +686,7 @@ function fixture(
     findings: [],
     head: {
       sha: option.reviewBinding === 'stale-head' ? 'e'.repeat(40) : head,
-      tree: option.reviewBinding === 'wrong-tree' ? 'f'.repeat(40) : '0'.repeat(40),
+      tree: option.reviewBinding === 'wrong-tree' ? 'f'.repeat(40) : (option.headTree ?? '0'.repeat(40)),
     },
     issueNumber: option.reviewBinding === 'wrong-issue' ? 18 : 17,
     prNumber: option.reviewBinding === 'wrong-pr' ? 24 : 23,
@@ -788,13 +797,20 @@ function fixture(
       get: async () => ({ data: { node_id: 'REPO', default_branch: 'main', full_name: 'example/widget' } }),
     },
     git: {
-      getCommit: async () => ({ data: { sha: head, tree: { sha: '0'.repeat(40) } } }),
+      getCommit: async () => ({ data: { sha: head, tree: { sha: option.headTree ?? '0'.repeat(40) } } }),
       getRef: async ({ ref }: { ref: string }) => ({
         data: {
           ref: `refs/${ref}`,
           object: {
             type: 'commit',
-            sha: ref === 'heads/main' || ref === 'heads/other' ? (option.baseMoved ? 'e'.repeat(40) : base) : head,
+            sha:
+              ref === 'heads/main' || ref === 'heads/other'
+                ? option.baseMoved
+                  ? 'e'.repeat(40)
+                  : merged
+                    ? (option.remoteBaseSha ?? base)
+                    : base
+                : head,
           },
         },
       }),
@@ -1611,4 +1627,100 @@ describe('recorded public fragments with labeled synthetic transitions', () => {
     assert.equal(retry.merges.length, 1);
     assert.deepEqual(retry.events, ['pr', 'pr', 'decision', 'pr', 'main', 'merge', 'pr']);
   });
+});
+
+describe('verified finish registered source cleanup', () => {
+  for (const mode of [
+    'clean',
+    'squash',
+    'dirty',
+    'unretained',
+    'mismatched',
+    'ignored',
+    'hidden',
+    'unregistered',
+    'absent',
+    'wrong-pr',
+  ] as const) {
+    it(`finishes with ${mode} local source without losing unretained data`, async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'finish-cleanup-')));
+      const git = (cwd: string, ...args: string[]) =>
+        execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      try {
+        git(root, 'init', '-q', '-b', 'main');
+        git(root, 'config', 'user.name', 'Fixture');
+        git(root, 'config', 'user.email', 'fixture@example.invalid');
+        writeFileSync(join(root, 'change.ts'), 'base\n');
+        git(root, 'add', '.');
+        git(root, 'commit', '-qm', 'base');
+        const base = git(root, 'rev-parse', 'HEAD');
+        git(root, 'remote', 'add', 'origin', 'https://github.com/example/widget.git');
+        const path = join(root, '.worktrees', 'issue-17');
+        git(root, 'worktree', 'add', '-b', 'issue/17', path);
+        writeFileSync(join(path, 'change.ts'), 'delivered\n');
+        git(path, 'commit', '-qam', 'change');
+        const source = git(path, 'rev-parse', 'HEAD');
+        let merged = source;
+        if (mode === 'squash') {
+          git(root, 'merge', '--squash', 'issue/17');
+          git(root, 'commit', '-qm', 'squash');
+          merged = git(root, 'rev-parse', 'HEAD');
+        }
+        git(root, 'update-ref', 'refs/remotes/origin/main', mode === 'unretained' ? base : merged);
+        git(root, 'update-ref', 'refs/heads/unrelated', base);
+        if (mode !== 'unregistered')
+          await addWorktreeEntry(
+            {
+              path,
+              branch: 'issue/17',
+              type: 'issue',
+              identity: 'author',
+              issueNumber: 17,
+              prNumber: mode === 'wrong-pr' ? 24 : 23,
+              status: 'pr-published',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+            root,
+          );
+        if (mode === 'dirty' || mode === 'hidden') writeFileSync(join(path, 'change.ts'), 'local data\n');
+        if (mode === 'hidden') git(path, 'update-index', '--assume-unchanged', 'change.ts');
+        if (mode === 'mismatched') git(path, 'checkout', '-b', 'other');
+        if (mode === 'ignored') {
+          writeFileSync(join(root, '.git', 'info', 'exclude'), 'cached.txt\n');
+          writeFileSync(join(path, 'cached.txt'), 'local data\n');
+        }
+        if (mode === 'absent') {
+          git(root, 'worktree', 'remove', path);
+          git(root, 'update-ref', '-d', 'refs/heads/issue/17', source);
+        }
+        const f = fixture('clean', {
+          headSha: source,
+          headTree: git(root, 'rev-parse', `${source}^{tree}`),
+          baseSha: base,
+          mergeSha: mode === 'unretained' ? 'b'.repeat(40) : merged,
+          remoteBaseSha: merged,
+        });
+        f.context.root = root;
+        const result = await finishIssue(f.context, { issueNumber: 17, prNumber: 23 });
+        assert.ok('issueClosed' in result && result.issueClosed);
+        assert.ok('cleanup' in result);
+        if (mode === 'clean' || mode === 'squash' || mode === 'absent') {
+          assert.deepEqual(result.cleanup, { status: 'removed' });
+          assert.equal(existsSync(path), false);
+          assert.throws(() => git(root, 'rev-parse', '--verify', 'refs/heads/issue/17'));
+          assert.deepEqual(listWorktreesStrict(root), []);
+          const replay = await finishIssue(f.context, { issueNumber: 17, prNumber: 23 });
+          assert.ok('issueClosed' in replay && replay.issueClosed);
+        } else {
+          assert.equal(existsSync(path), true);
+          assert.equal(git(root, 'rev-parse', 'refs/heads/issue/17'), source);
+          assert.ok(JSON.stringify(result).includes(mode === 'unregistered' ? 'absent' : 'retained'));
+        }
+        assert.equal(git(root, 'rev-parse', 'refs/heads/unrelated'), base);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 });

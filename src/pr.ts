@@ -15,14 +15,23 @@ import {
 import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { assertPrivateFile, digestBytes, digestValue, stableJson } from './delivery/common.js';
-import { gitCommonDir, primaryGitRoot } from './git.js';
+import { gitCommonDir, primaryGitRoot, defaultBaseRef, gitExitCode, git } from './git.js';
 import { ensurePrivateDirectoryDurably } from './utils/atomicJson.js';
 import { resolveRepoFromRemote } from './github/repo.js';
 import { authenticatedWorktreeActors, assertNativeWorktreeAcceptance } from './worktreeTransition.js';
 import { withWorktreeTransitionWriterAbsent } from './verification.js';
-import { assertInvestigationSource, investigationSourceIdentity, removeInvestigationSource } from './worktree.js';
+import {
+  assertInvestigationSource,
+  investigationSourceIdentity,
+  removeInvestigationSource,
+  removeFinishedIssueSource,
+  type MergeCleanupAttestation,
+} from './worktree.js';
 import {
   InvestigationPreparationSchema,
+  listWorktreesStrict,
+  getIssueWorktreeStrict,
+  reconcileCompletedIssueWorktreeDelivery,
   completeInvestigationCustody,
   readInvestigationAcknowledgement,
   readInvestigationPreparation,
@@ -2343,7 +2352,86 @@ export async function finishIssue(
   const readback = (await context.clients.rest.issues.get({ ...context.repo, issue_number: input.issueNumber })).data;
   if (readback.number !== input.issueNumber || readback.state !== 'closed')
     throw new DeliveryError('GitHub issue closure readback disagrees.');
-  return { ...result, issueClosed: true };
+  return {
+    ...result,
+    issueClosed: true,
+    cleanup: await cleanupFinishedIssue(context, input.issueNumber, pr, result.headSha!, result.mergeSha!),
+  };
+}
+async function cleanupFinishedIssue(
+  context: DeliveryContext,
+  issueNumber: number,
+  pr: Awaited<ReturnType<typeof verifyIssuePr>>,
+  headSha: string,
+  mergeSha: string,
+): Promise<{ status: 'absent' | 'removed' | 'retained'; reason?: string }> {
+  if (!context.root || !existsSync(context.root))
+    return { status: 'absent', reason: 'No local checkout selected; no registered source was removed.' };
+  try {
+    const root = primaryGitRoot(context.root);
+    const repo = resolveRepoFromRemote(root, 'origin');
+    if (`${repo.owner}/${repo.repo}`.toLowerCase() !== context.config.repository.toLowerCase())
+      throw new DeliveryError('Local repository differs from the finished repository; preserve its source.');
+    const matches = listWorktreesStrict(root).filter((row) => row.type === 'issue' && row.issueNumber === issueNumber);
+    if (matches.length === 0)
+      return { status: 'absent', reason: 'No registered issue worktree exists; host-owned source was not adopted.' };
+    const row = getIssueWorktreeStrict(issueNumber, root);
+    if (
+      row.identity !== context.config.roles.author.identity ||
+      (row.prNumber !== undefined && row.prNumber !== pr.number)
+    )
+      throw new DeliveryError('Registered owner or PR differs from the finished delivery; preserve the source.');
+    let attestation: MergeCleanupAttestation | undefined;
+    const branchPresent = gitExitCode(root, 'show-ref', '--verify', '--quiet', `refs/heads/${row.branch}`) === 0;
+    if (branchPresent && gitExitCode(root, 'merge-base', '--is-ancestor', row.branch, defaultBaseRef(root)) !== 0) {
+      if (gitExitCode(root, 'cat-file', '-e', `${mergeSha}^{commit}`) !== 0)
+        throw new DeliveryError(
+          'Merged source retention is unavailable locally; fetch the verified base before cleanup.',
+        );
+      const mergeTree = git(root, 'rev-parse', `${mergeSha}^{tree}`);
+      if (mergeTree !== git(root, 'rev-parse', `${row.branch}^{tree}`))
+        throw new DeliveryError('Merged tree does not retain the source tree; preserve its commits.');
+      const base = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data;
+      let remoteHeadSha: string | null;
+      try {
+        remoteHeadSha = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${row.branch}` })).data
+          .object.sha;
+      } catch (error) {
+        if ((error as { status?: number }).status !== 404) throw error;
+        remoteHeadSha = null;
+      }
+      attestation = {
+        baseBranch: pr.base.ref,
+        baseSha: pr.base.sha,
+        headBranch: pr.head.ref,
+        headSha,
+        mergeSha,
+        mergeTree,
+        remoteBaseSha: base.object.sha,
+        remoteHeadSha,
+        strategy: 'squash',
+      };
+    }
+    await withIssueWorktreeExclusion(root, row.path, async () =>
+      reconcileCompletedIssueWorktreeDelivery({
+        projectRoot: root,
+        issueNumber,
+        path: row.path,
+        branch: row.branch,
+        prNumber: pr.number,
+        removeSource: (current) => removeFinishedIssueSource(current, root, headSha, attestation),
+      }),
+    );
+    return { status: 'removed' };
+  } catch (error) {
+    return {
+      status: 'retained',
+      reason:
+        error instanceof DeliveryError
+          ? error.message
+          : 'Cleanup could not prove safe source removal; preserve the worktree and inspect its retention.',
+    };
+  }
 }
 export { startIssueBranch };
 
@@ -2357,7 +2445,7 @@ function investigationRoot(context: DeliveryContext): string {
     throw new DeliveryError('Investigation repository identity disagrees.');
   return root;
 }
-async function withInvestigationExclusion<T>(root: string, target: string, operation: () => Promise<T>): Promise<T> {
+async function withIssueWorktreeExclusion<T>(root: string, target: string, operation: () => Promise<T>): Promise<T> {
   const common = gitCommonDir(root);
   for (const directory of [join(common, 'ai-delivery'), join(common, 'ai-delivery', 'writers@1')]) {
     try {
@@ -2487,7 +2575,7 @@ export async function registerInvestigation(
     reviewerActor: actors.reviewerActor,
   };
   const preparation = InvestigationPreparationSchema.parse({ ...content, preparationId: digestValue(content) });
-  await withInvestigationExclusion(root, target, () =>
+  await withIssueWorktreeExclusion(root, target, () =>
     registerInvestigationCustody(preparation, async () => {
       if (stableJson(investigationSourceIdentity(root, input.issueNumber)) !== stableJson(observed))
         throw new DeliveryError('Investigation source changed before preparation acknowledgement.');
@@ -2605,7 +2693,7 @@ export async function finishInvestigation(
     input.acceptanceCommentId! <= 0
   )
     throw new DeliveryError('Investigation evidence requires positive native comment IDs.');
-  return withInvestigationExclusion(root, preparation.row.path, () =>
+  return withIssueWorktreeExclusion(root, preparation.row.path, () =>
     completeInvestigationCustody({
       preparation,
       result,
