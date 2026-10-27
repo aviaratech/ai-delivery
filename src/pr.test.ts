@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addWorktreeEntry, listWorktreesStrict } from './services/worktreeRegistry.js';
@@ -1641,6 +1650,10 @@ describe('verified finish registered source cleanup', () => {
     'unregistered',
     'absent',
     'wrong-pr',
+    'symbolic',
+    'aliased',
+    'ineligible',
+    'dry-run',
   ] as const) {
     it(`finishes with ${mode} local source without losing unretained data`, async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), 'finish-cleanup-')));
@@ -1694,7 +1707,16 @@ describe('verified finish registered source cleanup', () => {
           git(root, 'worktree', 'remove', path);
           git(root, 'update-ref', '-d', 'refs/heads/issue/17', source);
         }
-        const f = fixture('clean', {
+        if (mode === 'symbolic') {
+          git(root, 'worktree', 'remove', path);
+          git(root, 'update-ref', 'refs/heads/unrelated', source);
+          git(root, 'symbolic-ref', 'refs/heads/issue/17', 'refs/heads/unrelated');
+        }
+        if (mode === 'aliased') {
+          renameSync(join(root, '.worktrees'), join(root, 'physical-source'));
+          symlinkSync(join(root, 'physical-source'), join(root, '.worktrees'), 'dir');
+        }
+        const f = fixture(mode === 'ineligible' ? 'blocked' : 'clean', {
           headSha: source,
           headTree: git(root, 'rev-parse', `${source}^{tree}`),
           baseSha: base,
@@ -1702,6 +1724,15 @@ describe('verified finish registered source cleanup', () => {
           remoteBaseSha: merged,
         });
         f.context.root = root;
+        if (mode === 'ineligible' || mode === 'dry-run') {
+          const finish = () => finishIssue(f.context, { issueNumber: 17, prNumber: 23, dryRun: mode === 'dry-run' });
+          if (mode === 'ineligible') await assert.rejects(finish());
+          else await finish();
+          assert.equal(existsSync(path), true);
+          assert.equal(git(root, 'rev-parse', 'refs/heads/issue/17'), source);
+          assert.equal(readFileSync(join(path, 'change.ts'), 'utf8'), 'delivered\n');
+          return;
+        }
         const result = await finishIssue(f.context, { issueNumber: 17, prNumber: 23 });
         assert.ok('issueClosed' in result && result.issueClosed);
         assert.ok('cleanup' in result);
@@ -1712,12 +1743,22 @@ describe('verified finish registered source cleanup', () => {
           assert.deepEqual(listWorktreesStrict(root), []);
           const replay = await finishIssue(f.context, { issueNumber: 17, prNumber: 23 });
           assert.ok('issueClosed' in replay && replay.issueClosed);
+        } else if (mode === 'symbolic') {
+          assert.equal(existsSync(path), false);
+          assert.equal(git(root, 'symbolic-ref', 'refs/heads/issue/17'), 'refs/heads/unrelated');
+          assert.equal(git(root, 'rev-parse', 'refs/heads/unrelated'), source);
+          assert.equal(result.cleanup.status, 'retained');
         } else {
           assert.equal(existsSync(path), true);
           assert.equal(git(root, 'rev-parse', 'refs/heads/issue/17'), source);
+          assert.equal(
+            readFileSync(join(path, 'change.ts'), 'utf8'),
+            mode === 'dirty' || mode === 'hidden' ? 'local data\n' : 'delivered\n',
+          );
+          if (mode === 'ignored') assert.equal(readFileSync(join(path, 'cached.txt'), 'utf8'), 'local data\n');
           assert.ok(JSON.stringify(result).includes(mode === 'unregistered' ? 'absent' : 'retained'));
         }
-        assert.equal(git(root, 'rev-parse', 'refs/heads/unrelated'), base);
+        assert.equal(git(root, 'rev-parse', 'refs/heads/unrelated'), mode === 'symbolic' ? source : base);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

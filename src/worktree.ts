@@ -270,6 +270,10 @@ export function removeFinishedIssueSource(
     row.path !== join(root, '.worktrees', `issue-${String(row.issueNumber)}`)
   )
     throw new DeliveryError('Registered path or branch differs from the finished issue; preserve the source.');
+  if (gitExitCode(root, 'symbolic-ref', '--quiet', `refs/heads/${row.branch}`) === 0)
+    throw new DeliveryError('Registered branch is symbolic; preserve its target and restore direct branch ownership.');
+  if (investigationPathPresent(row.path) && realpathSync(row.path) !== row.path)
+    throw new DeliveryError('Registered source has a symlinked path; preserve its physical worktree.');
   const current = relative(row.path, realpathSync(process.cwd()));
   if (row.path === primaryGitRoot(root) || !(current === '..' || current.startsWith(`..${sep}`) || isAbsolute(current)))
     throw new DeliveryError('Cleanup targets the current or primary worktree; run finish from outside that worktree.');
@@ -304,7 +308,7 @@ export function removeFinishedIssueSource(
   if (git(root, 'rev-parse', `refs/heads/${row.branch}`) !== headSha)
     throw new DeliveryError('Local branch differs from the finished PR head; preserve its commits.');
   removeMergedIssueSource(row, root, undefined, attestation, true);
-  git(root, 'update-ref', '-d', `refs/heads/${row.branch}`, headSha);
+  git(root, 'update-ref', '--no-deref', '-d', `refs/heads/${row.branch}`, headSha);
   if (
     investigationPathPresent(row.path) ||
     gitExitCode(root, 'show-ref', '--verify', '--quiet', `refs/heads/${row.branch}`) === 0
