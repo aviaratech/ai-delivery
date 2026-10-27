@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { executeTool } from './dispatch.js';
+import { renderIssueBody } from './issueContract.js';
 import * as github from './github/client.js';
 import { issue63Fixture } from './fixtures/issue63.js';
 import { syntheticDiscoveryClients, syntheticDiscoveryConfig } from './fixtures/discovery.js';
@@ -24,9 +25,41 @@ type Route = (typeof routes)[number];
 type Tool = 'issue_info' | 'issue_update';
 type NativeLabel = string | { name: string };
 
-function fixture(labels: NativeLabel[] = [], milestone: { id: number; number: number } | null = null) {
+function fixture(
+  labels: NativeLabel[] = [],
+  milestone: { id: number; number: number } | null = null,
+  metadata?: { points: number | null; issueType: string | null },
+) {
   const f = issue63Fixture();
   const native = Object.assign(f.rows.get(17)!, { labels, milestone });
+  const nativeMetadata = metadata ?? { points: 2, issueType: 'Task' };
+  if (nativeMetadata.issueType === null) Reflect.deleteProperty(native, 'type');
+  else native.type = { name: nativeMetadata.issueType };
+  const metadataWrites: unknown[] = [];
+  const originalRequest = f.context.clients.rest.request;
+  const values = () =>
+    nativeMetadata.points === null
+      ? []
+      : [
+          {
+            issue_field_id: 101,
+            issue_field_name: 'Estimate',
+            data_type: 'single_select',
+            value: String(nativeMetadata.points),
+            single_select_option: { name: String(nativeMetadata.points) },
+          },
+        ];
+  f.context.clients.rest.request = (async (route: string, input: Record<string, unknown>) => {
+    if (route === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values') return { data: values() };
+    if (route === 'POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values') {
+      const changes = input.issue_field_values as { field_id: number; value: string }[];
+      metadataWrites.push(structuredClone(changes));
+      for (const change of changes) if (change.field_id === 101) nativeMetadata.points = Number(change.value);
+      return { data: values() };
+    }
+    return originalRequest(route, input);
+  }) as typeof originalRequest;
+
   const available = ['Needs Review', 'MixedCase'];
   f.context.clients.rest.issues.listLabelsForRepo = vi.fn(async () => ({
     data: available.map((name) => ({ name })),
@@ -45,6 +78,21 @@ function fixture(labels: NativeLabel[] = [], milestone: { id: number; number: nu
   const discovery = syntheticDiscoveryClients();
   const nativeGraphql = f.context.clients.graphql;
   f.context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
+    if (query.includes('IssueClosureReadback')) {
+      const reason: unknown = Reflect.get(native, 'state_reason');
+      return {
+        repository: {
+          issue: {
+            number: native.number,
+            repository: { nameWithOwner: 'example/widget' },
+            state: native.state.toUpperCase(),
+            stateReason: typeof reason === 'string' ? reason.toUpperCase() : null,
+            duplicateOf: null,
+          },
+        },
+      };
+    }
+
     if (
       /DeliveryRepository|ProjectDeliveryConfiguration|issueFields\(first:|issueTypes\(first:|projectsV2\(first:/u.test(
         query,
@@ -61,7 +109,33 @@ function fixture(labels: NativeLabel[] = [], milestone: { id: number; number: nu
       }
       return result;
     }
-    return nativeGraphql(query, variables);
+    if (query.includes('UpdateProjectDeliveryStatus') && variables.optionId === 'DONE') {
+      f.statuses.set(Number(String(variables.itemId).replace('ITEM', '')), 'Shipped');
+      return { updateProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
+    }
+    const result = await nativeGraphql(query, variables);
+    if (query.includes('ProjectDeliveryItems'))
+      for (const item of (
+        result as {
+          organization: { projectV2: { items: { nodes: { fieldValueByName: { name: string; optionId: string } }[] } } };
+        }
+      ).organization.projectV2.items.nodes)
+        if (item.fieldValueByName.name === 'Shipped') item.fieldValueByName.optionId = 'DONE';
+    if (
+      query.includes('ProjectDeliveryItemReadback') &&
+      f.statuses.get(Number(String(variables.itemId).replace('ITEM', ''))) === 'Shipped'
+    )
+      Object.assign((result as { node: { fieldValueByName: object } }).node.fieldValueByName, {
+        name: 'Shipped',
+        optionId: 'DONE',
+      });
+    if (metadata !== undefined && query.includes('blockedBy(') && variables.number === 17)
+      (result as { repository: { issue: { parent: unknown } } }).repository.issue.parent = {
+        id: 'ISSUE2',
+        number: 2,
+        repository: { nameWithOwner: 'example/widget' },
+      };
+    return result;
   }) as typeof f.context.clients.graphql;
   vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(f.context.clients);
   const root = mkdtempSync(join(tmpdir(), 'issue-info-readback-'));
@@ -92,7 +166,7 @@ function fixture(labels: NativeLabel[] = [], milestone: { id: number; number: nu
     }),
   );
   vi.stubEnv('AI_DELIVERY_CONFIG', configPath);
-  return { ...f, native };
+  return { ...f, native, metadataWrites };
 }
 
 async function caller(route: Route) {
@@ -214,3 +288,64 @@ for (const route of routes) {
     }
   });
 }
+
+// Replay the documented before/patch/readback combination from #224;
+// repository identifiers and status prose are deidentified, not historical-writer attribution.
+for (const mode of ['recorded-close', 'divergent-history'] as const) {
+  test(`MCP ${mode} preserves omitted native metadata and relationships`, async () => {
+    const points = mode === 'recorded-close' ? null : 2;
+    const issueType = mode === 'recorded-close' ? null : 'Bug';
+    const f = fixture([], null, { points, issueType });
+    if (mode === 'divergent-history')
+      f.native.body = renderIssueBody({
+        ...f.ready,
+        points: 1,
+        bug: {
+          steps: ['Update status.'],
+          expected: 'Keep native fields.',
+          actual: 'Rewrites native fields.',
+          reproducibility: 'Every update.',
+          environment: 'Synthetic MCP server.',
+        },
+      });
+    const api = await caller('MCP');
+    try {
+      const before = await api.call('issue_info', { issueNumber: 17 });
+      const patch = mode === 'recorded-close' ? { state: 'closed', closeReason: 'completed' } : {};
+      await api.call('issue_update', {
+        issueNumber: 17,
+        ...patch,
+        status: { nextMilestone: 'Complete', latestJournal: 'Recorded display update.' },
+        preserveHistory: true,
+      });
+      const after = await api.call('issue_info', { issueNumber: 17 });
+      assert.equal(after.points ?? null, points);
+      assert.equal(after.issueType, issueType);
+      assert.deepEqual(after.fields, before.fields);
+      assert.deepEqual(after.blockedBy, before.blockedBy);
+      assert.equal(after.parentIssueNumber, before.parentIssueNumber);
+      assert.deepEqual(f.metadataWrites, []);
+    } finally {
+      await api.close();
+    }
+  });
+}
+
+test('MCP explicit native metadata still updates and configured-value refusals write nothing', async () => {
+  const f = fixture([], null, { points: null, issueType: null });
+  const api = await caller('MCP');
+  try {
+    await api.call('issue_update', { issueNumber: 17, points: 2, issueType: 'Task' });
+    const after = await api.call('issue_info', { issueNumber: 17 });
+    assert.equal(after.points, 2);
+    assert.equal(after.issueType, 'Task');
+    assert.equal(f.metadataWrites.length, 1);
+    const before = [...f.writes];
+    await assert.rejects(api.call('issue_update', { issueNumber: 17, points: 99 }));
+    await assert.rejects(api.call('issue_update', { issueNumber: 17, issueType: 'Unconfigured' }));
+    assert.deepEqual(f.writes, before);
+    assert.equal(f.metadataWrites.length, 1);
+  } finally {
+    await api.close();
+  }
+});

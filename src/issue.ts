@@ -1480,8 +1480,6 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
       ? {}
       : {
           title: prepared.issue.title,
-          ...(prepared.issue.issueType === undefined ? {} : { issueType: prepared.issue.issueType }),
-          ...(prepared.issue.points === undefined ? {} : { points: prepared.issue.points }),
           ...(prepared.issue.draft ? { park: true as const } : {}),
         }),
     preserveHistory: prepared.preserveHistory,
