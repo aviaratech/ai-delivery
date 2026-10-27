@@ -937,7 +937,18 @@ test(
       const inspectClosure = () =>
         spawnSync(
           process.execPath,
-          [npmCli, 'ls', '--prefix', f.input.runtimeDirectory, '--omit=dev', '--all', '--json', '--logs-max', '0'],
+          [
+            npmCli,
+            'ls',
+            '--prefix',
+            f.input.runtimeDirectory,
+            '--omit=dev',
+            '--all',
+            '--json',
+            '--long=false',
+            '--logs-max',
+            '0',
+          ],
           { cwd: f.root, encoding: 'utf8', maxBuffer: 1024 ** 2 },
         );
       const closure = () => {
