@@ -820,6 +820,14 @@ export async function reconcileCompletedIssueWorktreeDelivery(
         );
       }
       assertAiDeliveryWorktreeOwner(entry, root);
+      if (
+        options.removeSource !== undefined &&
+        registry.worktrees.some(
+          (other, index) =>
+            index !== matchingIndex && registryIdentitiesOverlap(other, { ...entry, prNumber: options.prNumber }),
+        )
+      )
+        throw new Error('Another registry owner claims this source; preserve both registrations before cleanup.');
       if (entry.status === 'merged' && entry.prNumber === options.prNumber && options.removeSource === undefined) {
         return 'already-reconciled';
       }

@@ -2376,10 +2376,8 @@ async function cleanupFinishedIssue(
     if (matches.length === 0)
       return { status: 'absent', reason: 'No registered issue worktree exists; host-owned source was not adopted.' };
     const row = getIssueWorktreeStrict(issueNumber, root);
-    if (
-      row.identity !== context.config.roles.author.identity ||
-      (row.prNumber !== undefined && row.prNumber !== pr.number)
-    )
+    const authorIdentity = context.config.roles.author.identity;
+    if (row.identity !== authorIdentity || (row.prNumber !== undefined && row.prNumber !== pr.number))
       throw new DeliveryError('Registered owner or PR differs from the finished delivery; preserve the source.');
     let attestation: MergeCleanupAttestation | undefined;
     const branchPresent = gitExitCode(root, 'show-ref', '--verify', '--quiet', `refs/heads/${row.branch}`) === 0;
@@ -2419,7 +2417,11 @@ async function cleanupFinishedIssue(
         path: row.path,
         branch: row.branch,
         prNumber: pr.number,
-        removeSource: (current) => removeFinishedIssueSource(current, root, headSha, attestation),
+        removeSource: (current) => {
+          if (current.identity !== authorIdentity || current.createdAt !== row.createdAt)
+            throw new DeliveryError('Registered source ownership changed; preserve the new owner before cleanup.');
+          removeFinishedIssueSource(current, root, headSha, attestation);
+        },
       }),
     );
     return { status: 'removed' };

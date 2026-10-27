@@ -12,8 +12,9 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addWorktreeEntry, listWorktreesStrict } from './services/worktreeRegistry.js';
+import { addWorktreeEntry, listWorktreesStrict, removeWorktreeEntry } from './services/worktreeRegistry.js';
 import { describe, it } from 'vitest';
+import { ISSUE_CLI_DATA_DIR } from './utils/filesystem.js';
 import { publishPr, mergePr, finishIssue, prChecks, queueChecks, queuePr } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
@@ -1650,6 +1651,9 @@ describe('verified finish registered source cleanup', () => {
     'unregistered',
     'absent',
     'wrong-pr',
+    'overlap',
+    'pr-overlap',
+    'owner-race',
     'symbolic',
     'aliased',
     'ineligible',
@@ -1674,7 +1678,7 @@ describe('verified finish registered source cleanup', () => {
         git(path, 'commit', '-qam', 'change');
         const source = git(path, 'rev-parse', 'HEAD');
         let merged = source;
-        if (mode === 'squash') {
+        if (mode === 'squash' || mode === 'owner-race') {
           git(root, 'merge', '--squash', 'issue/17');
           git(root, 'commit', '-qm', 'squash');
           merged = git(root, 'rev-parse', 'HEAD');
@@ -1689,13 +1693,32 @@ describe('verified finish registered source cleanup', () => {
               type: 'issue',
               identity: 'author',
               issueNumber: 17,
-              prNumber: mode === 'wrong-pr' ? 24 : 23,
-              status: 'pr-published',
+              ...(mode === 'pr-overlap' ? {} : { prNumber: mode === 'wrong-pr' ? 24 : 23 }),
+              status: mode === 'pr-overlap' ? 'active' : 'pr-published',
               createdAt: '2026-01-01T00:00:00.000Z',
               updatedAt: '2026-01-01T00:00:00.000Z',
             },
             root,
           );
+        let competingRegistry: string | undefined;
+        const registryPath = join(root, ISSUE_CLI_DATA_DIR, 'worktrees.json');
+        if (mode === 'overlap' || mode === 'pr-overlap') {
+          const registry = { worktrees: listWorktreesStrict(root) };
+          const other = { ...registry.worktrees[0]!, type: 'standalone' as const };
+          delete other.issueNumber;
+          if (mode === 'pr-overlap') {
+            other.path = join(root, '.worktrees', 'claimed-pr');
+            other.branch = 'claimed-pr';
+            other.prNumber = 23;
+            await addWorktreeEntry(other, root);
+            competingRegistry = readFileSync(registryPath, 'utf8');
+          } else {
+            delete other.prNumber;
+            registry.worktrees.push(other);
+            competingRegistry = JSON.stringify(registry);
+            writeFileSync(registryPath, competingRegistry);
+          }
+        }
         if (mode === 'dirty' || mode === 'hidden') writeFileSync(join(path, 'change.ts'), 'local data\n');
         if (mode === 'hidden') git(path, 'update-index', '--assume-unchanged', 'change.ts');
         if (mode === 'mismatched') git(path, 'checkout', '-b', 'other');
@@ -1724,6 +1747,21 @@ describe('verified finish registered source cleanup', () => {
           remoteBaseSha: merged,
         });
         f.context.root = root;
+        if (mode === 'owner-race') {
+          const getRef = f.context.clients.rest.git.getRef;
+          let replaced = false;
+          Object.assign(f.context.clients.rest.git, {
+            getRef: async (input: { owner: string; repo: string; ref: string }) => {
+              if (f.closes() > 0 && input.ref === 'heads/main' && !replaced) {
+                replaced = true;
+                const current = listWorktreesStrict(root)[0]!;
+                await removeWorktreeEntry(path, root);
+                await addWorktreeEntry({ ...current, identity: 'other-owner' }, root);
+              }
+              return getRef(input);
+            },
+          });
+        }
         if (mode === 'ineligible' || mode === 'dry-run') {
           const finish = () => finishIssue(f.context, { issueNumber: 17, prNumber: 23, dryRun: mode === 'dry-run' });
           if (mode === 'ineligible') await assert.rejects(finish());
@@ -1758,6 +1796,9 @@ describe('verified finish registered source cleanup', () => {
           if (mode === 'ignored') assert.equal(readFileSync(join(path, 'cached.txt'), 'utf8'), 'local data\n');
           assert.ok(JSON.stringify(result).includes(mode === 'unregistered' ? 'absent' : 'retained'));
         }
+        if (mode === 'overlap' || mode === 'pr-overlap')
+          assert.equal(readFileSync(registryPath, 'utf8'), competingRegistry);
+        if (mode === 'owner-race') assert.equal(listWorktreesStrict(root)[0]!.identity, 'other-owner');
         assert.equal(git(root, 'rev-parse', 'refs/heads/unrelated'), mode === 'symbolic' ? source : base);
       } finally {
         rmSync(root, { recursive: true, force: true });
