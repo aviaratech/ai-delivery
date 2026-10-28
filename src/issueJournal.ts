@@ -112,6 +112,17 @@ export const JournalInputSchema = z
 
 export function renderJournal(raw: JournalInput, marker?: string): string {
   const input = JournalVariants.parse(raw);
+  const plainPreview = (value: string): string => {
+    const plain = value
+      .replace(/!?\[([^\]]+)\]\([^)]*\)/gu, '$1')
+      .replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-+*]\s+|\d+[.)]\s+)/gmu, '')
+      .replace(/[*_~`<>[\]\\]/gu, '')
+      .replace(/\s+/gu, ' ')
+      .trim();
+    const preview = plain.slice(0, 32);
+    const last = preview.charCodeAt(preview.length - 1);
+    return last >= 0xd800 && last <= 0xdbff ? preview.slice(0, -1) : preview;
+  };
   const field = (label: string, value: string): string =>
     `**${label}:**${/\n|^(?:[-*+]\s|\d+[.)]\s)/u.test(value) ? '\n' : ' '}${value}`;
   const list = (values: string[]): string => values.map((value) => '- ' + value.replace(/\n/gu, '\n  ')).join('\n');
@@ -142,7 +153,7 @@ export function renderJournal(raw: JournalInput, marker?: string): string {
     `**Evidence:** ${input.evidence.length ? input.evidence.join(' · ') : 'None yet.'}`,
   );
   if (input.details) sections.push(input.details);
-  let body = input.summary;
+  let body = `Status: ${plainPreview(input.status)}. Next: ${plainPreview(input.nextStep)}.\n\n${input.summary}`;
   let overflow = '';
   for (const section of sections) {
     if (overflow || body.length + section.length + 2 > (input.lengthCap ?? 1800)) overflow += `\n\n${section}`;
@@ -167,6 +178,9 @@ export function parseJournalAttention(body: string): JournalAttention {
     request: null,
     reason: 'Journal structure is incomplete or ambiguous.',
   });
+  const preview = /^Status: ([^\r\n]{0,32})\. Next: ([^\r\n]{0,32})\.\n\n(?!\*\*Kind:\*\*)/u.exec(body);
+  if (preview && preview.slice(1).every((value) => value.length <= 32 && !/[*_~`<>[\]\\]|[^\S ]/u.test(value)))
+    body = body.slice(preview[0].length);
   const markers = body.match(/<!--\s*ai-delivery:journal@/gu) ?? [];
   if (markers.length) {
     const suffix = /\n\n<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u.exec(body);
