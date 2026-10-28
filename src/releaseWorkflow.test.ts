@@ -29,6 +29,7 @@ import { gzipSync } from 'node:zlib';
 import { Script } from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'vitest';
+import { withResolvedClosureDiagnostic } from './fixtures/resolvedClosureDiagnostic.js';
 
 type Json = { [key: string]: unknown };
 type DiagnosticReads = { readSync?: typeof readSync; openSync?: typeof openSync; lstatSync?: typeof lstatSync };
@@ -527,6 +528,106 @@ function diagnosticFixture() {
     logs: () => outputs['logs_directory'],
   };
 }
+
+test('closure provenance survives the scanned artifact boundary without masking its assertion', () => {
+  for (const scenario of ['hidden', 'installed', 'missing', 'unsafe', 'oversized', 'invalid'] as const) {
+    const f = diagnosticFixture();
+    try {
+      const runtimeDirectory = join(f.root, 'current', 'staged');
+      const fixtureRoot = join(f.root, 'current', 'consumer');
+      const actual = `file:${join(f.root, 'other-fixture', 'staged', 'reviewed-archive.tgz')}`;
+      const hidden = join(runtimeDirectory, 'node_modules', '.package-lock.json');
+      const installed = join(runtimeDirectory, 'node_modules', '@aviaratech', 'ai-delivery', 'package.json');
+      const declared = 'file:reviewed-archive.tgz';
+      const packages = {
+        '': { dependencies: { '@aviaratech/ai-delivery': declared } },
+        'node_modules/@aviaratech/ai-delivery': { resolved: declared },
+      };
+      mkdirSync(dirname(hidden), { recursive: true });
+      mkdirSync(dirname(installed), { recursive: true });
+      writeFileSync(
+        hidden,
+        JSON.stringify({
+          packages: { 'node_modules/@aviaratech/ai-delivery': { resolved: scenario === 'hidden' ? actual : declared } },
+        }),
+      );
+      writeFileSync(installed, JSON.stringify({ _resolved: actual, _where: fixtureRoot, private: f.sensitive }));
+      if (scenario === 'missing') rmSync(hidden);
+      if (scenario === 'unsafe') {
+        rmSync(hidden);
+        symlinkSync(installed, hidden);
+      }
+      if (scenario === 'oversized') truncateSync(hidden, 65537);
+      if (scenario === 'invalid') writeFileSync(hidden, '{');
+      const input = {
+        runtimeDirectory,
+        fixtureRoot,
+        actual,
+        rootPackage: Buffer.from(JSON.stringify(packages[''])),
+        rootLock: Buffer.from(JSON.stringify({ packages })),
+      };
+      const failure = new Error('Recorded absolute closure mismatch');
+      const chunks: string[] = [];
+      assert.throws(
+        () =>
+          withResolvedClosureDiagnostic(
+            input,
+            () => {
+              throw failure;
+            },
+            (line) => chunks.push(line),
+          ),
+        (error) => error === failure,
+      );
+      assert.equal(chunks.length, 1, 'The failed assertion must emit its provenance receipt.');
+      const output = chunks[0]!;
+      assert.ok(Buffer.byteLength(output) <= 2048);
+      assert.ok(output.startsWith('RESOLVED_CLOSURE_ORIGIN_RECEIPT '));
+      assert.ok(!output.includes(f.root) && !output.includes(f.sensitive));
+      const receipt = JSON.parse(output.slice(output.indexOf(' ') + 1)) as Json;
+      const root = receipt['root'] as Json;
+      const observed = receipt['actual'] as Json;
+      const hiddenReceipt = receipt['hidden'] as Json;
+      assert.equal(root['previouslyCaptured'], true);
+      assert.equal(observed['matchesExpected'], false);
+      assert.equal(hiddenReceipt['state'], ['hidden', 'installed'].includes(scenario) ? 'valid' : scenario);
+      if (scenario === 'hidden') assert.equal((hiddenReceipt['resolved'] as Json)['matchesActual'], true);
+      if (scenario === 'installed')
+        assert.equal(((receipt['installed'] as Json)['resolved'] as Json)['matchesActual'], true);
+      f.log(`release-tests-${f.runId}/tests/stdout.txt`, output);
+      f.execute();
+      const directory = f.logs();
+      assert.ok(directory);
+      const uploaded = failureLogUpload(directory, 'success', 'true');
+      assert.equal(readFileSync(uploaded.find((file) => file.name === 'release.stdout.txt')!.path, 'utf8'), output);
+      assert.deepEqual(failureLogUpload(directory, 'failure', 'true'), []);
+      assert.throws(
+        () =>
+          withResolvedClosureDiagnostic(
+            input,
+            () => {
+              throw failure;
+            },
+            () => {
+              throw new Error('Reporting unavailable');
+            },
+          ),
+        (error) => error === failure,
+      );
+      let emitted = false;
+      withResolvedClosureDiagnostic(
+        input,
+        () => {},
+        () => {
+          emitted = true;
+        },
+      );
+      assert.equal(emitted, false);
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  }
+});
 
 test.each(['producer', 'release', 'both'] as const)(
   'failed qualification stages exact fixed %s test output including the actual synthetic receipt',
