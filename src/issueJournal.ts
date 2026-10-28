@@ -178,7 +178,8 @@ export function parseJournalAttention(body: string): JournalAttention {
     request: null,
     reason: 'Journal structure is incomplete or ambiguous.',
   });
-  const preview = /^Status: ([^\r\n]{0,32})\. Next: ([^\r\n]{0,32})\.\n\n(?!\*\*Kind:\*\*)/u.exec(body);
+  // Match the same UTF-16 unit bounds used by plainPreview.
+  const preview = /^Status: ([^\r\n]{0,32})\. Next: ([^\r\n]{0,32})\.\n\n(?!\*\*Kind:\*\*)/.exec(body);
   if (preview && preview.slice(1).every((value) => value.length <= 32 && !/[*_~`<>[\]\\]|[^\S ]/u.test(value)))
     body = body.slice(preview[0].length);
   const markers = body.match(/<!--\s*ai-delivery:journal@/gu) ?? [];

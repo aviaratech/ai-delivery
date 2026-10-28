@@ -99,6 +99,7 @@ test('duplicate free-text structural labels are unknown', () => {
   for (const summary of ['```md', '~~~']) assert.equal(parse!(renderJournal({ ...input, summary })).state, 'unknown');
   for (const status of ['<det**ails>', '<!**-- ai-delivery:journal@1'])
     assert.equal(parse!(renderJournal({ ...input, status })).state, 'pending');
+  assert.equal(parse!(renderJournal({ ...input, status: '🙂'.repeat(16), nextStep: 'a. Next: b' })).state, 'pending');
   const marked = renderJournal(
     { ...input, decisionNeeded: 'None' },
     `<!-- ai-delivery:journal@1:sha256:${'a'.repeat(64)} -->`,
