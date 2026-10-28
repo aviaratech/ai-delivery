@@ -46,7 +46,7 @@ ai-delivery --repo example/widget plugin doctor --host codex --scope user --chec
 
 Use `--host claude-code` for the managed native selection. Diagnostics refuse absent, disabled, modified, or failed-startup plugins, then validate settings and report missing variable names without values. Missing reviewer/custom references stop before key read or authentication. Credential names must not overlap runtime controls such as `PATH`, `HOME`, host config, or Node/npm/Git variables.
 
-This opt-in probe supervises the selected CLI for 30 seconds and awaits owned cleanup on timeout/cancellation. Unconfirmed cleanup (`probe_cleanup_unverified`) leaves authentication unverified; its `selected_runtime_cli` context does not prove GUI propagation. `--dry-run` neither validates settings nor authenticates.
+This opt-in probe supervises the selected CLI for 30 seconds and awaits owned cleanup on timeout/cancellation. Its output keeps raw errors, upstream bodies/headers, tokens, and key paths private. Unconfirmed cleanup (`probe_cleanup_unverified`) leaves authentication unverified; its `selected_runtime_cli` context does not prove GUI propagation. `--dry-run` neither validates settings nor authenticates.
 
 For direct package CLI readback, run `config:resolve`:
 
@@ -54,7 +54,7 @@ For direct package CLI readback, run `config:resolve`:
 ai-delivery --repo example/widget config:resolve
 ```
 
-It reads routing, authenticated author/reviewer App, and visible repository rules without creating an issue, branch, review, or PR. Output keeps raw errors, upstream bodies/headers, tokens, and key paths private. Discovery/auth failure can leave identity/access unknown; it is not a permission diagnosis. Synthetic fixtures validate contracts, not real credentials or native installation. Keep GUI, CLI, and fixture evidence separate; never share values, keys/paths, headers, or raw auth errors.
+It reads routing, authenticated author/reviewer App, and visible repository rules without creating an issue, branch, review, or PR. Discovery/auth failure can leave identity/access unknown; it is not a permission diagnosis. Synthetic fixtures validate contracts, not real credentials or native installation. Keep GUI, CLI, and fixture evidence separate; never share values, keys/paths, headers, or raw auth errors.
 
 Inside either host, request actual read-only `issue_info` with a known issue and explicit `repo: "example/widget"`; label it author-only. Full-role `issue_pr_create` with `dryRun: true` requires an existing open issue, a linked branch with readable valid head, default base, and compatible existing PR/issue association. If multiple linked branches exist, name one with `headBranch`; without it, exactly one must be linked. A branch/state refusal may occur before reviewer preflight, so it does not prove credentials invalid. Leave full-role readiness unverified unless the prerequisites and successful dry-run result are available. Do not create a branch or PR to force this diagnostic. See the package guide's [GitHub-gated lifecycle](../../README.md#github-gated-lifecycle).
 
