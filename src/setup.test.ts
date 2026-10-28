@@ -33,6 +33,7 @@ import * as privateFiles from './delivery/common.js';
 import { digestBytes, digestValue } from './delivery/index.js';
 import { assertDeliveryRuntimeAdmitted, type RuntimeAdmission } from './services/deliveryAdmission.js';
 import * as atomicJson from './utils/atomicJson.js';
+import { withResolvedClosureDiagnostic } from './fixtures/resolvedClosureDiagnostic.js';
 
 const { actors, controllerObservation, syncFailure, sharedOutputRead, retirementFailure } = runtimeSetupState;
 afterEach(() => vi.unstubAllEnvs());
@@ -964,7 +965,17 @@ test(
         assert.equal(target.version, '0.3.5');
         assert.equal(target.invalid, undefined);
         assert.equal(target.missing, undefined);
-        assertReviewedResolved(target.resolved, `file:${join(f.input.runtimeDirectory, 'reviewed-archive.tgz')}`);
+        withResolvedClosureDiagnostic(
+          {
+            runtimeDirectory: f.input.runtimeDirectory,
+            fixtureRoot: f.root,
+            rootPackage: metadataBytes[0]!,
+            rootLock: metadataBytes[1]!,
+            actual: target.resolved,
+          },
+          () =>
+            assertReviewedResolved(target.resolved, `file:${join(f.input.runtimeDirectory, 'reviewed-archive.tgz')}`),
+        );
       };
       closure();
       const lockTime = lstatSync(hidden).mtime;
