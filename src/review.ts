@@ -698,9 +698,8 @@ async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArti
         ),
       ),
     ];
-    if (
-      git(
-        root,
+    const touched = (from: string, to: string) =>
+      run([
         '--literal-pathspecs',
         'log',
         '--format=',
@@ -708,11 +707,11 @@ async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArti
         '-z',
         '--full-history',
         '--diff-merges=separate',
-        `${base.mergeBaseSha}..${next.mergeBaseSha}`,
+        `${from}..${to}`,
         '--',
         ...paths,
-      ) !== ''
-    )
+      ]).length !== 0;
+    if (touched(base.mergeBaseSha, next.mergeBaseSha) || touched(base.baseSha, next.baseSha))
       throw new Error('Base touched review paths.');
     const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
     const report = z

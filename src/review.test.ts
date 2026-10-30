@@ -88,6 +88,7 @@ for (const scenario of [
   'clean',
   'base-touch',
   'reverted-touch',
+  'late-base-touch',
   'changed-hunk',
   'failed-verify',
   'focused-verify',
@@ -148,6 +149,20 @@ for (const scenario of [
         g('commit', '-qam', 'Change reviewed hunk');
       }
       const newHead = { sha: g('rev-parse', 'HEAD'), tree: g('rev-parse', 'HEAD^{tree}') };
+      let currentBase = newBase;
+      if (scenario === 'late-base-touch') {
+        g('checkout', '-qb', 'later-base', newBase);
+        const later = [...lines];
+        later[50] = 'line 50';
+        later[5] = 'late base touch';
+        writeFileSync(join(state.root, 'change.ts'), later.join('\n') + '\n');
+        g('commit', '-qam', 'Touch reviewed path after rebase');
+        later[5] = 'line 5';
+        writeFileSync(join(state.root, 'change.ts'), later.join('\n') + '\n');
+        g('commit', '-qam', 'Revert late base touch');
+        currentBase = g('rev-parse', 'HEAD');
+        g('checkout', '-q', newHead.sha);
+      }
       const seal = (content: object) => ({ ...content, artifactId: digestValue(content) }) as typeof state.artifact;
       const { artifactId: _id, ...original } = state.artifact;
       const oldArtifact = seal({
@@ -191,7 +206,7 @@ for (const scenario of [
       const artifact = seal({
         ...original,
         head: newHead,
-        reviewBase: { baseSha: newBase, mergeBaseSha: newBase },
+        reviewBase: { baseSha: currentBase, mergeBaseSha: newBase },
         reuse: { fromReviewId: 41, verificationResultPath: resultPath },
       });
       const rest = state.context.clients.rest;
@@ -214,7 +229,7 @@ for (const scenario of [
                   number: 19,
                   state: 'open',
                   changed_files: 1,
-                  base: { sha: newBase, repo: { full_name: 'example/repo' } },
+                  base: { sha: currentBase, repo: { full_name: 'example/repo' } },
                   head: { sha: newHead.sha, repo: { full_name: 'example/repo' } },
                   user: { login: 'author' },
                 },
@@ -244,11 +259,7 @@ for (const scenario of [
         const result = await action();
         assert.equal(result.githubReviewId, 42);
         assert.equal(result.artifact.head.sha, newHead.sha);
-        const reused = (
-          result.artifact as typeof result.artifact & {
-            reusedFrom?: { oldHead: string; newHead: string; reviewId: number };
-          }
-        ).reusedFrom;
+        const reused = result.artifact.reusedFrom;
         assert.equal(reused?.oldHead, oldHead);
         assert.equal(reused?.newHead, newHead.sha);
         assert.equal(reused?.reviewId, 41);
