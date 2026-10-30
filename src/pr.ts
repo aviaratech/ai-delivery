@@ -490,7 +490,7 @@ async function verifyUnpublishedCommits(context: DeliveryContext, baseSha: strin
   }
   throw new DeliveryError('Introduced commit range exceeds the bounded readback window.');
 }
-async function readNonClosingReference(context: DeliveryContext, issueNumber: number, pr: RemotePr) {
+async function readNonClosingReference(context: DeliveryContext, issueNumber: number, pr: RemotePr, forReview = false) {
   if (
     typeof pr.node_id !== 'string' ||
     !pr.node_id ||
@@ -641,7 +641,12 @@ async function readNonClosingReference(context: DeliveryContext, issueNumber: nu
   await verifyNonClosingCommits(context, pr);
   if (!pr.merged) {
     const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${pr.base.ref}` })).data;
-    if (ref.ref !== `refs/heads/${pr.base.ref}` || ref.object.type !== 'commit' || ref.object.sha !== pr.base.sha)
+    if (
+      ref.ref !== `refs/heads/${pr.base.ref}` ||
+      ref.object.type !== 'commit' ||
+      !validSha(ref.object.sha) ||
+      (!forReview && ref.object.sha !== pr.base.sha)
+    )
       throw new DeliveryError('Non-closing default base has moved or is incomplete.');
   }
   const after = await openReferenceIssue(context, issueNumber);
@@ -698,8 +703,13 @@ async function readClosingReferenceIds(
   }
   throw new DeliveryError('Native closing-reference graph exceeds the bounded readback window.');
 }
-async function verifyNonClosingReference(context: DeliveryContext, issueNumber: number, pr: RemotePr) {
-  const graph = await readNonClosingReference(context, issueNumber, pr);
+async function verifyNonClosingReference(
+  context: DeliveryContext,
+  issueNumber: number,
+  pr: RemotePr,
+  forReview = false,
+) {
+  const graph = await readNonClosingReference(context, issueNumber, pr, forReview);
   if (graph.closesTarget || graph.allClosing.length || graph.manualClosing.length)
     throw new DeliveryError('Non-closing PR has a closing native PR reference/association.');
   return graph.issue;
@@ -862,10 +872,10 @@ async function verifyIssuePr(
   issueNumber: number,
   prNumber: number,
   nonClosing = false,
-  explainMissingClosing = false,
+  forReview = false,
 ) {
   const pr = await getPr(context, prNumber);
-  if (nonClosing) await verifyNonClosingReference(context, issueNumber, pr);
+  if (nonClosing) await verifyNonClosingReference(context, issueNumber, pr, forReview);
   else
     await verifyPrIssueAssociation(
       context,
@@ -875,7 +885,7 @@ async function verifyIssuePr(
       false,
       undefined,
       undefined,
-      explainMissingClosing && !hasClosingLink(pr.body, issueNumber)
+      forReview && !hasClosingLink(pr.body, issueNumber)
         ? {
             missingMessage: `Missing \`Closes #${issueNumber}\` in PR #${prNumber}. Restore it with issue_pr_create(${JSON.stringify({ repo: context.config.repository, issueNumber, head: pr.head.ref })}).`,
           }
@@ -2194,7 +2204,7 @@ export async function submitFormalReview(
   });
   try {
     if (nonClosing) {
-      sameReferencePr(pr, await verifyIssuePr(context, input.issueNumber, input.prNumber, true));
+      sameReferencePr(pr, await verifyIssuePr(context, input.issueNumber, input.prNumber, true, true));
       sameReferenceIssue(issue!, await openReferenceIssue(context, input.issueNumber));
     }
     if ('dryRun' in result) return result;
