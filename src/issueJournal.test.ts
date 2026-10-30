@@ -96,6 +96,24 @@ test('duplicate free-text structural labels are unknown', () => {
     '<details>\n**Decision needed:** None\n</details>',
   ])
     assert.equal(parse!(renderJournal({ ...input, details })).state, 'unknown', details);
+  for (const summary of ['```md', '~~~']) assert.equal(parse!(renderJournal({ ...input, summary })).state, 'unknown');
+  for (const status of ['<det**ails>', '<!**-- ai-delivery:journal@1'])
+    assert.equal(parse!(renderJournal({ ...input, status })).state, 'pending');
+  assert.equal(parse!(renderJournal({ ...input, status: '🙂'.repeat(16), nextStep: 'a. Next: b' })).state, 'pending');
+  const marked = renderJournal(
+    { ...input, decisionNeeded: 'None' },
+    `<!-- ai-delivery:journal@1:sha256:${'a'.repeat(64)} -->`,
+  );
+  for (const header of [
+    'Status: <!-- ai-delivery:journal@. Next: Review.',
+    'Status: **Decision needed:** None. Next: Review.',
+    'Status: Ready\t. Next: Review.',
+    `Status: ${'🙂'.repeat(17)}. Next: Review.`,
+  ])
+    assert.equal(parse!(`${header}${marked.slice(marked.indexOf('\n\n'))}`).state, 'unknown');
+  const legacy =
+    'Status: Ready. Next: Review.\n\n**Kind:** progress. **Status:** Ready\n\n**Done since last:**\n- Prepared\n\n**Decision needed:** Approve design\n\n**Key numbers:** None reported.\n\n**Next:** Review (date not scheduled).\n\n**Evidence:** https://github.com/example/widget/issues/17';
+  assert.equal(parse!(legacy).state, 'pending');
   for (const body of [
     '> **Kind:** progress. **Status:** Ready\n\n**Decision needed:** Approve',
     '```\n**Kind:** progress. **Status:** Ready\n\n**Decision needed:** Approve\n```',
@@ -119,7 +137,7 @@ test('decision journal list fields start below their label and preserve nested s
   });
   assert.equal(
     result,
-    'A decision was made.\n\n**Kind:** decision. **Status:** Ready\n\n**Decision:**\n- First\n  - Nested\n- Second\n\n**Rationale:** The existing owner is sufficient.\n\n**Key numbers:** None reported.\n\n**Next:** Run checks (date not scheduled).\n\n**Evidence:** None yet.',
+    'Status: Ready. Next: Run checks.\n\nA decision was made.\n\n**Kind:** decision. **Status:** Ready\n\n**Decision:**\n- First\n  - Nested\n- Second\n\n**Rationale:** The existing owner is sufficient.\n\n**Key numbers:** None reported.\n\n**Next:** Run checks (date not scheduled).\n\n**Evidence:** None yet.',
   );
 });
 
@@ -134,7 +152,7 @@ test('published comment schema lists required fields for every journal kind', ()
   ]);
 });
 
-test('journal tool validates all five typed templates before dispatch', () => {
+test('all typed journals validate and lead with plain status and next-step previews', () => {
   const tool = getAiDeliveryMcpTool('issue_comment');
   assert.ok(tool, 'issue_comment must be exposed');
   const common = {
@@ -169,6 +187,29 @@ test('journal tool validates all five typed templates before dispatch', () => {
     }
     assert.equal(JournalInputSchema.safeParse(input).success, true);
     assert.equal(JournalInputSchema.safeParse({ ...input, repo: 'example/widget' }).success, false);
+    for (const summary of [input.summary, 'S'.repeat(500)]) {
+      const marker = `<!-- ai-delivery:journal@1:sha256:${'a'.repeat(64)} -->`;
+      const body = renderJournal(
+        {
+          ...input,
+          summary,
+          status: '**In progress**',
+          nextStep: 'Run\nchecks',
+          lengthCap: 600,
+          details: 'D'.repeat(900),
+        },
+        marker,
+      );
+      assert.equal(body.startsWith(`Status: In progress. Next: Run checks.\n\n${summary}\n\n`), true);
+      assert.match(body, /<details>/u);
+      assert.ok(body.endsWith(marker));
+      assert.deepEqual(journalReaders.parseJournalAttention(body), {
+        kind: input.kind,
+        state: 'clear',
+        request: null,
+        reason: null,
+      });
+    }
   }
   for (const input of [
     { ...common, kind: 'progress' },
@@ -328,7 +369,7 @@ test('canonical comment writes read back and recover a lost response without dup
     assert.equal(recovered.commentId, 91);
     assert.equal(recovered.reused, true);
     assert.equal(stored.length, 1);
-    assert.match(recovered.body, /^Implementation started\./u);
+    assert.match(recovered.body, /^Status: In progress\. Next: Run checks\.\n\nImplementation started\./u);
     corruptReadback = true;
     await assert.rejects(comment(context, input), /readback/u);
     corruptReadback = false;
@@ -381,20 +422,24 @@ test('canonical comment writes read back and recover a lost response without dup
 });
 
 test('length cap keeps the summary visible and moves every excess field into collapsed detail', () => {
+  const summary = 'S'.repeat(500);
   const rendered = renderJournal({
     issueNumber: 17,
     kind: 'progress',
-    summary: 'Validation is implemented.',
-    status: 'In progress',
+    summary,
+    status: 'In progress '.repeat(500),
     done: ['A'.repeat(900)],
     decisionNeeded: 'None',
     keyNumbers: ['7 tests'],
     evidence: ['https://github.com/example/widget/pull/23'],
-    nextStep: 'Review',
+    nextStep: 'Review '.repeat(1000),
     nextDate: '2026-10-09',
     lengthCap: 600,
   });
-  assert.equal(rendered.split('\n')[0], 'Validation is implemented.');
+  const first = rendered.split('\n')[0]!;
+  assert.ok(first.startsWith('Status: In progress'));
+  assert.ok(first.length <= 100 && rendered.split('\n')[2] === summary);
+  assert.ok(rendered.indexOf('Next: Review') < rendered.indexOf(summary));
   assert.match(rendered, /<details>/u);
   assert.match(rendered, /A{900}/u);
   assert.match(rendered, /7 tests/u);
@@ -548,7 +593,7 @@ test('registered journal tool returns actionable decision refusals before native
     const renderedDecision = f.comments[0]!.body;
     assert.match(
       renderedDecision,
-      /^Parser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
+      /^Status: In progress\. Next: Review the parser\.\n\nParser validation is ready\.\n\n\*\*Kind:\*\* decision\. \*\*Status:\*\* In progress\n\n\*\*Decision:\*\* Use the existing parser\n\n\*\*Rationale:\*\* Preserves compatibility/u,
     );
     assert.match(renderedDecision, /<!-- ai-delivery:journal@1:sha256:[a-f0-9]{64} -->$/u);
     const retry = await client.callTool({ name: 'issue_comment', arguments: { ...decision, verbose: true } });
