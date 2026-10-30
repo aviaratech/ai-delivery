@@ -34,7 +34,7 @@ import { fileURLToPath } from 'node:url';
 /** @typedef {{result?:{url:string, functions:{ranges:{startOffset:number,endOffset:number,count:number}[]}[]}[]}} V8Report */
 /** @typedef {Partial<CommandRecord> & {stage:string, command:string[], status:string, directory:string}} StageRecord */
 /** @typedef {{path:string,dev:number,ino:number,quiescent:boolean,removed:boolean,error?:string}} ReleaseTemporary */
-/** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, release?:ReleaseContext & {contractSha256:string,historicalInputSupplied:boolean,temporary?:ReleaseTemporary}, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
+/** @typedef {{schemaVersion:string, runId:string, startedAt:string, scope:string, status:string, fullSuccess:boolean, artifactQualified:boolean, artifactOmitted:string[], gates:string[], omitted:string[], commands:StageRecord[], resultsDir:string, timeoutMs:number, cancellationGraceMs:number, tree?:TreeIdentity, verifiedHead?:{sha:string,tree:string}, toolchain?:Toolchain, environmentKeys?:string[], selectedTestFiles?:string[], tests?:ReturnType<typeof analyzeTests>, release?:ReleaseContext & {contractSha256:string,historicalInputSupplied:boolean,temporary?:ReleaseTemporary}, observedTests?:{files:number,total:number,passed:number,failed:number,skips:{file:string,title:string,reason:string}[]}, inventory?:ReturnType<typeof analyzeInventory>, coverage?:ReturnType<typeof coverageBaseline>, error?:string, completedAt?:string, exitCode?:number}} CheckReport */
 /** @typedef {{cwd?:string, resultsDir?:string, fast?:boolean, testFiles?:string[], buildPlugin?:boolean, release?:ReleaseContext, install?:boolean, stagedTree?:string, signal?:AbortSignal, timeoutMs?:number, execute?:typeof executeCommand, toolchain?:typeof validateToolchain, environment?:Environment}} CheckOptions */
 
 /** @param {unknown} error */
@@ -1044,6 +1044,45 @@ export function treeIdentity(cwd) {
   };
 }
 
+/** @param {string} cwd */
+function committedHead(cwd) {
+  try {
+    /** @param {string[]} args */
+    const git = (...args) =>
+      sync(
+        '/usr/bin/git',
+        ['--no-replace-objects', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args],
+        cwd,
+      );
+    const sha = git('rev-parse', '--verify', 'HEAD');
+    const tree = git('rev-parse', `${sha}^{tree}`);
+    assert.match(sha, /^[a-f0-9]{40}$/u);
+    assert.match(tree, /^[a-f0-9]{40}$/u);
+    if (
+      git('ls-files', '--others', '--exclude-standard', '-z') !== '' ||
+      git('diff', '--cached', '--raw', '--no-ext-diff', '--no-textconv', sha, '--') !== '' ||
+      git('ls-files', '-v', '-z')
+        .split('\0')
+        .some((entry) => /^(?:[a-z]|S) /u.test(entry))
+    )
+      return undefined;
+    for (const entry of git('ls-tree', '-r', '-z', '--full-tree', sha).split('\0').filter(Boolean)) {
+      const split = entry.indexOf('\t');
+      const identity = /^(100644|100755) blob ([a-f0-9]{40})$/u.exec(entry.slice(0, split));
+      if (!identity) return undefined;
+      const path = join(cwd, entry.slice(split + 1));
+      const stat = lstatSync(path);
+      if (!stat.isFile() || Boolean(stat.mode & 0o111) !== (identity[1] === '100755')) return undefined;
+      const bytes = readFileSync(path);
+      if (createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== identity[2])
+        return undefined;
+    }
+    return { sha, tree };
+  } catch {
+    return undefined;
+  }
+}
+
 /** @returns {Map<number,ProcessRow>} */
 function processes() {
   const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,rss=,stat=,lstart='], { encoding: 'utf8' });
@@ -1462,9 +1501,6 @@ export function coverageBaseline(directory, cwd) {
 /** @param {string} directory @param {CheckReport} report */
 function persist(directory, report) {
   mkdirSync(directory, { recursive: true });
-  const temporary = join(directory, 'result.json.tmp');
-  writeFileSync(temporary, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, join(directory, 'result.json'));
   const lines = [
     `${report.scope.toUpperCase()} contributor checks: ${report.status}`,
     `Tree: ${JSON.stringify(report.tree ?? null)}`,
@@ -1498,6 +1534,9 @@ function persist(directory, report) {
       `Threshold proposal: ${report.coverage.thresholdProposal}`,
     );
   writeFileSync(join(directory, 'result.txt'), `${lines.join('\n')}\n`, { mode: 0o600 });
+  const temporary = join(directory, 'result.json.tmp');
+  writeFileSync(temporary, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, join(directory, 'result.json'));
 }
 
 /** @param {CheckOptions} [options] @returns {Promise<CheckReport>} */
@@ -1561,6 +1600,7 @@ export async function runChecks({
     cancellationGraceMs: 3000,
   };
   persist(directory, report);
+  const initialHead = report.scope === 'full' ? committedHead(cwd) : undefined;
   /** @param {string} message */
   const notify = (message) => process.stdout.write(`[${report.scope}] ${message}\n`);
   try {
@@ -1802,6 +1842,14 @@ export async function runChecks({
       if (report.status !== 'cancelled') report.status = 'failed';
     }
   }
+  if (
+    report.scope === 'full' &&
+    report.status === 'passed' &&
+    initialHead &&
+    report.commands.every((command) => command.cleanupConfirmed === true) &&
+    JSON.stringify(committedHead(cwd)) === JSON.stringify(initialHead)
+  )
+    report.verifiedHead = initialHead;
   report.completedAt = new Date().toISOString();
   report.exitCode =
     report.status === 'passed' || report.status === 'partial-passed' ? 0 : report.status === 'cancelled' ? 130 : 1;

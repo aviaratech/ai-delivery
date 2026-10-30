@@ -411,6 +411,28 @@ function fixture(published = true, nonClosing = false) {
 
 afterEach(() => vi.restoreAllMocks());
 
+it('publishes a pushed canonical branch without native creation and preserves the open issue', async () => {
+  const { context, state } = fixture(false, true);
+  state.remoteHead = head;
+  await publishPr(context, nonClosingCreation);
+  assert.equal(state.creations, 1);
+  assert.equal(state.issueState, 'open');
+  state.issueState = 'closed';
+  await assert.rejects(issues.issueBranch(context, 17), /open|OPEN/u);
+  await assert.rejects(issues.issueBranch(context, 17, 'issue/18'), /branch/u);
+});
+
+it('accepts a hyphenated close mention while refusing an actual closing directive', async () => {
+  const { context, state } = fixture(true, true);
+  state.title = 'absent-close (#3777)';
+  await publishPr(context, { issueNumber: 17, nonClosing: true, prNumber: 23, draft: false });
+  state.title = 'closes #3777';
+  await assert.rejects(
+    publishPr(context, { issueNumber: 17, nonClosing: true, prNumber: 23, draft: false }),
+    /closing directives/u,
+  );
+});
+
 describe('remote closing PR creation', () => {
   it('replays a plain-git head from a temporary non-git directory through the public tool', async () => {
     const { context, state } = fixture(false);
@@ -1791,9 +1813,9 @@ describe('explicit native non-closing reference delivery', () => {
     assert.equal(state.creations, 0);
   });
 
-  it('keeps new PR publication behind native start/branch linkage and checks introduced messages first', async () => {
+  it('keeps new PR publication behind the exact pushed head and checks introduced messages first', async () => {
     const { context, state } = fixture(false, true);
-    await assert.rejects(publishPr(context, nonClosingCreation), /branch/u);
+    await assert.rejects(publishPr(context, nonClosingCreation), /expected head/u);
     state.linked = true;
     state.remoteHead = head;
     state.commitMessage = 'Fixes: example/widget#99';
