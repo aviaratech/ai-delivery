@@ -1,3 +1,6 @@
+import { syntheticDiscoveryClients, syntheticDiscoveryConfig } from './fixtures/discovery.js';
+import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
+import { quietReadViewResponse } from './fixtures/readView.js';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -360,6 +363,10 @@ function fixture(published = true, nonClosing = false) {
         state.promotionReadback ?? { markPullRequestReadyForReview: { pullRequest: { id: 'PR23', isDraft: false } } }
       );
     }
+    if (query.includes('ProjectDeliveryIssueItems')) return issueProjectItemsResponse(variables, []);
+    if (query.includes('ProjectDeliveryConfiguration')) return syntheticDiscoveryClients().graphql(query, variables);
+    const quiet = quietReadViewResponse(query, variables);
+    if (quiet !== undefined) return quiet;
     throw new Error(`Unexpected synthetic query: ${query}`);
   };
   const reviewer = {
@@ -377,6 +384,7 @@ function fixture(published = true, nonClosing = false) {
       schemaVersion: 'ai-delivery.github@1',
       repository: repo,
       roles: { author: { authSource: 'personal', identity: 'author' }, reviewer: { identity: 'reviewer' } },
+      native: syntheticDiscoveryConfig.native,
     },
     clients: {
       role: 'author',
@@ -1353,7 +1361,7 @@ describe('directory-independent exact-PR contract', () => {
       await server.connect(serverTransport);
       await client.connect(clientTransport);
       const info = await client.callTool({ name: 'issue_pr_info', arguments: { repo, issueNumber: 17, prNumber: 23 } });
-      assert.equal(info.isError, undefined);
+      assert.equal(info.isError, undefined, JSON.stringify(info.content));
       const review = await client.callTool({
         name: 'issue_pr_review',
         arguments: { repo, issueNumber: 17, prNumber: 23, artifact, dryRun: true },

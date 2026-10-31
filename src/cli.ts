@@ -55,10 +55,17 @@ for (let index = 2; index < process.argv.length; index++) {
 }
 
 function execution(): ExecutionContext {
-  const options = program.opts<{ identity?: string; personalAuth?: boolean; repo?: string; repoRoot: string }>();
+  const options = program.opts<{
+    identity?: string;
+    personalAuth?: boolean;
+    repo?: string;
+    repoRoot: string;
+    verbose?: boolean;
+  }>();
   const identity = (options.identity ?? process.env.AI_DELIVERY_IDENTITY)?.trim() || undefined;
   return {
     repoRoot: options.repoRoot,
+    ...(options.verbose === true ? { verbose: true } : {}),
     ...(identity === undefined ? {} : { identity }),
     personalAuth: options.personalAuth === true,
     ...(options.repo === undefined ? {} : { repo: options.repo }),

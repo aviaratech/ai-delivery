@@ -57,7 +57,11 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
         try {
           const signal = context.signal === undefined ? extra.signal : AbortSignal.any([context.signal, extra.signal]);
           const { verbose, ...input } = parsed.data;
-          const pending = executeTool(tool.name as AiDeliveryMcpToolName, input, { ...context, signal });
+          const pending = executeTool(tool.name as AiDeliveryMcpToolName, input, {
+            ...context,
+            signal,
+            ...(verbose === true ? { verbose } : {}),
+          });
           activeCalls?.add(pending);
           let value: unknown;
           try {
