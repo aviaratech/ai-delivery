@@ -38,7 +38,7 @@ jobs:
           # A PR that touches a release case's file runs the release lane, whose producer is the PR checks.
           lane=checks
           if [ "$EVENT_NAME" = pull_request ]; then
-            lane=$(node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { touchesReleaseCases } from './scripts/checks.mjs'; const paths = execFileSync('git', ['diff', '--name-only', '-z', 'HEAD^1', 'HEAD'], { encoding: 'utf8' }).split('\0'); console.log(touchesReleaseCases(paths) ? 'checks:release' : 'checks');")
+            lane=$(node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { touchesReleaseCases } from './scripts/checks.mjs'; const paths = execFileSync('git', ['diff', '--no-renames', '--name-only', '-z', 'HEAD^1', 'HEAD'], { encoding: 'utf8' }).split('\0'); console.log(touchesReleaseCases(paths) ? 'checks:release' : 'checks');")
           fi
           echo "Running npm run $lane"
           npm run "$lane" -- --results-dir "$RUNNER_TEMP/ai-delivery-check-results"
