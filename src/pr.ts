@@ -249,9 +249,9 @@ function closingBody(issue: { number: number; title: string; body?: string | nul
 // This is a closure safety check, never authority for an issue association.
 function refuseClosingDirective(text: unknown): asserts text is string {
   if (typeof text !== 'string') throw new DeliveryError('Incomplete non-closing message readback.');
-  const normalized = text.replace(/[*_~`\\<>[\]]/gu, '');
+  const normalized = text.replace(/\[[^\]\r\n]*\]\(([^()\s]+)\)/gu, '$1').replace(/[*_~`\\<>[\]]/gu, '');
   if (
-    /\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\b(?:\s*:\s*|\s+)[^\n]*?(?:#[0-9]+|[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+#[0-9]+|https?:\/\/(?:www\.)?github\.com\/[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+\/(?:issues|pull)\/[0-9]+)/iu.test(
+    /(?<![\p{L}\p{N}_-])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)(?:\s*:\s*|\s+)(?:#[0-9]+|[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+#[0-9]+|https?:\/\/(?:www\.)?github\.com\/[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+\/(?:issues|pull)\/[0-9]+)/iu.test(
       normalized,
     )
   )
@@ -1813,6 +1813,14 @@ export async function publishPr(
   if (matches.length > 1 || (explicit && (matches.length !== 1 || matches[0]!.number !== explicit.number)))
     throw new DeliveryError('Remote issue branch has conflicting PR matches.');
   let pr = explicit ?? (matches[0] === undefined ? undefined : await getPr(context, matches[0].number));
+  if (
+    pr &&
+    input.draft === false &&
+    input.headBranch === undefined &&
+    input.prNumber === undefined &&
+    (await linkedIssueBranches(context, input.issueNumber)).filter((entry) => entry.name === branch).length !== 1
+  )
+    throw new DeliveryError('Select an explicit PR or head after GitHub-linked branch references disappear.');
   if (reconcileReference && pr && !explicit)
     throw new DeliveryError(
       'Reference reconciliation of an existing match requires explicit --pr and caller-reconciled authority/attempt receipts.',
