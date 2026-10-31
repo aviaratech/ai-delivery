@@ -351,6 +351,8 @@ export function resolveProjectDeliveryConfiguration(
   if (statusField.__typename !== 'ProjectV2SingleSelectField' || statusField.isIssueField !== false) {
     throw new DeliveryError('Project Status must be the sole Project-owned single-select workflow field.');
   }
+  if (PROJECT_DELIVERY_STATUSES.some((status) => settings.statuses[status] === PROJECT_REVIEW_STATUS))
+    throw new DeliveryError(`Rename the configured Status that uses ${PROJECT_REVIEW_STATUS}; that name is reserved.`);
   const allStatusOptions = readOptions(statusField.options, `Project ${settings.statusField}`);
   const reviewOptions = allStatusOptions.filter((option) => option.name === PROJECT_REVIEW_STATUS);
   const statusOptions = allStatusOptions.filter((option) => option.name !== PROJECT_REVIEW_STATUS);

@@ -18,6 +18,7 @@ export interface DeliveryRouting {
   projectSource: 'explicit' | 'linked';
   statusFieldId: string;
   statusOptionIds: ProjectDeliveryConfiguration['statusOptionIds'];
+  reviewOptionId?: string;
   pointsFieldId: string;
   priorityFieldId: string;
   native: DeliveryConfig['native'];
@@ -241,6 +242,7 @@ export async function discoverDeliveryRouting(input: {
     projectSource,
     statusFieldId: selected.statusFieldId,
     statusOptionIds: selected.statusOptionIds,
+    ...(selected.reviewOptionId ? { reviewOptionId: selected.reviewOptionId } : {}),
     pointsFieldId: selected.pointsFieldId,
     priorityFieldId: selected.priorityFieldId,
     native: {

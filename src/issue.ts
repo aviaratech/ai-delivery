@@ -261,6 +261,7 @@ export async function loadDeliveryContext(input: {
     priorityFieldId: routing.priorityFieldId,
     statusFieldId: routing.statusFieldId,
     statusOptionIds: routing.statusOptionIds,
+    ...(routing.reviewOptionId ? { reviewOptionId: routing.reviewOptionId } : {}),
     settings: projectSettingsFromDeliveryConfig(config),
     writable: true,
   };
