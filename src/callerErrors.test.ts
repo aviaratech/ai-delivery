@@ -53,20 +53,6 @@ const cases: [AiDeliveryMcpToolName, Record<string, unknown>, string, string, st
     'too_small',
     ['artifact'],
   ],
-  [
-    'issue_pr_merge',
-    { issueNumber: 17, prNumber: 23, reviewedHeadSha: 'bad' },
-    'Reviewed head is invalid; provide the exact 40-character lowercase commit SHA.',
-    'invalid_format',
-    ['reviewedHeadSha'],
-  ],
-  [
-    'issue_pr_merge',
-    { prNumber: 23 },
-    'Direct merge is missing its issue number; provide issueNumber.',
-    'custom',
-    ['issueNumber'],
-  ],
 ];
 afterEach(() => vi.restoreAllMocks());
 

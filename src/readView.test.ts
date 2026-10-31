@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { test } from 'vitest';
+import { afterEach, test, vi } from 'vitest';
 
 import { recordedIssue233Links, recordedPr235Summary } from './fixtures/readView.js';
+import * as projectDelivery from './github/projectDelivery.js';
 import type { DeliveryContext } from './issue.js';
-import { latestJournal, readIssueLinks, readPrSummary, summarizePr } from './readView.js';
+import * as prs from './pr.js';
+import { latestJournal, prView, readIssueLinks, readPrSummary, summarizePr } from './readView.js';
 
 const pr235 = recordedPr235Summary.repository.pullRequest;
 const context = (response: unknown) =>
@@ -131,4 +133,32 @@ test('a PR summary reports its closing issues in this repository only', async ()
 
 test('a missing issue is one plain sentence, not a schema dump', async () => {
   await assert.rejects(readIssueLinks(context({ repository: { issue: null } }), 999), /Issue #999 was not found/u);
+});
+
+afterEach(() => vi.restoreAllMocks());
+
+test('a linked issue keeps the In Review flag of its Project item', async () => {
+  vi.spyOn(prs, 'prInfo').mockResolvedValue({ prNumber: 235 } as Awaited<ReturnType<typeof prs.prInfo>>);
+  vi.spyOn(projectDelivery, 'projectSettingsFromDeliveryConfig').mockReturnValue(
+    {} as ReturnType<typeof projectDelivery.projectSettingsFromDeliveryConfig>,
+  );
+  vi.spyOn(projectDelivery, 'getIssueProjectStatus').mockResolvedValue({
+    itemId: 'ITEM233',
+    status: 'In Progress',
+    review: true,
+  });
+  const graphql = async (query: string) =>
+    query.includes('ReadPrSummary') ? recordedPr235Summary : recordedIssue233Links;
+  const view = await prView(
+    {
+      ...context(null),
+      config: { native: { organization: 'aviaratech' } },
+      clients: { graphql },
+    } as unknown as DeliveryContext,
+    { prNumber: 235, issueNumber: 233 },
+  );
+  assert.deepEqual(
+    view.issues.map((issue) => [issue.number, issue.projectStatus, 'inReview' in issue ? issue.inReview : undefined]),
+    [[233, 'In Progress', true]],
+  );
 });

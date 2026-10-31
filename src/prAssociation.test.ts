@@ -1409,7 +1409,7 @@ describe('directory-independent exact-PR contract', () => {
         assert.match(creationHelp, /--reconcile-non-closing-reference/u);
         assert.match(creationHelp, /--expected-head <sha>/u);
         assert.match(creationHelp, /--expected-base <sha>/u);
-        for (const command of ['pr:create', 'pr:info', 'pr:review', 'pr:merge', 'finish']) {
+        for (const command of ['pr:create', 'pr:info', 'pr:review']) {
           const modeHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), command, '--help'], {
             cwd: root,
             env: { HOME: root, PATH: process.env.PATH },

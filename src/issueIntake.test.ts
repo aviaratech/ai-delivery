@@ -1657,13 +1657,6 @@ test('joined MCP start modes preserve ordinary input and reject mixed investigat
     ),
     /selectors disagree/u,
   );
-  const finish = getAiDeliveryMcpTool('issue_finish')!.inputSchema;
-  assert(finish.safeParse({ issueNumber: 17, prNumber: 23 }).success);
-  assert.equal(finish.safeParse({ issueNumber: 17 }).success, false);
-  assert.equal(
-    finish.safeParse({ issueNumber: 17, investigation: true, resultPath: '/fictional/result', prNumber: 23 }).success,
-    false,
-  );
 });
 
 test('created readiness refusal returns exact retry markers through safe resume and original request retry', async () => {

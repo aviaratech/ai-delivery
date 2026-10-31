@@ -10,9 +10,6 @@ import { test } from 'vitest';
 
 import pkg from '../package.json' with { type: 'json' };
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
-import type { LoadedDeliveryConfig } from './config/deliveryConfig.js';
-import { buildRuntimeAdmission, validateRuntimeAdmission } from './services/deliveryAdmission.js';
-import { retainedWorktreeTransitionProducerDigest } from './verification.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { BoardReconcilePlanSchema, BoardReconcileResultSchema } from './services/boardReconcileService.js';
 
@@ -544,49 +541,3 @@ test('standalone plugin ships application and bundled dependency notices', () =>
   assert.match(notices, /@modelcontextprotocol\/sdk/u);
   assert.match(notices, /commander/u);
 });
-
-test(
-  'a copied plugin has a real CLI and producer identity that existing admission can bind',
-  { tags: ['release'] },
-  () => {
-    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-native-identity-')));
-    const copiedRoot = join(directory, 'plugin');
-    cpSync(pluginRoot, copiedRoot, { recursive: true });
-    // The validator only reads repository/configDigest. No repository config,
-    // credentials, admission publication or lifecycle authority exists here.
-    const configuration = {
-      config: { repository: 'example/widget' },
-      configDigest: `sha256:${'a'.repeat(64)}`,
-    } as unknown as LoadedDeliveryConfig;
-    try {
-      const cliPath = join(copiedRoot, 'runtime', 'dist', 'cli.js');
-      assert.equal(
-        execFileSync(process.execPath, [cliPath, '--version'], { encoding: 'utf8', maxBuffer: 65536 }).trim(),
-        pkg.version,
-      );
-      const admission = buildRuntimeAdmission({
-        cliPath,
-        mcpLauncherPath: join(copiedRoot, 'dist', 'mcp-launcher.js'),
-        pluginManifestPath: join(copiedRoot, '.claude-plugin', 'plugin.json'),
-        packageVersion: pkg.version,
-        sourceArchiveSha256: `sha256:${'b'.repeat(64)}`,
-        sourceCommit: '1'.repeat(40),
-        configuration,
-      });
-      assert.equal(validateRuntimeAdmission(admission, configuration, cliPath).admissionId, admission.admissionId);
-      assert.match(
-        retainedWorktreeTransitionProducerDigest(join(copiedRoot, 'runtime', 'dist')),
-        /^sha256:[a-f0-9]{64}$/u,
-      );
-      const otherRoot = join(directory, 'other');
-      cpSync(copiedRoot, otherRoot, { recursive: true });
-      assert.throws(() =>
-        validateRuntimeAdmission(admission, configuration, join(otherRoot, 'runtime', 'dist', 'cli.js')),
-      );
-      writeFileSync(cliPath, `${readFileSync(cliPath, 'utf8')}\n/* altered runtime */\n`);
-      assert.throws(() => validateRuntimeAdmission(admission, configuration, cliPath));
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  },
-);

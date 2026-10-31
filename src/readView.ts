@@ -192,6 +192,7 @@ async function readIssueBrief(context: DeliveryContext, issueNumber: number) {
     number: issueNumber,
     state: links.state,
     projectStatus: status?.status ?? null,
+    ...(status?.review ? { inReview: true as const } : {}),
     latestJournal: links.latestJournal,
   };
 }

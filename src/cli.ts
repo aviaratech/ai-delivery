@@ -676,37 +676,6 @@ program
     }
   });
 
-for (const [command, tool] of [
-  ['pr:merge', 'issue_pr_merge'],
-  ['finish', 'issue_finish'],
-] as const) {
-  program
-    .command(command)
-    .requiredOption('--issue <number>')
-    .requiredOption('--pr <number>')
-    .option('--strategy <method>')
-    .option('--reviewed-head <sha>')
-    .option('--non-closing', 'Retain the referenced issue OPEN; finish refuses this mode')
-    .option('--dry-run')
-    .action(
-      async (o: {
-        issue: string;
-        pr: string;
-        strategy?: string;
-        reviewedHead?: string;
-        dryRun?: boolean;
-        nonClosing?: boolean;
-      }) =>
-        run(tool, {
-          issueNumber: int(o.issue),
-          prNumber: int(o.pr),
-          strategy: o.strategy,
-          reviewedHeadSha: o.reviewedHead,
-          dryRun: o.dryRun === true,
-          nonClosing: o.nonClosing,
-        }),
-    );
-}
 program
   .command('migrate:legacy-issues')
   .requiredOption('--input-file <path>', 'Offline legacy issue inventory JSON')

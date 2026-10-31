@@ -25,7 +25,6 @@ import {
   logWarn,
   setLogsSuppressed,
 } from './logger.js';
-import { addWorktreeEntry, removeWorktreeEntry, type WorktreeEntry } from './services/worktreeRegistry.js';
 
 // Project/field metadata is unrelated to stream routing. Keep these provider
 // adapters local while exercising real parent linking, issue start and dispatch.
@@ -233,40 +232,6 @@ test('parent replacement emits its diagnostic on stderr without writing any stdo
   }
 });
 
-test.each(['add', 'remove'] as const)(
-  'registry %s emits its diagnostic without writing any stdout bytes',
-  async (operation) => {
-    const f = fixture();
-    const row: WorktreeEntry = {
-      path: join(f.context.root, '.worktrees', 'synthetic'),
-      branch: 'issue/17',
-      type: 'issue',
-      issueNumber: 17,
-      identity: 'host-author',
-      status: 'active',
-      createdAt: '2026-10-08T00:00:00Z',
-      updatedAt: '2026-10-08T00:00:00Z',
-    };
-    const capture = captureStreams();
-    try {
-      await addWorktreeEntry(row, f.context.root);
-      if (operation === 'remove') {
-        capture.output.stdout = '';
-        capture.output.stderr = '';
-        assert.equal(await removeWorktreeEntry(row.path, f.context.root), true);
-      }
-      assert.equal(capture.output.stdout, '');
-      assert.match(
-        capture.output.stderr,
-        operation === 'add' ? /Added to worktree registry:/u : /Removed from worktree registry:/u,
-      );
-    } finally {
-      capture.restore();
-      f.cleanup();
-    }
-  },
-);
-
 async function runCli(
   context: DeliveryContext,
   args: string[],
@@ -274,7 +239,6 @@ async function runCli(
   vi.resetModules();
   const configuration = await import('./config/deliveryConfig.js');
   const issues = await import('./issue.js');
-  const admission = await import('./services/deliveryAdmission.js');
   const prs = await import('./pr.js');
   const dispatch = await import('./dispatch.js');
   vi.spyOn(configuration, 'loadDeliverySettings').mockResolvedValue({
@@ -286,9 +250,6 @@ async function runCli(
   });
   vi.spyOn(issues, 'loadDeliveryContext').mockResolvedValue(context);
   // Synthetic authorization seams: these tests exercise streams, not live access.
-  vi.spyOn(admission, 'assertDeliveryRuntimeAdmitted').mockResolvedValue(
-    {} as Awaited<ReturnType<typeof admission.assertDeliveryRuntimeAdmitted>>,
-  );
   vi.spyOn(prs, 'preflightReviewRoute').mockResolvedValue({} as Awaited<ReturnType<typeof prs.preflightReviewRoute>>);
   const argv = process.argv;
   const exitCode = process.exitCode;

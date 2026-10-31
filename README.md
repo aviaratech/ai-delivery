@@ -1,6 +1,6 @@
 # ai-delivery
 
-ai-delivery handles **GitHub issues, pull requests, independent reviews and guarded merges** through a CLI, stdio MCP server and Codex/Claude Code plugin. GitHub owns relationships, Project tracking, checks and review eligibility. Hosts prepare worktrees, run checks, commit, push and clean up.
+ai-delivery handles **GitHub issues, pull requests and independent reviews** through a CLI, stdio MCP server and Codex/Claude Code plugin. GitHub owns relationships, Project tracking, checks and review eligibility. Hosts prepare worktrees, run checks, commit, push and clean up.
 
 Explicit `--repo owner/name` or MCP `repo: "owner/name"` works outside Git. Without it, the checkout's `origin` selects the repository. Only `github.com` is supported. The runtime reads operator-owned JSON; it never executes a consuming repository's policy or checks.
 
@@ -65,14 +65,14 @@ ai-delivery --repo example/widget pr:create --issue 17 --body-file pr-body.md
 # Independent reviewer submits its own exact-head verdict/artifact.
 ai-delivery --repo example/widget pr:create --issue 17 --ready
 ai-delivery --repo example/widget pr:checks --pr 23
-ai-delivery --repo example/widget finish --issue 17 --pr 23 --reviewed-head <sha>
+gh pr merge 23 --repo example/widget --squash --match-head-commit <sha>
 ```
 
 GitHub's current required checks, counted reviews, blockers and merge eligibility govern the exact head/current base. The builder never approves its own work. Read back uncertain writes before retrying; a dry run grants no authority. Respect explicit provider/read-only requests and actual host refusals.
 
-After verified `finish`, cleanup removes only the exact clean registered worktree and local branch with retained-source proof. Run outside that worktree; unregistered or unsafe source stays in place with a reason.
+GitHub deletes the merged head branch; the host removes its own worktree.
 
-For partial delivery, `--non-closing` requires a canonical `References owner/repo#number` body and complete native evidence; a new linked-branch draft requires a separately authorized exact reference action. `finish` refuses nonclosing delivery. A complete executable child can close normally while its parent stays open.
+For partial delivery, `--non-closing` requires a canonical `References owner/repo#number` body and complete native evidence; a new linked-branch draft requires a separately authorized exact reference action. A complete executable child can close normally while its parent stays open.
 
 ## Command and tool map
 
@@ -91,7 +91,6 @@ These are all executable routes; groups/help flags are omitted. A dash means no 
 | Pull requests: observations | `pr:list`, `pr:checks` | — |
 | Reviews: artifact | `pr:review` | `issue_pr_review` |
 | Reviews: profile/verdict | `review doctor`, `review submit` | — |
-| Merges/completion | `pr:merge`, `finish` | `issue_pr_merge`, `issue_finish` |
 | Delivery support: plugin | `plugin install`, `plugin doctor`, `plugin preview`, `plugin update`, `plugin rollback`, `plugin remove` | — |
 | Issues: offline migration plan | `migrate:legacy-issues` | — |
 | All: setup/transport | `config:resolve`, `mcp:serve` | — |
@@ -116,4 +115,4 @@ Release still requires the exact mandatory archive inventory, complete release/c
 
 Release is manual, main-only and uses npm trusted publishing. A packaged README edit changes the release candidate: retain accepted archives and independently qualify the new exact source/archive before dispatching.
 
-Source version **0.3.36** and green PR checks do not establish its qualification; see [#199](https://github.com/aviaratech/ai-delivery/issues/199). Wrappers and workflow definitions do not prove [#200](https://github.com/aviaratech/ai-delivery/issues/200)'s **under-60-second regular checks / under-five-minute qualification** targets. Functional removals and remaining documentation obligations stay with [#201](https://github.com/aviaratech/ai-delivery/issues/201).
+Source version **0.3.37** and green PR checks do not establish its qualification; see [#199](https://github.com/aviaratech/ai-delivery/issues/199). Wrappers and workflow definitions do not prove [#200](https://github.com/aviaratech/ai-delivery/issues/200)'s **under-60-second regular checks / under-five-minute qualification** targets. Functional removals and remaining documentation obligations stay with [#201](https://github.com/aviaratech/ai-delivery/issues/201).

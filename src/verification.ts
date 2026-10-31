@@ -20,28 +20,10 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
 import { assertPrivateFile } from './delivery/common.js';
-import {
-  digestBytes,
-  digestValue,
-  writeRepositoryCommandOutput,
-  type RepositoryClassificationReceipt,
-  type RepositoryStageAggregate,
-  type RepositoryStageReceipt,
-} from './delivery/legacy.js';
+import { digestBytes, digestValue, writeRepositoryCommandOutput } from './delivery/legacy.js';
 import { DeliveryError } from './errors.js';
 import { gitCommonDir } from './git.js';
 import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
-
-export interface VerificationRun {
-  aggregate: RepositoryStageAggregate;
-  classification: RepositoryClassificationReceipt;
-  completedAt: string;
-  manifestId: string;
-  resources?: VerificationResourceSummary;
-  schemaVersion: 'ai-delivery.run@1' | 'ai-delivery.run@2' | 'ai-delivery.run@3';
-  writer?: { worktreeDigest: string; producerDigest: string };
-  stageReceipts: RepositoryStageReceipt[];
-}
 
 export interface VerificationResourceBounds {
   maxAggregateRssBytes: number;
@@ -819,28 +801,6 @@ export function terminateOwnedProcesses(state: OwnedProcessState): void {
   for (const member of alive.reverse()) signal(member.pid);
 }
 
-const ProcessIdentitySchema = z.strictObject({ pid: z.number().int().positive(), identity: z.string().min(1) });
-const WriterStateSchema = z
-  .strictObject({
-    schemaVersion: z.literal('ai-delivery.verification-writer@1'),
-    writerId: z.uuid(),
-    worktreeDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-    owner: ProcessIdentitySchema,
-    command: z.union([
-      z.strictObject({ phase: z.literal('idle') }),
-      z.strictObject({ phase: z.literal('starting') }),
-      z.strictObject({
-        phase: z.literal('running'),
-        root: ProcessIdentitySchema,
-        tracked: z.array(z.strictObject({ ...ProcessIdentitySchema.shape, pgid: z.number().int().positive() })),
-      }),
-    ]),
-    stateId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  })
-  .superRefine((state, ctx) => {
-    const { stateId, ...content } = state;
-    if (stateId !== digestValue(content)) ctx.addIssue({ code: 'custom', message: 'Writer state is corrupt.' });
-  });
 interface VerificationWriter {
   starting(): void;
   observed(state: OwnedProcessState): void;
@@ -848,49 +808,6 @@ interface VerificationWriter {
   assertQuiescent(): void;
 }
 
-/** @internal Durable transition evidence must precede changes to the existing writer slot. */
-export interface WorktreeTransitionWriterLeaseInput {
-  repoRoot: string;
-  worktreePath?: string;
-  writerId: string;
-  beforeClaim(input: {
-    previousBytes: Buffer | undefined;
-    owner: { pid: number; identity: string };
-  }): void | Promise<void>;
-  recordClaim(bytes: Buffer): void | Promise<void>;
-  afterClaim?(bytes: Buffer): void | Promise<void>;
-  recordRelease(bytes: Buffer): void | Promise<void>;
-  afterRelease?(): void | Promise<void>;
-  onLockReleaseError?: (error: unknown) => void;
-  onLockCompromised?: (error: Error) => void;
-}
-
-/** @internal Read-only closure check shared by inspection and the locked transition lease. */
-export function assertWorktreeTransitionWriterQuiescent(worktreePath: string, bytes: Buffer | undefined): void {
-  if (bytes === undefined) return;
-  const previous = WriterStateSchema.parse(JSON.parse(bytes.toString('utf8')));
-  if (previous.worktreeDigest !== worktreeDigest(worktreePath))
-    throw new DeliveryError('Verification writer belongs to another worktree.');
-  const snapshot = processSnapshot();
-  const owner = snapshot.get(previous.owner.pid);
-  if (owner?.identity === previous.owner.identity && !owner.status.startsWith('Z'))
-    throw new DeliveryError('A live verification writer still owns this worktree.');
-  if (previous.command.phase === 'starting')
-    throw new DeliveryError('Interrupted writer has unknown command ownership; reconcile before retrying.');
-  if (previous.command.phase === 'running') {
-    const identities = [previous.command.root, ...previous.command.tracked];
-    const groups = new Set([previous.command.root.pid, ...previous.command.tracked.map((member) => member.pgid)]);
-    if (
-      identities.some((member) => snapshot.has(member.pid)) ||
-      [...snapshot.values()].some((member) => groups.has(member.pgid))
-    )
-      throw new DeliveryError('Transition requires identity-bound command and process-group absence.');
-  }
-}
-
-function worktreeDigest(root: string): string {
-  return digestValue(resolve(root));
-}
 function producerContent(root: string) {
   const code: { path: string; digest: string }[] = [];
   const collect = (directory: string): void => {

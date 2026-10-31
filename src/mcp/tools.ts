@@ -98,19 +98,6 @@ const NormalStart = z.strictObject({
   resumeCreated: z.boolean().optional(),
   branch: z.string().min(1).optional(),
 });
-const NormalFinish = z.strictObject({
-  repo: Repo,
-  verbose: Verbose,
-  issueNumber: Positive,
-  prNumber: Positive,
-  nonClosing: z.boolean().optional(),
-  reviewedHeadSha: z
-    .string()
-    .regex(/^[a-f0-9]{40}$/u)
-    .optional(),
-  strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
-  dryRun: z.boolean().optional(),
-});
 const IssueListing = {
   repo: Repo,
   verbose: Verbose,
@@ -324,35 +311,6 @@ export const AI_DELIVERY_MCP_TOOLS = [
       identity: z.string().min(1).optional(),
       dryRun: z.boolean().optional(),
     }),
-  },
-  {
-    name: 'issue_pr_merge',
-    commandName: 'pr:merge',
-    description: 'Guarded exact-head merge',
-    inputSchema: z
-      .strictObject({
-        repo: Repo,
-        verbose: Verbose,
-        issueNumber: Positive.optional(),
-        prNumber: Positive,
-        nonClosing: z.boolean().optional(),
-        reviewedHeadSha: z
-          .string()
-          .regex(/^[a-f0-9]{40}$/u, 'Reviewed head is invalid; provide the exact 40-character lowercase commit SHA.')
-          .optional(),
-        strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
-        dryRun: z.boolean().optional(),
-      })
-      .refine((input) => input.issueNumber !== undefined, {
-        path: ['issueNumber'],
-        message: 'Direct merge is missing its issue number; provide issueNumber.',
-      }),
-  },
-  {
-    name: 'issue_finish',
-    commandName: 'finish',
-    description: 'Finish merged delivery',
-    inputSchema: NormalFinish,
   },
 ] as const;
 

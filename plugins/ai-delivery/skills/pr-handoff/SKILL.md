@@ -20,7 +20,7 @@ ai-delivery review submit --pr <pr> --head <sha> --identity <reviewer-profile> \
 # Mark it ready, check it, and merge.
 ai-delivery --repo <owner/name> pr:create --issue <n> --ready
 ai-delivery --repo <owner/name> pr:checks --pr <pr>
-ai-delivery --repo <owner/name> finish --issue <n> --pr <pr> --reviewed-head <sha>
+gh pr merge <pr> --repo <owner/name> --squash --match-head-commit <sha>
 ```
 
 ## Rules
@@ -33,9 +33,9 @@ ai-delivery --repo <owner/name> finish --issue <n> --pr <pr> --reviewed-head <sh
   The reviewer submits that file itself.
 - **New head.** If the head changes after review, the reviewer reviews the new
   head before merge.
-- **Merging.** `finish` merges only when GitHub says the PR can merge at the
-  reviewed head with its required checks green. If it refuses, fix the reason
-  it gives. Don't merge another way.
+- **Merging.** GitHub's branch rules decide when the PR can merge.
+  `--match-head-commit` merges only the reviewed head. If GitHub refuses, fix
+  the reason it gives.
 - **Unclear results.** If a command times out or its result is unclear, run
   `pr:info` before retrying, so you don't create a duplicate.
 - **Reviewer setup.** To check a reviewer App's setup without posting
