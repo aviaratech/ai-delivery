@@ -62,13 +62,6 @@ const cases: [AiDeliveryMcpToolName, Record<string, unknown>, string, string, st
   ],
   [
     'issue_pr_merge',
-    { prNumber: 23, queue: true, dryRun: true },
-    'Queue requests cannot include direct-merge options; remove those options or omit queue.',
-    'custom',
-    [],
-  ],
-  [
-    'issue_pr_merge',
     { prNumber: 23 },
     'Direct merge is missing its issue number; provide issueNumber.',
     'custom',

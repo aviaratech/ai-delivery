@@ -12,7 +12,7 @@ Use `--host claude-code` for Claude Code, with its supported `user`, `project`, 
 
 Standalone MCP registration is legacy; new consumers should install one complete plugin. CLI, SDK, and MCP entry points remain available. Legacy support lasts at least two subsequent stable releases and 90 days after a qualified migration path first ships. The actual release/date anchor is unknown: this diagnostics phase starts no clock and removes no legacy support.
 
-Remote tools accept explicit `repo` outside a checkout; one server can switch repositories. Roles default from settings without `AI_DELIVERY_IDENTITY`. Hosts own worktrees, checks, commits, and pushes. `runtime:stage`/`runtime:admit` remain separate; plugin installation neither activates private runtimes nor adopts historical custody.
+Remote tools accept explicit `repo` outside a checkout; one server can switch repositories. Roles default from settings without `AI_DELIVERY_IDENTITY`. Hosts own worktrees, checks, commits, and pushes. Plugin installation does not adopt historical custody.
 
 ## Preview, activation, and migration
 

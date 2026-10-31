@@ -407,14 +407,15 @@ describe('per-call repository selection', () => {
       assert.deepEqual(journalTargets, ['example/a', 'example/b', 'example/a', 'example/a']);
       assert.equal(vi.mocked(repository.resolveRepoFromRemote).mock.calls.length, 0);
       const names = AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name as string);
-      for (const removed of ['issue_develop', 'issue_verify', 'issue_worktree_create'])
-        assert.equal(names.includes(removed), false);
-      for (const retained of [
+      for (const removed of [
+        'issue_develop',
+        'issue_verify',
+        'issue_worktree_create',
         'runtime_stage',
         'runtime_admit',
-        'issue_worktree_transition_inspect',
-        'issue_worktree_transition_apply',
       ])
+        assert.equal(names.includes(removed), false);
+      for (const retained of ['issue_worktree_transition_inspect', 'issue_worktree_transition_apply'])
         assert.equal(names.includes(retained), true);
     } finally {
       await client.close();

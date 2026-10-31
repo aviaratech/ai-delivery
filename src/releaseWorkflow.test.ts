@@ -29,7 +29,6 @@ import { gzipSync } from 'node:zlib';
 import { Script } from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'vitest';
-import { withResolvedClosureDiagnostic } from './fixtures/resolvedClosureDiagnostic.js';
 
 type Json = { [key: string]: unknown };
 type DiagnosticReads = { readSync?: typeof readSync; openSync?: typeof openSync; lstatSync?: typeof lstatSync };
@@ -529,106 +528,6 @@ function diagnosticFixture() {
   };
 }
 
-test('closure provenance survives the scanned artifact boundary without masking its assertion', () => {
-  for (const scenario of ['hidden', 'installed', 'missing', 'unsafe', 'oversized', 'invalid'] as const) {
-    const f = diagnosticFixture();
-    try {
-      const runtimeDirectory = join(f.root, 'current', 'staged');
-      const fixtureRoot = join(f.root, 'current', 'consumer');
-      const actual = `file:${join(f.root, 'other-fixture', 'staged', 'reviewed-archive.tgz')}`;
-      const hidden = join(runtimeDirectory, 'node_modules', '.package-lock.json');
-      const installed = join(runtimeDirectory, 'node_modules', '@aviaratech', 'ai-delivery', 'package.json');
-      const declared = 'file:reviewed-archive.tgz';
-      const packages = {
-        '': { dependencies: { '@aviaratech/ai-delivery': declared } },
-        'node_modules/@aviaratech/ai-delivery': { resolved: declared },
-      };
-      mkdirSync(dirname(hidden), { recursive: true });
-      mkdirSync(dirname(installed), { recursive: true });
-      writeFileSync(
-        hidden,
-        JSON.stringify({
-          packages: { 'node_modules/@aviaratech/ai-delivery': { resolved: scenario === 'hidden' ? actual : declared } },
-        }),
-      );
-      writeFileSync(installed, JSON.stringify({ _resolved: actual, _where: fixtureRoot, private: f.sensitive }));
-      if (scenario === 'missing') rmSync(hidden);
-      if (scenario === 'unsafe') {
-        rmSync(hidden);
-        symlinkSync(installed, hidden);
-      }
-      if (scenario === 'oversized') truncateSync(hidden, 65537);
-      if (scenario === 'invalid') writeFileSync(hidden, '{');
-      const input = {
-        runtimeDirectory,
-        fixtureRoot,
-        actual,
-        rootPackage: Buffer.from(JSON.stringify(packages[''])),
-        rootLock: Buffer.from(JSON.stringify({ packages })),
-      };
-      const failure = new Error('Recorded absolute closure mismatch');
-      const chunks: string[] = [];
-      assert.throws(
-        () =>
-          withResolvedClosureDiagnostic(
-            input,
-            () => {
-              throw failure;
-            },
-            (line) => chunks.push(line),
-          ),
-        (error) => error === failure,
-      );
-      assert.equal(chunks.length, 1, 'The failed assertion must emit its provenance receipt.');
-      const output = chunks[0]!;
-      assert.ok(Buffer.byteLength(output) <= 2048);
-      assert.ok(output.startsWith('RESOLVED_CLOSURE_ORIGIN_RECEIPT '));
-      assert.ok(!output.includes(f.root) && !output.includes(f.sensitive));
-      const receipt = JSON.parse(output.slice(output.indexOf(' ') + 1)) as Json;
-      const root = receipt['root'] as Json;
-      const observed = receipt['actual'] as Json;
-      const hiddenReceipt = receipt['hidden'] as Json;
-      assert.equal(root['previouslyCaptured'], true);
-      assert.equal(observed['matchesExpected'], false);
-      assert.equal(hiddenReceipt['state'], ['hidden', 'installed'].includes(scenario) ? 'valid' : scenario);
-      if (scenario === 'hidden') assert.equal((hiddenReceipt['resolved'] as Json)['matchesActual'], true);
-      if (scenario === 'installed')
-        assert.equal(((receipt['installed'] as Json)['resolved'] as Json)['matchesActual'], true);
-      f.log(`release-tests-${f.runId}/tests/stdout.txt`, output);
-      f.execute();
-      const directory = f.logs();
-      assert.ok(directory);
-      const uploaded = failureLogUpload(directory, 'success', 'true');
-      assert.equal(readFileSync(uploaded.find((file) => file.name === 'release.stdout.txt')!.path, 'utf8'), output);
-      assert.deepEqual(failureLogUpload(directory, 'failure', 'true'), []);
-      assert.throws(
-        () =>
-          withResolvedClosureDiagnostic(
-            input,
-            () => {
-              throw failure;
-            },
-            () => {
-              throw new Error('Reporting unavailable');
-            },
-          ),
-        (error) => error === failure,
-      );
-      let emitted = false;
-      withResolvedClosureDiagnostic(
-        input,
-        () => {},
-        () => {
-          emitted = true;
-        },
-      );
-      assert.equal(emitted, false);
-    } finally {
-      rmSync(f.root, { recursive: true, force: true });
-    }
-  }
-});
-
 test.each(['producer', 'release', 'both'] as const)(
   'failed qualification stages exact fixed %s test output including the actual synthetic receipt',
   (scope) => {
@@ -1021,14 +920,14 @@ test.each([1110, 1114, 1122])('diagnostic frames preserve the public closure hel
   const f = diagnosticFixture();
   try {
     f.failures([
-      `AssertionError: ${f.sensitive}\n    at closure (${f.sourceRoot}/src/setup.test.ts:1108:7)\n    at test (${f.sourceRoot}/src/setup.test.ts:${caller}:3)`,
+      `AssertionError: ${f.sensitive}\n    at closure (${f.sourceRoot}/src/lifecycle.test.ts:1108:7)\n    at test (${f.sourceRoot}/src/lifecycle.test.ts:${caller}:3)`,
     ]);
     assert.deepEqual(f.frames(), {
       status: 'matched',
       truncated: false,
       frames: [
-        { file: 'src/setup.test.ts', line: 1108, column: 7, message: 1 },
-        { file: 'src/setup.test.ts', line: caller, column: 3, message: 1 },
+        { file: 'src/lifecycle.test.ts', line: 1108, column: 7, message: 1 },
+        { file: 'src/lifecycle.test.ts', line: caller, column: 3, message: 1 },
       ],
     });
   } finally {
@@ -1039,19 +938,19 @@ test.each([1110, 1114, 1122])('diagnostic frames preserve the public closure hel
 test('diagnostic frames preserve message order, repeats, file URLs and distinct source/dist coordinates', () => {
   const f = diagnosticFixture();
   try {
-    const source = pathToFileURL(join(f.sourceRoot, 'src/setup.test.ts')).href;
+    const source = pathToFileURL(join(f.sourceRoot, 'src/lifecycle.test.ts')).href;
     f.failures([
-      `${f.sensitive}\n    at privateFrame (/private/unrelated/src/setup.test.ts:5:2)\n    at closure (\u001b[36m${source}:1108:7\u001b[0m)\n    at caller (${f.sourceRoot}/src/setup.test.ts:1110:3)`,
-      `Error: ${f.sensitive}\n    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)\n    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)`,
+      `${f.sensitive}\n    at privateFrame (/private/unrelated/src/lifecycle.test.ts:5:2)\n    at closure (\u001b[36m${source}:1108:7\u001b[0m)\n    at caller (${f.sourceRoot}/src/lifecycle.test.ts:1110:3)`,
+      `Error: ${f.sensitive}\n    at compiled (${f.sourceRoot}/dist/lifecycle.test.js:100:4)\n    at compiled (${f.sourceRoot}/dist/lifecycle.test.js:100:4)`,
     ]);
     assert.deepEqual(f.frames(), {
       status: 'matched',
       truncated: false,
       frames: [
-        { file: 'src/setup.test.ts', line: 1108, column: 7, message: 1 },
-        { file: 'src/setup.test.ts', line: 1110, column: 3, message: 1 },
-        { file: 'dist/setup.test.js', line: 100, column: 4, message: 2 },
-        { file: 'dist/setup.test.js', line: 100, column: 4, message: 2 },
+        { file: 'src/lifecycle.test.ts', line: 1108, column: 7, message: 1 },
+        { file: 'src/lifecycle.test.ts', line: 1110, column: 3, message: 1 },
+        { file: 'dist/lifecycle.test.js', line: 100, column: 4, message: 2 },
+        { file: 'dist/lifecycle.test.js', line: 100, column: 4, message: 2 },
       ],
     });
   } finally {
@@ -1140,7 +1039,7 @@ test.each([
 ])('diagnostic reader refuses malformed %s observations without guessing identities', (failure) => {
   const f = diagnosticFixture();
   try {
-    f.failures([`    at caller (${f.sourceRoot}/src/setup.test.ts:1110:3)`]);
+    f.failures([`    at caller (${f.sourceRoot}/src/lifecycle.test.ts:1110:3)`]);
     const wire = f.raw();
     const release = wire['release'] as Json;
     const inventory = release['inventory'] as Json;
@@ -1201,12 +1100,12 @@ test.each([
 test.each(['link', 'changed-coordinates'])('diagnostic reader refuses %s public source after projection', (failure) => {
   const f = diagnosticFixture();
   try {
-    const path = join(f.sourceRoot, 'src/setup.test.ts');
+    const path = join(f.sourceRoot, 'src/lifecycle.test.ts');
     f.failures([`    at caller (${path}:1110:3)`]);
     const wire = f.raw();
     if (failure === 'link') {
       rmSync(path);
-      symlinkSync(join(f.sourceRoot, 'dist/setup.test.js'), path);
+      symlinkSync(join(f.sourceRoot, 'dist/lifecycle.test.js'), path);
     } else writeFileSync(path, '// changed\n');
     assert.throws(() => decodeDiagnostic(wire, 'a'.repeat(40), f.sourceRoot));
   } finally {
@@ -1366,10 +1265,10 @@ test.each(['frames', 'messages', 'text', 'lines', 'line-bytes', 'partial-line', 
   (bound) => {
     const f = diagnosticFixture();
     try {
-      const helper = `    at closure (${f.sourceRoot}/src/setup.test.ts:1108:7)`;
-      const caller = `    at caller (${f.sourceRoot}/src/setup.test.ts:1110:3)`;
+      const helper = `    at closure (${f.sourceRoot}/src/lifecycle.test.ts:1108:7)`;
+      const caller = `    at caller (${f.sourceRoot}/src/lifecycle.test.ts:1110:3)`;
       let messages = [helper + '\n' + caller];
-      let expected = [{ file: 'src/setup.test.ts', line: 1108, column: 7, message: 1 }];
+      let expected = [{ file: 'src/lifecycle.test.ts', line: 1108, column: 7, message: 1 }];
       if (bound === 'frames') {
         messages = [Array.from({ length: 5 }, () => helper).join('\n')];
         expected = Array.from({ length: 4 }, () => expected[0]!);
@@ -1402,9 +1301,9 @@ test.each(['private-suffix', 'path-traversal', 'file-query', 'file-host', 'funct
   (kind) => {
     const f = diagnosticFixture();
     try {
-      const file = join(f.sourceRoot, 'src/setup.test.ts');
+      const file = join(f.sourceRoot, 'src/lifecycle.test.ts');
       let frame = `    at fake (/private${file}:1108:7)`;
-      if (kind === 'path-traversal') frame = `    at fake (${f.sourceRoot}/src/../src/setup.test.ts:1108:7)`;
+      if (kind === 'path-traversal') frame = `    at fake (${f.sourceRoot}/src/../src/lifecycle.test.ts:1108:7)`;
       if (kind === 'file-query') frame = `    at fake (${pathToFileURL(file).href}?${f.sensitive}:1108:7)`;
       if (kind === 'file-host') frame = `    at fake (file://unrelated${file}:1108:7)`;
       if (kind === 'function-body') frame = `Error: (not a frame ${file}:1108:7)`;
@@ -1421,7 +1320,7 @@ test.each(['0:1', '-1:1', '1202:1', '1:999', '999999999999999999:1'])(
   (coordinates) => {
     const f = diagnosticFixture();
     try {
-      f.failures([`    at closure (${f.sourceRoot}/src/setup.test.ts:${coordinates})`]);
+      f.failures([`    at closure (${f.sourceRoot}/src/lifecycle.test.ts:${coordinates})`]);
       assert.deepEqual(f.frames(), { status: 'unknown', truncated: false, frames: [] });
     } finally {
       rmSync(f.root, { recursive: true, force: true });
@@ -1432,18 +1331,18 @@ test.each(['0:1', '-1:1', '1202:1', '1:999', '999999999999999999:1'])(
 test('diagnostic frames do not follow public-code symlinks or claim malformed messages are complete', () => {
   const f = diagnosticFixture();
   try {
-    const file = join(f.sourceRoot, 'src/setup.test.ts');
+    const file = join(f.sourceRoot, 'src/lifecycle.test.ts');
     rmSync(file);
-    symlinkSync(join(f.sourceRoot, 'dist/setup.test.js'), file);
+    symlinkSync(join(f.sourceRoot, 'dist/lifecycle.test.js'), file);
     f.failures([`    at closure (${file}:1108:7)`]);
     assert.deepEqual(f.frames(), { status: 'unknown', truncated: false, frames: [] });
-    f.failures([null, `    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)`]);
+    f.failures([null, `    at compiled (${f.sourceRoot}/dist/lifecycle.test.js:100:4)`]);
     assert.deepEqual(f.frames(), {
       status: 'unknown',
       truncated: false,
-      frames: [{ file: 'dist/setup.test.js', line: 100, column: 4, message: 2 }],
+      frames: [{ file: 'dist/lifecycle.test.js', line: 100, column: 4, message: 2 }],
     });
-    f.failures([`    at compiled (${f.sourceRoot}/dist/setup.test.js:100:4)`], 'passed');
+    f.failures([`    at compiled (${f.sourceRoot}/dist/lifecycle.test.js:100:4)`], 'passed');
     assert.equal(f.frames(), undefined);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
@@ -2456,7 +2355,7 @@ test.each(['archive-drift', 'source-drift', 'compiled-drift', 'destination-link'
       if (failure === 'archive-drift') writeFileSync(f.archivePath, 'changed archive');
       if (failure === 'source-drift') writeFileSync(join(f.source, 'untracked'), 'changed source');
       if (failure === 'compiled-drift') {
-        writeFileSync(join(f.source, 'dist/setup.test.js'), '// changed ignored compiled bytes\n');
+        writeFileSync(join(f.source, 'dist/lifecycle.test.js'), '// changed ignored compiled bytes\n');
         assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: f.source, encoding: 'utf8' }), '');
       }
       if (failure === 'destination-link') symlinkSync(f.archivePath, destination);

@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import {
-  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -11,9 +9,8 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { hostname, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { onTestFinished, vi } from 'vitest';
 import type { LoadedDeliverySettings, GitHubDeliveryConfig, LoadedGitHubConfig } from '../config/deliveryConfig.js';
 import type { DeliveryRouting } from '../github/discovery.js';
@@ -24,10 +21,8 @@ import * as githubClients from '../github/client.js';
 import * as issueOwner from '../issue.js';
 import type { DeliveryContext } from '../issue.js';
 import { renderJournal, type JournalInput } from '../issueJournal.js';
-import * as queueOwner from '../mergeQueue.js';
 import * as worktreeOwner from '../worktree.js';
 import * as projectOwner from '../github/projectDelivery.js';
-import { retainedWorktreeTransitionProducerDigest } from '../verification.js';
 import { fixtureGit } from './inertTarget.js';
 import { syntheticDiscoveryClients, syntheticDiscoveryConfig, syntheticOverrides } from './discovery.js';
 
@@ -65,7 +60,6 @@ export interface BoardReplayOptions {
   contextIdentityMismatch?: boolean;
   lateMetricFailure?: boolean;
   recentBoundary?: boolean;
-  queue?: 'missing' | 'corrupt' | 'unsafe' | 'no-checkout';
 }
 
 /** Fictional native projections. Only external client/context ports and forbidden writers are replaced. */
@@ -85,7 +79,6 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     unexpectedReads: 0,
     clientFactory: 0,
     contexts: 0,
-    queueReads: 0,
   };
   const count = (name: string) => {
     calls.operations[name] = (calls.operations[name] ?? 0) + 1;
@@ -102,7 +95,6 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
       mtimeMs: stat.mtimeMs,
     };
   };
-  const queueHashes = new Map<string, ReturnType<typeof snapshot>>();
   const configHashes = new Map<string, ReturnType<typeof snapshot>>();
   const dispose = () => {
     if (disposed) return;
@@ -162,7 +154,7 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     },
     configPath: join(base, 'SYNTHETIC_PRIVATE_CONFIG'),
     overrides,
-    checkoutRoots: options.queue === 'no-checkout' ? [] : [base],
+    checkoutRoots: [base],
     sourceDigest: digestValue({ fixture: 'delivery-board-settings' }),
   };
   const config = (repository: string): GitHubDeliveryConfig => ({
@@ -673,76 +665,8 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     fixtureGit(root, 'add', '.');
     fixtureGit(root, 'commit', '-m', 'Synthetic inert target');
     configHashes.set(root, snapshot(join(root, '.git', 'config')));
-    const directory = join(root, '.git', 'ai-delivery', 'merge-queue');
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const path = join(directory, 'queue.json');
-    if (options.queue !== 'missing') {
-      const repository = repos[i]!;
-      const entries = Array.from({ length: 5 }, (_, j) => ({
-        id: randomUUID(),
-        issueNumber: 11 + j,
-        prNumber: 101 + j,
-        prId: prId(repository, 101 + j),
-        head: sha(101 + j + i * 1000),
-        authorLogin: 'fixture-author',
-        sequence: j,
-        notified: [],
-        state: 'waiting',
-        reason: 'SYNTHETIC_PRIVATE_REASON /synthetic/private/path',
-      }));
-      const content = {
-        schemaVersion: 'ai-delivery.merge-queue@2',
-        binding: digestValue({
-          repository: repoId(repository),
-          common: join(root, '.git'),
-          host: hostname(),
-          uid: process.getuid?.(),
-          config: context(repository).configuration!.configDigest,
-          runtime: retainedWorktreeTransitionProducerDigest(
-            dirname(fileURLToPath(new URL('../mergeQueue.js', import.meta.url))),
-          ),
-        }),
-        baseRef: 'main',
-        writerRoot: root,
-        entries,
-        grants: [
-          {
-            id: 'synthetic-grant',
-            bodyDigest: 'SYNTHETIC_GRANT_BODY',
-            authorId: 'actor',
-            authorLogin: 'fixture-author',
-            repositoryId: repoId(repository),
-            anchorId: 'anchor',
-            anchorNumber: 1,
-            expiresAt: '2099-01-01',
-            consumed: 0,
-            members: [{ entryId: entries[0]!.id, prId: entries[0]!.prId, prNumber: entries[0]!.prNumber }],
-          },
-        ],
-        pending: {
-          kind: 'comment',
-          entryId: entries[0]!.id,
-          key: 'notice',
-          body: 'SYNTHETIC_PENDING_BODY /synthetic/private/path',
-          actor: 'fixture-author',
-          prId: entries[0]!.prId,
-        },
-      };
-      writeFileSync(
-        path,
-        JSON.stringify({ ...content, stateId: options.queue === 'corrupt' ? 'invalid' : digestValue(content) }),
-        { mode: 0o600 },
-      );
-      if (options.queue === 'unsafe') chmodSync(path, 0o666);
-    }
-    queueHashes.set(path, snapshot(path));
   }
   vi.spyOn(configuration, 'loadDeliverySettings').mockResolvedValue(settings);
-  const readQueueStatus = queueOwner.queueStatus;
-  vi.spyOn(queueOwner, 'queueStatus').mockImplementation(async (...args) => {
-    calls.queueReads++;
-    return readQueueStatus(...args);
-  });
   vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockImplementation(async (input) => {
     input.signal?.throwIfAborted();
     calls.clientFactory++;
@@ -772,14 +696,6 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     calls.perItemStatusReads++;
     throw new Error('Per-item Project lookup forbidden');
   });
-  vi.spyOn(queueOwner, 'enqueuePr').mockImplementation(async () => {
-    calls.nativeWrites++;
-    throw new Error('Queue enqueue forbidden');
-  });
-  vi.spyOn(queueOwner, 'runQueue').mockImplementation(async () => {
-    calls.nativeWrites++;
-    throw new Error('Queue advance forbidden');
-  });
   vi.spyOn(worktreeOwner, 'prepareIssueWorktree').mockImplementation(async () => {
     calls.setupCalls++;
     throw new Error('Checkout setup forbidden');
@@ -791,8 +707,6 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
     assert.equal(calls.perItemStatusReads, 0);
     assert.equal(calls.unexpectedReads, 0);
     assert.equal(existsSync(trap), false);
-    for (const [path, original] of queueHashes)
-      assert.deepEqual(snapshot(path), original, 'queue bytes, mode and identity remain unchanged');
     for (const [root, original] of configHashes)
       assert.deepEqual(snapshot(join(root, '.git', 'config')), original, 'checkout configuration remains unchanged');
   };
