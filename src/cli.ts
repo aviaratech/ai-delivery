@@ -459,7 +459,9 @@ program
 program
   .command('info')
   .requiredOption('--issue <number>')
-  .action(async (o: { issue: string }) => run('issue_info', { issueNumber: int(o.issue) }));
+  .action(async (o: { issue: string }) =>
+    run('issue_info', { issueNumber: int(o.issue), verbose: program.opts<{ verbose?: boolean }>().verbose === true }),
+  );
 program
   .command('ready:check')
   .requiredOption('--issue <number>')

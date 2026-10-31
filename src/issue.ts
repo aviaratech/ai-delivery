@@ -2418,8 +2418,10 @@ export interface IssueChildProgress {
   targetDateConfigured: boolean;
 }
 
+export type IssueChildCounts = Pick<IssueChildProgress, 'childCount' | 'closedChildCount' | 'percentClosed'>;
+
 export interface IssueInfo {
-  childProgress?: IssueChildProgress;
+  childProgress?: IssueChildProgress | IssueChildCounts;
   deferred?: IssueDeferralData | null;
   routing?: LoadedDeliveryConfig['routing'];
   blockedBy: number[];
@@ -2448,6 +2450,7 @@ async function readIssueInfo(
   issueNumber: number,
   includeProject = true,
   expectedTarget?: { nodeId: string; url: string },
+  childDetail = true,
 ) {
   const { clients, config, repo } = context;
   const issue = (await clients.rest.issues.get({ issue_number: issueNumber, owner: repo.owner, repo: repo.repo })).data;
@@ -2489,7 +2492,13 @@ async function readIssueInfo(
     nativeIssueSettingsFromDeliveryConfig(config),
   );
   const info: IssueInfo = {
-    ...(children.length ? { childProgress: await readChildProgress(context, children, nativeFields.catalog) } : {}),
+    ...(children.length
+      ? {
+          childProgress: childDetail
+            ? await readChildProgress(context, children, nativeFields.catalog)
+            : childCounts(children),
+        }
+      : {}),
     ...deferralReadback(issue.body, issue.title),
     ...(context.configuration ? { routing: context.configuration.routing } : {}),
     blockedBy: relationships.blockers.filter((blocker) => blocker.state === 'OPEN').map((blocker) => blocker.number),
@@ -2520,8 +2529,22 @@ async function readIssueInfo(
   return { info, issueNodeId: issue.node_id, issueNumber: issue.number };
 }
 
-export async function issueInfo(context: DeliveryContext, issueNumber: number): Promise<IssueInfo> {
-  return (await readIssueInfo(context, issueNumber)).info;
+/** `childDetail: false` reports child counts only, skipping the per-child Points and status reads. */
+export async function issueInfo(
+  context: DeliveryContext,
+  issueNumber: number,
+  options: { childDetail?: boolean } = {},
+): Promise<IssueInfo> {
+  return (await readIssueInfo(context, issueNumber, true, undefined, options.childDetail)).info;
+}
+
+function childCounts(children: readonly { state: 'open' | 'closed' }[]): IssueChildCounts {
+  const closedChildCount = children.filter((child) => child.state === 'closed').length;
+  return {
+    childCount: children.length,
+    closedChildCount,
+    percentClosed: Math.round((1000 * closedChildCount) / children.length) / 10,
+  };
 }
 
 /** Invalid canonical content stays inspectable; omitted state is unknown, never an assertion of undeferred. */

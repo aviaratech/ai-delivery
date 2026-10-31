@@ -1,3 +1,4 @@
+import { issueView, prView } from './readView.js';
 import { deliveryHealth, type DeliveryHealthRequest } from './services/deliveryHealthService.js';
 import { collectDeliveryBoard, parseDeliveryBoardRequest } from './deliveryBoard.js';
 import {
@@ -16,7 +17,6 @@ import {
   createIssue,
   canonicalIssueBody,
   commentIssue,
-  issueInfo,
   listIssues,
   journalIssueStart,
   loadDeliveryContext,
@@ -37,7 +37,6 @@ import {
   finishInvestigation,
   finishIssue,
   mergePr,
-  prInfo,
   publishPr,
   registerInvestigation,
   submitFormalReview,
@@ -328,7 +327,7 @@ export async function executeTool(
       ...(execution.signal === undefined ? {} : { signal: execution.signal }),
     });
   }
-  const { repo: selected, verbose: _verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
+  const { repo: selected, verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
   if (name === 'issue_finish' && input.nonClosing === true)
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
@@ -382,7 +381,7 @@ export async function executeTool(
     case 'issue_search':
       return listIssues(context, input as ListIssuesInput);
     case 'issue_info':
-      return issueInfo(context, requiredNumber(input, 'issueNumber'));
+      return issueView(context, requiredNumber(input, 'issueNumber'), { verbose: verbose === true });
     case 'issue_ready_check':
       return readyCheck(context, requiredNumber(input, 'issueNumber'));
     case 'issue_pr_create':
@@ -405,7 +404,7 @@ export async function executeTool(
         dryRun: input.dryRun === true,
       });
     case 'issue_pr_info':
-      return prInfo(context, input as { issueNumber?: number; prNumber?: number; nonClosing?: boolean });
+      return prView(context, input as { issueNumber?: number; prNumber?: number; nonClosing?: boolean });
     case 'issue_pr_review':
       return submitFormalReview(context, {
         artifact: requireString(input, 'artifact'),

@@ -1,3 +1,4 @@
+import { quietReadViewResponse } from './readView.js';
 import { issueProjectItemsResponse } from './issueProjectItems.js';
 import type { DeliveryContext } from '../issue.js';
 import { IssueFields, renderIssueBody } from '../issueContract.js';
@@ -266,6 +267,8 @@ export function issue63Fixture() {
           writes.push('remove');
           return {};
         }
+        const quiet = quietReadViewResponse(query, v);
+        if (quiet !== undefined) return quiet;
         throw new Error('Unexpected fixture query ' + query);
       },
     },
