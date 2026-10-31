@@ -33,7 +33,10 @@ export function syntheticOverrides(config: Pick<DeliveryConfig, 'native' | 'repo
   };
 }
 
-export function syntheticDiscoveryClients(config = syntheticDiscoveryConfig): DiscoveryClients {
+export function syntheticDiscoveryClients(
+  config = syntheticDiscoveryConfig,
+  extraStatuses: string[] = [],
+): DiscoveryClients {
   const native = config.native;
   const field = (value: DeliveryConfig['native']['points']) => ({
     __typename: 'IssueFieldSingleSelect',
@@ -60,7 +63,9 @@ export function syntheticDiscoveryClients(config = syntheticDiscoveryConfig): Di
       native.project.statuses.inProgress,
       native.project.statuses.blocked,
       native.project.statuses.done,
-    ].map((name, index) => ({ id: `STATUS-${index}`, name })),
+    ]
+      .map((name, index) => ({ id: `STATUS-${index}`, name }))
+      .concat(extraStatuses.map((name, index) => ({ id: `STATUS-EXTRA-${index}`, name }))),
   };
   const project = {
     id: `PROJECT-${native.project.number}`,

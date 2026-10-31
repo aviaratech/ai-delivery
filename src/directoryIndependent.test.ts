@@ -10,6 +10,8 @@ import * as githubClients from './github/client.js';
 import * as repository from './github/repo.js';
 import * as gitCommands from './git.js';
 import { executeTool } from './dispatch.js';
+import { loadDeliveryContext } from './issue.js';
+import * as deliveryConfig from './config/deliveryConfig.js';
 import { createAiDeliveryMcpServer, AI_DELIVERY_MCP_TOOLS } from './mcp/index.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -92,6 +94,33 @@ describe('directory-independent user configuration', () => {
       assert.equal(loaded.config.roles.author.identity, 'host-author');
       assert.equal(loaded.configPath, process.env.AI_DELIVERY_CONFIG);
       assert.equal('policy' in loaded.config, false);
+    } finally {
+      if (previous === undefined) delete process.env.AI_DELIVERY_CONFIG;
+      else process.env.AI_DELIVERY_CONFIG = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // #65: tools load their Project configuration through this context, not a fresh Project read.
+  it('carries a discovered In Review option into the delivery context', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'delivery-review-option-'));
+    const previous = process.env.AI_DELIVERY_CONFIG;
+    try {
+      process.env.AI_DELIVERY_CONFIG = join(root, 'user.json');
+      writeFileSync(process.env.AI_DELIVERY_CONFIG, JSON.stringify(userSettings));
+      const loaded = await loadDeliveryConfig(root, {
+        repository: 'example/widget',
+        clients: syntheticDiscoveryClients(syntheticDiscoveryConfig, ['In Review']),
+      } as never);
+      vi.spyOn(deliveryConfig, 'loadDeliveryConfig').mockResolvedValue(loaded);
+      vi.spyOn(githubClients, 'createDeliveryGitHubClients').mockResolvedValue({} as never);
+      const context = await loadDeliveryContext({
+        identity: 'host-author',
+        role: 'author',
+        repoRoot: root,
+        repository: 'example/widget',
+      });
+      assert.equal(context.projectConfiguration?.reviewOptionId, 'STATUS-EXTRA-0');
     } finally {
       if (previous === undefined) delete process.env.AI_DELIVERY_CONFIG;
       else process.env.AI_DELIVERY_CONFIG = previous;
