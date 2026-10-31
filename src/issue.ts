@@ -261,6 +261,7 @@ export async function loadDeliveryContext(input: {
     priorityFieldId: routing.priorityFieldId,
     statusFieldId: routing.statusFieldId,
     statusOptionIds: routing.statusOptionIds,
+    ...(routing.reviewOptionId ? { reviewOptionId: routing.reviewOptionId } : {}),
     settings: projectSettingsFromDeliveryConfig(config),
     writable: true,
   };
@@ -783,6 +784,8 @@ export interface ListedTrackingIssue {
   parent: { repository: string; number: number } | null;
   blockers: { repository: string; number: number; title: string; state: 'OPEN' | 'CLOSED' }[];
   projectStatus: string | null;
+  /** The Project item sits in the optional In Review option; projectStatus reads In Progress. */
+  inReview?: true;
   fields: Record<string, string | number | string[] | null>;
   url: string;
   updatedAt: string;
@@ -1212,6 +1215,7 @@ export async function listIssues(
         state,
       })),
       projectStatus: project?.status ?? null,
+      ...(project?.review ? { inReview: true as const } : {}),
       fields,
       url: current.html_url,
       updatedAt: current.updated_at,
@@ -2431,6 +2435,8 @@ export interface IssueInfo {
   points?: number;
   priority?: string;
   projectStatus: string | null;
+  /** The Project item sits in the optional In Review option; projectStatus reads In Progress. */
+  inReview?: true;
   state: string;
   title: string;
   url: string;
@@ -2505,6 +2511,7 @@ async function readIssueInfo(
     ...(metadata.points === undefined ? {} : { points: metadata.points }),
     ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),
     projectStatus: project?.status ?? null,
+    ...(project?.review ? { inReview: true as const } : {}),
     state: issue.state,
     title: issue.title,
     url: issue.html_url,
