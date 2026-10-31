@@ -2651,3 +2651,18 @@ describe('first-call PR creation', () => {
     assert.equal(state.creations, 0);
   });
 });
+
+// aviaratech/ai-delivery#238: PR #237 referenced #236 without closing it, and a body update was refused.
+describe('non-closing body update', () => {
+  it('updates an already non-closing PR body and keeps its issue open', async () => {
+    const { context, state } = fixture(true, true);
+    const update = { issueNumber: 17, prNumber: 23, nonClosing: true, body: 'Revised widget scope.' };
+    await publishPr(context, update);
+    assert.equal(state.body, `References ${repo}#17\n\nRevised widget scope.`);
+    await publishPr(context, update);
+    assert.equal(state.updates, 1);
+    assert.equal(state.issueState, 'open');
+    await assert.rejects(publishPr(context, { ...update, body: 'Closes #17' }), /closing directives/u);
+    assert.equal(state.updates, 1);
+  });
+});

@@ -267,6 +267,14 @@ function nonClosingBody(context: DeliveryContext, issueNumber: number, requested
   verifyReferenceBody(context, issueNumber, body);
   return body;
 }
+function hasReferenceBody(context: DeliveryContext, issueNumber: number, body: unknown): boolean {
+  try {
+    verifyReferenceBody(context, issueNumber, body);
+    return true;
+  } catch {
+    return false;
+  }
+}
 function verifyReferenceBody(context: DeliveryContext, issueNumber: number, body: unknown): asserts body is string {
   refuseClosingDirective(body);
   const lines = body.split(/\r?\n/u);
@@ -1861,6 +1869,8 @@ export async function publishPr(
   );
   const closingRepair = !nonClosing && pr !== undefined && !hasClosingLink(pr.body, input.issueNumber);
   const transition = nonClosing && pr !== undefined && pr.body !== body;
+  // A PR that already references the issue changes only its body; a closing PR converts (#238).
+  const referenceUpdate = transition && hasReferenceBody(context, input.issueNumber, pr?.body);
   if (reconcileReference && transition)
     throw new DeliveryError('Reference reconciliation refuses body transition; retain exact original intent.');
   if (transition && (input.prNumber === undefined || input.body === undefined))
@@ -1939,7 +1949,12 @@ export async function publishPr(
     const current =
       reconcileReference || pendingClosingRepair
         ? await getPr(context, existing!.number)
-        : await verifyIssuePr(context, input.issueNumber, existing!.number, nonClosing && !pendingTransition);
+        : await verifyIssuePr(
+            context,
+            input.issueNumber,
+            existing!.number,
+            nonClosing && (!pendingTransition || referenceUpdate),
+          );
     if (
       current.state !== 'open' ||
       current.merged ||
@@ -1971,7 +1986,7 @@ export async function publishPr(
         throw new DeliveryError('Closing-link repair remote head drifted; reconcile read-only.');
       sameReferencePr(current, await getPr(context, current.number));
     }
-    if (pendingTransition) {
+    if (pendingTransition && !referenceUpdate) {
       await verifyPrIssueAssociation(
         context,
         current.number,
