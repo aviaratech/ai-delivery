@@ -89,13 +89,6 @@ const Tracking = {
     .min(1, 'Issue title is empty; enter a title.')
     .max(256, 'Issue title exceeds 256 characters; shorten the title.'),
 };
-const InvestigationStart = z.strictObject({
-  repo: Repo,
-  verbose: Verbose,
-  issueNumber: Positive,
-  investigationWorktree: z.string().min(1),
-  expectedHeadSha: z.string().regex(/^[a-f0-9]{40}$/u),
-});
 const NormalStart = z.strictObject({
   ...Tracking,
   title: Tracking.title.optional(),
@@ -118,22 +111,6 @@ const NormalFinish = z.strictObject({
   strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
   dryRun: z.boolean().optional(),
 });
-const InvestigationFinish = z.strictObject({
-  repo: Repo,
-  verbose: Verbose,
-  issueNumber: Positive,
-  investigation: z.literal(true),
-  resultPath: z.string().min(1),
-  authorityCommentId: Positive.optional(),
-  acceptanceCommentId: Positive.optional(),
-  dryRun: z.boolean().optional(),
-});
-
-function validateMode(schema: z.ZodType, input: unknown, context: z.RefinementCtx): void {
-  const result = schema.safeParse(input);
-  if (!result.success) context.addIssue({ code: 'custom', message: result.error.message });
-}
-
 const IssueListing = {
   repo: Repo,
   verbose: Verbose,
@@ -228,19 +205,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_start',
     commandName: 'start',
-    description: 'Start a linked issue, or prospectively register an unchanged host-created investigation worktree',
-    inputSchema: NormalStart.extend({
-      investigationWorktree: z.string().optional(),
-      expectedHeadSha: z.string().optional(),
-    }).superRefine((input, context) =>
-      validateMode(
-        input.investigationWorktree !== undefined || input.expectedHeadSha !== undefined
-          ? InvestigationStart
-          : NormalStart,
-        input,
-        context,
-      ),
-    ),
+    description: 'Start a linked issue',
+    inputSchema: NormalStart,
   },
   {
     name: 'issue_list',
@@ -385,48 +351,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_finish',
     commandName: 'finish',
-    description:
-      'Finish merged delivery, or remove a prospectively registered unchanged investigation with native acceptance',
-    inputSchema: NormalFinish.extend({
-      prNumber: Positive.optional(),
-      investigation: z.literal(true).optional(),
-      resultPath: z.string().optional(),
-      authorityCommentId: Positive.optional(),
-      acceptanceCommentId: Positive.optional(),
-    }).superRefine((input, context) =>
-      validateMode(input.investigation === true ? InvestigationFinish : NormalFinish, input, context),
-    ),
-  },
-  {
-    name: 'issue_worktree_transition_inspect',
-    commandName: 'worktree:transition:inspect',
-    description: 'Read a legacy issue row, original evidence and exact closure gaps without changing ownership',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      verbose: Verbose,
-      issueNumber: Positive,
-      purpose: z.enum(['active-resume', 'merged-cleanup']),
-      disposition: z.enum(['retain', 'remove']).optional(),
-      terminalPrNumber: Positive.optional(),
-      retainedHoldCommentIds: z.array(Positive).optional(),
-      retainedAdmissionPath: z.string().min(1).optional(),
-      retainedArchivePath: z.string().min(1).optional(),
-    }),
-  },
-  {
-    name: 'issue_worktree_transition_apply',
-    commandName: 'worktree:transition:apply',
-    description:
-      'Apply or resume one exact independently accepted transition with immutable preservation and closure proof',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      verbose: Verbose,
-      authority: z.literal('worktree:transition'),
-      planPath: z.string().min(1),
-      expectedPlanId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-      relinquishmentCommentId: Positive,
-      acceptanceCommentId: Positive,
-    }),
+    description: 'Finish merged delivery',
+    inputSchema: NormalFinish,
   },
 ] as const;
 

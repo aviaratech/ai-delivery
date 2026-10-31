@@ -442,10 +442,10 @@ describe('per-call repository selection', () => {
         'issue_worktree_create',
         'runtime_stage',
         'runtime_admit',
+        'issue_worktree_transition_inspect',
+        'issue_worktree_transition_apply',
       ])
         assert.equal(names.includes(removed), false);
-      for (const retained of ['issue_worktree_transition_inspect', 'issue_worktree_transition_apply'])
-        assert.equal(names.includes(retained), true);
     } finally {
       await client.close();
       await server.close();

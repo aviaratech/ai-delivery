@@ -4,39 +4,15 @@ import { DeliveryError } from './errors.js';
 import * as githubClients from './github/client.js';
 import type { GitHubClients } from './github/client.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
-import {
-  commentIssue,
-  issueBranch,
-  linkedIssueBranches,
-  readIssueClosure,
-  startIssueBranch,
-  type DeliveryContext,
-} from './issue.js';
-import { existsSync, lstatSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { assertPrivateFile, digestBytes, digestValue, stableJson } from './delivery/common.js';
-import { gitCommonDir, primaryGitRoot, defaultBaseRef, gitExitCode, git } from './git.js';
-import { ensurePrivateDirectoryDurably } from './utils/atomicJson.js';
+import { issueBranch, linkedIssueBranches, startIssueBranch, type DeliveryContext } from './issue.js';
+import { existsSync } from 'node:fs';
+import { primaryGitRoot, defaultBaseRef, gitExitCode, git } from './git.js';
 import { resolveRepoFromRemote } from './github/repo.js';
-import { authenticatedWorktreeActors, assertNativeWorktreeAcceptance } from './worktreeTransition.js';
-import { withWorktreeTransitionWriterAbsent } from './verification.js';
+import { removeFinishedIssueSource, type MergeCleanupAttestation } from './worktree.js';
 import {
-  assertInvestigationSource,
-  investigationSourceIdentity,
-  removeInvestigationSource,
-  removeFinishedIssueSource,
-  type MergeCleanupAttestation,
-} from './worktree.js';
-import {
-  InvestigationPreparationSchema,
   listWorktreesStrict,
   getIssueWorktreeStrict,
   reconcileCompletedIssueWorktreeDelivery,
-  completeInvestigationCustody,
-  readInvestigationAcknowledgement,
-  readInvestigationPreparation,
-  registerInvestigationCustody,
-  type InvestigationPreparation,
 } from './services/worktreeRegistry.js';
 import {
   parseReviewArtifact,
@@ -2411,20 +2387,18 @@ async function cleanupFinishedIssue(
         strategy: 'squash',
       };
     }
-    await withIssueWorktreeExclusion(root, row.path, async () =>
-      reconcileCompletedIssueWorktreeDelivery({
-        projectRoot: root,
-        issueNumber,
-        path: row.path,
-        branch: row.branch,
-        prNumber: pr.number,
-        removeSource: (current) => {
-          if (current.identity !== authorIdentity || current.createdAt !== row.createdAt)
-            throw new DeliveryError('Registered source ownership changed; preserve the new owner before cleanup.');
-          removeFinishedIssueSource(current, root, headSha, attestation);
-        },
-      }),
-    );
+    await reconcileCompletedIssueWorktreeDelivery({
+      projectRoot: root,
+      issueNumber,
+      path: row.path,
+      branch: row.branch,
+      prNumber: pr.number,
+      removeSource: (current) => {
+        if (current.identity !== authorIdentity || current.createdAt !== row.createdAt)
+          throw new DeliveryError('Registered source ownership changed; preserve the new owner before cleanup.');
+        removeFinishedIssueSource(current, root, headSha, attestation);
+      },
+    });
     return { status: 'removed' };
   } catch (error) {
     return {
@@ -2437,275 +2411,3 @@ async function cleanupFinishedIssue(
   }
 }
 export { startIssueBranch };
-
-function investigationRoot(context: DeliveryContext): string {
-  const root = primaryGitRoot(context.root);
-  const repo = resolveRepoFromRemote(root, 'origin');
-  if (
-    `${repo.owner}/${repo.repo}`.toLowerCase() !== context.config.repository.toLowerCase() ||
-    `${context.repo.owner}/${context.repo.repo}`.toLowerCase() !== context.config.repository.toLowerCase()
-  )
-    throw new DeliveryError('Investigation repository identity disagrees.');
-  return root;
-}
-async function withIssueWorktreeExclusion<T>(root: string, target: string, operation: () => Promise<T>): Promise<T> {
-  const common = gitCommonDir(root);
-  for (const directory of [join(common, 'ai-delivery'), join(common, 'ai-delivery', 'writers@1')]) {
-    try {
-      const metadata = lstatSync(directory);
-      if (!metadata.isDirectory() || metadata.isSymbolicLink())
-        throw new DeliveryError('Investigation writer namespace is unsafe.');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    ensurePrivateDirectoryDurably(directory);
-  }
-  return withWorktreeTransitionWriterAbsent(root, target, operation);
-}
-async function investigationNativeSource(
-  context: DeliveryContext,
-  issueNumber: number,
-  headSha: string,
-  state: 'open' | 'closed',
-) {
-  const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
-  if (
-    issue.number !== issueNumber ||
-    'pull_request' in issue ||
-    issue.state !== state ||
-    new URL(issue.html_url).pathname.toLowerCase() !==
-      `/${context.config.repository}/issues/${String(issueNumber)}`.toLowerCase()
-  )
-    throw new DeliveryError('Investigation requires the exact native issue and expected state.');
-  const branches = await linkedIssueBranches(context, issueNumber);
-  if (branches.length !== 1 || branches[0]!.name !== `issue/${String(issueNumber)}` || branches[0]!.sha !== headSha)
-    throw new DeliveryError('Investigation requires one exact unchanged native linked branch.');
-  const prs = (
-    await context.clients.rest.pulls.list({
-      ...context.repo,
-      state: 'all',
-      head: `${context.repo.owner}:${branches[0]!.name}`,
-      per_page: 100,
-    })
-  ).data;
-  if (prs.length !== 0) throw new DeliveryError('Investigation completion cannot substitute for PR delivery.');
-}
-export function investigationPreparationBody(preparation: InvestigationPreparation): string {
-  return stableJson({
-    schemaVersion: 'ai-delivery.investigation-preparation-acknowledgement@1',
-    preparation,
-    authority: 'prospective-registration-before-investigation-no-legacy-adoption',
-  });
-}
-export function investigationAuthorityBody(preparation: InvestigationPreparation, resultDigest: string): string {
-  return stableJson({
-    schemaVersion: 'ai-delivery.investigation-removal-authority@1',
-    preparationId: preparation.preparationId,
-    repository: preparation.repository,
-    issueNumber: preparation.row.issueNumber,
-    head: preparation.head,
-    worktree: preparation.row.path,
-    branch: preparation.row.branch,
-    resultDigest,
-    disposition: 'remove-only-this-unchanged-investigation-worktree-retain-branch-and-evidence',
-    operationalClosure:
-      'all-investigation-producers-quiescent-and-excluded-through-completion-and-resume-no-outstanding-holds',
-  });
-}
-export function investigationAcceptanceBody(
-  preparation: InvestigationPreparation,
-  resultDigest: string,
-  authorityCommentId: number,
-): string {
-  return stableJson({
-    schemaVersion: 'ai-delivery.investigation-result-acceptance@1',
-    authority: JSON.parse(investigationAuthorityBody(preparation, resultDigest)) as unknown,
-    authorityCommentId,
-    verdict: 'approved',
-    independentlyReviewed: 'complete-durable-result-exact-source-and-removal-scope',
-  });
-}
-
-/** Explicit author mode for a host-created worktree; ordinary start remains remote-only. */
-export async function registerInvestigation(
-  context: DeliveryContext,
-  input: {
-    issueNumber: number;
-    investigationWorktree: string;
-    expectedHeadSha: string;
-  },
-) {
-  if (!Number.isSafeInteger(input.issueNumber) || input.issueNumber <= 0 || !Sha.test(input.expectedHeadSha))
-    throw new DeliveryError('Investigation preparation requires a positive issue and expected commit.');
-  const root = investigationRoot(context);
-  const target = join(root, '.worktrees', `issue-${String(input.issueNumber)}`);
-  if (input.investigationWorktree !== target || realpathSync(target) !== target)
-    throw new DeliveryError('Investigation worktree must be the exact canonical .worktrees/issue-N path.');
-  if (existsSync(join(root, '.issue-cli', 'issues', String(input.issueNumber))))
-    throw new DeliveryError('Historical issue custody remains preservation-only; investigation cannot adopt it.');
-  const actors = await authenticatedWorktreeActors(context);
-  const observed = investigationSourceIdentity(root, input.issueNumber);
-  const prior = readInvestigationPreparation(root, input.issueNumber);
-  await investigationNativeSource(context, input.issueNumber, observed.head.sha, 'open');
-  if (observed.head.sha !== input.expectedHeadSha)
-    throw new DeliveryError('Investigation preparation source drifted from the expected head.');
-  if (prior === undefined) {
-    const repository = (await context.clients.rest.repos.get({ ...context.repo })).data;
-    if (repository.full_name.toLowerCase() !== context.config.repository.toLowerCase() || !repository.default_branch)
-      throw new DeliveryError('Investigation native repository identity is incomplete.');
-    const base = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${repository.default_branch}` }))
-      .data;
-    if (base.object.sha !== observed.head.sha)
-      throw new DeliveryError('Prospective investigation must begin at the current native default commit.');
-  }
-  const date = new Date().toISOString();
-  const content = {
-    schemaVersion: 'ai-delivery.investigation-preparation@1' as const,
-    repository: context.config.repository,
-    repoRoot: root,
-    row: prior?.row ?? {
-      branch: `issue/${String(input.issueNumber)}`,
-      createdAt: date,
-      identity: context.config.roles.author.identity,
-      issueNumber: input.issueNumber,
-      path: target,
-      status: 'active' as const,
-      type: 'issue' as const,
-      updatedAt: date,
-    },
-    ...observed,
-    operator: { actorLogin: actors.operator.actorLogin, credentialIdentity: actors.operator.credentialIdentity },
-    reviewerActor: actors.reviewerActor,
-  };
-  const preparation = InvestigationPreparationSchema.parse({ ...content, preparationId: digestValue(content) });
-  await withIssueWorktreeExclusion(root, target, () =>
-    registerInvestigationCustody(preparation, async () => {
-      if (stableJson(investigationSourceIdentity(root, input.issueNumber)) !== stableJson(observed))
-        throw new DeliveryError('Investigation source changed before preparation acknowledgement.');
-      await investigationNativeSource(context, input.issueNumber, observed.head.sha, 'open');
-      const { commentId, url, body } = await commentIssue(context, {
-        issueNumber: input.issueNumber,
-        body: investigationPreparationBody(preparation),
-      });
-      if (stableJson(investigationSourceIdentity(root, input.issueNumber)) !== stableJson(observed))
-        throw new DeliveryError('Investigation source changed during preparation acknowledgement.');
-      return { commentId, url, body };
-    }),
-  );
-  return { preparation, acknowledgement: readInvestigationAcknowledgement(root, input.issueNumber), registered: true };
-}
-
-/** One non-mergeable completion path. No PR, issue close, reviewer submission or branch deletion occurs. */
-export async function finishInvestigation(
-  context: DeliveryContext,
-  input: {
-    issueNumber: number;
-    resultPath: string;
-    authorityCommentId?: number;
-    acceptanceCommentId?: number;
-    dryRun?: boolean;
-  },
-) {
-  if (['prNumber', 'strategy', 'reviewedHeadSha', 'nonClosing'].some((key) => key in input))
-    throw new DeliveryError('Investigation completion refuses PR or merge options.');
-  const root = investigationRoot(context);
-  const preparation = readInvestigationPreparation(root, input.issueNumber);
-  if (!preparation)
-    throw new DeliveryError('No prospective investigation preparation; historical custody cannot be reconstructed.');
-  const resultPath = resolve(input.resultPath);
-  const resultRelative = relative(preparation.row.path, resultPath);
-  const resultOutside = resultRelative === '..' || resultRelative.startsWith(`..${sep}`) || isAbsolute(resultRelative);
-  if (realpathSync(resultPath) !== resultPath || !resultOutside)
-    throw new DeliveryError('Durable investigation result must be canonical and outside the removable worktree.');
-  const result = assertPrivateFile(resultPath, { maxBytes: 512 * 1024 });
-  if (result.length === 0) throw new DeliveryError('Investigation result must contain durable evidence.');
-  const resultDigest = digestBytes(result);
-  const authorityBody = investigationAuthorityBody(preparation, resultDigest);
-  const acceptanceBody =
-    input.authorityCommentId === undefined
-      ? undefined
-      : investigationAcceptanceBody(preparation, resultDigest, input.authorityCommentId);
-  const authorize = async () => {
-    await investigationNativeSource(context, input.issueNumber, preparation.head.sha, 'closed');
-    const closure = await readIssueClosure(context, input.issueNumber);
-    if (closure.state !== 'closed' || closure.closeReason !== 'completed' || closure.duplicateOf !== null)
-      throw new DeliveryError('Investigation requires native completed closed-issue authority.');
-    const acknowledgement = readInvestigationAcknowledgement(root, input.issueNumber);
-    const native = (
-      await context.clients.rest.issues.getComment({ ...context.repo, comment_id: acknowledgement.commentId })
-    ).data;
-    if (
-      native.id !== acknowledgement.commentId ||
-      native.body !== investigationPreparationBody(preparation) ||
-      native.body !== acknowledgement.body ||
-      native.issue_url.toLowerCase() !==
-        `https://api.github.com/repos/${preparation.repository}/issues/${String(input.issueNumber)}`.toLowerCase() ||
-      native.user?.type !== 'User' ||
-      native.user.login.toLowerCase() !== preparation.operator.actorLogin.toLowerCase() ||
-      `user:${String(native.user.id)}` !== preparation.operator.credentialIdentity
-    )
-      throw new DeliveryError('Native prospective preparation acknowledgement changed.');
-    if (
-      input.authorityCommentId === undefined ||
-      input.acceptanceCommentId === undefined ||
-      acceptanceBody === undefined
-    )
-      throw new DeliveryError('Existing authentic operator and independent App acceptance comments are required.');
-    const authority = await assertNativeWorktreeAcceptance(context, {
-      repository: preparation.repository,
-      subject: input.issueNumber,
-      operator: preparation.operator,
-      reviewerActor: preparation.reviewerActor,
-      authorityCommentId: input.authorityCommentId,
-      acceptanceCommentId: input.acceptanceCommentId,
-      operatorBody: authorityBody,
-      reviewerBody: acceptanceBody,
-      revokedBody: stableJson({
-        schemaVersion: 'ai-delivery.investigation-removal-revocation@1',
-        preparationId: preparation.preparationId,
-        resultDigest,
-        authorityCommentId: input.authorityCommentId,
-      }),
-    });
-    const preparedAt = Date.parse(native.created_at);
-    for (const value of [authority.relinquishment, authority.acceptance]) {
-      const createdAt = Date.parse((value as { created_at: string }).created_at);
-      if (!Number.isFinite(preparedAt) || !Number.isFinite(createdAt) || createdAt < preparedAt)
-        throw new DeliveryError('Investigation acceptance must follow its prospective preparation.');
-    }
-    return { acknowledgement: native, closure, ...authority };
-  };
-  if (input.dryRun && (input.authorityCommentId === undefined || input.acceptanceCommentId === undefined)) {
-    assertInvestigationSource(preparation, context.root);
-    await investigationNativeSource(context, input.issueNumber, preparation.head.sha, 'closed');
-    return {
-      completed: false,
-      ready: false,
-      preparationId: preparation.preparationId,
-      resultDigest,
-      authorityBody,
-      ...(acceptanceBody === undefined ? {} : { acceptanceBody }),
-      missingEvidence:
-        'Existing authentic operator and configured-App exact-result acceptance are prerequisites; no submission route is supplied.',
-    };
-  }
-  if (
-    !Number.isSafeInteger(input.authorityCommentId) ||
-    !Number.isSafeInteger(input.acceptanceCommentId) ||
-    input.authorityCommentId! <= 0 ||
-    input.acceptanceCommentId! <= 0
-  )
-    throw new DeliveryError('Investigation evidence requires positive native comment IDs.');
-  return withIssueWorktreeExclusion(root, preparation.row.path, () =>
-    completeInvestigationCustody({
-      preparation,
-      result,
-      authorityCommentId: input.authorityCommentId!,
-      acceptanceCommentId: input.acceptanceCommentId!,
-      dryRun: input.dryRun === true,
-      authorize,
-      assertSource: (allowAbsent) => assertInvestigationSource(preparation, context.root, allowAbsent),
-      removeSource: () => removeInvestigationSource(preparation, context.root),
-    }),
-  );
-}

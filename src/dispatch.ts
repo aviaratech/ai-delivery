@@ -8,7 +8,6 @@ import {
   incompleteBoardReconcile,
 } from './services/boardReconcileService.js';
 import { loadDeliverySettings, type LoadedDeliverySettings } from './config/deliveryConfig.js';
-import { resolveCheckout, resolveRepoFromRemote } from './github/repo.js';
 import { DeliveryError } from './errors.js';
 import { digestValue } from './delivery/common.js';
 import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js';
@@ -33,19 +32,7 @@ import {
   type UpdateIssueInput,
 } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import {
-  finishInvestigation,
-  finishIssue,
-  mergePr,
-  publishPr,
-  registerInvestigation,
-  submitFormalReview,
-} from './pr.js';
-import {
-  applyWorktreeTransition,
-  inspectWorktreeTransition,
-  type InspectWorktreeTransitionInput,
-} from './worktreeTransition.js';
+import { finishIssue, mergePr, publishPr, submitFormalReview } from './pr.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 import { IssueValidationError } from './issueContract.js';
 
@@ -338,28 +325,12 @@ export async function executeTool(
   if (name === 'issue_create') canonicalIssueBody(input as unknown as CreateIssueInput);
   const repo = typeof selected === 'string' ? selected : execution.repo;
   const selectedExecution = { ...execution, ...(repo === undefined ? {} : { repo }) };
-  const local =
-    name.startsWith('issue_worktree_transition_') ||
-    (name === 'issue_start' && input.investigationWorktree !== undefined) ||
-    (name === 'issue_finish' && input.investigation === true);
-  let root = execution.repoRoot;
-  if (local) {
-    const settings = await loadDeliverySettings();
-    const coordinates =
-      repo ??
-      (() => {
-        const r = resolveRepoFromRemote(root, 'origin');
-        return `${r.owner}/${r.repo}`;
-      })();
-    root = resolveCheckout({ repository: coordinates, launchDirectory: root, checkoutRoots: settings.checkoutRoots });
-  }
   const requestedIdentity = name === 'issue_pr_review' ? optionalString(input, 'identity') : undefined;
   const context = await contextFor(
     { ...selectedExecution, ...(requestedIdentity === undefined ? {} : { identity: requestedIdentity }) },
     definition.commandName,
     name === 'issue_pr_review' ? 'reviewer' : 'author',
   );
-  if (local) context.root = root;
   switch (name) {
     case 'delivery_health':
       return deliveryHealth(context, { ...input, repo: repo! } as DeliveryHealthRequest);
@@ -368,12 +339,6 @@ export async function executeTool(
     case 'issue_create':
       return createIssue(context, input as unknown as CreateIssueInput);
     case 'issue_start':
-      if (input.investigationWorktree !== undefined)
-        return registerInvestigation(context, {
-          issueNumber: requiredNumber(input, 'issueNumber'),
-          investigationWorktree: requireString(input, 'investigationWorktree'),
-          expectedHeadSha: requireString(input, 'expectedHeadSha'),
-        });
       return startTrackedIssue(context, input);
     case 'issue_batch_update':
       return batchUpdateIssues(context, input as unknown as BatchUpdateIssueInput, selectedExecution.signal);
@@ -417,18 +382,6 @@ export async function executeTool(
       });
     case 'issue_pr_merge':
     case 'issue_finish': {
-      if (name === 'issue_finish' && input.investigation === true)
-        return finishInvestigation(context, {
-          issueNumber: requiredNumber(input, 'issueNumber'),
-          resultPath: requireString(input, 'resultPath'),
-          ...(input.authorityCommentId === undefined
-            ? {}
-            : { authorityCommentId: requiredNumber(input, 'authorityCommentId') }),
-          ...(input.acceptanceCommentId === undefined
-            ? {}
-            : { acceptanceCommentId: requiredNumber(input, 'acceptanceCommentId') }),
-          dryRun: input.dryRun === true,
-        });
       const merge = {
         issueNumber: requiredNumber(input, 'issueNumber'),
         ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),
@@ -441,19 +394,5 @@ export async function executeTool(
         ? finishIssue({ ...context, root: execution.repoRoot }, merge)
         : mergePr(context, merge);
     }
-    case 'issue_worktree_transition_inspect':
-      return inspectWorktreeTransition(context, {
-        ...input,
-        ...(execution.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: execution.runtimeEntryPath }),
-      } as unknown as InspectWorktreeTransitionInput);
-    case 'issue_worktree_transition_apply':
-      return applyWorktreeTransition(context, {
-        authority: 'worktree:transition',
-        planPath: requireString(input, 'planPath'),
-        expectedPlanId: requireString(input, 'expectedPlanId'),
-        relinquishmentCommentId: requiredNumber(input, 'relinquishmentCommentId'),
-        acceptanceCommentId: requiredNumber(input, 'acceptanceCommentId'),
-        ...(execution.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: execution.runtimeEntryPath }),
-      });
   }
 }
