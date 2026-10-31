@@ -1110,3 +1110,14 @@ test('closure reuse refuses duplicate authored journals and corrupted authoritat
     assert.equal(f.writes.length, writes);
   }
 });
+
+// Recorded Oct 31 (aviaratech/ai-delivery#240): closing #171 and #178 reported "failed", although GitHub
+// closed both and their archived Project items already showed Done.
+test('closing an issue whose archived Project item already shows Done reports applied', async () => {
+  const f = batchFixture();
+  f.controls.archived = true;
+  f.statuses.set(1, 'Shipped');
+  const result = await runBatch({ items: [{ issueNumber: 1, state: 'closed', closeReason: 'not_planned' }] });
+  assert.equal(f.rows.get(1)!.state, 'closed');
+  assert.deepEqual(result.summary, { total: 1, applied: 1, planned: 0, unchanged: 0, failed: 0, rateLimits: [] });
+});
