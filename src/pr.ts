@@ -889,60 +889,6 @@ async function verifyIssuePr(
   return pr;
 }
 
-/** Queue admission shares the native association and configured author owners. */
-export async function queuePr(context: DeliveryContext, prNumber: number, issueNumber?: number) {
-  if (
-    context.clients.role !== 'author' ||
-    !context.clients.authenticatedAuthor ||
-    context.clients.authSource !== (context.config.roles.author.authSource ?? 'app')
-  )
-    throw new DeliveryError('Queue mutations require the configured authenticated author.');
-  const author = await context.clients.authenticatedAuthor();
-  if (!author.actorLogin || !author.credentialIdentity) throw new DeliveryError('Queue author identity is incomplete.');
-  let derivedPrId: string | undefined;
-  if (issueNumber === undefined) {
-    const result = await context.clients.graphql<ClosingIssuesQuery>(
-      'query DeliveryClosingIssues($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){nameWithOwner pullRequest(number:$number){id number closingIssuesReferences(first:100,after:$cursor){nodes{__typename id number repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}',
-      { ...context.repo, number: prNumber, cursor: null },
-    );
-    const native = result.repository?.pullRequest;
-    const link = native?.closingIssuesReferences;
-    if (
-      result.repository?.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
-      native?.number !== prNumber ||
-      typeof native.id !== 'string' ||
-      !native.id ||
-      !link ||
-      link.pageInfo?.hasNextPage !== false ||
-      !Array.isArray(link.nodes) ||
-      link.nodes.length !== 1
-    )
-      throw new DeliveryError(
-        'Queue add requires one complete native closing issue association or an explicit issue selector.',
-      );
-    const node = link.nodes[0];
-    if (
-      !node ||
-      node.__typename !== 'Issue' ||
-      typeof node.id !== 'string' ||
-      !node.id ||
-      typeof node.repository?.id !== 'string' ||
-      !node.repository.id ||
-      node.repository.nameWithOwner.toLowerCase() !== context.config.repository.toLowerCase() ||
-      !Number.isSafeInteger(node.number) ||
-      node.number <= 0
-    )
-      throw new DeliveryError('Queue closing issue identity is invalid.');
-    issueNumber = node.number;
-    derivedPrId = native.id;
-  }
-  const pr = await verifyIssuePr(context, issueNumber, prNumber);
-  if (derivedPrId !== undefined && pr.node_id !== derivedPrId)
-    throw new DeliveryError('Queue native PR identity changed after issue derivation.');
-  if (pr.user.login.toLowerCase() !== author.actorLogin.toLowerCase())
-    throw new DeliveryError('Queue requires the configured PR author.');
-  return { pr, issueNumber, author };
-}
 export async function prInfo(
   context: DeliveryContext,
   input: { issueNumber?: number; prNumber?: number; nonClosing?: boolean },
@@ -1072,7 +1018,6 @@ async function readRequiredCheckNames(context: PrReadContext, base: string) {
   return { names: [...names].sort(), complete, required: [...required.values()] };
 }
 
-/** @internal Queue proof belongs to the exact published SHA and the required check producer. */
 export async function queueChecks(context: DeliveryContext, base: string, sha: string) {
   return readRequiredCheckProof(context, base, sha, false);
 }
