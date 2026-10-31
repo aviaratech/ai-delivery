@@ -12,11 +12,267 @@ import { digestValue, type RepositoryClassificationReceipt } from './delivery/le
 import { createDeliveryGitHubClients, withAuthorGitToken } from './github/client.js';
 import type { DeliveryContext } from './issue.js';
 import { preflightReviewRoute } from './pr.js';
-import { readRequiredReviewState, ReviewArtifactSchema, submitReview } from './review.js';
+import {
+  buildReviewArtifact,
+  parseReviewVerdict,
+  readRequiredReviewState,
+  ReviewArtifactSchema,
+  submitReview,
+} from './review.js';
 
 const head = { sha: 'a'.repeat(40), tree: 'b'.repeat(40) };
 const publicationEvidenceId = `sha256:${'c'.repeat(64)}`;
 const marker = (id: string) => `<!-- ai-delivery-review-artifact: ${id} -->`;
+
+const verdictInput = () => ({
+  schemaVersion: 'ai-delivery.review-verdict@1',
+  verdict: 'approve',
+  summary: 'Reviewed changes.',
+  issueNumber: 17,
+  scope: { headSha: head.sha, headTree: head.tree, changedPaths: ['change.ts'] },
+  verificationReproduced: ['Required checks passed.'],
+  requestedModel: 'gpt-6-astra',
+  effectiveModel: 'gpt-6-astra',
+  elapsedMs: 1,
+  findings: [],
+  readOnly: true,
+});
+
+test('a verdict without an effort override truthfully records inherited effort', () => {
+  const verdict = parseReviewVerdict(verdictInput());
+  assert.equal(verdict.requestedEffort, 'inherited');
+  assert.equal(verdict.effectiveEffort, 'inherited');
+  assert.equal(parseReviewVerdict({ ...verdictInput(), effectiveEffort: 'xhigh' }).effectiveEffort, 'xhigh');
+});
+
+test('formal review normalizes unsorted duplicate and canonical rename-old paths', async () => {
+  const state = fixture();
+  try {
+    state.context.clients.rest.pulls.listFiles = (async () => ({
+      data: [{ filename: 'change.ts', previous_filename: 'old.ts', status: 'renamed' }],
+    })) as typeof state.context.clients.rest.pulls.listFiles;
+    const make = (changedPaths: string[]) =>
+      buildReviewArtifact({
+        verdict: parseReviewVerdict({
+          ...verdictInput(),
+          requestedEffort: 'high',
+          effectiveEffort: 'high',
+          scope: { ...verdictInput().scope, changedPaths },
+        }),
+        verdictFileSha256: `sha256:${'d'.repeat(64)}`,
+        identity: 'synthetic-reviewer',
+        provider: 'openai',
+        expectedHead: head.sha,
+        prNumber: 19,
+        authorIdentity: 'synthetic-author',
+      });
+    await submitReview({
+      context: state.context,
+      artifact: make(['old.ts', 'change.ts', 'change.ts']),
+      issueNumber: 17,
+      prNumber: 19,
+      dryRun: true,
+    });
+    for (const paths of [['old.ts'], ['change.ts', 'unknown.ts']])
+      await assert.rejects(
+        submitReview({ context: state.context, artifact: make(paths), issueNumber: 17, prNumber: 19, dryRun: true }),
+        /scope/u,
+      );
+    assert.equal(state.created, 0);
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
+for (const scenario of [
+  'clean',
+  'base-touch',
+  'reverted-touch',
+  'late-base-touch',
+  'changed-hunk',
+  'failed-verify',
+  'focused-verify',
+  'unfinalized-verify',
+  'legacy',
+] as const) {
+  test(`clean-rebase submission eligibility: ${scenario}`, async () => {
+    const state = fixture();
+    const proof = mkdtempSync(join(tmpdir(), 'review-reuse-proof-'));
+    try {
+      const g = (...args: string[]) =>
+        execFileSync(
+          'git',
+          [
+            '-c',
+            'user.name=Fixture',
+            '-c',
+            'user.email=fixture@example.invalid',
+            '-c',
+            'commit.gpgsign=false',
+            '-c',
+            'core.hooksPath=/dev/null',
+            ...args,
+          ],
+          { cwd: state.root, encoding: 'utf8' },
+        ).trim();
+      const lines = Array.from({ length: 100 }, (_, i) => `line ${i}`);
+      writeFileSync(join(state.root, 'change.ts'), lines.join('\n') + '\n');
+      g('add', '.');
+      g('commit', '-qm', 'Original base');
+      const oldBase = g('rev-parse', 'HEAD');
+      lines[50] = 'reviewed change';
+      writeFileSync(join(state.root, 'change.ts'), lines.join('\n') + '\n');
+      g('commit', '-qam', 'Reviewed patch');
+      const oldHead = g('rev-parse', 'HEAD');
+      const oldTree = g('rev-parse', 'HEAD^{tree}');
+      g('checkout', '-qb', 'advanced', oldBase);
+      writeFileSync(join(state.root, 'other.ts'), 'Unrelated base change\n');
+      if (scenario === 'base-touch' || scenario === 'reverted-touch') {
+        const baseLines = [...lines];
+        baseLines[50] = 'line 50';
+        baseLines[5] = 'base touched';
+        writeFileSync(join(state.root, 'change.ts'), baseLines.join('\n') + '\n');
+      }
+      g('add', '.');
+      g('commit', '-qm', 'Advance base');
+      if (scenario === 'reverted-touch') {
+        const restored = [...lines];
+        restored[50] = 'line 50';
+        writeFileSync(join(state.root, 'change.ts'), restored.join('\n') + '\n');
+        g('commit', '-qam', 'Revert base touch');
+      }
+      const newBase = g('rev-parse', 'HEAD');
+      g('cherry-pick', oldHead);
+      if (scenario === 'changed-hunk') {
+        lines[50] = 'different patch';
+        writeFileSync(join(state.root, 'change.ts'), lines.join('\n') + '\n');
+        g('commit', '-qam', 'Change reviewed hunk');
+      }
+      const newHead = { sha: g('rev-parse', 'HEAD'), tree: g('rev-parse', 'HEAD^{tree}') };
+      let currentBase = newBase;
+      if (scenario === 'late-base-touch') {
+        g('checkout', '-qb', 'later-base', newBase);
+        const later = [...lines];
+        later[50] = 'line 50';
+        later[5] = 'late base touch';
+        writeFileSync(join(state.root, 'change.ts'), later.join('\n') + '\n');
+        g('commit', '-qam', 'Touch reviewed path after rebase');
+        later[5] = 'line 5';
+        writeFileSync(join(state.root, 'change.ts'), later.join('\n') + '\n');
+        g('commit', '-qam', 'Revert late base touch');
+        currentBase = g('rev-parse', 'HEAD');
+        g('checkout', '-q', newHead.sha);
+      }
+      const seal = (content: object) => ({ ...content, artifactId: digestValue(content) }) as typeof state.artifact;
+      const { artifactId: _id, ...original } = state.artifact;
+      const oldArtifact = seal({
+        ...original,
+        head: { sha: oldHead, tree: oldTree },
+        ...(scenario === 'legacy' ? {} : { reviewBase: { baseSha: oldBase, mergeBaseSha: oldBase } }),
+      });
+      const oldBody = `${marker(oldArtifact.artifactId)}\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(oldArtifact)).toString('base64url')} -->`;
+      const reviews = [
+        {
+          id: 41,
+          state: 'APPROVED',
+          commit_id: newHead.sha,
+          user: { login: 'synthetic-reviewer[bot]' },
+          html_url: 'https://github.com/example/repo/pull/19#pullrequestreview-41',
+          body: oldBody,
+        },
+      ];
+      const resultPath = join(proof, scenario === 'unfinalized-verify' ? 'result.json.tmp' : 'result.json');
+      writeFileSync(
+        resultPath,
+        JSON.stringify({
+          schemaVersion: 'contributor-checks@1',
+          scope: scenario === 'focused-verify' ? 'focused' : 'full',
+          status: scenario === 'failed-verify' ? 'failed' : 'passed',
+          exitCode: scenario === 'failed-verify' ? 1 : 0,
+          fullSuccess: true,
+          omitted: [],
+          gates: ['format', 'lint', 'types', 'build', 'tests', 'inventory'],
+          verifiedHead: newHead,
+          completedAt: new Date().toISOString(),
+          commands: ['format', 'lint', 'types', 'build', 'tests', 'inventory'].map((stage) => ({
+            stage,
+            status: 'passed',
+            exitCode: 0,
+            cleanupConfirmed: true,
+          })),
+        }),
+        { mode: 0o600 },
+      );
+      const artifact = seal({
+        ...original,
+        head: newHead,
+        reviewBase: { baseSha: currentBase, mergeBaseSha: newBase },
+        reuse: { fromReviewId: 41, verificationResultPath: resultPath },
+      });
+      const rest = state.context.clients.rest;
+      const context = {
+        ...state.context,
+        clients: {
+          ...state.context.clients,
+          rest: Object.assign({}, rest, {
+            git: {
+              ...rest.git,
+              getCommit: async ({ commit_sha }: { commit_sha: string }) => ({
+                data: { sha: commit_sha, tree: { sha: g('rev-parse', `${commit_sha}^{tree}`) } },
+              }),
+            },
+            repos: { compareCommitsWithBasehead: async () => ({ data: { merge_base_commit: { sha: newBase } } }) },
+            pulls: {
+              ...rest.pulls,
+              get: async () => ({
+                data: {
+                  number: 19,
+                  state: 'open',
+                  changed_files: 1,
+                  base: { sha: currentBase, repo: { full_name: 'example/repo' } },
+                  head: { sha: newHead.sha, repo: { full_name: 'example/repo' } },
+                  user: { login: 'author' },
+                },
+              }),
+              listReviews: async () => ({ data: reviews }),
+              getReview: async ({ review_id }: { review_id: number }) => ({
+                data: reviews.find((x) => x.id === review_id),
+              }),
+              createReview: async ({ body, commit_id }: { body: string; commit_id: string }) => {
+                assert.equal(commit_id, newHead.sha);
+                const created = {
+                  ...reviews[0]!,
+                  id: 42,
+                  body,
+                  commit_id,
+                  html_url: 'https://github.com/example/repo/pull/19#pullrequestreview-42',
+                };
+                reviews.push(created);
+                return { data: created };
+              },
+            },
+          }),
+        },
+      } as unknown as DeliveryContext;
+      const action = () => submitReview({ context, artifact, issueNumber: 17, prNumber: 19 });
+      if (scenario === 'clean') {
+        const result = await action();
+        assert.equal(result.githubReviewId, 42);
+        assert.equal(result.artifact.head.sha, newHead.sha);
+        const reused = result.artifact.reusedFrom;
+        assert.equal(reused?.oldHead, oldHead);
+        assert.equal(reused?.newHead, newHead.sha);
+        assert.equal(reused?.reviewId, 41);
+        assert.ok(!reviews[1]!.body.includes(resultPath));
+      } else await assert.rejects(action(), /fresh review/u);
+      assert.equal(reviews.length, scenario === 'clean' ? 2 : 1);
+      assert.equal(reviews[0]!.body, oldBody);
+    } finally {
+      rmSync(state.root, { recursive: true, force: true });
+      rmSync(proof, { recursive: true, force: true });
+    }
+  });
+}
 
 function fixture(
   input: {

@@ -2760,9 +2760,18 @@ export async function linkedIssueBranches(context: DeliveryContext, issueNumber:
   throw new DeliveryError('GitHub linked issue branches exceed the bounded readback window.');
 }
 export async function issueBranch(context: DeliveryContext, issueNumber: number, selected?: string): Promise<string> {
-  const branches = (await linkedIssueBranches(context, issueNumber)).filter(
-    (branch) => selected === undefined || branch.name === selected,
-  );
+  const linked = await linkedIssueBranches(context, issueNumber);
+  const branches = linked.filter((branch) => selected === undefined || branch.name === selected);
+  if (linked.length === 0 && (selected === undefined || selected === `issue/${issueNumber}`)) {
+    const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
+    if (issue.number !== issueNumber || 'pull_request' in issue || issue.state !== 'open')
+      throw new DeliveryError('Canonical issue branch requires its matching open GitHub issue.');
+    const name = `issue/${issueNumber}`;
+    const ref = (await context.clients.rest.git.getRef({ ...context.repo, ref: `heads/${name}` })).data;
+    if (ref.ref !== `refs/heads/${name}` || ref.object.type !== 'commit' || !/^[a-f0-9]{40}$/u.test(ref.object.sha))
+      throw new DeliveryError('Canonical issue branch head/ref readback is invalid.');
+    return name;
+  }
   if (branches.length !== 1)
     throw new DeliveryError(
       'Select exactly one GitHub-linked issue branch; no local worktree or receipt fallback is available.',

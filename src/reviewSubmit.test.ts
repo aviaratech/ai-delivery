@@ -59,8 +59,6 @@ test('verdict validation reports missing metadata and rejects scope expansion in
     'verificationReproduced',
     'requestedModel',
     'effectiveModel',
-    'requestedEffort',
-    'effectiveEffort',
     'elapsedMs',
     'findings',
   ]) {
@@ -73,10 +71,13 @@ test('verdict validation reports missing metadata and rejects scope expansion in
     { ...verdict(), summary: '  ' },
     { ...verdict(), effectiveEffort: 'unknown' },
     { ...verdict(), unexpected: true },
-    { ...verdict(), scope: { ...verdict().scope, changedPaths: ['change.ts', 'change.ts'] } },
   ])
     assert.throws(() => parse(input));
   assert.throws(() => parse('{'), /JSON/u);
+  assert.deepEqual(
+    parse({ ...verdict(), scope: { ...verdict().scope, changedPaths: ['change.ts', 'change.ts'] } }).scope.changedPaths,
+    ['change.ts'],
+  );
 });
 
 function commandFixture() {
@@ -214,6 +215,7 @@ globalThis.fetch=async(input,init={})=>{
  if(url.pathname==='/app')return response({id:scenario==='foreign-app'?999:${id},slug:scenario==='wrong-actor'?'other-app':'fixture-${provider}-reviewer'});
  if(decodeURIComponent(url.pathname).endsWith('/git/ref/heads/issue/17'))return response({ref:'refs/heads/issue/17',object:{type:'commit',sha:scenario==='head-moved'?'${'f'.repeat(40)}':'${sha}'}});
  if(url.pathname.endsWith('/git/commits/${sha}'))return response({sha:'${sha}',tree:{sha:'${tree}'}});
+ if(url.pathname.includes('/compare/'))return response({merge_base_commit:{sha:'${'c'.repeat(40)}'}});
  if(url.pathname.endsWith('/pulls/19/files'))return response([{filename:scenario==='scope-mismatch'?'other.ts':'change.ts'}]);
  if(url.pathname.endsWith('/pulls/19')){
   reads++;

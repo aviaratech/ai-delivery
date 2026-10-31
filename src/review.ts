@@ -1,4 +1,5 @@
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 
 import type { DeliveryConfig } from './config/deliveryConfig.js';
@@ -10,14 +11,17 @@ import {
   type RepositoryClassificationReceipt,
 } from './delivery/legacy.js';
 import { DeliveryError } from './errors.js';
-import { gitCommonDir } from './git.js';
+import { git, gitCommonDir, gitExitCode } from './git.js';
+import { GIT_EXECUTABLE, gitEnvironment, inertGitArguments } from './gitProcess.js';
 import type { DeliveryContext } from './issue.js';
 import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 const Sha = z.string().regex(/^[a-f0-9]{40}$/u);
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const Text = z.string().trim().min(1);
-const Effort = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+const Effort = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'inherited']);
+const ReviewBase = z.strictObject({ baseSha: Sha, mergeBaseSha: Sha });
+const Reuse = z.strictObject({ fromReviewId: z.number().int().positive(), verificationResultPath: Text });
 export const ReviewVerdictSchema = z.strictObject({
   schemaVersion: z.literal('ai-delivery.review-verdict@1'),
   verdict: z.enum(['approve', 'request-changes']),
@@ -33,20 +37,18 @@ export const ReviewVerdictSchema = z.strictObject({
           .min(1)
           .refine((path) => !path.includes('\0'), 'Paths cannot contain NUL.'),
       )
-      .refine(
-        (paths) => paths.every((path, index) => index === 0 || paths[index - 1]! < path),
-        'Paths must be complete, sorted and unique.',
-      ),
+      .transform((paths) => [...new Set(paths)].sort()),
   }),
   verificationReproduced: z.array(Text).min(1),
   requestedModel: Text,
-  requestedEffort: Effort,
+  requestedEffort: Effort.default('inherited'),
   effectiveModel: Text,
-  effectiveEffort: Effort,
+  effectiveEffort: Effort.default('inherited'),
   elapsedMs: z.number().int().nonnegative(),
   findings: z.array(Text),
   readOnly: z.literal(true),
   nonClosing: z.boolean().optional(),
+  reuse: Reuse.optional(),
 });
 export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
 
@@ -73,6 +75,7 @@ export function buildReviewArtifact(input: {
   expectedHead: string;
   prNumber: number;
   authorIdentity: string;
+  reviewBase?: z.infer<typeof ReviewBase>;
 }): ReviewArtifact {
   const verdict = parseReviewVerdict(input.verdict);
   if (!Digest.safeParse(input.verdictFileSha256).success)
@@ -89,6 +92,9 @@ export function buildReviewArtifact(input: {
     issueNumber: verdict.issueNumber,
     prNumber: input.prNumber,
     diffScopeHash: digestValue(verdict.scope.changedPaths),
+    changedPaths: verdict.scope.changedPaths,
+    ...(input.reviewBase === undefined ? {} : { reviewBase: input.reviewBase }),
+    ...(verdict.reuse === undefined ? {} : { reuse: verdict.reuse }),
     checks: verdict.verificationReproduced,
     elapsedMs: verdict.elapsedMs,
     findings: verdict.findings,
@@ -145,6 +151,25 @@ export const ReviewArtifactSchema = z
     elapsedMs: z.number().int().nonnegative(),
     findings: z.array(z.string()),
     head: z.object({ sha: Sha, tree: Sha }).strict(),
+    reviewBase: ReviewBase.optional(),
+    reuse: Reuse.optional(),
+    reusedFrom: z
+      .strictObject({
+        reviewId: z.number().int().positive(),
+        artifactId: Digest,
+        oldHead: Sha,
+        newHead: Sha,
+        reason: Text,
+      })
+      .optional(),
+    changedPaths: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .refine((path) => !path.includes('\0')),
+      )
+      .optional(),
     issueNumber: z.number().int().positive(),
     prNumber: z.number().int().positive().nullable(),
     readOnly: z.literal(true),
@@ -160,7 +185,11 @@ export const ReviewArtifactSchema = z
   .strict()
   .superRefine((artifact, ctx) => {
     const { artifactId, ...content } = artifact;
-    if (artifactId !== digestValue(content) || artifact.authorIdentity === artifact.reviewerIdentity) {
+    if (
+      artifactId !== digestValue(content) ||
+      artifact.authorIdentity === artifact.reviewerIdentity ||
+      (artifact.changedPaths !== undefined && artifact.diffScopeHash !== digestValue(artifact.changedPaths))
+    ) {
       ctx.addIssue({ code: 'custom', message: 'Review artifact identity or role separation is invalid.' });
     }
   });
@@ -371,22 +400,60 @@ function githubReviewBody(artifact: ReviewArtifact): string {
   return body;
 }
 
-export async function readGitHubPrScopeHash(
+async function readGitHubPrPaths(
   context: DeliveryContext,
   prNumber: number,
   changedFiles: number,
-): Promise<string> {
+  claimed?: string[],
+): Promise<string[]> {
   const files: string[] = [];
+  const renamed = new Set<string>();
   for (let page = 1; page <= 30; page++) {
     const batch = (
       await context.clients.rest.pulls.listFiles({ ...context.repo, pull_number: prNumber, page, per_page: 100 })
     ).data;
     files.push(...batch.map((file) => file.filename));
+    for (const file of batch)
+      if (file.status === 'renamed' && file.previous_filename) renamed.add(file.previous_filename);
     if (batch.length < 100) break;
   }
   if (!Number.isSafeInteger(changedFiles) || files.length !== changedFiles || new Set(files).size !== files.length)
     throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
-  return digestValue(files.sort());
+  const current = new Set(files);
+  if (
+    claimed &&
+    digestValue([...new Set(claimed.filter((path) => current.has(path) || !renamed.has(path)))].sort()) !==
+      digestValue(files.sort())
+  )
+    throw new DeliveryError('Independent review scope differs from the canonical remote rename inventory.');
+  return files.sort();
+}
+
+export async function readGitHubPrScopeHash(
+  context: DeliveryContext,
+  prNumber: number,
+  changedFiles: number,
+): Promise<string> {
+  return digestValue(await readGitHubPrPaths(context, prNumber, changedFiles));
+}
+
+export async function readGitHubReviewBase(context: DeliveryContext, prNumber: number, expectedHead: string) {
+  const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
+  if (
+    pr.number !== prNumber ||
+    pr.state !== 'open' ||
+    pr.head.sha !== expectedHead ||
+    !Sha.safeParse(pr.base.sha).success
+  )
+    throw new DeliveryError('Review comparison changed; obtain a fresh review.');
+  const comparison = (
+    await context.clients.rest.repos.compareCommitsWithBasehead({
+      ...context.repo,
+      basehead: `${pr.base.sha}...${expectedHead}`,
+      per_page: 1,
+    })
+  ).data;
+  return ReviewBase.parse({ baseSha: pr.base.sha, mergeBaseSha: comparison.merge_base_commit.sha });
 }
 
 export function reviewArtifactApproval(input: {
@@ -528,16 +595,177 @@ export async function validateReviewTarget(context: DeliveryContext, artifact: R
   const commit = (await context.clients.rest.git.getCommit({ ...context.repo, commit_sha: artifact.head.sha })).data;
   if (commit.sha !== artifact.head.sha || commit.tree.sha !== artifact.head.tree)
     throw new DeliveryError('Independent review tree differs from the remote commit.');
-  if (artifact.diffScopeHash !== (await readGitHubPrScopeHash(context, prNumber, pr.changed_files)))
+  const reviewPaths = await readGitHubPrPaths(context, prNumber, pr.changed_files, artifact.changedPaths);
+  if (artifact.changedPaths === undefined && artifact.diffScopeHash !== digestValue(reviewPaths))
     throw new DeliveryError('Independent review scope is incomplete or differs from the remote PR diff.');
-  return pr;
+  if (
+    artifact.reviewBase &&
+    digestValue(artifact.reviewBase) !== digestValue(await readGitHubReviewBase(context, prNumber, artifact.head.sha))
+  )
+    throw new DeliveryError('Review comparison changed; obtain a fresh review.');
+  return { ...pr, reviewPaths };
+}
+
+async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArtifact, prNumber: number, actor: string) {
+  try {
+    const request = artifact.reuse!;
+    if (basename(request.verificationResultPath) !== 'result.json') throw new Error('Verification is not finalized.');
+    const review = (
+      await context.clients.rest.pulls.getReview({
+        ...context.repo,
+        pull_number: prNumber,
+        review_id: request.fromReviewId,
+      })
+    ).data;
+    const original = parseGitHubReviewArtifact(review.body);
+    if (
+      review.id !== request.fromReviewId ||
+      review.state !== 'APPROVED' ||
+      review.user?.login.toLowerCase() !== actor.toLowerCase() ||
+      original.verdict !== 'approve' ||
+      artifact.verdict !== 'approve' ||
+      original.prNumber !== prNumber ||
+      original.issueNumber !== artifact.issueNumber ||
+      original.authorIdentity !== artifact.authorIdentity ||
+      original.reviewerIdentity !== artifact.reviewerIdentity ||
+      !original.reviewBase ||
+      !artifact.reviewBase ||
+      original.reuse ||
+      original.head.sha === artifact.head.sha
+    )
+      throw new Error('Original comparison unavailable.');
+    const root = context.root;
+    const base = original.reviewBase;
+    const next = artifact.reviewBase;
+    const mergeBase = (baseSha: string, headSha: string) => {
+      const sha = git(root, 'merge-base', '--all', baseSha, headSha);
+      return Sha.parse(sha);
+    };
+    if (
+      mergeBase(base.baseSha, original.head.sha) !== base.mergeBaseSha ||
+      mergeBase(next.baseSha, artifact.head.sha) !== next.mergeBaseSha ||
+      gitExitCode(root, 'merge-base', '--is-ancestor', base.baseSha, next.baseSha) !== 0 ||
+      gitExitCode(root, 'merge-base', '--is-ancestor', base.mergeBaseSha, next.mergeBaseSha) !== 0 ||
+      git(root, 'rev-parse', `${original.head.sha}^{tree}`) !== original.head.tree
+    )
+      throw new Error('History differs.');
+    const run = (args: string[], input?: Buffer) =>
+      execFileSync(GIT_EXECUTABLE, [...inertGitArguments(root), ...args], {
+        cwd: root,
+        env: gitEnvironment(),
+        input,
+        timeout: 10000,
+        maxBuffer: 4 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    const diff = (from: string, to: string) =>
+      run([
+        'diff',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--no-color',
+        '--no-renames',
+        '--no-relative',
+        '--src-prefix=a/',
+        '--dst-prefix=b/',
+        '--ignore-submodules=none',
+        '--binary',
+        '--full-index',
+        from,
+        to,
+        '--',
+      ]);
+    const before = diff(base.mergeBaseSha, original.head.sha);
+    const after = diff(next.mergeBaseSha, artifact.head.sha);
+    const patch = run(['patch-id', '--stable'], before);
+    if (
+      !before.length ||
+      !before.equals(after) ||
+      !patch.equals(run(['patch-id', '--stable'], after)) ||
+      !Sha.safeParse(patch.toString('utf8').split(/\s/u)[0]).success
+    )
+      throw new Error('Patch differs.');
+    const paths = [
+      ...new Set(
+        [
+          [base.mergeBaseSha, original.head.sha],
+          [next.mergeBaseSha, artifact.head.sha],
+        ].flatMap(([from, to]) =>
+          run(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', from!, to!, '--'])
+            .toString('utf8')
+            .split('\0')
+            .filter(Boolean),
+        ),
+      ),
+    ];
+    const touched = (from: string, to: string) =>
+      run([
+        '--literal-pathspecs',
+        'log',
+        '--format=',
+        '--name-only',
+        '-z',
+        '--full-history',
+        '--diff-merges=separate',
+        `${from}..${to}`,
+        '--',
+        ...paths,
+      ]).length !== 0;
+    if (touched(base.mergeBaseSha, next.mergeBaseSha) || touched(base.baseSha, next.baseSha))
+      throw new Error('Base touched review paths.');
+    const gates = ['format', 'lint', 'types', 'build', 'tests', 'inventory'];
+    const report = z
+      .object({
+        schemaVersion: z.literal('contributor-checks@1'),
+        scope: z.literal('full'),
+        status: z.literal('passed'),
+        exitCode: z.literal(0),
+        fullSuccess: z.literal(true),
+        omitted: z.array(Text).length(0),
+        completedAt: z.iso.datetime(),
+        verifiedHead: z.strictObject({ sha: Sha, tree: Sha }),
+        gates: z.array(Text),
+        commands: z.array(
+          z.object({
+            stage: Text,
+            status: z.literal('passed'),
+            exitCode: z.literal(0),
+            cleanupConfirmed: z.literal(true),
+          }),
+        ),
+      })
+      .parse(
+        JSON.parse(assertPrivateFile(request.verificationResultPath, { maxBytes: 4 * 1024 * 1024 }).toString('utf8')),
+      );
+    if (
+      digestValue(report.gates) !== digestValue(gates) ||
+      digestValue(report.commands.map((command) => command.stage)) !== digestValue(gates) ||
+      digestValue(report.verifiedHead) !== digestValue(artifact.head) ||
+      git(root, 'rev-parse', 'HEAD') !== artifact.head.sha ||
+      git(root, 'rev-parse', 'HEAD^{tree}') !== artifact.head.tree ||
+      git(root, 'status', '--porcelain', '--untracked-files=all') !== ''
+    )
+      throw new Error('Exact-head required verification unavailable.');
+    return {
+      reviewId: review.id,
+      artifactId: original.artifactId,
+      oldHead: original.head.sha,
+      newHead: artifact.head.sha,
+      reason: 'Exact patch, untouched base paths and successful exact-head required verification.',
+    };
+  } catch {
+    throw new DeliveryError(
+      'Clean-rebase reuse lacks complete unchanged-content and verification proof; obtain a fresh review.',
+    );
+  }
 }
 
 export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
 export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
 export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
 export async function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun> {
-  const { artifact, context, issueNumber, prNumber } = input;
+  const { context, issueNumber, prNumber } = input;
+  let artifact = input.artifact;
   ReviewArtifactSchema.parse(artifact);
   if (
     artifact.issueNumber !== issueNumber ||
@@ -552,6 +780,16 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
   const actor = await context.clients.appActorLogin();
   if (!actor || !pr.user?.login || actor.toLowerCase() === pr.user.login.toLowerCase())
     throw new DeliveryError('Reviewer GitHub actor must differ from PR author.');
+  if (artifact.reusedFrom) throw new DeliveryError('Reuse requires current comparison proof; obtain a fresh review.');
+  const { artifactId: _artifactId, reuse, ...content } = artifact;
+  const canonical = {
+    ...content,
+    ...(artifact.changedPaths === undefined
+      ? {}
+      : { changedPaths: pr.reviewPaths, diffScopeHash: digestValue(pr.reviewPaths) }),
+    ...(reuse === undefined ? {} : { reusedFrom: await qualifyReviewReuse(context, artifact, prNumber, actor) }),
+  };
+  artifact = ReviewArtifactSchema.parse({ ...canonical, artifactId: digestValue(canonical) });
   const body = githubReviewBody(artifact);
   const expectedState = artifact.verdict === 'approve' ? ('APPROVED' as const) : ('CHANGES_REQUESTED' as const);
   const event = artifact.verdict === 'approve' ? ('APPROVE' as const) : ('REQUEST_CHANGES' as const);
