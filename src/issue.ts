@@ -31,6 +31,7 @@ import {
   setConfiguredNativeIssueMetadata,
 } from './github/nativeIssueMetadata.js';
 import {
+  getArchivedIssueProjectStatus,
   getIssueProjectStatus,
   assertIssueProjectWritable,
   getProjectDeliveryConfiguration,
@@ -2016,6 +2017,15 @@ async function updateProjection(
     nativeOnly ? plan.nativeTarget : undefined,
   );
   const values: Record<string, unknown> = { ...readback };
+  // A preserved archived item keeps its Status; compare against it rather than null (#240).
+  if (plan.preserveArchived && readback.projectStatus === null)
+    values.projectStatus = await getArchivedIssueProjectStatus({
+      graphql: context.clients.graphql,
+      issueNodeId: plan.nativeTarget.nodeId,
+      org: context.config.native.organization,
+      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+      settings: projectSettingsFromDeliveryConfig(context.config),
+    });
   if (input.projectStatus !== undefined) {
     const comment = await findUpdateComment(context, input.issueNumber, projectStatusBody(input)!);
     values.projectStatusReason = comment === null ? null : input.projectStatus.reason;
