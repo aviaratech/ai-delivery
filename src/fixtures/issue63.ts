@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './issueProjectItems.js';
 import type { DeliveryContext } from '../issue.js';
 import { IssueFields, renderIssueBody } from '../issueContract.js';
 import { syntheticDiscoveryConfig } from './discovery.js';
@@ -205,35 +206,29 @@ export function issue63Fixture() {
             },
           };
         }
-        if (query.includes('ProjectDeliveryItems'))
-          return {
-            organization: {
-              projectV2: {
-                items: {
-                  nodes: [...rows.values()]
-                    .filter((row) => row.number !== controls.missingProjectIssue)
-                    .map((r) => ({
-                      id: `ITEM${r.number}`,
-                      isArchived: false,
-                      content: { id: r.node_id },
-                      fieldValueByName:
-                        controls.missingProjectStatus === r.number
-                          ? null
-                          : {
-                              name: statuses.get(r.number),
-                              optionId:
-                                statuses.get(r.number) === 'Active'
-                                  ? 'ACTIVE'
-                                  : statuses.get(r.number) === 'Waiting'
-                                    ? 'BLOCKED'
-                                    : 'TODO',
-                            },
-                    })),
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                },
-              },
-            },
-          };
+        if (query.includes('ProjectDeliveryIssueItems'))
+          return issueProjectItemsResponse(
+            v,
+            [...rows.values()]
+              .filter((row) => row.node_id === v.issueNodeId && row.number !== controls.missingProjectIssue)
+              .map((r) => ({
+                id: `ITEM${r.number}`,
+                isArchived: false,
+                content: { id: r.node_id },
+                fieldValueByName:
+                  controls.missingProjectStatus === r.number
+                    ? null
+                    : {
+                        name: statuses.get(r.number),
+                        optionId:
+                          statuses.get(r.number) === 'Active'
+                            ? 'ACTIVE'
+                            : statuses.get(r.number) === 'Waiting'
+                              ? 'BLOCKED'
+                              : 'TODO',
+                      },
+              })),
+          );
         if (query.includes('UpdateProjectDeliveryStatus')) {
           const n = Number(String(v.itemId).replace('ITEM', ''));
           statuses.set(n, v.optionId === 'ACTIVE' ? 'Active' : v.optionId === 'BLOCKED' ? 'Waiting' : 'Queued');

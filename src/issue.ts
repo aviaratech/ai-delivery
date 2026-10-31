@@ -1115,8 +1115,8 @@ export async function listIssues(
         : null;
   }
   const catalog = await readIssueFieldCatalog(context, options.capacityRead);
-  const issues: ListedTrackingIssue[] = [];
   const seen = new Set<number>();
+  const entries: { current: z.infer<typeof ListedIssue>; selectedLabels: string[] }[] = [];
   for (const entry of raw) {
     if (typeof entry === 'object' && entry !== null && 'pull_request' in entry) continue;
     const current = ListedIssue.parse(entry);
@@ -1127,7 +1127,12 @@ export async function listIssues(
       `/${context.repo.owner}/${context.repo.repo}/issues/${String(current.number)}`.toLowerCase()
     )
       throw new DeliveryError('GitHub issue list returned a foreign repository issue.');
-    const selectedLabels = current.labels.map((label) => (typeof label === 'string' ? label : label.name));
+    entries.push({
+      current,
+      selectedLabels: current.labels.map((label) => (typeof label === 'string' ? label : label.name)),
+    });
+  }
+  const rows = await mapConcurrent(entries, READ_CONCURRENCY, async ({ current, selectedLabels }) => {
     if (options.capacityRead) {
       const url = new URL(current.html_url);
       if (url.protocol !== 'https:' || url.hostname !== 'github.com')
@@ -1142,22 +1147,39 @@ export async function listIssues(
       )
         throw new DeliveryError('WIP capacity issue identity or state changed during native readback.');
     }
-    if (input.state !== undefined && input.state !== 'all' && current.state !== input.state) continue;
+    if (input.state !== undefined && input.state !== 'all' && current.state !== input.state) return null;
     if (
       (input.labels ?? []).some(
         (label) => !selectedLabels.some((selected) => selected.toLowerCase() === label.toLowerCase()),
       )
     )
-      continue;
-    if (input.issueType !== undefined && current.type?.name !== input.issueType) continue;
-    if (input.updatedSince !== undefined && Date.parse(current.updated_at) < Date.parse(input.updatedSince)) continue;
-    const relationships = await getNativeBlockerRelationships({
-      graphql: context.clients.graphql,
-      issueNumber: current.number,
-      repo: context.repo,
-      requireRepositoryIdentity: true,
-      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit, issueNodeId: current.node_id }),
-    });
+      return null;
+    if (input.issueType !== undefined && current.type?.name !== input.issueType) return null;
+    if (input.updatedSince !== undefined && Date.parse(current.updated_at) < Date.parse(input.updatedSince))
+      return null;
+    const [relationships, project, { fields }] = await Promise.all([
+      getNativeBlockerRelationships({
+        graphql: context.clients.graphql,
+        issueNumber: current.number,
+        repo: context.repo,
+        requireRepositoryIdentity: true,
+        ...(context.readPageLimit === undefined
+          ? {}
+          : { maxPages: context.readPageLimit, issueNodeId: current.node_id }),
+      }),
+      getIssueProjectStatus({
+        graphql: context.clients.graphql,
+        issueNodeId: current.node_id,
+        ...(options.capacityRead ? { capacityRead: true, maxPages: 20 } : {}),
+        ...(context.readPageLimit === undefined
+          ? {}
+          : { maxPages: Math.min(context.readPageLimit, options.capacityRead ? 20 : context.readPageLimit) }),
+        org: context.config.native.organization,
+        ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
+        settings: projectSettingsFromDeliveryConfig(context.config),
+      }),
+      readIssueFields(context, current.number, catalog, options.capacityRead),
+    ]);
     const localParent =
       relationships.parentRepository?.toLowerCase() === `${context.repo.owner}/${context.repo.repo}`.toLowerCase()
         ? relationships.parentNumber
@@ -1166,21 +1188,9 @@ export async function listIssues(
       input.parentIssueNumber !== undefined &&
       (input.parentIssueNumber === null ? relationships.parentNumber !== null : localParent !== input.parentIssueNumber)
     )
-      continue;
-    const project = await getIssueProjectStatus({
-      graphql: context.clients.graphql,
-      issueNodeId: current.node_id,
-      ...(options.capacityRead ? { capacityRead: true, maxPages: 20 } : {}),
-      ...(context.readPageLimit === undefined
-        ? {}
-        : { maxPages: Math.min(context.readPageLimit, options.capacityRead ? 20 : context.readPageLimit) }),
-      org: context.config.native.organization,
-      ...(context.projectConfiguration ? { configuration: context.projectConfiguration } : {}),
-      settings: projectSettingsFromDeliveryConfig(context.config),
-    });
-    if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) continue;
-    const { fields } = await readIssueFields(context, current.number, catalog, options.capacityRead);
-    issues.push({
+      return null;
+    if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) return null;
+    const listed: ListedTrackingIssue = {
       ...(options.capacityRead
         ? { nodeId: current.node_id, fieldIds: Object.fromEntries(catalog.map((field) => [field.name, field.id])) }
         : {}),
@@ -1205,8 +1215,10 @@ export async function listIssues(
       fields,
       url: current.html_url,
       updatedAt: current.updated_at,
-    });
-  }
+    };
+    return listed;
+  });
+  const issues = rows.filter((row): row is ListedTrackingIssue => row !== null);
   return { issues, page, perPage, nextPage };
 }
 
@@ -2593,6 +2605,23 @@ async function readDirectIssueChildren(
   }
 }
 
+/** GitHub answers in about 0.3 s per request, so per-item reads run a few at a time. */
+const READ_CONCURRENCY = 6;
+
+async function mapConcurrent<T, R>(items: readonly T[], limit: number, read: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await read(items[index]!);
+      }
+    }),
+  );
+  return results;
+}
+
 async function readChildProgress(
   context: DeliveryContext,
   children: Awaited<ReturnType<typeof readDirectIssueChildren>>,
@@ -2629,8 +2658,23 @@ async function readChildProgress(
   };
   let pointsTotal = 0;
   const inProgress: number[] = [];
-  for (const child of children) {
-    const fields = await readIssueFields(context, child.number, catalog, false, true);
+  const reads = await mapConcurrent(children, READ_CONCURRENCY, async (child) => {
+    const [fields, status] = await Promise.all([
+      readIssueFields(context, child.number, catalog, false, true),
+      getIssueProjectStatus({
+        graphql: context.clients.graphql,
+        org: context.config.native.organization,
+        issueNodeId: child.node_id,
+        configuration,
+        settings: projectSettingsFromDeliveryConfig(context.config),
+        capacityRead: true,
+        ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
+      }),
+    ]);
+    return { fields, status };
+  });
+  for (const [index, child] of children.entries()) {
+    const { fields, status } = reads[index]!;
     const points = fields.values.find(
       (field) => String(field.issue_field_id) === context.config.native.points.databaseId,
     );
@@ -2647,15 +2691,6 @@ async function readChildProgress(
       if (!Number.isSafeInteger(pointsTotal))
         throw new DeliveryError('Parent progress Points aggregate exceeds the safe integer range.');
     }
-    const status = await getIssueProjectStatus({
-      graphql: context.clients.graphql,
-      org: context.config.native.organization,
-      issueNodeId: child.node_id,
-      configuration,
-      settings: projectSettingsFromDeliveryConfig(context.config),
-      capacityRead: true,
-      ...(context.readPageLimit === undefined ? {} : { maxPages: context.readPageLimit }),
-    });
     if (status === null) progress.missingProjectStatus.push(child.number);
     else if (status.status === 'In Progress') inProgress.push(child.number);
     if (child.state === 'open') {
