@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -153,28 +154,24 @@ export function entrypointClients(head: string) {
   };
   const graphql = async (query: string, input: Record<string, unknown> = {}) => {
     record(query.match(/(?:query|mutation)\s+(\w+)/u)?.[1] ?? 'relationships', input);
-    if (query.includes('ProjectDeliveryItems'))
-      return {
-        organization: {
-          projectV2: {
-            id: 'PROJECT-1',
-            number: 1,
-            items: page([
-              item,
-              ...children.map((child) => ({
-                ...item,
-                id: `ITEM${child.number}`,
-                content: { __typename: 'Issue', id: child.node_id },
-                fieldValueByName: {
-                  ...item.fieldValueByName,
-                  optionId: child.number === 18 ? 'STATUS-3' : 'STATUS-1',
-                  name: child.number === 18 ? 'Shipped' : 'Active',
-                },
-              })),
-            ]),
-          },
-        },
-      };
+    if (query.includes('ProjectDeliveryIssueItems'))
+      return issueProjectItemsResponse(
+        input,
+        [
+          item,
+          ...children.map((child) => ({
+            ...item,
+            id: `ITEM${child.number}`,
+            content: { __typename: 'Issue', id: child.node_id },
+            fieldValueByName: {
+              ...item.fieldValueByName,
+              optionId: child.number === 18 ? 'STATUS-3' : 'STATUS-1',
+              name: child.number === 18 ? 'Shipped' : 'Active',
+            },
+          })),
+        ].filter((row) => (row.content as { id: string }).id === input.issueNodeId),
+        { id: 'PROJECT-1', number: 1 },
+      );
     if (query.includes('blockedBy(first:'))
       return {
         repository: {

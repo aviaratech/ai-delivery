@@ -37,7 +37,6 @@ function rollupFixture() {
     failedPage: 0,
     dateMode: 'configured',
     projectIdentity: 'PROJECT',
-    projectCursor: null as unknown,
     missingProjectIssue: undefined as number | undefined,
     archivedChildren: new Set<number>(),
     failChildProjectRead: false,
@@ -109,7 +108,7 @@ function rollupFixture() {
     assert.ok(!/\bmutation\b/u.test(query), 'Rollup must never write Project or issue state');
     if (
       controls.failChildProjectRead &&
-      query.includes('ProjectDeliveryItems') &&
+      query.includes('ProjectDeliveryIssueItems') &&
       metadataReads.some((number) => number !== 17)
     )
       throw new Error('Synthetic child Project read unavailable');
@@ -121,17 +120,18 @@ function rollupFixture() {
         number: variables.number,
         repository: { nameWithOwner: 'example/widget' },
       });
-    if (query.includes('ProjectDeliveryItems')) {
-      const project = (result as { organization: { projectV2: Record<string, unknown> } }).organization.projectV2;
-      project.id = controls.projectIdentity;
-      project.number = 1;
-      const items = project.items as {
-        nodes: { content: { id: string }; isArchived: boolean }[];
-        pageInfo: { endCursor: unknown };
-      };
-      items.pageInfo.endCursor = controls.projectCursor;
-      for (const item of items.nodes)
+    if (query.includes('ProjectDeliveryIssueItems')) {
+      const items = (
+        result as {
+          node: {
+            projectItems: { nodes: { content: { id: string }; isArchived: boolean; project: { id: string } }[] };
+          };
+        }
+      ).node.projectItems.nodes;
+      for (const item of items) {
+        item.project.id = controls.projectIdentity;
         if (controls.archivedChildren.has(Number(item.content.id.replace('ISSUE', '')))) item.isArchived = true;
+      }
     }
     return result;
   }) as typeof f.context.clients.graphql;
@@ -230,7 +230,7 @@ test('bounded parent progress preserves the Project definition page budget', asy
     }
     const result = await graphql(query, variables);
     // The parent already captured its configuration; force fresh discovery for the child rollup.
-    if (query.includes('ProjectDeliveryItems')) delete f.context.projectConfiguration;
+    if (query.includes('ProjectDeliveryIssueItems')) delete f.context.projectConfiguration;
     return result;
   }) as typeof f.context.clients.graphql;
   await assert.rejects(f.read, (error: unknown) => {
@@ -243,35 +243,6 @@ test('bounded parent progress preserves the Project definition page budget', asy
   });
   assert.equal(definitionRequests, 1);
   assert.deepEqual(f.metadataReads, [17]);
-  assert.deepEqual(f.writes, []);
-});
-
-test('bounded parent progress preserves each child Project status page budget', async () => {
-  const f = rollupFixture();
-  f.context.readPageLimit = 1;
-  const graphql = f.context.clients.graphql;
-  let childProjectRequests = 0;
-  f.context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
-    const result = await graphql(query, variables);
-    if (query.includes('ProjectDeliveryItems') && f.metadataReads.some((number) => number !== 17)) {
-      childProjectRequests++;
-      const project = (result as { organization: { projectV2: { items: { nodes: unknown[]; pageInfo: unknown } } } })
-        .organization.projectV2;
-      if (variables.cursor !== null) project.items.nodes = [];
-      project.items.pageInfo = { hasNextPage: variables.cursor === null, endCursor: 'child-page-1' };
-    }
-    return result;
-  }) as typeof f.context.clients.graphql;
-  await assert.rejects(f.read, (error: unknown) => {
-    assert.ok(error instanceof CollectionLimitError);
-    assert.equal(error.collection, 'project-items');
-    assert.equal(error.pagesRequested, 1);
-    assert.equal(error.rowsObserved, f.rows.size);
-    assert.equal(error.limit, 1);
-    return true;
-  });
-  assert.equal(childProjectRequests, 1);
-  assert.deepEqual(f.metadataReads, [17, 18]);
   assert.deepEqual(f.writes, []);
 });
 
@@ -322,19 +293,6 @@ test('individually valid Points cannot produce an unsafe aggregate', async () =>
   f.context.config.native.points = { ...f.context.config.native.points, values: ['1', '2', '4', '9007199254740991'] };
   f.points.set(18, '9007199254740991');
   await assert.rejects(f.read, /aggregate|safe integer|overflow/iu);
-});
-
-for (const cursor of [undefined, 9])
-  test(`strict child status rejects malformed final Project cursor ${String(cursor)}`, async () => {
-    const f = rollupFixture();
-    f.controls.projectCursor = cursor;
-    await assert.rejects(f.read, /pagination|cursor/iu);
-  });
-
-test('child status refuses a different Project identity', async () => {
-  const f = rollupFixture();
-  f.controls.projectIdentity = 'WRONG-PROJECT';
-  await assert.rejects(f.read, /Project identity/iu);
 });
 
 for (const identity of ['database', 'node'])

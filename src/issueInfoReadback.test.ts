@@ -114,12 +114,10 @@ function fixture(
       return { updateProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
     }
     const result = await nativeGraphql(query, variables);
-    if (query.includes('ProjectDeliveryItems'))
+    if (query.includes('ProjectDeliveryIssueItems'))
       for (const item of (
-        result as {
-          organization: { projectV2: { items: { nodes: { fieldValueByName: { name: string; optionId: string } }[] } } };
-        }
-      ).organization.projectV2.items.nodes)
+        result as { node: { projectItems: { nodes: { fieldValueByName: { name: string; optionId: string } }[] } } }
+      ).node.projectItems.nodes)
         if (item.fieldValueByName.name === 'Shipped') item.fieldValueByName.optionId = 'DONE';
     if (
       query.includes('ProjectDeliveryItemReadback') &&

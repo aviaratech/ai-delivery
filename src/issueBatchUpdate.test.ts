@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { afterEach, test, vi } from 'vitest';
 import * as issue from './issue.js';
@@ -224,7 +225,7 @@ function batchFixture() {
         if (
           controls.moveProjectToTodoAfterWrite &&
           writes.includes('update:1') &&
-          query.includes('ProjectDeliveryItems') &&
+          query.includes('ProjectDeliveryIssueItems') &&
           ++controls.projectReadsAfterWrite === 2
         )
           throw new Error('PRIVATE_SYNC_READ_FAILURE');
@@ -288,32 +289,28 @@ function batchFixture() {
           );
           return {};
         }
-        if (query.includes('ProjectDeliveryItems'))
-          return {
-            organization: {
-              projectV2: {
-                items: {
-                  nodes: [...rows.keys()].map((n) => ({
-                    id: `ITEM${n}`,
-                    isArchived: controls.archived,
-                    content: { id: `ISSUE${n}` },
-                    fieldValueByName: {
-                      name: statuses.get(n),
-                      optionId:
-                        statuses.get(n) === 'Active'
-                          ? 'ACTIVE'
-                          : statuses.get(n) === 'Shipped'
-                            ? 'DONE'
-                            : statuses.get(n) === 'Waiting'
-                              ? 'BLOCKED'
-                              : 'TODO',
-                    },
-                  })),
-                  pageInfo: { hasNextPage: false, endCursor: null },
+        if (query.includes('ProjectDeliveryIssueItems'))
+          return issueProjectItemsResponse(
+            variables,
+            [...rows.keys()]
+              .filter((n) => `ISSUE${n}` === variables.issueNodeId)
+              .map((n) => ({
+                id: `ITEM${n}`,
+                isArchived: controls.archived,
+                content: { id: `ISSUE${n}` },
+                fieldValueByName: {
+                  name: statuses.get(n),
+                  optionId:
+                    statuses.get(n) === 'Active'
+                      ? 'ACTIVE'
+                      : statuses.get(n) === 'Shipped'
+                        ? 'DONE'
+                        : statuses.get(n) === 'Waiting'
+                          ? 'BLOCKED'
+                          : 'TODO',
                 },
-              },
-            },
-          };
+              })),
+          );
         if (query.includes('UpdateProjectDeliveryStatus')) {
           writes.push('project');
           statuses.set(

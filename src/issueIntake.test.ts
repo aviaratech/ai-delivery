@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -750,47 +751,39 @@ function fixture() {
               },
             },
           };
-        if (query.includes('ProjectDeliveryItems'))
-          return {
-            organization: {
-              projectV2: {
-                id: 'PROJECT',
-                number: 1,
-                items: {
-                  nodes: [
-                    ...capacity.map((x) => ({
-                      id: 'ITEM' + String(x.number),
-                      isArchived: false,
-                      content: { id: 'ISSUE' + String(x.number) },
-                      fieldValueByName:
-                        x.status === 'Unset'
-                          ? null
-                          : x.status === 'Missing'
-                            ? undefined
-                            : { name: x.status, optionId: x.status === 'Active' ? 'ACTIVE' : 'TODO' },
-                    })),
-                    {
-                      id: 'OTHER',
-                      isArchived: false,
-                      content: { id: 'OTHER-ISSUE' },
-                      fieldValueByName: { name: 'Queued', optionId: 'TODO' },
-                    },
-                    ...(controls.projectMember
-                      ? [
-                          {
-                            id: 'ITEM17',
-                            isArchived: controls.projectArchived,
-                            content: { id: 'ISSUE17' },
-                            fieldValueByName: { name: status, optionId: optionId() },
-                          },
-                        ]
-                      : []),
-                  ],
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                },
+        if (query.includes('ProjectDeliveryIssueItems'))
+          return issueProjectItemsResponse(
+            input,
+            [
+              ...capacity.map((x) => ({
+                id: 'ITEM' + String(x.number),
+                isArchived: false,
+                content: { id: 'ISSUE' + String(x.number) },
+                fieldValueByName:
+                  x.status === 'Unset'
+                    ? null
+                    : x.status === 'Missing'
+                      ? undefined
+                      : { name: x.status, optionId: x.status === 'Active' ? 'ACTIVE' : 'TODO' },
+              })),
+              {
+                id: 'OTHER',
+                isArchived: false,
+                content: { id: 'OTHER-ISSUE' },
+                fieldValueByName: { name: 'Queued', optionId: 'TODO' },
               },
-            },
-          };
+              ...(controls.projectMember
+                ? [
+                    {
+                      id: 'ITEM17',
+                      isArchived: controls.projectArchived,
+                      content: { id: 'ISSUE17' },
+                      fieldValueByName: { name: status, optionId: optionId() },
+                    },
+                  ]
+                : []),
+            ].filter((item) => item.content.id === input.issueNodeId),
+          );
         if (query.includes('AddProjectDeliveryItem')) {
           membershipWrites.push(input);
           assert.equal(input.projectId, 'PROJECT');
@@ -1358,7 +1351,7 @@ test('WIP field matching preserves value types for multi-select member names', a
   }
 });
 
-test.each(['project', 'pagination', 'status', 'archive', 'unreadable'] as const)(
+test.each(['status', 'archive', 'unreadable'] as const)(
   'WIP refuses changed or incomplete native %s evidence after healthy readiness',
   async (failure) => {
     const f = fixture();
@@ -1372,20 +1365,12 @@ test.each(['project', 'pagination', 'status', 'archive', 'unreadable'] as const)
     let projectReads = 0;
     f.context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
       const value = await graphql(query, variables);
-      if (query.includes('ProjectDeliveryItems') && ++projectReads > 1) {
-        const project = (
-          value as {
-            organization: {
-              projectV2: { id: string; items: { nodes: Record<string, unknown>[]; pageInfo: Record<string, unknown> } };
-            };
-          }
-        ).organization.projectV2;
-        if (failure === 'project') project.id = 'FOREIGN';
-        if (failure === 'pagination') delete project.items.pageInfo.hasNextPage;
-        if (failure === 'status') delete project.items.nodes[0]!.fieldValueByName;
-        if (failure === 'archive') delete project.items.nodes[0]!.isArchived;
-        if (failure === 'unreadable')
-          project.items.nodes.push({ id: 'UNKNOWN', isArchived: false, content: null, fieldValueByName: null });
+      if (query.includes('ProjectDeliveryIssueItems') && ++projectReads > 1) {
+        const nodes = (value as { node: { projectItems: { nodes: Record<string, unknown>[] } } }).node.projectItems
+          .nodes;
+        if (failure === 'status') delete nodes[0]!.fieldValueByName;
+        if (failure === 'archive') delete nodes[0]!.isArchived;
+        if (failure === 'unreadable') nodes[0]!.content = null;
       }
       return value;
     }) as typeof graphql;

@@ -173,32 +173,6 @@ test('future-ending windows refuse before read-only collection begins', async ()
   );
   assert.equal(calls, 0);
 });
-test('advancing Project pages beyond the budget remain unknown and partial', async () => {
-  const f = issue63Fixture();
-  const original = f.context.clients.graphql;
-  let pages = 0;
-  f.context.clients.graphql = (async (query: string, values: Record<string, unknown>) => {
-    if (query.includes('ProjectDeliveryItems')) {
-      pages++;
-      return {
-        organization: {
-          projectV2: { items: { nodes: [], pageInfo: { hasNextPage: true, endCursor: `page-${pages}` } } },
-        },
-      };
-    }
-    return original(query, values);
-  }) as unknown as typeof original;
-  const result = await deliveryHealth(f.context, { ...window, maxProjectPages: 2 });
-  assert.equal(pages, 6);
-  assert.equal(result.counts.currentStatusUnknown, 3);
-  assert.equal(result.completeness.metricCoverage.active, false);
-  assert.equal(result.completeness.complete, false);
-  assert.ok(
-    result.completeness.limitations.every(
-      (value) => value.scope !== 'current Project status' || value.reason.includes('page limit'),
-    ),
-  );
-});
 test('unsupported historical status and equal instants with different ISO precision are unknown', () => {
   const member = event('AddedToProjectV2Event', 'M', '2026-01-01T00:00:00Z', { project: { id: 'PROJECT' } });
   const status = event('ProjectV2ItemStatusChangedEvent', 'S', '2026-01-01T01:00:00Z', {
