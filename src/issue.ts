@@ -2772,10 +2772,14 @@ export async function issueBranch(context: DeliveryContext, issueNumber: number,
       throw new DeliveryError('Canonical issue branch head/ref readback is invalid.');
     return name;
   }
-  if (branches.length !== 1)
+  if (branches.length !== 1) {
+    const found = linked.map((branch) => branch.name).join(', ') || 'none';
     throw new DeliveryError(
-      'Select exactly one GitHub-linked issue branch; no local worktree or receipt fallback is available.',
+      selected === undefined
+        ? `Issue #${issueNumber} has no single linked branch (GitHub-linked: ${found}); pass the branch you pushed as headBranch.`
+        : `Branch ${selected} is not linked to issue #${issueNumber} (GitHub-linked: ${found}); ${linked.length ? 'select one of those' : `push the work as issue/${issueNumber}`}.`,
     );
+  }
   return branches[0]!.name;
 }
 export async function startIssueBranch(context: DeliveryContext, issueNumber: number, selected?: string) {
