@@ -32,7 +32,7 @@ import {
   type UpdateIssueInput,
 } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import { finishIssue, mergePr, publishPr, submitFormalReview } from './pr.js';
+import { publishPr, submitFormalReview } from './pr.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 import { IssueValidationError } from './issueContract.js';
 
@@ -317,8 +317,6 @@ export async function executeTool(
     });
   }
   const { repo: selected, verbose: _verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
-  if (name === 'issue_finish' && input.nonClosing === true)
-    throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
     throw new DeliveryError('Tool and execution repository selectors disagree.');
   // Ready diagnostics need no repository checkout, configuration or credential lookup.
@@ -380,19 +378,5 @@ export async function executeTool(
         prNumber: requiredNumber(input, 'prNumber'),
         dryRun: input.dryRun === true,
       });
-    case 'issue_pr_merge':
-    case 'issue_finish': {
-      const merge = {
-        issueNumber: requiredNumber(input, 'issueNumber'),
-        ...(input.nonClosing === undefined ? {} : { nonClosing: input.nonClosing === true }),
-        prNumber: requiredNumber(input, 'prNumber'),
-        ...(input.strategy === undefined ? {} : { strategy: input.strategy as 'merge' | 'squash' | 'rebase' }),
-        ...(input.reviewedHeadSha === undefined ? {} : { reviewedHeadSha: requireString(input, 'reviewedHeadSha') }),
-        dryRun: input.dryRun === true,
-      };
-      return name === 'issue_finish'
-        ? finishIssue({ ...context, root: execution.repoRoot }, merge)
-        : mergePr(context, merge);
-    }
   }
 }

@@ -1,6 +1,8 @@
-import { lstatSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fileDigest, directoryDigest } from './services/deliveryAdmission.js';
+import { digestValue } from './delivery/common.js';
 import { DeliveryError } from './errors.js';
 
 const packageMetadata: unknown = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -30,4 +32,26 @@ export function readPackageArtifactIdentity(): {
     packageManifestDigest: fileDigest(manifest),
     packageDistDigest: directoryDigest(distribution),
   };
+}
+
+function fileDigest(path: string): string {
+  return `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+}
+
+function directoryDigest(path: string): string {
+  const entries: { path: string; sha256: string }[] = [];
+  const visit = (directory: string, relative: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    )) {
+      const child = join(directory, entry.name);
+      const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) visit(child, childRelative);
+      else if (entry.isFile()) entries.push({ path: childRelative, sha256: fileDigest(child) });
+      else throw new DeliveryError('Runtime distribution contains an unsupported link or file type.');
+    }
+  };
+  visit(path, '');
+  if (entries.length === 0) throw new DeliveryError('Runtime distribution is empty.');
+  return digestValue(entries);
 }

@@ -148,25 +148,6 @@ const routes: Route[] = [
       assert.match(f.reviews[0]!.body, /ai-delivery-review-artifact-data/u);
     },
   },
-  {
-    name: 'issue_pr_merge',
-    args: { issueNumber: 17, prNumber: 23 },
-    witness: 'pulls.merge',
-    verify: (_v, f) => {
-      assert.equal(f.state.merged, true);
-      assert.equal(f.state.closedCount, 0);
-    },
-  },
-  {
-    name: 'issue_finish',
-    args: { issueNumber: 17, prNumber: 23 },
-    witness: 'issues.update',
-    verify: (_v, f) => {
-      assert.equal(f.state.merged, true);
-      assert.equal(f.state.closedCount, 1);
-      assert.equal(f.state.issueState, 'closed');
-    },
-  },
 ];
 
 for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
@@ -270,9 +251,7 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
     }
   }, 5_000);
 
-  test(`public MCP pagination and refused merge preserve policy and issue with ${kind} consumer policy`, async ({
-    signal,
-  }) => {
+  test(`public MCP pagination preserves policy and issue with ${kind} consumer policy`, async ({ signal }) => {
     const f = inertTarget(signal);
     let connection: Awaited<ReturnType<typeof f.connect>> | undefined;
     try {
@@ -299,16 +278,6 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
           [1, 2, 3],
         );
       }
-      f.state.reviewDecision = 'REVIEW_REQUIRED';
-      const refused = await connection.call('issue_pr_merge', { issueNumber: 17, prNumber: 23 });
-      assert.equal(refused.response.isError, true);
-      assert.match(refused.text, /qualifying|review|approval/u);
-      assert.ok(f.calls.some((c) => c.name === 'DeliveryReviewDecision'));
-      assert.equal(
-        f.calls.some((c) => c.name === 'pulls.merge'),
-        false,
-      );
-      assert.equal(f.state.closedCount, 0);
     } finally {
       await f.dispose(connection);
     }

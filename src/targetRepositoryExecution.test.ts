@@ -160,18 +160,6 @@ const routes: Route[] = [
       f.reviews.length = 0;
     },
   },
-  {
-    name: 'issue_pr_merge',
-    input: () => ({ issueNumber: 17, prNumber: 23 }),
-    cli: () => ['pr:merge', '--issue', '17', '--pr', '23'],
-    witness: 'pulls.merge',
-  },
-  {
-    name: 'issue_finish',
-    input: () => ({ issueNumber: 17, prNumber: 23 }),
-    cli: () => ['finish', '--issue', '17', '--pr', '23'],
-    witness: 'issues.update',
-  },
 ];
 
 // Capture the real registered Commander tree without running process.argv. Each

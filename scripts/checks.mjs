@@ -157,7 +157,6 @@ export const RELEASE_CASES = [
       titles: [
         'CLI reports the selected package version',
         'README and delivery skill CLI examples name supported commands and required options',
-        'a copied plugin has a real CLI and producer identity that existing admission can bind',
         'a copied plugin root starts its exact MCP contract without a parent runtime installation',
         'the bundled launcher creates, updates and journals repository B from checkout A without an identity environment',
       ],

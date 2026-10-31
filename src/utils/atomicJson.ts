@@ -17,11 +17,6 @@ export function ensurePrivateDirectoryDurably(path: string): void {
   ensureDirectoryDurably(path, 0o700);
 }
 
-/** Publish a complete JSON file with a same-directory durable rename. */
-export function writeJsonFileAtomically(path: string, value: unknown): void {
-  writeJsonAtomically({ directoryMode: 0o777, mode: 0o666, path, value });
-}
-
 /** Publish private JSON evidence with the same durable rename contract. */
 export function writePrivateJsonFileAtomically(path: string, value: unknown): void {
   writeJsonAtomically({ directoryMode: 0o700, mode: 0o600, path, value });
