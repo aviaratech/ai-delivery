@@ -47,10 +47,8 @@ import {
   inspectWorktreeTransition,
   type InspectWorktreeTransitionInput,
 } from './worktreeTransition.js';
-import { stageRuntime, admitRuntime, type StageRuntimeInput, type AdmitRuntimeInput } from './setup.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 import { IssueValidationError } from './issueContract.js';
-import { enqueuePr, queueStatus, runQueue, type QueueOptions } from './mergeQueue.js';
 
 export interface ExecutionContext {
   settings?: LoadedDeliverySettings;
@@ -61,7 +59,6 @@ export interface ExecutionContext {
   repoRoot: string;
   runtimeEntryPath?: string;
   signal?: AbortSignal;
-  queueProgress?: QueueOptions['onProgress'];
 }
 function requiredNumber(input: Record<string, unknown>, key: string): number {
   const value = input[key];
@@ -341,8 +338,6 @@ export async function executeTool(
   const repo = typeof selected === 'string' ? selected : execution.repo;
   const selectedExecution = { ...execution, ...(repo === undefined ? {} : { repo }) };
   const local =
-    name === 'runtime_stage' ||
-    name === 'runtime_admit' ||
     name.startsWith('issue_worktree_transition_') ||
     (name === 'issue_start' && input.investigationWorktree !== undefined) ||
     (name === 'issue_finish' && input.investigation === true);
@@ -356,18 +351,6 @@ export async function executeTool(
         return `${r.owner}/${r.repo}`;
       })();
     root = resolveCheckout({ repository: coordinates, launchDirectory: root, checkoutRoots: settings.checkoutRoots });
-    if (name === 'runtime_stage' || name === 'runtime_admit') {
-      const setup = {
-        ...input,
-        repoRoot: root,
-        identity: optionalString(input, 'identity') ?? execution.identity ?? settings.roles.author.identity,
-        ...(execution.personalAuth === undefined ? {} : { personalAuth: execution.personalAuth }),
-        ...(execution.signal === undefined ? {} : { signal: execution.signal }),
-      };
-      return name === 'runtime_stage'
-        ? stageRuntime(setup as unknown as StageRuntimeInput)
-        : admitRuntime(setup as unknown as AdmitRuntimeInput);
-    }
   }
   const requestedIdentity = name === 'issue_pr_review' ? optionalString(input, 'identity') : undefined;
   const context = await contextFor(
@@ -376,35 +359,6 @@ export async function executeTool(
     name === 'issue_pr_review' ? 'reviewer' : 'author',
   );
   if (local) context.root = root;
-  if (
-    (name === 'issue_pr_merge' && input.queue === true) ||
-    name === 'issue_pr_merge_queue_status' ||
-    name === 'issue_pr_merge_queue_run'
-  ) {
-    const settings = execution.settings ?? (await loadDeliverySettings());
-    const options = {
-      root: resolveCheckout({
-        repository: context.config.repository,
-        launchDirectory: execution.repoRoot,
-        checkoutRoots: settings.checkoutRoots,
-        canonical: true,
-      }),
-      ...(execution.signal === undefined ? {} : { signal: execution.signal }),
-      ...(execution.queueProgress === undefined ? {} : { onProgress: execution.queueProgress }),
-    };
-    return name === 'issue_pr_merge_queue_status'
-      ? queueStatus(context, options)
-      : name === 'issue_pr_merge_queue_run'
-        ? runQueue(context, options)
-        : enqueuePr(
-            context,
-            {
-              prNumber: requiredNumber(input, 'prNumber'),
-              ...(input.issueNumber === undefined ? {} : { issueNumber: requiredNumber(input, 'issueNumber') }),
-            },
-            options,
-          );
-  }
   switch (name) {
     case 'delivery_health':
       return deliveryHealth(context, { ...input, repo: repo! } as DeliveryHealthRequest);

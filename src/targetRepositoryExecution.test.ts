@@ -7,7 +7,7 @@ import { Command } from 'commander';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { beforeAll, test, vi } from 'vitest';
-import { fixtureFields, inertTarget, queueScenario } from './fixtures/inertTarget.js';
+import { fixtureFields, inertTarget } from './fixtures/inertTarget.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './mcp/tools.js';
 
 type Fixture = ReturnType<typeof inertTarget>;
@@ -26,19 +26,6 @@ function inputFile(f: Fixture, name: string, value: unknown): string {
   writeFileSync(path, JSON.stringify(value));
   return path;
 }
-const setup = (f: Fixture) => ({
-  expectedSourceCommit: 'f'.repeat(40),
-  expectedConfigDigest: digest,
-  runtimeDirectory: join(f.base, 'runtime'),
-});
-const setupCli = (f: Fixture) => [
-  '--source-commit',
-  'f'.repeat(40),
-  '--config-digest',
-  digest,
-  '--runtime-directory',
-  join(f.base, 'runtime'),
-];
 const journal = {
   issueNumber: 17,
   kind: 'decision',
@@ -84,34 +71,6 @@ const routes: Route[] = [
     name: 'issue_comment',
     input: () => journal,
     witness: 'issues.getComment',
-  },
-  {
-    name: 'runtime_stage',
-    input: (f) => ({
-      ...setup(f),
-      authority: 'runtime:stage',
-      archivePath: join(f.base, 'archive.tgz'),
-      expectedArchiveSha256: digest,
-      packageVersion: '1.0.0',
-    }),
-    cli: (f) => [
-      'runtime:stage',
-      ...setupCli(f),
-      '--archive',
-      join(f.base, 'archive.tgz'),
-      '--archive-sha256',
-      digest,
-      '--package-version',
-      '1.0.0',
-      '--authorize-stage',
-    ],
-    refusal: /Primary controller source commit changed/u,
-  },
-  {
-    name: 'runtime_admit',
-    input: (f) => ({ ...setup(f), authority: 'runtime:admit', stageId: digest, expectedPriorAdmissionSha256: null }),
-    cli: (f) => ['runtime:admit', ...setupCli(f), '--stage-id', digest, '--expected-absent', '--authorize-admit'],
-    refusal: /Primary controller source commit changed/u,
   },
   {
     name: 'issue_create',
@@ -207,29 +166,6 @@ const routes: Route[] = [
     input: () => ({ issueNumber: 17, prNumber: 23 }),
     cli: () => ['pr:merge', '--issue', '17', '--pr', '23'],
     witness: 'pulls.merge',
-  },
-  {
-    name: 'issue_pr_merge_queue_status',
-    input: () => ({}),
-    cli: () => ['merge', 'queue', 'status'],
-    witness: 'repos.get',
-    verify: (value) => assert.deepEqual(value.entries, []),
-  },
-  {
-    name: 'issue_pr_merge_queue_run',
-    input: () => ({}),
-    cli: () => ['merge', 'queue', 'run'],
-    witness: 'pulls.merge',
-    before: async (f) => {
-      queueScenario(f, 1);
-      const c = await f.connect();
-      try {
-        const result = await c.call('issue_pr_merge', { prNumber: 23, queue: true });
-        assert.notEqual(result.response.isError, true, result.text);
-      } finally {
-        await c.close();
-      }
-    },
   },
   {
     name: 'issue_finish',
@@ -392,7 +328,6 @@ const cliOnly: {
   witness?: string;
   before?: (f: Fixture) => void;
 }[] = [
-  { command: 'merge queue add', args: () => ['merge', 'queue', 'add', '23'], witness: 'pulls.get' },
   { command: 'parent', args: () => ['parent', '--issue', '17'], witness: 'issues.get' },
   { command: 'blockers', args: () => ['blockers', '--issue', '17'], witness: 'issues.get' },
   { command: 'subissues', args: () => ['subissues', '--issue', '17'], witness: 'issues.listSubIssues' },

@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   lstatSync,
@@ -11,15 +10,14 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, test, vi } from 'vitest';
+import { test, vi } from 'vitest';
 
 import { loadDeliveryConfig } from './config/deliveryConfig.js';
-import { digestBytes, digestValue } from './delivery/common.js';
+import { digestBytes } from './delivery/common.js';
 import { investigationAcceptanceBody, investigationAuthorityBody } from './pr.js';
 import { readInvestigationPreparation } from './services/worktreeRegistry.js';
-import { WorktreeTransitionPlanSchema } from './worktreeTransition.js';
 import { fixtureGit, inertTarget, type PolicyState } from './fixtures/inertTarget.js';
 
 type Fixture = ReturnType<typeof inertTarget>;
@@ -31,28 +29,6 @@ const DRAIN_MS = 15_000;
 const GIT_MS = 5_000;
 const REQUEST_MS = 60_000; // Existing MCP initialize/callTool request bound.
 type SetupStep = readonly [name: string, budgetMs: number];
-// Acquisition has seven 5s Git calls. Policy has three Git calls and one 5s
-// child. Archive is one 5s tar; local config retains its former 15s bound.
-// Closing is handler drain, not a new 60s request allowance.
-const stageSteps = [
-  ['fixture', 7 * GIT_MS],
-  ['archive', GIT_MS],
-  ['config', ASSERTED_MS],
-  ['policy', 4 * GIT_MS],
-  ['connect', REQUEST_MS],
-  ['runtime_stage', REQUEST_MS],
-] as const satisfies readonly SetupStep[];
-const transitionSteps = [
-  ['fixture', 7 * GIT_MS],
-  ['worktree', GIT_MS],
-  ['connect', REQUEST_MS],
-  ['archive', GIT_MS],
-  ['config', ASSERTED_MS],
-  ['runtime_stage', REQUEST_MS],
-  ['runtime_admit', REQUEST_MS],
-  ['close', DRAIN_MS],
-  ['reconnect', REQUEST_MS],
-] as const satisfies readonly SetupStep[];
 type Phase = {
   name: string;
   budgetMs: number;
@@ -480,114 +456,6 @@ test(neverReleasedCase, { tags: ['release'], timeout: faultBudget + 4_000 }, asy
   process.stdout.write('DRAIN_FAULT_SUPERVISION_RECEIPT ' + JSON.stringify(receipt) + '\n');
 }); // Existing supervisor: 3s TERM grace + 1s quiescence confirmation.
 
-function scopedRuntimeCase<T extends object>(
-  name: string,
-  steps: readonly SetupStep[],
-  prepare: (scope: Scope) => Promise<T>,
-  observe: (prepared: T) => Promise<void>,
-) {
-  describe('per-operation runtime preparation (15s asserted work, 15s drain)', () => {
-    let owned: { scope: Scope; prepared?: T; ready: boolean } | undefined;
-    beforeEach(
-      async ({ signal }) => {
-        assert.equal(owned, undefined, 'Previous case must finish owned teardown');
-        const scope = runtimeScope(steps);
-        owned = { scope, ready: false };
-        scope.forward(signal);
-        owned.prepared = await prepareScope(scope, () => prepare(scope));
-        owned.ready = true;
-      },
-      steps.reduce((sum, [, budget]) => sum + budget, 0) + DRAIN_MS,
-    );
-    afterEach(async () => {
-      const current = owned;
-      if (current) {
-        await current.scope.join();
-        process.stderr.write('ai-delivery.fixture-phases ' + JSON.stringify(current.scope.phases) + '\n');
-        owned = undefined;
-      }
-    }, ASSERTED_MS + DRAIN_MS);
-    test(name, { tags: ['release'], timeout: ASSERTED_MS + DRAIN_MS }, async ({ signal }) => {
-      const current = owned;
-      assert.ok(current?.ready, 'Real case prerequisites must finish before the asserted body');
-      assert.ok(current.prepared);
-      const prepared = current.prepared;
-      current.scope.forward(signal);
-      try {
-        await scopedPhase(current.scope, 'asserted body', ASSERTED_MS, () => observe(prepared));
-      } finally {
-        await current.scope.join();
-      }
-    });
-  });
-}
-
-async function runtimeFixture(f: Fixture, scope?: Scope) {
-  f.signal.throwIfAborted();
-  const archive = () => {
-    const packageRoot = join(f.base, 'archive', 'package');
-    const lifecycleSentinel = join(f.base, 'lifecycle-executed');
-    const files = {
-      'package.json': JSON.stringify({
-        name: '@aviaratech/ai-delivery',
-        version: '0.3.5',
-        type: 'module',
-        bin: { 'ai-delivery': './dist/cli.js' },
-        scripts: { preinstall: 'node lifecycle.cjs', postinstall: 'node lifecycle.cjs' },
-      }),
-      'lifecycle.cjs': `require('node:fs').appendFileSync(${JSON.stringify(lifecycleSentinel)},'executed\\n');\n`,
-      'dist/cli.js': "#!/usr/bin/env node\nconsole.log('0.3.5');\n",
-      'dist/agent.js': 'export const fictional = true;\n',
-      'plugins/ai-delivery/dist/mcp-launcher.js': '/* Owned inert launcher bytes. */\n',
-      'plugins/ai-delivery/.claude-plugin/plugin.json': JSON.stringify({
-        name: 'ai-delivery',
-        packageVersion: '0.3.5',
-        deliveryCapabilityVersion: 2,
-      }),
-    };
-    for (const [path, bytes] of Object.entries(files)) {
-      const file = join(packageRoot, path);
-      mkdirSync(dirname(file), { recursive: true });
-      writeFileSync(file, bytes);
-    }
-    const archivePath = join(f.base, 'inert.tgz');
-    execFileSync('tar', ['-czf', archivePath, '-C', dirname(packageRoot), 'package'], {
-      timeout: 5_000,
-      maxBuffer: 64 * 1024,
-    });
-    return { archivePath, lifecycleSentinel };
-  };
-  const { archivePath, lifecycleSentinel } = scope ? await setupStep(scope, 'archive', archive) : archive();
-  const config = () =>
-    loadDeliveryConfig(f.root, {
-      repository: 'example/widget',
-      signal: f.signal,
-      clients: { graphql: f.graphql } as never,
-    });
-  const loaded = scope ? await setupStep(scope, 'config', config) : await config();
-  const runtimeDirectory = join(f.base, 'runtime');
-  const common = { expectedSourceCommit: f.head, expectedConfigDigest: loaded.configDigest, runtimeDirectory };
-  return {
-    archivePath,
-    lifecycleSentinel,
-    common,
-    stage: {
-      ...common,
-      authority: 'runtime:stage',
-      archivePath,
-      expectedArchiveSha256: digestBytes(readFileSync(archivePath)),
-      packageVersion: '0.3.5',
-      resourceBounds: {
-        maxAggregateRssBytes: 384 * 1024 ** 2,
-        minFreeDiskBytes: 8 * 1024 ** 2,
-        maxNewOutputBytes: 8 * 1024 ** 2,
-        maxCapturedOutputBytes: 64 * 1024,
-      },
-    },
-    cli: join(runtimeDirectory, 'node_modules/@aviaratech/ai-delivery/dist/cli.js'),
-  };
-}
-
 const cancellationSteps = [
   ['fixture', 7 * GIT_MS],
   ['policy', 4 * GIT_MS],
@@ -728,22 +596,6 @@ test(
   },
 );
 
-async function stageAndAdmit(f: Fixture, c: Connection, scope: Scope) {
-  const runtime = await runtimeFixture(f, scope);
-  const staged = await setupStep(scope, 'runtime_stage', () => c.call('runtime_stage', runtime.stage));
-  assert.notEqual(staged.response.isError, true, staged.text);
-  const admitted = await setupStep(scope, 'runtime_admit', () =>
-    c.call('runtime_admit', {
-      ...runtime.common,
-      authority: 'runtime:admit',
-      stageId: staged.value!.stageId,
-      expectedPriorAdmissionSha256: null,
-    }),
-  );
-  assert.notEqual(admitted.response.isError, true, admitted.text);
-  return { ...runtime, stageId: staged.value!.stageId, admission: admitted.value!.admission };
-}
-
 for (const cancellation of ['hook signal', 'owned setup deadline'] as const) {
   test(
     `scoped runtime setup ${cancellation} aborts and drains a real handler before releasing globals`,
@@ -871,313 +723,7 @@ test(
   },
 );
 
-async function lifecycleControl(f: Fixture, runtime: Awaited<ReturnType<typeof runtimeFixture>>) {
-  // Same archive, real npm and same environment; explicitly enabled scripts establish the lifecycle control.
-  f.signal.throwIfAborted();
-  execFileSync(
-    'npm',
-    [
-      'install',
-      '--prefix',
-      join(f.base, 'control-install'),
-      '--omit=dev',
-      '--ignore-scripts=false',
-      '--offline',
-      '--no-audit',
-      '--no-fund',
-      '--package-lock=false',
-      '--cache',
-      join(f.base, 'control-cache'),
-      '--userconfig',
-      '/dev/null',
-      '--globalconfig',
-      join(f.base, 'fictional-global.npmrc'),
-      runtime.archivePath,
-    ],
-    { env: process.env, cwd: f.base, timeout: 10_000, maxBuffer: 64 * 1024 },
-  );
-  assert.match(readFileSync(runtime.lifecycleSentinel, 'utf8'), /executed/u);
-}
-
-async function prepareStage(scope: Scope) {
-  const f = await setupStep(scope, 'fixture', () => scope.acquire());
-  const runtime = await runtimeFixture(f, scope);
-  await setupStep(scope, 'policy', () => f.policy('tracked'));
-  const c = await setupStep(scope, 'connect', () => f.connect());
-  const staged = await setupStep(scope, 'runtime_stage', () => c.call('runtime_stage', runtime.stage));
-  assert.notEqual(staged.response.isError, true, staged.text);
-  assert.ok(existsSync(runtime.cli));
-  assert.equal(existsSync(runtime.lifecycleSentinel), false);
-  assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false, 'Staging must not admit');
-  return { f, c, runtime, staged };
-}
-
-// The edited-policy refusal has the same real staged prerequisites, then one
-// separately bounded tracked-to-edited transition (three Git calls, two controls).
-const editedAdmitSteps = [...stageSteps, ['edited policy', 5 * GIT_MS]] as const satisfies readonly SetupStep[];
-
-async function prepareEditedAdmit(scope: Scope) {
-  const prepared = await prepareStage(scope);
-  await setupStep(scope, 'edited policy', () => prepared.f.policy('edited'));
-  return prepared;
-}
-
-async function observeEditedAdmit({ f, c, runtime, staged }: Awaited<ReturnType<typeof prepareEditedAdmit>>) {
-  const admitted = await c.call('runtime_admit', {
-    ...runtime.common,
-    authority: 'runtime:admit',
-    stageId: staged.value!.stageId,
-    expectedPriorAdmissionSha256: null,
-  });
-  assert.equal(admitted.response.isError, true);
-  assert.match(admitted.text, /Delivery requires an exact clean worktree\./u);
-  assert.equal(existsSync(join(f.root, '.git/ai-delivery/runtime-admission.json')), false);
-  assert.equal(existsSync(runtime.lifecycleSentinel), false);
-}
-
-for (const cancellation of ['operation deadline', 'forwarded cancellation'] as const)
-  test(
-    `edited runtime_admit preparation ${cancellation} retains its real stage handler through drain stall and late settlement`,
-    { tags: ['release'], timeout: editedAdmitSteps.reduce((sum, [, budget]) => sum + budget, 0) + 2 * DRAIN_MS },
-    async ({ signal }) => {
-      const scope = runtimeScope(
-        editedAdmitSteps.map(([name, budget]) => [name, name === 'runtime_stage' ? 3_000 : budget] as const),
-      );
-      const hook = new AbortController();
-      scope.forward(signal);
-      scope.forward(hook.signal);
-      let release!: () => void;
-      let entered!: () => void;
-      const held = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const reached = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      const acquire = scope.acquire.bind(scope);
-      let handlerSettled = false;
-      scope.acquire = () => {
-        const f = acquire();
-        const get = f.rest.repos.get;
-        f.rest.repos.get = async (input) => {
-          entered();
-          await held;
-          handlerSettled = true;
-          return get(input);
-        };
-        return f;
-      };
-      try {
-        const preparing = prepareScope(scope, () => prepareEditedAdmit(scope)).then(
-          () => new Error('Controlled stage handler was not held'),
-          (error: unknown) => error,
-        );
-        await Promise.race([
-          reached,
-          preparing.then((result) => {
-            throw result;
-          }),
-        ]);
-        const f = scope.fixture!;
-        process.stderr.write('EDITED_REFUSAL_HELD ' + JSON.stringify({ cancellation, phases: scope.phases }) + '\n');
-        // This actual stage owns native supervision too: keep real timers while
-        // its held handler reaches the shortened fault-only operation deadline.
-        if (cancellation === 'forwarded cancellation')
-          hook.abort(new Error('Controlled edited-refusal setup cancellation'));
-        assert.match(String(await preparing), /drain-stall/u);
-        assert.equal(handlerSettled, false, 'Rejected transport cannot establish handler settlement');
-        assert.equal(scope.signal.aborted, true);
-        assert.equal(existsSync(f.base), true, 'Stalled handler must retain fixture and globals');
-        assert.throws(() => inertTarget(signal), /previous fixture must finish disposal/u);
-        assert.ok(
-          scope.phases.some(
-            (phase) =>
-              phase.name === 'setup:runtime_stage' &&
-              phase.outcome === (cancellation === 'operation deadline' ? 'deadline' : 'cancelled'),
-          ),
-        );
-        assert.ok(scope.phases.some((phase) => phase.name === 'drain' && phase.outcome === 'drain-stall'));
-        assert.equal(
-          scope.phases.some((phase) => phase.name === 'setup:edited policy'),
-          false,
-        );
-        release();
-        await scope.join();
-        assert.equal(handlerSettled, true);
-        assert.equal(scope.pending.size, 0);
-        assert.equal(existsSync(f.base), false);
-        process.stderr.write(
-          'EDITED_REFUSAL_OWNERSHIP ' +
-            JSON.stringify({ cancellation, phases: scope.phases, rootRemoved: true }) +
-            '\n',
-        );
-        const next = inertTarget(signal);
-        await next.dispose(undefined);
-      } finally {
-        release();
-        await scope.join();
-      }
-    },
-  );
-
-async function prepareTransition(scope: Scope) {
-  const f = await setupStep(scope, 'fixture', () => scope.acquire());
-  await setupStep(scope, 'worktree', () => f.worktree());
-  let c = await setupStep(scope, 'connect', () => f.connect());
-  const runtime = await stageAndAdmit(f, c, scope);
-  await setupStep(scope, 'close', () => c.close());
-  c = await setupStep(scope, 'reconnect', () => f.connect({ runtimeEntryPath: runtime.cli }));
-  return { f, c, runtime };
-}
-
-async function observeTransition(
-  f: Fixture,
-  c: Connection,
-  runtime: Awaited<ReturnType<typeof stageAndAdmit>>,
-  kind: PolicyState,
-) {
-  const row = {
-    branch: 'issue/17',
-    path: f.target,
-    issueNumber: 17,
-    identity: 'author',
-    type: 'issue',
-    status: 'active',
-    createdAt: '2026-01-01',
-    updatedAt: '2026-01-01',
-  };
-  writeFileSync(join(f.root, '.issue-cli/worktrees.json'), JSON.stringify({ worktrees: [row] }));
-  f.policy(kind, f.target);
-  const digest = digestValue('Owned synthetic closure placeholder; not operational attestation.');
-  const content = {
-    schemaVersion: 'ai-delivery.worktree-transition-plan@1',
-    repository: 'example/widget',
-    repoRoot: f.root,
-    row,
-    purpose: 'active-resume',
-    disposition: 'retain',
-    terminalPrNumber: null,
-    head: { sha: f.head, tree: f.tree },
-    lineage: [],
-    remoteRefs: null,
-    retainedHoldCommentIds: [],
-    holdEvidence: [],
-    inventory: [],
-    inventoryId: digestValue([]),
-    historicalProducer: 'UNKNOWN',
-    closure: {
-      family: 'public-ai-delivery-0.3.5-posix@1',
-      admissionPath: join(f.base, 'retained-admission.json'),
-      archivePath: runtime.archivePath,
-      admission: runtime.admission,
-      admissionBytesDigest: digest,
-      producerDigest: digest,
-      runManifestIds: [digest],
-    },
-    currentRuntime: runtime.admission,
-    policyDigest: digestBytes(readFileSync(join(f.root, 'ai-delivery.policy.mjs'))),
-    operator: { actorLogin: 'operator', credentialIdentity: 'user:42' },
-    reviewerActor: 'reviewer[bot]',
-  };
-  const plan = WorktreeTransitionPlanSchema.parse({ ...content, planId: digestValue(content) });
-  const planPath = join(f.base, 'transition.json');
-  writeFileSync(planPath, JSON.stringify(plan), { mode: 0o600 });
-  const result = await c.call('issue_worktree_transition_apply', {
-    authority: 'worktree:transition',
-    planPath,
-    expectedPlanId: plan.planId,
-    relinquishmentCommentId: 201,
-    acceptanceCommentId: 202,
-  });
-  assert.equal(result.response.isError, true);
-  assert.match(result.text, /Historical repository configuration binding is unsupported/u);
-  assert.equal(existsSync(f.target), true);
-  assert.equal(
-    existsSync(join(f.root, '.git/ai-delivery/worktree-transitions', plan.planId.slice(7), 'intent.json')),
-    false,
-  );
-  assert.equal(existsSync(runtime.lifecycleSentinel), false);
-}
-
 for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
-  if (kind === 'tracked') {
-    scopedRuntimeCase(
-      'public MCP runtime_stage asserts bounded first install and exact reuse/lifecycle control with tracked policy inert',
-      stageSteps,
-      prepareStage,
-      async ({ f, c, runtime, staged }) => {
-        const reused = await c.call('runtime_stage', runtime.stage);
-        assert.notEqual(reused.response.isError, true, reused.text);
-        assert.equal(reused.value!.stageId, staged.value!.stageId);
-        assert.equal(reused.value!.reused, true);
-        await lifecycleControl(f, runtime);
-      },
-    );
-    scopedRuntimeCase(
-      'public MCP runtime_admit binds and reuses exact stage bytes after bounded real stage setup and leaves tracked policy inert',
-      stageSteps,
-      prepareStage,
-      async ({ f, c, runtime, staged }) => {
-        const args = {
-          ...runtime.common,
-          authority: 'runtime:admit',
-          stageId: staged.value!.stageId,
-          expectedPriorAdmissionSha256: null,
-        };
-        const admitted = await c.call('runtime_admit', args);
-        assert.notEqual(admitted.response.isError, true, admitted.text);
-        const disk = JSON.parse(
-          readFileSync(join(f.root, '.git/ai-delivery/runtime-admission.json'), 'utf8'),
-        ) as unknown;
-        assert.deepEqual(disk, admitted.value!.admission);
-        const reused = await c.call('runtime_admit', args);
-        assert.notEqual(reused.response.isError, true, reused.text);
-        assert.equal(reused.value!.reused, true);
-        assert.deepEqual(reused.value!.admission, disk);
-        assert.equal(existsSync(runtime.lifecycleSentinel), false);
-      },
-    );
-  } else {
-    test(
-      'public MCP runtime_stage refuses primary source edits and leaves edited policy inert',
-      { tags: ['release'], timeout: 15_000 },
-      async ({ signal }) => {
-        const f = inertTarget(signal);
-        let c: Connection | undefined;
-        try {
-          const runtime = await runtimeFixture(f);
-          f.policy('edited');
-          c = await f.connect();
-          const result = await c.call('runtime_stage', runtime.stage);
-          assert.equal(result.response.isError, true);
-          assert.match(result.text, /Delivery requires an exact clean worktree\./u);
-          assert.equal(existsSync(runtime.common.runtimeDirectory), false);
-        } finally {
-          await f.dispose(c);
-        }
-      },
-    );
-    scopedRuntimeCase(
-      'public MCP runtime_admit refuses primary source edits and leaves edited policy inert',
-      editedAdmitSteps,
-      prepareEditedAdmit,
-      observeEditedAdmit,
-    );
-    scopedRuntimeCase(
-      'edited runtime_admit refusal keeps bounded preparation outside its asserted-work budget',
-      [['controlled before fixture', 10_000], ...editedAdmitSteps, ['controlled after staging', 10_000]],
-      async (scope) => {
-        const started = performance.now();
-        await setupStep(scope, 'controlled before fixture', () => new Promise((resolve) => setTimeout(resolve, 8_000)));
-        const prepared = await prepareEditedAdmit(scope);
-        await setupStep(scope, 'controlled after staging', () => new Promise((resolve) => setTimeout(resolve, 8_000)));
-        assert.ok(performance.now() - started > ASSERTED_MS, 'Preparation must exceed the original aggregate fuse');
-        return prepared;
-      },
-      observeEditedAdmit,
-    );
-  }
-
   test(
     `public MCP investigation start ${kind === 'tracked' ? 'registers exact selected source' : 'refuses selected worktree edits'} with ${kind} policy`,
     { tags: ['release'], timeout: 15_000 },
@@ -1317,12 +863,5 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
         await f.dispose(c);
       }
     },
-  );
-
-  scopedRuntimeCase(
-    `public MCP transition apply reaches unsupported historical binding after bounded stage/admit/reconnect without loading ${kind} policy`,
-    transitionSteps,
-    prepareTransition,
-    async ({ f, c, runtime }) => observeTransition(f, c, runtime, kind),
   );
 }

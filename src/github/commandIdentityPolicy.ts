@@ -9,8 +9,6 @@ export interface CommandIdentityPolicyEvaluation {
 
 const AUTHOR_COMMANDS = new Set([
   'board:reconcile',
-  'runtime:stage',
-  'runtime:admit',
   'cleanup',
   'close',
   'comment',
@@ -22,7 +20,6 @@ const AUTHOR_COMMANDS = new Set([
   'batch:update',
   'pr:create',
   'pr:merge',
-  'merge queue run',
   'worktree',
   'worktree:create',
   'worktree:transition:apply',
