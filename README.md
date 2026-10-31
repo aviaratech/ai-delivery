@@ -65,14 +65,14 @@ ai-delivery --repo example/widget pr:create --issue 17 --body-file pr-body.md
 # Independent reviewer submits its own exact-head verdict/artifact.
 ai-delivery --repo example/widget pr:create --issue 17 --ready
 ai-delivery --repo example/widget pr:checks --pr 23
-ai-delivery --repo example/widget finish --issue 17 --pr 23 --reviewed-head <sha>
+gh pr merge 23 --repo example/widget --squash --match-head-commit <sha>
 ```
 
 GitHub's current required checks, counted reviews, blockers and merge eligibility govern the exact head/current base. The builder never approves its own work. Read back uncertain writes before retrying; a dry run grants no authority. Respect explicit provider/read-only requests and actual host refusals.
 
-After verified `finish`, cleanup removes only the exact clean registered worktree and local branch with retained-source proof. Run outside that worktree; unregistered or unsafe source stays in place with a reason.
+GitHub deletes the merged head branch; the host removes its own worktree.
 
-For partial delivery, `--non-closing` requires a canonical `References owner/repo#number` body and complete native evidence; a new linked-branch draft requires a separately authorized exact reference action. `finish` refuses nonclosing delivery. A complete executable child can close normally while its parent stays open.
+For partial delivery, `--non-closing` requires a canonical `References owner/repo#number` body and complete native evidence; a new linked-branch draft requires a separately authorized exact reference action. A complete executable child can close normally while its parent stays open.
 
 ## Command and tool map
 
