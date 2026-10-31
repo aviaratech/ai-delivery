@@ -76,7 +76,7 @@ For partial delivery, `--non-closing` requires a canonical `References owner/rep
 
 ## Command and tool map
 
-These are all executable routes; groups/help flags are omitted. A dash means no matching surface. Compatibility/setup routes remain shipped; this documentation change removes no functionality. Use each route's `--help` and the published MCP schema for inputs.
+These are all executable routes; groups/help flags are omitted. A dash means no matching surface. Use each route's `--help` and the published MCP schema for inputs.
 
 | Charter/job                    | CLI                                                                                                      | MCP                                                                    |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
