@@ -473,7 +473,7 @@ describe('portable delivery configuration', () => {
         });
       };
       await assert.rejects(loadDeliveryConfig(temp, { personalAuth: true }), /Incomplete GitHub repository/u);
-      assert.equal(selectedRequests, 1);
+      assert.ok(selectedRequests > 0, 'discovery must use the selected token');
       globalThis.fetch = async () => new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
       await assert.rejects(
         contextFor({ repoRoot: temp, identity: 'host-author' }, 'pr:create'),
@@ -525,11 +525,10 @@ describe('portable delivery configuration', () => {
         const statusField = loaded.config.native.project.statusField;
         const inProgressName = loaded.config.native.project.statuses.inProgress;
         const graphql = (query: string, variables: Record<string, unknown>) => {
-          if (query.includes('ProjectDeliveryItems')) {
-            assert.equal(variables.number, projectNumber);
+          if (query.includes('ProjectDeliveryIssueItems')) {
             assert.equal(variables.statusField, statusField);
             return Promise.resolve({
-              organization: { projectV2: { items: { nodes: [], pageInfo: { endCursor: null, hasNextPage: false } } } },
+              node: { id: 'ISSUE', projectItems: { nodes: [], pageInfo: { hasNextPage: false } } },
             });
           }
           if (query.includes('AddProjectDeliveryItem')) {

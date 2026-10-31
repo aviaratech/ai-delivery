@@ -120,14 +120,34 @@ export async function discoverDeliveryRouting(input: {
 }): Promise<DeliveryRouting> {
   const [owner, repo] = input.repository.split('/');
   if (!owner || !repo) throw new DeliveryError('Invalid delivery repository.');
-  const identity = responseRepository(
-    await input.clients.graphql(
+  // The four repository reads are independent; validation below keeps the original order.
+  const read = (field: 'issueTypes' | 'issueFields' | 'projectsV2', selection: string) =>
+    repositoryConnection({ ...input, owner, repo, field, selection });
+  const [identityResponse, fields, types, candidates] = await Promise.all([
+    input.clients.graphql(
       `query DeliveryRepository($owner: String!, $repo: String!) {
     repository(owner: $owner, name: $repo) { id nameWithOwner isFork owner { __typename login } }
   }`,
       { owner, repo },
     ),
-  );
+    read(
+      'issueFields',
+      `__typename
+    ... on IssueFieldSingleSelect { id fullDatabaseId name options { id name } }
+    ... on IssueFieldDate { id }
+    ... on IssueFieldNumber { id }
+    ... on IssueFieldText { id }
+  `,
+    ),
+    read('issueTypes', 'id name isEnabled'),
+    input.overrides.project === undefined
+      ? read(
+          'projectsV2',
+          'id number title closed viewerCanUpdate owner { __typename ... on Organization { login } ... on User { login } }',
+        )
+      : [{ number: input.overrides.project } as Record<string, unknown>],
+  ]);
+  const identity = responseRepository(identityResponse);
   const repository = text(identity.nameWithOwner, 'repository name');
   if (repository.toLowerCase() !== input.repository.toLowerCase())
     throw new DeliveryError('GitHub repository does not match the selected Git remote.');
@@ -138,27 +158,8 @@ export async function discoverDeliveryRouting(input: {
   if (org.__typename !== 'Organization' || text(org.login, 'organization').toLowerCase() !== owner.toLowerCase()) {
     throw new DeliveryError('Native delivery requires a repository owned by its selected GitHub organization.');
   }
-  const fields = await repositoryConnection({
-    ...input,
-    owner,
-    repo,
-    field: 'issueFields',
-    selection: `__typename
-    ... on IssueFieldSingleSelect { id fullDatabaseId name options { id name } }
-    ... on IssueFieldDate { id }
-    ... on IssueFieldNumber { id }
-    ... on IssueFieldText { id }
-  `,
-  });
   const points = nativeField(fields, input.overrides.pointsField ?? 'Points');
   const priority = nativeField(fields, input.overrides.priorityField ?? 'Priority');
-  const types = await repositoryConnection({
-    ...input,
-    owner,
-    repo,
-    field: 'issueTypes',
-    selection: 'id name isEnabled',
-  });
   const availableTypes = types
     .filter((type) => {
       if (typeof type.isEnabled !== 'boolean') throw new DeliveryError('GitHub omitted issue type availability.');
@@ -172,17 +173,6 @@ export async function discoverDeliveryRouting(input: {
   if (issueTypes.some((type) => !availableTypes.includes(type)))
     throw new DeliveryError('Configured issue type is unavailable in the selected repository.');
   const projectSource = input.overrides.project === undefined ? 'linked' : 'explicit';
-  const candidates =
-    input.overrides.project === undefined
-      ? await repositoryConnection({
-          ...input,
-          owner,
-          repo,
-          field: 'projectsV2',
-          selection:
-            'id number title closed viewerCanUpdate owner { __typename ... on Organization { login } ... on User { login } }',
-        })
-      : [{ number: input.overrides.project }];
   const compatible: ProjectDeliveryConfiguration[] = [];
   for (const candidate of candidates) {
     if (projectSource === 'linked') {

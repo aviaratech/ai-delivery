@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -311,16 +312,14 @@ function trackingRepository() {
         },
       };
     }
-    if (query.includes('ProjectDeliveryItems'))
-      return {
-        organization: {
-          projectV2: {
-            id: 'PROJECT-1',
-            number: 1,
-            items: page([...issues.values()].filter((issue) => issue.status !== null).map(projectItem)),
-          },
-        },
-      };
+    if (query.includes('ProjectDeliveryIssueItems'))
+      return issueProjectItemsResponse(
+        input,
+        [...issues.values()]
+          .filter((issue) => issue.status !== null && issue.node_id === input.issueNodeId)
+          .map(projectItem),
+        { id: 'PROJECT-1', number: 1 },
+      );
     if (query.includes('AddProjectDeliveryItem')) {
       const issue = [...issues.values()].find((value) => value.node_id === input.contentId);
       assert.ok(issue);
