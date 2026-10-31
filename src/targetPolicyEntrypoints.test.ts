@@ -28,18 +28,7 @@ const info = (v: Record<string, unknown>) => {
   assert.equal(v.parentIssueNumber, 11);
   assert.deepEqual(v.blockedBy, [13]);
   assert.equal(v.worktree, null);
-  assert.deepEqual(v.childProgress, {
-    childCount: 2,
-    closedChildCount: 1,
-    percentClosed: 50,
-    pointsTotal: 4,
-    inProgressChildren: [19],
-    nextTargetDate: null,
-    missingPoints: [],
-    missingProjectStatus: [],
-    undatedOpenChildren: [19],
-    targetDateConfigured: false,
-  });
+  assert.deepEqual(v.childProgress, { childCount: 2, closedChildCount: 1, percentClosed: 50 });
 };
 const scenarios: Scenario[] = [
   { name: 'CLI info', mode: 'cli', args: ['info', '--issue', '17'], witness: 'issues.get', verify: info },

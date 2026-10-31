@@ -161,6 +161,7 @@ globalThis.fetch=async(url,init)=>{
       data={addProjectV2ItemById:{item:{id:boardState.member}}};
     }
     else if(query.includes('ProjectDeliveryIssueItems'))data={node:{id:json.variables.issueNodeId,projectItems:{nodes:boardState.member?[item()]:[],pageInfo:{hasNextPage:false}}}};
+    else if(query.includes('ProjectDeliveryItems'))data={organization:{projectV2:{id:'PROJECT-1',number:1,items:page(boardState.member?[item()]:[])}}};
     else if(query.includes('ProjectDeliveryItemReadback'))data={node:boardState.member===json.variables.itemId?item():null};
     else if(query.includes('blockedBy('))data={repository:{issue:{id:'ISSUE17',number:17,repository:{nameWithOwner:'example/b'},parent:null,blockedBy:page([])}}};
     else if(query.includes('DeliveryIssueBranches'))data={repository:{issue:{linkedBranches:page([])}}};
