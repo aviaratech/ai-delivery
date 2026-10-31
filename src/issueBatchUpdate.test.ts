@@ -68,6 +68,12 @@ function batchFixture() {
     }));
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
   const statuses = new Map(Array.from(rows.keys(), (number) => [number, 'Active']));
+  const statusOptionIds: Record<string, string> = {
+    'In Review': 'REVIEW',
+    Active: 'ACTIVE',
+    Shipped: 'DONE',
+    Waiting: 'BLOCKED',
+  };
   const context = {
     root: '/synthetic',
     repo: { owner: 'example', repo: 'widget' },
@@ -302,16 +308,7 @@ function batchFixture() {
                 content: { id: `ISSUE${n}` },
                 fieldValueByName: {
                   name: statuses.get(n),
-                  optionId:
-                    statuses.get(n) === 'In Review'
-                      ? 'REVIEW'
-                      : statuses.get(n) === 'Active'
-                        ? 'ACTIVE'
-                        : statuses.get(n) === 'Shipped'
-                          ? 'DONE'
-                          : statuses.get(n) === 'Waiting'
-                            ? 'BLOCKED'
-                            : 'TODO',
+                  optionId: statusOptionIds[statuses.get(n)!] ?? 'TODO',
                 },
               })),
           );
@@ -342,16 +339,7 @@ function batchFixture() {
               content: { id: `ISSUE${number}` },
               fieldValueByName: {
                 name: statuses.get(number),
-                optionId:
-                  statuses.get(number) === 'In Review'
-                    ? 'REVIEW'
-                    : statuses.get(number) === 'Active'
-                      ? 'ACTIVE'
-                      : statuses.get(number) === 'Shipped'
-                        ? 'DONE'
-                        : statuses.get(number) === 'Waiting'
-                          ? 'BLOCKED'
-                          : 'TODO',
+                optionId: statusOptionIds[statuses.get(number)!] ?? 'TODO',
               },
             },
           };
