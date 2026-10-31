@@ -4,7 +4,7 @@ import { z } from 'zod';
 const Text = z.string().trim().min(1).max(10000);
 const Summary = Text.max(500).refine((value) => !/[\r\n]/u.test(value), 'Summary must be one plain-language line.');
 const Date = z.iso.date();
-const Evidence = z.url({ protocol: /^https$/u }).refine((value) => {
+const EvidenceUrl = z.url({ protocol: /^https$/u }).refine((value) => {
   let url: URL;
   try {
     url = new URL(value);
@@ -22,6 +22,9 @@ const Evidence = z.url({ protocol: /^https$/u }).refine((value) => {
     !hostname.endsWith('.local')
   );
 }, 'Evidence must be an HTTPS link with a public DNS hostname and no credentials or IP literal.');
+const Evidence = EvidenceUrl.describe(
+  'HTTPS link with a public DNS hostname, such as a GitHub URL; no IP, localhost or credentials.',
+);
 const Common = {
   issueNumber: z.number().int().positive(),
   summary: Summary,

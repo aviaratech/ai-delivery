@@ -57,6 +57,7 @@ function fixture(published = true, nonClosing = false) {
     baseRepo: repo,
     baseSha: base,
     baseRef: 'main',
+    remoteBase: { ref: 'refs/heads/main', object: { type: 'commit', sha: base } },
     nodeId: 'PR23',
     prAuthor: 'author',
     prState: 'open',
@@ -146,10 +147,10 @@ function fixture(published = true, nonClosing = false) {
       getRef: async (input: { owner: string; repo: string; ref: string }) => {
         assert.equal(`${input.owner}/${input.repo}`, repo);
         return {
-          data: {
-            ref: input.ref === 'heads/main' ? 'refs/heads/main' : state.remoteRef,
-            object: { type: state.remoteType, sha: input.ref === 'heads/main' ? base : state.remoteHead },
-          },
+          data:
+            input.ref === 'heads/main'
+              ? state.remoteBase
+              : { ref: state.remoteRef, object: { type: state.remoteType, sha: state.remoteHead } },
         };
       },
       getCommit: async () => ({ data: { sha: head, tree: { sha: tree } } }),
@@ -1826,15 +1827,27 @@ describe('explicit native non-closing reference delivery', () => {
     assert.equal(state.issueState, 'open');
   });
 
-  it('uses the independent reviewer route for dry-run, submission and authoritative idempotence', async () => {
+  it('submits exact non-closing review after the default base advances and refuses invalid refs', async () => {
     const { context, reviewerContext, state, artifact } = fixture(true, true);
     vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
+    state.remoteBase.object.sha = 'd'.repeat(40);
     await submitFormalReview(reviewerContext, { ...input, artifact, dryRun: true });
     assert.equal(state.submissions, 0);
     await submitFormalReview(reviewerContext, { ...input, artifact });
     await submitFormalReview(reviewerContext, { ...input, artifact });
     assert.equal(state.submissions, 1);
     assert.equal(state.issueState, 'open');
+    for (const ref of [
+      { ref: '', object: { type: 'commit', sha: base } },
+      { ref: 'refs/heads/other', object: { type: 'commit', sha: base } },
+      { ref: 'refs/heads/main', object: { type: 'tag', sha: base } },
+      { ref: 'refs/heads/main', object: { type: 'commit', sha: '' } },
+      { ref: 'refs/heads/main', object: { type: 'commit', sha: 'not-a-sha' } },
+    ]) {
+      state.remoteBase = ref;
+      await assert.rejects(submitFormalReview(reviewerContext, { ...input, artifact }));
+      assert.equal(state.submissions, 1);
+    }
   });
 
   for (const directive of [
@@ -2636,5 +2649,20 @@ describe('first-call PR creation', () => {
       /Branch claude\/17-widget is not linked to issue #17 \(GitHub-linked: none\); push the work as issue\/17\./u,
     );
     assert.equal(state.creations, 0);
+  });
+});
+
+// aviaratech/ai-delivery#238: PR #237 referenced #236 without closing it, and a body update was refused.
+describe('non-closing body update', () => {
+  it('updates an already non-closing PR body and keeps its issue open', async () => {
+    const { context, state } = fixture(true, true);
+    const update = { issueNumber: 17, prNumber: 23, nonClosing: true, body: 'Revised widget scope.' };
+    await publishPr(context, update);
+    assert.equal(state.body, `References ${repo}#17\n\nRevised widget scope.`);
+    await publishPr(context, update);
+    assert.equal(state.updates, 1);
+    assert.equal(state.issueState, 'open');
+    await assert.rejects(publishPr(context, { ...update, body: 'Closes #17' }), /closing directives/u);
+    assert.equal(state.updates, 1);
   });
 });
