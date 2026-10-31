@@ -1,3 +1,4 @@
+import { quietReadViewResponse } from './fixtures/readView.js';
 import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -836,6 +837,8 @@ function fixture() {
             },
           };
         }
+        const quiet = quietReadViewResponse(query, input);
+        if (quiet !== undefined) return quiet;
         throw new Error('Unexpected native query ' + query);
       },
     },

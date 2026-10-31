@@ -1,3 +1,4 @@
+import { quietReadViewResponse } from './readView.js';
 import type { DeliveryConfig, DeliveryOverrides } from '../config/deliveryConfig.js';
 import type { DiscoveryClients } from '../github/discovery.js';
 
@@ -79,7 +80,7 @@ export function syntheticDiscoveryClients(
       pageInfo: { hasNextPage: false, endCursor: null },
     },
   };
-  const graphql = async (query: string): Promise<unknown> => {
+  const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
     if (query.includes('query DeliveryRepository'))
       return {
         repository: { id: 'REPO', nameWithOwner: config.repository, isFork: false, owner: project.owner },
@@ -95,6 +96,8 @@ export function syntheticDiscoveryClients(
         },
       };
     if (query.includes('projectsV2(first:')) return { repository: { projectsV2: page([project]) } };
+    const quiet = quietReadViewResponse(query, variables);
+    if (quiet !== undefined) return quiet;
     throw new Error('Unexpected synthetic discovery query.');
   };
   return { graphql: graphql as DiscoveryClients['graphql'] };

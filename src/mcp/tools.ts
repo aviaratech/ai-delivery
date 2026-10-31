@@ -243,7 +243,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_info',
     commandName: 'info',
     description:
-      'Read live GitHub issue metadata, relationships, Project status and direct-child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
+      'Read live GitHub issue metadata, relationships, Project status, linked PRs (state, checks, reviews) and the latest journal in one call. Child counts by default; verbose adds the body, routing and full child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
     inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo, verbose: Verbose }),
   },
   {
@@ -300,7 +300,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_pr_info',
     commandName: 'pr:info',
-    description: 'Inspect a PR by number or its GitHub-linked issue branch',
+    description:
+      "Inspect a PR by number or its GitHub-linked issue branch: state, merge state, checks, reviews and each linked issue's state, Project status and latest journal, in one call",
     inputSchema: z.strictObject({
       repo: Repo,
       verbose: Verbose,

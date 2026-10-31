@@ -1,3 +1,4 @@
+import { issueView, prView } from './readView.js';
 import { deliveryHealth, type DeliveryHealthRequest } from './services/deliveryHealthService.js';
 import { collectDeliveryBoard, parseDeliveryBoardRequest } from './deliveryBoard.js';
 import {
@@ -15,7 +16,6 @@ import {
   createIssue,
   canonicalIssueBody,
   commentIssue,
-  issueInfo,
   listIssues,
   journalIssueStart,
   loadDeliveryContext,
@@ -32,7 +32,7 @@ import {
   type UpdateIssueInput,
 } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import { finishIssue, mergePr, prInfo, publishPr, submitFormalReview } from './pr.js';
+import { finishIssue, mergePr, publishPr, submitFormalReview } from './pr.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 import { IssueValidationError } from './issueContract.js';
 
@@ -45,6 +45,8 @@ export interface ExecutionContext {
   repoRoot: string;
   runtimeEntryPath?: string;
   signal?: AbortSignal;
+  /** Presentation only: lets issue_info skip the per-child rollup unless the caller asked for the full readback. */
+  verbose?: boolean;
 }
 function requiredNumber(input: Record<string, unknown>, key: string): number {
   const value = input[key];
@@ -346,7 +348,7 @@ export async function executeTool(
     case 'issue_search':
       return listIssues(context, input as ListIssuesInput);
     case 'issue_info':
-      return issueInfo(context, requiredNumber(input, 'issueNumber'));
+      return issueView(context, requiredNumber(input, 'issueNumber'), { verbose: execution.verbose === true });
     case 'issue_ready_check':
       return readyCheck(context, requiredNumber(input, 'issueNumber'));
     case 'issue_pr_create':
@@ -369,7 +371,7 @@ export async function executeTool(
         dryRun: input.dryRun === true,
       });
     case 'issue_pr_info':
-      return prInfo(context, input as { issueNumber?: number; prNumber?: number; nonClosing?: boolean });
+      return prView(context, input as { issueNumber?: number; prNumber?: number; nonClosing?: boolean });
     case 'issue_pr_review':
       return submitFormalReview(context, {
         artifact: requireString(input, 'artifact'),
