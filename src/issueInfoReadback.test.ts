@@ -75,7 +75,13 @@ function fixture(
     return { data: { ...native } };
   }) as unknown as typeof f.context.clients.rest.issues.update;
 
-  const discovery = syntheticDiscoveryClients();
+  // Like the live Points field, a 13-point issue's Estimate offers 13, which the ready contract refuses.
+  const base = syntheticDiscoveryConfig.native.points;
+  const points = nativeMetadata.points === 13 ? { ...base, values: [...base.values, '13'] } : base;
+  const discovery = syntheticDiscoveryClients({
+    ...syntheticDiscoveryConfig,
+    native: { ...syntheticDiscoveryConfig.native, points },
+  });
   const nativeGraphql = f.context.clients.graphql;
   f.context.clients.graphql = (async (query: string, variables: Record<string, unknown>) => {
     if (query.includes('IssueClosureReadback')) {
@@ -328,6 +334,64 @@ for (const mode of ['recorded-close', 'divergent-history'] as const) {
     }
   });
 }
+
+// Closes refused on Oct 31 (#240): #65, #116 and #58 had bodies that fail today's ready contract.
+const finishedBodies = [
+  {
+    name: 'points 13 and an 82-character title',
+    points: 13,
+    edit: (native: { title: string; body: string }, ready: object) => {
+      native.title = 'Close finished work whose title predates the ready contract limit of eighty chars.';
+      native.body = renderIssueBody({ ...ready, title: native.title, points: 13 } as Parameters<
+        typeof renderIssueBody
+      >[0]);
+    },
+  },
+  {
+    name: 'an old-format body without problem, acceptance criteria or out of scope',
+    points: 2,
+    edit: (native: { body: string }) => (native.body = '## Summary\n\nShipped before the issue contract.\n'),
+  },
+  {
+    name: 'a hand-edited canonical body',
+    points: 2,
+    edit: (native: { body: string }) => (native.body = native.body.replace('Unexplained', 'Hand-edited')),
+  },
+];
+for (const { name, points, edit } of finishedBodies) {
+  test(`MCP close with a reason skips the ready contract for ${name}`, async () => {
+    const f = fixture([], null, { points, issueType: 'Task' });
+    edit(f.native, f.ready);
+    const before = { title: f.native.title, body: f.native.body };
+    const api = await caller('MCP');
+    try {
+      await api.call('issue_update', { issueNumber: 17, state: 'closed', closeReason: 'completed' });
+      assert.equal(f.native.state, 'closed');
+      assert.deepEqual({ title: f.native.title, body: f.native.body }, before);
+    } finally {
+      await api.close();
+    }
+  });
+}
+
+test('MCP edit that rewrites a hand-edited canonical body still refuses', async () => {
+  const f = fixture();
+  finishedBodies[2]!.edit(f.native, f.ready);
+  const api = await caller('MCP');
+  try {
+    await assert.rejects(
+      api.call('issue_update', { issueNumber: 17, title: 'Rename the hand-edited issue' }),
+      /body\.canonical/u,
+    );
+    await assert.rejects(
+      api.call('issue_update', { issueNumber: 17, state: 'closed', closeReason: 'completed', title: 'Rename it' }),
+      /body\.canonical/u,
+    );
+    assert.deepEqual(f.writes, []);
+  } finally {
+    await api.close();
+  }
+});
 
 test('MCP explicit native metadata still updates and configured-value refusals write nothing', async () => {
   const f = fixture([], null, { points: null, issueType: null });
