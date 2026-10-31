@@ -569,6 +569,18 @@ export function compiledTestFile(file) {
   return file.replace(/^src\/(.*)\.test\.ts$/u, 'dist/$1.test.js');
 }
 
+/** PR CI adds the release lane when a PR touches a release case's test file or the source it is named for.
+ * @param {string[]} paths */
+export function touchesReleaseCases(paths) {
+  const owned = new Set(
+    RELEASE_CASES.flatMap(({ file }) => {
+      const source = file.replace(/^dist\/(.*)\.test\.js$/u, 'src/$1');
+      return [file, `${source}.test.ts`, `${source}.ts`];
+    }),
+  );
+  return paths.some((path) => owned.has(path));
+}
+
 /** @param {string} cwd @param {'source'|'compiled'} [mode] */
 export function expectedTests(cwd, mode = 'compiled') {
   assert.ok(mode === 'source' || mode === 'compiled', 'Unknown test input mode.');

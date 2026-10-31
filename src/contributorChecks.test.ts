@@ -78,6 +78,7 @@ type Checks = {
   })[];
   FULL_GATES: string[];
   FAST_GATES: string[];
+  touchesReleaseCases(paths: string[]): boolean;
   safeEnvironment(input: Record<string, string>): Record<string, string>;
   validateToolchain(cwd: string, env: Record<string, string>): Toolchain;
   expectedTests(cwd: string, mode?: string): string[];
@@ -672,12 +673,16 @@ test('local and CI share the PR producer while explicit release owns package qua
   assert.equal(manifest.scripts['checks:producer'], 'node scripts/current-qualification.mjs --producer-only');
   assert.equal(manifest.scripts['checks:fast'], 'node scripts/checks.mjs --fast');
   const ci = readFileSync(join(repository, '.github/workflows/ci.yml'), 'utf8');
-  assert.match(ci, /npm run checks -- --results-dir/u);
   assert.doesNotMatch(ci, /npm run build|npm pack/u);
-  assert.doesNotMatch(ci, /checks:release|current-qualification/u);
   assert.match(ci, /Retain PR producer and interrupted check evidence/u);
   assert.match(ci, /if: always\(\)/u);
   assert.deepEqual(checks.FULL_GATES, ['format', 'lint', 'types', 'build', 'tests', 'inventory']);
+});
+
+test('PR CI adds the release lane only when a PR touches a release case file or its source', () => {
+  assert.equal(checks.touchesReleaseCases(['README.md', 'src/toolOutput.test.ts']), true);
+  assert.equal(checks.touchesReleaseCases(['src/toolOutput.ts']), true);
+  assert.equal(checks.touchesReleaseCases(['README.md', 'src/issue.ts', 'src/readView.test.ts']), false);
 });
 
 test('clean full graph removes deleted/renamed compiled tests and retains exact command evidence', async () => {
