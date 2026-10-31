@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { DeliveryError } from './errors.js';
 import { getIssueProjectStatus, projectSettingsFromDeliveryConfig } from './github/projectDelivery.js';
 import { issueInfo, type DeliveryContext } from './issue.js';
 import { prInfo } from './pr.js';
@@ -84,13 +85,25 @@ export function summarizePr(raw: unknown) {
   };
 }
 
-const Comment = z.object({ body: z.string(), createdAt: z.string(), url: z.string() });
+const Comment = z.object({
+  author: z.object({ login: z.string() }).nullable(),
+  body: z.string(),
+  createdAt: z.string(),
+  url: z.string(),
+});
 const JOURNAL_MARKER = /<!--\s*ai-delivery:journal@1:sha256:[a-f0-9]{64}\s*-->\s*$/u;
 
 /** The newest typed journal comment, reduced to its own `Status: … Next: …` preview line. */
 export function latestJournal(comments: readonly z.infer<typeof Comment>[]) {
   const journal = comments.findLast((comment) => JOURNAL_MARKER.test(comment.body));
-  return journal ? { url: journal.url, createdAt: journal.createdAt, preview: journal.body.split('\n')[0]! } : null;
+  return journal
+    ? {
+        by: journal.author?.login ?? 'unknown',
+        url: journal.url,
+        createdAt: journal.createdAt,
+        preview: journal.body.split('\n')[0]!,
+      }
+    : null;
 }
 
 function sameRepository(source: unknown, repository: string): boolean {
@@ -100,18 +113,20 @@ function sameRepository(source: unknown, repository: string): boolean {
 
 const IssueLinks = z.object({
   repository: z.object({
-    issue: z.object({
-      id: z.string(),
-      state: z.enum(['OPEN', 'CLOSED']),
-      comments: z.object({ nodes: z.array(Comment) }),
-      timelineItems: z.object({
-        nodes: z.array(
-          z.object({
-            source: z.looseObject({ __typename: z.string() }),
-          }),
-        ),
-      }),
-    }),
+    issue: z
+      .object({
+        id: z.string(),
+        state: z.enum(['OPEN', 'CLOSED']),
+        comments: z.object({ nodes: z.array(Comment) }),
+        timelineItems: z.object({
+          nodes: z.array(
+            z.object({
+              source: z.looseObject({ __typename: z.string() }),
+            }),
+          ),
+        }),
+      })
+      .nullable(),
   }),
 });
 
@@ -119,7 +134,7 @@ export const ISSUE_LINKS_QUERY = `query ReadIssueLinks($owner: String!, $repo: S
         repository(owner: $owner, name: $repo) {
           issue(number: $number) {
             id state
-            comments(last: 30) { nodes { body createdAt url } }
+            comments(last: 30) { nodes { author { login } body createdAt url } }
             timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], last: 5) { nodes { ... on CrossReferencedEvent {
               source { __typename ... on PullRequest { repository { nameWithOwner } ${PR_FIELDS} } }
             } } }
@@ -131,6 +146,7 @@ export async function readIssueLinks(context: DeliveryContext, issueNumber: numb
   const data = IssueLinks.parse(
     await context.clients.graphql(ISSUE_LINKS_QUERY, { ...context.repo, number: issueNumber }),
   ).repository.issue;
+  if (data === null) throw new DeliveryError(`Issue #${String(issueNumber)} was not found.`);
   const repository = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
   const seen = new Set<number>();
   const pullRequests = data.timelineItems.nodes
@@ -147,9 +163,16 @@ export async function readIssueLinks(context: DeliveryContext, issueNumber: numb
   };
 }
 
+/** Runs reads together, then reports the first listed rejection, so an existing reader's refusal wins over a new read's error. */
+async function inOrder<T extends unknown[]>(reads: { [K in keyof T]: Promise<T[K]> }): Promise<T> {
+  const settled = await Promise.allSettled(reads);
+  for (const result of settled) if (result.status === 'rejected') throw result.reason;
+  return settled.map((result) => (result as PromiseFulfilledResult<unknown>).value) as T;
+}
+
 /** issue_info plus the linked PRs (state, checks, reviews) and the latest journal, in one call. */
 export async function issueView(context: DeliveryContext, issueNumber: number, options: { verbose: boolean }) {
-  const [info, links] = await Promise.all([
+  const [info, links] = await inOrder([
     issueInfo(context, issueNumber, { childDetail: options.verbose }),
     readIssueLinks(context, issueNumber),
   ]);
@@ -178,10 +201,10 @@ export async function prView(
   context: DeliveryContext,
   input: { issueNumber?: number; prNumber?: number; nonClosing?: boolean },
 ) {
-  const [info, early, given] = await Promise.all([
+  const [info, early, given] = await inOrder([
     prInfo(context, input),
-    input.prNumber === undefined ? undefined : readPrSummary(context, input.prNumber),
-    input.issueNumber === undefined ? undefined : readIssueBrief(context, input.issueNumber),
+    input.prNumber === undefined ? Promise.resolve(undefined) : readPrSummary(context, input.prNumber),
+    input.issueNumber === undefined ? Promise.resolve(undefined) : readIssueBrief(context, input.issueNumber),
   ]);
   const summary = early ?? (await readPrSummary(context, info.prNumber));
   const others = await Promise.all(
@@ -193,7 +216,7 @@ export async function prView(
 
 export const PR_SUMMARY_QUERY = `query ReadPrSummary($owner: String!, $repo: String!, $number: Int!) {
           repository(owner: $owner, name: $repo) {
-            pullRequest(number: $number) { ${PR_FIELDS} closingIssuesReferences(first: 5) { nodes { number } } }
+            pullRequest(number: $number) { ${PR_FIELDS} closingIssuesReferences(first: 5) { nodes { number repository { nameWithOwner } } } }
           }
         }`;
 
@@ -202,11 +225,22 @@ export async function readPrSummary(context: DeliveryContext, prNumber: number) 
     .object({
       repository: z.object({
         pullRequest: PrNode.extend({
-          closingIssuesReferences: z.object({ nodes: z.array(z.object({ number: z.number().int().positive() })) }),
+          closingIssuesReferences: z.object({
+            nodes: z.array(
+              z.object({
+                number: z.number().int().positive(),
+                repository: z.object({ nameWithOwner: z.string() }),
+              }),
+            ),
+          }),
         }),
       }),
     })
     .parse(await context.clients.graphql(PR_SUMMARY_QUERY, { ...context.repo, number: prNumber }))
     .repository.pullRequest;
-  return { ...summarizePr(data), closes: data.closingIssuesReferences.nodes.map((issue) => issue.number) };
+  const repository = `${context.repo.owner}/${context.repo.repo}`.toLowerCase();
+  const closes = data.closingIssuesReferences.nodes
+    .filter((issue) => issue.repository.nameWithOwner.toLowerCase() === repository)
+    .map((issue) => issue.number);
+  return { ...summarizePr(data), closes };
 }

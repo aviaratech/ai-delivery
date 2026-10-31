@@ -69,8 +69,14 @@ test('a response that drifts from the expected shape is refused, not guessed', (
 
 test('the latest typed journal wins over later plain comments', () => {
   const [journal] = recordedIssue233Links.repository.issue.comments.nodes;
-  const plain = { body: 'LGTM', createdAt: '2026-10-29T00:00:00Z', url: 'https://example.test/c/2' };
+  const plain = {
+    author: { login: 'someone' },
+    body: 'LGTM',
+    createdAt: '2026-10-29T00:00:00Z',
+    url: 'https://example.test/c/2',
+  };
   assert.deepEqual(latestJournal([journal!, plain]), {
+    by: 'PaulSavignano',
     url: journal!.url,
     createdAt: journal!.createdAt,
     preview: 'Work started on Lead typed journal comments with status and next step.',
@@ -104,8 +110,25 @@ test('issue links ignore references from other repositories', async () => {
   assert.deepEqual((await readIssueLinks(context(foreign), 233)).pullRequests, []);
 });
 
-test('a PR summary reports its closing issues', async () => {
+test('a PR summary reports its closing issues in this repository only', async () => {
   const summary = await readPrSummary(context(recordedPr235Summary), 235);
   assert.deepEqual(summary.closes, [233]);
   assert.equal(summary.state, 'merged');
+  // Synthetic edit: GitHub also lists issues a PR closes in other repositories.
+  const pull = recordedPr235Summary.repository.pullRequest;
+  const crossRepo = {
+    repository: {
+      pullRequest: {
+        ...pull,
+        closingIssuesReferences: {
+          nodes: [...pull.closingIssuesReferences.nodes, { number: 7, repository: { nameWithOwner: 'example/other' } }],
+        },
+      },
+    },
+  };
+  assert.deepEqual((await readPrSummary(context(crossRepo), 235)).closes, [233]);
+});
+
+test('a missing issue is one plain sentence, not a schema dump', async () => {
+  await assert.rejects(readIssueLinks(context({ repository: { issue: null } }), 999), /Issue #999 was not found/u);
 });

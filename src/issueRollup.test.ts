@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { test } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { afterEach, test, vi } from 'vitest';
+import * as settings from './config/deliveryConfig.js';
+import * as issues from './issue.js';
+import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { issueInfo, listIssueSubissues } from './issue.js';
 import { issue63Fixture } from './fixtures/issue63.js';
 import { CollectionLimitError } from './errors.js';
@@ -487,3 +492,34 @@ for (const surface of ['catalog', 'values'])
     }) as typeof f.context.clients.rest.request;
     await assert.rejects(f.read, /pagination/iu);
   });
+
+afterEach(() => vi.restoreAllMocks());
+
+test('issue_info over MCP reports child counts, and the full rollup only with verbose', async () => {
+  const f = rollupFixture();
+  vi.spyOn(settings, 'loadDeliverySettings').mockResolvedValue({
+    ...f.context.config,
+    roles: { author: { authSource: 'personal', identity: 'author' }, reviewer: { identity: 'reviewer' } },
+  } as unknown as Awaited<ReturnType<typeof settings.loadDeliverySettings>>);
+  vi.spyOn(issues, 'loadDeliveryContext').mockResolvedValue(f.context);
+  const server = createAiDeliveryMcpServer({ repoRoot: '/nonexistent-launch-directory' });
+  const client = new Client({ name: 'rollup-fixture', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const read = async (verbose?: boolean) => {
+      const result = await client.callTool({
+        name: 'issue_info',
+        arguments: { repo: 'example/widget', issueNumber: 17, ...(verbose === undefined ? {} : { verbose }) },
+      });
+      assert.equal(result.isError, undefined, JSON.stringify(result.content));
+      return JSON.parse((result.content as { text: string }[])[0]!.text) as Record<string, unknown>;
+    };
+    assert.deepEqual((await read()).childProgress, { childCount: 3, closedChildCount: 1, percentClosed: 33.3 });
+    assert.equal(((await read(true)).childProgress as { pointsTotal: number }).pointsTotal, 7);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});

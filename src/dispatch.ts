@@ -58,6 +58,8 @@ export interface ExecutionContext {
   repoRoot: string;
   runtimeEntryPath?: string;
   signal?: AbortSignal;
+  /** Presentation only: lets issue_info skip the per-child rollup unless the caller asked for the full readback. */
+  verbose?: boolean;
 }
 function requiredNumber(input: Record<string, unknown>, key: string): number {
   const value = input[key];
@@ -327,7 +329,7 @@ export async function executeTool(
       ...(execution.signal === undefined ? {} : { signal: execution.signal }),
     });
   }
-  const { repo: selected, verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
+  const { repo: selected, verbose: _verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
   if (name === 'issue_finish' && input.nonClosing === true)
     throw new DeliveryError('Non-closing delivery cannot finish or close its retained issue.');
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
@@ -381,7 +383,7 @@ export async function executeTool(
     case 'issue_search':
       return listIssues(context, input as ListIssuesInput);
     case 'issue_info':
-      return issueView(context, requiredNumber(input, 'issueNumber'), { verbose: verbose === true });
+      return issueView(context, requiredNumber(input, 'issueNumber'), { verbose: execution.verbose === true });
     case 'issue_ready_check':
       return readyCheck(context, requiredNumber(input, 'issueNumber'));
     case 'issue_pr_create':

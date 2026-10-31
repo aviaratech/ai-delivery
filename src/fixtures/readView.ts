@@ -12,6 +12,9 @@ export const recordedIssue233Links = {
       comments: {
         nodes: [
           {
+            author: {
+              login: 'PaulSavignano',
+            },
             body: 'Work started on Lead typed journal comments with status and next step.\n\n**Kind:** start. **Status:** Started\n\n**Outcome:** Lead typed journal comments with status and next step\n\n**Key numbers:** Issue #233\n\n**Next:** Implement the issue acceptance criteria and run its verification (date not scheduled).\n\n**Evidence:** https://github.com/aviaratech/ai-delivery/issues/233\n\n<!-- ai-delivery:journal@1:sha256:1ed32423d4dbdad95f2fb06cc4c33e958dc98e313aae0ee873d2fbe8a53d1b1e -->',
             createdAt: '2026-10-28T22:10:18Z',
             url: 'https://github.com/aviaratech/ai-delivery/issues/233#issuecomment-6481948952',
@@ -135,6 +138,9 @@ export const recordedPr235Summary = {
         nodes: [
           {
             number: 233,
+            repository: {
+              nameWithOwner: 'aviaratech/ai-delivery',
+            },
           },
         ],
       },
