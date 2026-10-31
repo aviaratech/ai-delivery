@@ -363,6 +363,16 @@ export function inertTarget(
         throw new Error(`Unexpected synthetic REST route: ${route}`);
       },
       repos: {
+        compareCommitsWithBasehead: async (input: unknown) => {
+          record('repos.compareCommitsWithBasehead', input);
+          assert.deepEqual(input, {
+            owner: 'example',
+            repo: 'widget',
+            basehead: `${head}...${head}`,
+            per_page: 1,
+          });
+          return { data: { merge_base_commit: { sha: head } } };
+        },
         getCombinedStatusForRef: async (input: unknown) => {
           record('repos.getCombinedStatusForRef', input);
           return { data: { state: 'success', total_count: 0, statuses: [] } };
