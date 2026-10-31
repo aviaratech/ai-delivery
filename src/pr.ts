@@ -249,9 +249,9 @@ function closingBody(issue: { number: number; title: string; body?: string | nul
 // This is a closure safety check, never authority for an issue association.
 function refuseClosingDirective(text: unknown): asserts text is string {
   if (typeof text !== 'string') throw new DeliveryError('Incomplete non-closing message readback.');
-  const normalized = text.replace(/[*_~`\\<>[\]]/gu, '');
+  const normalized = text.replace(/\[[^\]\r\n]*\]\(([^()\s]+)\)/gu, '$1').replace(/[*_~`\\<>[\]]/gu, '');
   if (
-    /\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\b(?:\s*:\s*|\s+)[^\n]*?(?:#[0-9]+|[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+#[0-9]+|https?:\/\/(?:www\.)?github\.com\/[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+\/(?:issues|pull)\/[0-9]+)/iu.test(
+    /(?<![\p{L}\p{N}_-])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)(?:\s*:\s*|\s+)(?:#[0-9]+|[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+#[0-9]+|https?:\/\/(?:www\.)?github\.com\/[A-Za-z0-9.-]+\/[A-Za-z0-9.-]+\/(?:issues|pull)\/[0-9]+)/iu.test(
       normalized,
     )
   )
@@ -752,7 +752,7 @@ async function verifyPrIssueAssociation(
   expectedIssueId?: string,
   expectedRepositoryId?: string,
   options: { allowMissing?: boolean; missingMessage?: string } = {},
-): Promise<void> {
+): Promise<number> {
   let cursor: string | null = null;
   const cursors = new Set<string>();
   let matches = 0;
@@ -810,7 +810,7 @@ async function verifyPrIssueAssociation(
             ? options.missingMessage
             : 'Native GitHub PR closing-issue association does not identify the intended issue.',
         );
-      return;
+      return matches;
     }
     const next = connection.pageInfo.endCursor;
     if (!next || cursors.has(next)) throw new DeliveryError('Native PR issue pagination did not advance.');
@@ -1581,6 +1581,38 @@ async function corroborateClassicProtectionAbsence(
   return { confirmedUnprotected, confirmedRulesetOnly };
 }
 
+async function routeAuthor(
+  context: DeliveryContext,
+  purpose: 'development' | 'publication',
+  check: () => Promise<void> = async () => {},
+  signal?: AbortSignal,
+): Promise<ReviewRoutePreflight['author']> {
+  const configuredAuthorSource = context.config.roles.author.authSource ?? 'app';
+  const personalDevelopmentOverride =
+    purpose === 'development' && configuredAuthorSource === 'app' && context.clients.authSource === 'personal';
+  if (context.clients.authSource !== configuredAuthorSource && !personalDevelopmentOverride) {
+    throw new DeliveryError(
+      purpose === 'publication'
+        ? 'PR publication requires the configured author credential; configure the personal author role for personal publication.'
+        : 'Development access preflight requires the configured author credential or the explicit personal author override.',
+    );
+  }
+  if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor) {
+    throw new DeliveryError('Delivery access preflight requires authenticated author identity readback.');
+  }
+  const author = await context.clients.authenticatedAuthor(signal);
+  await check();
+  if (!author.actorLogin || !author.credentialIdentity) {
+    throw new DeliveryError('Author GitHub identity readback is incomplete.');
+  }
+  return {
+    actorLogin: author.actorLogin,
+    authSource: context.clients.authSource,
+    credentialSource: context.clients.credentialSource ?? 'unreported',
+    identity: personalDevelopmentOverride ? 'personal' : context.config.roles.author.identity,
+  };
+}
+
 /** Check selected actors and rule evidence; publication also requires the configured author source. */
 export async function preflightReviewRoute(
   context: DeliveryContext,
@@ -1601,24 +1633,7 @@ export async function preflightReviewRoute(
     control?.signal.throwIfAborted();
   };
   await check();
-  const configuredAuthorSource = context.config.roles.author.authSource ?? 'app';
-  const personalDevelopmentOverride =
-    purpose === 'development' && configuredAuthorSource === 'app' && context.clients.authSource === 'personal';
-  if (context.clients.authSource !== configuredAuthorSource && !personalDevelopmentOverride) {
-    throw new DeliveryError(
-      purpose === 'publication'
-        ? 'PR publication requires the configured author credential; configure the personal author role for personal publication.'
-        : 'Development access preflight requires the configured author credential or the explicit personal author override.',
-    );
-  }
-  if (context.clients.role !== 'author' || !context.clients.authenticatedAuthor) {
-    throw new DeliveryError('Delivery access preflight requires authenticated author identity readback.');
-  }
-  const author = await context.clients.authenticatedAuthor(control?.signal);
-  await check();
-  if (!author.actorLogin || !author.credentialIdentity) {
-    throw new DeliveryError('Author GitHub identity readback is incomplete.');
-  }
+  const author = await routeAuthor(context, purpose, check, control?.signal);
   const reviewer =
     selectedReviewer ??
     context.reviewerClients ??
@@ -1708,12 +1723,7 @@ export async function preflightReviewRoute(
     observedRequiredApprovals > 0 &&
     reviewer.effectiveContentsPermission === 'read';
   return {
-    author: {
-      actorLogin: author.actorLogin,
-      authSource: context.clients.authSource,
-      credentialSource: context.clients.credentialSource ?? 'unreported',
-      identity: personalDevelopmentOverride ? 'personal' : context.config.roles.author.identity,
-    },
+    author,
     reviewer: {
       actorLogin: reviewerActor,
       credentialSource: reviewer.credentialSource ?? 'unreported',
@@ -1813,6 +1823,14 @@ export async function publishPr(
   if (matches.length > 1 || (explicit && (matches.length !== 1 || matches[0]!.number !== explicit.number)))
     throw new DeliveryError('Remote issue branch has conflicting PR matches.');
   let pr = explicit ?? (matches[0] === undefined ? undefined : await getPr(context, matches[0].number));
+  if (
+    pr &&
+    input.draft === false &&
+    input.headBranch === undefined &&
+    input.prNumber === undefined &&
+    (await linkedIssueBranches(context, input.issueNumber)).filter((entry) => entry.name === branch).length !== 1
+  )
+    throw new DeliveryError('Select an explicit PR or head after GitHub-linked branch references disappear.');
   if (reconcileReference && pr && !explicit)
     throw new DeliveryError(
       'Reference reconciliation of an existing match requires explicit --pr and caller-reconciled authority/attempt receipts.',
@@ -1848,7 +1866,10 @@ export async function publishPr(
       (input.title !== undefined && pr.title !== input.title))
   )
     throw new DeliveryError('Existing remote PR conflicts with the requested branch, intent or state.');
-  const reviewRoute = nonClosing ? await nonClosingRoute(context, base) : await preflightReviewRoute(context, base);
+  // Opening a closing PR needs only the author; review submission checks the reviewer App.
+  const reviewRoute = nonClosing
+    ? await nonClosingRoute(context, base)
+    : { author: await routeAuthor(context, 'publication') };
   if (pr && pr.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase())
     throw new DeliveryError('Existing PR author differs from the configured authenticated author.');
   if (pr && (typeof pr.node_id !== 'string' || !pr.node_id))
@@ -2010,6 +2031,7 @@ export async function publishPr(
       ...(reconcileReference ? { referenceRemoval: 'pending', nonClosingVerified: false } : {}),
     };
   let created = false;
+  const warnings: string[] = [];
   if (pr) {
     if (pendingClosingRepair) {
       pr = await readExisting();
@@ -2124,7 +2146,15 @@ export async function publishPr(
       sameReferencePr(pr, verified);
       pr = verified;
       await preserveIssue();
-    } else await verifyPrIssueAssociation(context, pr.number, input.issueNumber);
+    } else if (
+      // GitHub lists a new PR's closing link a few seconds after creation (aviaratech/ai#3780).
+      (await verifyPrIssueAssociation(context, pr.number, input.issueNumber, undefined, false, undefined, undefined, {
+        allowMissing: created,
+      })) === 0
+    )
+      warnings.push(
+        `GitHub has not yet listed PR #${pr.number} as closing #${input.issueNumber}; confirm with issue_pr_info.`,
+      );
     if (created) {
       const final = await getPr(context, pr.number);
       sameReferencePr(pr, final);
@@ -2144,6 +2174,7 @@ export async function publishPr(
     ...(closingRepair ? { closingLinkAdded: true } : {}),
     ...(nonClosing ? { nonClosing: true, nonClosingVerified: true } : {}),
     ...(reconcileReference ? { referenceRemoval: removalState } : {}),
+    ...(warnings.length ? { warnings } : {}),
   };
 }
 

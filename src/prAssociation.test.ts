@@ -411,6 +411,28 @@ function fixture(published = true, nonClosing = false) {
 
 afterEach(() => vi.restoreAllMocks());
 
+it('publishes a pushed canonical branch without native creation and preserves the open issue', async () => {
+  const { context, state } = fixture(false, true);
+  state.remoteHead = head;
+  await publishPr(context, nonClosingCreation);
+  assert.equal(state.creations, 1);
+  assert.equal(state.issueState, 'open');
+  state.issueState = 'closed';
+  await assert.rejects(issues.issueBranch(context, 17), /open|OPEN/u);
+  await assert.rejects(issues.issueBranch(context, 17, 'issue/18'), /Branch issue\/18 is not linked/u);
+});
+
+it('accepts a hyphenated close mention while refusing an actual closing directive', async () => {
+  const { context, state } = fixture(true, true);
+  state.title = 'absent-close (#3777)';
+  await publishPr(context, { issueNumber: 17, nonClosing: true, prNumber: 23, draft: false });
+  state.title = 'closes #3777';
+  await assert.rejects(
+    publishPr(context, { issueNumber: 17, nonClosing: true, prNumber: 23, draft: false }),
+    /closing directives/u,
+  );
+});
+
 describe('remote closing PR creation', () => {
   it('replays a plain-git head from a temporary non-git directory through the public tool', async () => {
     const { context, state } = fixture(false);
@@ -1162,11 +1184,9 @@ describe('authoritative existing PR promotion', () => {
     assert.deepEqual(state.events, []);
   });
 
-  it('retains configured author role and distinct App preflight before promotion', async () => {
-    const { context, reviewerContext, state } = fixture();
+  it('retains the configured author role before promotion', async () => {
+    const { reviewerContext, state } = fixture();
     await assert.rejects(publishPr(reviewerContext, input), /author/u);
-    state.reviewerActor = 'author';
-    await assert.rejects(publishPr(context, input), /distinct/u);
     assert.equal(state.promotions, 0);
   });
 });
@@ -1791,9 +1811,9 @@ describe('explicit native non-closing reference delivery', () => {
     assert.equal(state.creations, 0);
   });
 
-  it('keeps new PR publication behind native start/branch linkage and checks introduced messages first', async () => {
+  it('keeps new PR publication behind the exact pushed head and checks introduced messages first', async () => {
     const { context, state } = fixture(false, true);
-    await assert.rejects(publishPr(context, nonClosingCreation), /branch/u);
+    await assert.rejects(publishPr(context, nonClosingCreation), /expected head/u);
     state.linked = true;
     state.remoteHead = head;
     state.commitMessage = 'Fixes: example/widget#99';
@@ -2573,6 +2593,48 @@ describe('later-read publication and pre-creation parent bound', () => {
       ],
     };
     await assert.rejects(publishPr(context, nonClosingCreation), /Incomplete/u);
+    assert.equal(state.creations, 0);
+  });
+});
+
+// Recorded Oct 24–31 (aviaratech/ai-delivery#239): issue_pr_create failed 35 of 42 calls.
+describe('first-call PR creation', () => {
+  const recorded = { issueNumber: 17, headBranch: 'issue/17' };
+
+  it('opens a closing PR with only the author identity configured', async () => {
+    const { context, state } = fixture(false);
+    Reflect.deleteProperty(context, 'reviewerClients');
+    vi.spyOn(github, 'createDeliveryGitHubClients').mockRejectedValue(
+      new DeliveryError('Missing GitHub App credentials for reviewer role. Set GH_APP_ID_GPT_REVIEWER.'),
+    );
+    state.remoteHead = head;
+    assert.equal((await publishPr(context, recorded)).prNumber, 23);
+    assert.equal(state.creations, 1);
+  });
+
+  it('returns the created PR with a warning while GitHub has not yet listed its closing link', async () => {
+    const { context, state } = fixture(false);
+    state.remoteHead = head;
+    state.closingReadback = {
+      repository: {
+        nameWithOwner: repo,
+        pullRequest: { id: 'PR23', number: 23, closingIssuesReferences: { nodes: [], pageInfo } },
+      },
+    };
+    const created = await publishPr(context, recorded);
+    assert.equal(created.prNumber, 23);
+    assert.match(String(Reflect.get(created, 'warnings')), /not yet listed PR #23 as closing #17/u);
+    state.closingReadback = undefined;
+    assert.equal((await publishPr(context, recorded)).prNumber, 23);
+    assert.equal(state.creations, 1);
+  });
+
+  it('names an unlinked worktree branch and the step that publishes it', async () => {
+    const { context, state } = fixture(false, true);
+    await assert.rejects(
+      publishPr(context, { ...nonClosingCreation, headBranch: 'claude/17-widget' }),
+      /Branch claude\/17-widget is not linked to issue #17 \(GitHub-linked: none\); push the work as issue\/17\./u,
+    );
     assert.equal(state.creations, 0);
   });
 });

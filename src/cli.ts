@@ -14,6 +14,7 @@ import {
   assertReviewVerdictTarget,
   buildReviewArtifact,
   parseReviewVerdict,
+  readGitHubReviewBase,
   ReviewSubmissionError,
   validateReviewTarget,
 } from './review.js';
@@ -635,6 +636,12 @@ program
     const verdict = parseReviewVerdict(raw);
     assertReviewVerdictTarget(verdict, profile.provider, o.head);
     const prNumber = z.number().int().positive().parse(Number(o.pr));
+    const authorContext = await contextFor(
+      { ...execution(), settings, identity, reviewSubmission: true },
+      'pr:info',
+      'author',
+    );
+    const reviewBase = await readGitHubReviewBase(authorContext, prNumber, o.head);
     const artifact = buildReviewArtifact({
       verdict,
       verdictFileSha256,
@@ -643,12 +650,8 @@ program
       expectedHead: o.head,
       prNumber,
       authorIdentity: settings.roles.author.identity,
+      reviewBase,
     });
-    const authorContext = await contextFor(
-      { ...execution(), settings, identity, reviewSubmission: true },
-      'pr:info',
-      'author',
-    );
     await validateReviewTarget(authorContext, artifact, prNumber);
     const clients = await createDeliveryGitHubClients({
       config: authorContext.config,

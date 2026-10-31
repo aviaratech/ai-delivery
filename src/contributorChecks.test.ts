@@ -691,7 +691,7 @@ function executor(f: ReturnType<typeof fixture>, failStage = ''): Checks['execut
       stderrPath,
     };
     options.progress?.(result);
-    return result;
+    return { ...result, cleanupConfirmed: true };
   };
 }
 
@@ -740,6 +740,55 @@ test('clean full graph removes deleted/renamed compiled tests and retains exact 
     assert.throws(() => checks.assertCleanSelection(f.cwd), /stale, deleted, renamed/u);
   } finally {
     f.cleanup();
+  }
+});
+
+test('successful required checks bind only the same clean committed head through finalization', async () => {
+  for (const scenario of ['stable', 'head-drift', 'hidden-change', 'cleanup-unconfirmed']) {
+    const f = fixture();
+    try {
+      const git = (...args: string[]) =>
+        execFileSync(
+          'git',
+          [
+            '-c',
+            'user.name=Fixture',
+            '-c',
+            'user.email=fixture@example.invalid',
+            '-c',
+            'commit.gpgsign=false',
+            '-c',
+            'core.hooksPath=/dev/null',
+            ...args,
+          ],
+          { cwd: f.cwd, encoding: 'utf8' },
+        ).trim();
+      git('commit', '-qm', 'Clean source');
+      const expected = { sha: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}') };
+      if (scenario === 'hidden-change') {
+        git('update-index', '--assume-unchanged', 'src/original.test.ts');
+        writeFileSync(join(f.cwd, 'src/original.test.ts'), '// bytes outside the committed head\n');
+      }
+      const execute = executor(f);
+      const report = await checks.runChecks({
+        cwd: f.cwd,
+        resultsDir: join(f.base, 'head-results'),
+        toolchain: () => f.toolchain,
+        execute: async (command, options) => {
+          const result = await execute(command, options);
+          if (scenario === 'head-drift' && options.directory.endsWith('/inventory'))
+            git('commit', '--allow-empty', '-qm', 'Same-tree drift');
+          return { ...result, cleanupConfirmed: scenario !== 'cleanup-unconfirmed' };
+        },
+      });
+      assert.equal(report.status, 'passed', report.error);
+      assert.deepEqual(
+        (report as Report & { verifiedHead?: typeof expected }).verifiedHead,
+        scenario === 'stable' ? expected : undefined,
+      );
+    } finally {
+      f.cleanup();
+    }
   }
 });
 
