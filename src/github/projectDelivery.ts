@@ -445,7 +445,7 @@ export async function ensureIssueProjectMembership(
       requireWritable: true,
     }));
   assertWritableConfiguration(configuration);
-  const existing = await findIssueProjectItem({ ...input, configuration, refuseUnreadable: true });
+  const existing = await findIssueProjectItem({ ...input, configuration });
   if (existing?.archived) throw new DeliveryError('The issue delivery Project item is archived and cannot be updated.');
   let itemId = existing?.id;
   if (itemId === undefined) {
@@ -676,15 +676,52 @@ async function fetchProjectDeliveryItemNodes(
   return nodes;
 }
 
+/** Reads the issue's own Project items (one request) instead of paging the whole board. */
 async function findIssueProjectItem(
-  input: ProjectDeliveryInput & { configuration: ProjectDeliveryConfiguration; refuseUnreadable?: boolean },
+  input: ProjectDeliveryInput & { configuration: ProjectDeliveryConfiguration },
 ): Promise<null | ProjectDeliveryItem> {
+  const response: unknown = await input.graphql(
+    `
+      query ProjectDeliveryIssueItems($issueNodeId: ID!, $statusField: String!) {
+        node(id: $issueNodeId) {
+          ... on Issue {
+            id
+            projectItems(first: 50, includeArchived: true) {
+              nodes {
+                id
+                isArchived
+                project { id number }
+                content { ... on Issue { id } }
+                fieldValueByName(name: $statusField) {
+                  ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
+                }
+              }
+              pageInfo { hasNextPage }
+            }
+          }
+        }
+      }
+    `,
+    { issueNodeId: input.issueNodeId, statusField: input.configuration.settings.statusField },
+  );
+  const record = requireRecord(response, 'GitHub returned invalid issue Project evidence.');
+  const node = requireRecord(record.node, 'GitHub omitted the issue.');
+  const items = requireRecord(node.projectItems, 'GitHub omitted the issue Project items.');
+  if (node.id !== input.issueNodeId || !Array.isArray(items.nodes))
+    throw new DeliveryError('GitHub returned Project items for a different issue.');
+  if (requireRecord(items.pageInfo, 'GitHub omitted issue Project pagination.').hasNextPage !== false)
+    throw new DeliveryError('Issue belongs to more than 50 Projects; Project membership cannot be proved.');
   const matches: ProjectDeliveryItem[] = [];
-  for (const raw of await fetchProjectDeliveryItemNodes(input)) {
-    if (input.refuseUnreadable && (!isRecord(raw) || raw.content === null || raw.content === undefined))
-      throw new DeliveryError('Project membership is unreadable; absence cannot be proved.');
+  for (const raw of items.nodes as unknown[]) {
+    const project = requireRecord(
+      requireRecord(raw, 'GitHub returned an invalid Project item.').project,
+      'GitHub omitted the Project item identity.',
+    );
+    if (project.id !== input.configuration.projectId) continue;
     const item = parseProjectItem(raw, input.configuration, input.capacityRead);
-    if (item?.contentId === input.issueNodeId) matches.push(item);
+    if (item?.contentId !== input.issueNodeId)
+      throw new DeliveryError('Project membership is unreadable; absence cannot be proved.');
+    matches.push(item);
   }
   if (matches.length > 1)
     throw new DeliveryError(

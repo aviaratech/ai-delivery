@@ -92,7 +92,7 @@ for (const kind of ['tracked', 'edited'] satisfies PolicyState[]) {
       assert.equal((result.value!.completeness as { complete: boolean }).complete, true);
       assert.equal((result.value!.oldestActive as { number: number }[])[0]!.number, 17);
       assert.ok(f.calls.some((call) => call.name === 'issues.listForRepo'));
-      assert.ok(f.calls.some((call) => call.name === 'ProjectDeliveryItems'));
+      assert.ok(f.calls.some((call) => call.name === 'ProjectDeliveryIssueItems'));
       assert.equal(f.calls.filter((call) => call.name === 'NativeIssueHistory').length, 1);
       assert.equal(
         f.calls.some((call) => /create|update|merge|^mutation/iu.test(call.name)),

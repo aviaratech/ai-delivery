@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
@@ -517,15 +518,12 @@ export function inertTarget(
       record(query.match(/(?:query|mutation)\s+(\w+)/u)?.[1] ?? 'relationships', variables);
       const queueValue = queueRead?.(query, variables);
       if (queueValue !== undefined) return queueValue;
-      if (query.includes('ProjectDeliveryItems'))
-        return {
-          organization: {
-            projectV2: {
-              id: 'PROJECT-1',
-              items: { nodes: [item()], pageInfo: { hasNextPage: false, endCursor: null } },
-            },
-          },
-        };
+      if (query.includes('ProjectDeliveryIssueItems'))
+        return issueProjectItemsResponse(
+          variables,
+          [item()].filter((row) => row.content.id === variables.issueNodeId),
+          { id: 'PROJECT-1', number: 1 },
+        );
       if (query.includes('UpdateProjectDeliveryStatus')) {
         state.projectOption = String(variables.optionId);
         return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };

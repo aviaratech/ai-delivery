@@ -60,12 +60,10 @@ function fixture() {
       throw new Error('Synthetic Project write failure');
     const result = (await originalGraphql(query, variables)) as {
       repository: { issue: { parent: unknown; blockedBy: { nodes: { number: number; state: string }[] } } };
-      organization: { projectV2: { items: { nodes: { id: string }[] } } };
+      node: { projectItems: { nodes: { id: string }[] } };
     };
-    if (query.includes('ProjectDeliveryItems') && !recovery.member)
-      result.organization.projectV2.items.nodes = result.organization.projectV2.items.nodes.filter(
-        (row) => row.id !== 'ITEM20',
-      );
+    if (query.includes('ProjectDeliveryIssueItems') && !recovery.member)
+      result.node.projectItems.nodes = result.node.projectItems.nodes.filter((row) => row.id !== 'ITEM20');
     if (query.includes('blockedBy(first:'))
       for (const blocker of result.repository.issue.blockedBy.nodes)
         blocker.state = f.rows.get(blocker.number)!.state.toUpperCase();

@@ -10,6 +10,7 @@ import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import type { DeliveryContext } from './issue.js';
 import { getNativeBlockerRelationships } from './github/relationships.js';
 import * as projectDelivery from './github/projectDelivery.js';
+import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
 
 function updateFixture() {
   const root = mkdtempSync(join(tmpdir(), 'ai-delivery-history-'));
@@ -162,27 +163,18 @@ function updateFixture() {
               issue: { parent: null, blockedBy: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
             },
           };
-        if (query.includes('ProjectDeliveryItems'))
-          return {
-            organization: {
-              projectV2: {
-                items: {
-                  nodes: [
-                    {
-                      id: 'ITEM17',
-                      isArchived: controls.archived,
-                      content: { id: 'ISSUE17' },
-                      fieldValueByName: {
-                        name: projectStatus,
-                        optionId: projectStatus === 'Active' ? 'ACTIVE' : projectStatus === 'Queued' ? 'TODO' : 'DONE',
-                      },
-                    },
-                  ],
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                },
+        if (query.includes('ProjectDeliveryIssueItems'))
+          return issueProjectItemsResponse(variables, [
+            {
+              id: 'ITEM17',
+              isArchived: controls.archived,
+              content: { id: 'ISSUE17' },
+              fieldValueByName: {
+                name: projectStatus,
+                optionId: projectStatus === 'Active' ? 'ACTIVE' : projectStatus === 'Queued' ? 'TODO' : 'DONE',
               },
             },
-          };
+          ]);
         if (query.includes('UpdateProjectDeliveryStatus')) {
           events.push('project-update');
           projectStatus =
@@ -609,7 +601,7 @@ function listingFixture(
           };
         },
       },
-      graphql: async (query: string) => {
+      graphql: async (query: string, variables?: Record<string, unknown>) => {
         if (query.includes('blockedBy(first:'))
           return {
             repository: {
@@ -645,24 +637,15 @@ function listingFixture(
               },
             },
           };
-        if (query.includes('ProjectDeliveryItems'))
-          return {
-            organization: {
-              projectV2: {
-                items: {
-                  nodes: [
-                    {
-                      id: 'ITEM17',
-                      isArchived: false,
-                      content: { id: 'ISSUE17' },
-                      fieldValueByName: { name: 'Active', optionId: 'ACTIVE' },
-                    },
-                  ],
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                },
-              },
+        if (query.includes('ProjectDeliveryIssueItems'))
+          return issueProjectItemsResponse(variables, [
+            {
+              id: 'ITEM17',
+              isArchived: false,
+              content: { id: 'ISSUE17' },
+              fieldValueByName: { name: 'Active', optionId: 'ACTIVE' },
             },
-          };
+          ]);
         throw new Error('Unexpected query');
       },
     },
@@ -909,12 +892,8 @@ test.each([
       wipLimits: [{ repository: 'example/widget', name: 'Native', match: { field: 'Estimate', value: '4' }, limit: 2 }],
     };
   const originalGraphql = context.clients.graphql;
-  context.clients.graphql = (async (query: string) => {
-    const response = await originalGraphql(query);
-    if (query.includes('ProjectDeliveryItems')) {
-      const parsed = response as { organization: { projectV2: Record<string, unknown> } };
-      Object.assign(parsed.organization.projectV2, { id: 'PROJECT', number: 1 });
-    }
+  context.clients.graphql = (async (query: string, variables?: Record<string, unknown>) => {
+    const response = await originalGraphql(query, variables);
     if (!query.includes('blockedBy(first:')) return response;
     const parsed = response as { repository: { issue: Record<string, unknown> } };
     Object.assign(parsed.repository.issue, {
@@ -1031,7 +1010,7 @@ function membershipFixture() {
     fieldValueByName:
       status === null ? null : { name: 'Active', optionId: controls.corrupt === 'option' ? 'WRONG' : 'ACTIVE' },
   });
-  const graphql = (async (query: string) => {
+  const graphql = (async (query: string, variables?: Record<string, unknown>) => {
     if (query.includes('mutation AddProjectDeliveryItem')) {
       events.push('add');
       member = true;
@@ -1046,17 +1025,12 @@ function membershipFixture() {
       events.push('readback');
       return { node: item(true) };
     }
+    const items = member ? (controls.duplicate ? [item(), { ...item(), id: 'SECOND' }] : [item()]) : [];
+    if (query.includes('query ProjectDeliveryIssueItems')) return issueProjectItemsResponse(variables, items);
     if (query.includes('query ProjectDeliveryItems'))
       return {
         organization: {
-          projectV2: {
-            id: 'PROJECT',
-            number: 1,
-            items: {
-              nodes: member ? (controls.duplicate ? [item(), { ...item(), id: 'SECOND' }] : [item()]) : [],
-              pageInfo: { hasNextPage: false, endCursor: null },
-            },
-          },
+          projectV2: { id: 'PROJECT', number: 1, items: { nodes: items, pageInfo: { hasNextPage: false } } },
         },
       };
     throw new Error('Unexpected membership fixture query.');
@@ -1110,6 +1084,45 @@ test.each(['project', 'issue', 'item', 'archive', 'duplicate', 'unreadable'] as 
     );
   },
 );
+
+const projectRow = {
+  id: 'ITEM17',
+  isArchived: false,
+  project: { id: 'PROJECT', number: 1 },
+  content: { id: 'ISSUE17' },
+  fieldValueByName: { name: 'Active', optionId: 'ACTIVE' },
+};
+
+function readStatus(nodes: unknown[], overrides: { nodeId?: string; hasNextPage?: boolean } = {}) {
+  const { input } = membershipFixture();
+  const graphql = (async () => ({
+    node: {
+      id: overrides.nodeId ?? 'ISSUE17',
+      projectItems: { nodes, pageInfo: { hasNextPage: overrides.hasNextPage ?? false } },
+    },
+  })) as unknown as typeof input.graphql;
+  return projectDelivery.getIssueProjectStatus({ ...input, graphql });
+}
+
+test('issue Project Status is the exact configured item and never a guess (#180)', async () => {
+  assert.deepEqual(await readStatus([projectRow]), { itemId: 'ITEM17', status: 'In Progress' });
+  assert.equal(await readStatus([]), null);
+  assert.equal(await readStatus([{ ...projectRow, isArchived: true }]), null);
+  assert.equal(await readStatus([{ ...projectRow, project: { id: 'OTHER', number: 9 } }]), null);
+});
+
+test.each([
+  ['a different issue node', () => readStatus([projectRow], { nodeId: 'ISSUE99' }), /different issue/u],
+  ['more than 50 Projects', () => readStatus([projectRow], { hasNextPage: true }), /more than 50 Projects/u],
+  ['an unreadable item in the configured Project', () => readStatus([{ ...projectRow, content: null }]), /unreadable/u],
+  [
+    'a duplicate item in the configured Project',
+    () => readStatus([projectRow, { ...projectRow, id: 'SECOND' }]),
+    /duplicate/u,
+  ],
+])('issue Project lookup refuses %s', async (_name, read, message) => {
+  await assert.rejects(read(), message);
+});
 
 test('guards run immediately before both Project mutation boundaries', async () => {
   const f = membershipFixture();

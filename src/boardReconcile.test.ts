@@ -1,3 +1,4 @@
+import { issueProjectItemsResponse } from './fixtures/issueProjectItems.js';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
@@ -30,6 +31,8 @@ import { createAiDeliveryMcpServer } from './mcp/index.js';
 import type { AiDeliveryMcpToolName } from './mcp/tools.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+
+const ITEM_READ = /ProjectDelivery(Issue)?Items/u;
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -262,6 +265,14 @@ async function boardFixture(count = 101, repositories = ['example/widget'], inde
           return { updateProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
         }
         throw new Error('Unexpected mutation');
+      }
+      if (query.includes('ProjectDeliveryIssueItems')) {
+        controls.itemPages++;
+        return issueProjectItemsResponse(
+          variables,
+          [...members.entries()].filter(([node]) => node === variables.issueNodeId).map(([node, m]) => item(node, m)),
+          { id: projectId, number: 1 },
+        );
       }
       if (query.includes('ProjectDeliveryItems')) {
         controls.itemPages++;
@@ -1170,7 +1181,7 @@ test.each(['add', 'status'] as const)('native truth is guarded immediately befor
     const plan = await collect(f.contexts, f.request, [f.root]);
     let itemReads = 0;
     f.controls.beforeGraphql = (query) => {
-      if (query.includes('ProjectDeliveryItems') && ++itemReads === 3) row.state = kind === 'add' ? 'closed' : 'open';
+      if (ITEM_READ.test(query) && ++itemReads === 3) row.state = kind === 'add' ? 'closed' : 'open';
     };
     const result = await applyPlan(f, plan);
     assert.deepEqual(f.writes, []);
@@ -1300,7 +1311,7 @@ test('an exact Status target appearing at the final boundary skips the mutation'
     const plan = await collect(f.contexts, f.request, [f.root]);
     let reads = 0;
     f.controls.beforeGraphql = (query) => {
-      if (query.includes('ProjectDeliveryItems') && ++reads === 4) f.members.get(row.node_id)!.status = 'Done';
+      if (ITEM_READ.test(query) && ++reads === 4) f.members.get(row.node_id)!.status = 'Done';
     };
     const result = await applyPlan(f, plan);
     assert.deepEqual(f.writes, []);
@@ -1356,7 +1367,7 @@ test.each([false, true])(
       let first = true;
       const orderedFirst = plan.operations[0]!;
       f.controls.beforeGraphql = (query, variables) => {
-        if (first && query.includes('ProjectDeliveryItems') && f.controls.itemPages >= 1) {
+        if (first && ITEM_READ.test(query) && f.controls.itemPages >= 1) {
           // Wait until global preflight has collected every selected inventory.
           if (f.controls.issuePages >= plan.scope.length * 2) {
             first = false;
@@ -1441,7 +1452,7 @@ test('an interruption before add leaves a revalidated incomplete operation retry
     const plan = await collect(f.contexts, f.request, [f.root]);
     let reads = 0;
     f.controls.beforeGraphql = (query) => {
-      if (query.includes('ProjectDeliveryItems') && ++reads === 3) controller.abort();
+      if (ITEM_READ.test(query) && ++reads === 3) controller.abort();
     };
     const interrupted = await applyPlan(f, plan, undefined, controller.signal);
     assert.equal(f.writes.length, 0);
