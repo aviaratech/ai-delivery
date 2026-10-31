@@ -1446,6 +1446,17 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     Object.entries(input).every(
       ([key, value]) => value === undefined || ['repo', 'issueNumber', 'projectStatus', 'overrideReason'].includes(key),
     );
+  // Closing finished work leaves the body alone, so an old body need not meet today's ready contract.
+  const closeOnly =
+    input.state === 'closed' &&
+    input.closeReason !== undefined &&
+    Object.entries(input).every(
+      ([key, value]) =>
+        value === undefined ||
+        ['repo', 'issueNumber', 'state', 'closeReason', 'supersededBy', 'preserveHistory', 'overrideReason'].includes(
+          key,
+        ),
+    );
   requireDeferralPatch({
     ...(input.defer === undefined ? {} : { defer: input.defer }),
     ...(input.undefer === undefined ? {} : { undefer: input.undefer }),
@@ -1481,7 +1492,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   const legacyNativeEdit =
     archivedItemId !== null && !currentContent.body.trimStart().startsWith('<!-- ai-delivery:issue@1 -->');
   const prepared: ReturnType<typeof prepareIssueWrite> =
-    legacyNativeEdit || projectOnly
+    legacyNativeEdit || projectOnly || closeOnly
       ? {
           issue: IssueFields.parse({ title: input.title ?? currentContent.title, draft: true }),
           body: currentContent.body,
@@ -1492,7 +1503,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
       : prepareIssueWrite(input, currentContent);
   input = {
     ...input,
-    ...(projectOnly ? {} : { body: prepared.body }),
+    ...(projectOnly || closeOnly ? {} : { body: prepared.body }),
     ...(prepared.statusOnly
       ? {}
       : {
