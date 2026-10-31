@@ -1085,6 +1085,45 @@ test.each(['project', 'issue', 'item', 'archive', 'duplicate', 'unreadable'] as 
   },
 );
 
+const projectRow = {
+  id: 'ITEM17',
+  isArchived: false,
+  project: { id: 'PROJECT', number: 1 },
+  content: { id: 'ISSUE17' },
+  fieldValueByName: { name: 'Active', optionId: 'ACTIVE' },
+};
+
+function readStatus(nodes: unknown[], overrides: { nodeId?: string; hasNextPage?: boolean } = {}) {
+  const { input } = membershipFixture();
+  const graphql = (async () => ({
+    node: {
+      id: overrides.nodeId ?? 'ISSUE17',
+      projectItems: { nodes, pageInfo: { hasNextPage: overrides.hasNextPage ?? false } },
+    },
+  })) as unknown as typeof input.graphql;
+  return projectDelivery.getIssueProjectStatus({ ...input, graphql });
+}
+
+test('issue Project Status is the exact configured item and never a guess (#180)', async () => {
+  assert.deepEqual(await readStatus([projectRow]), { itemId: 'ITEM17', status: 'In Progress' });
+  assert.equal(await readStatus([]), null);
+  assert.equal(await readStatus([{ ...projectRow, isArchived: true }]), null);
+  assert.equal(await readStatus([{ ...projectRow, project: { id: 'OTHER', number: 9 } }]), null);
+});
+
+test.each([
+  ['a different issue node', () => readStatus([projectRow], { nodeId: 'ISSUE99' }), /different issue/u],
+  ['more than 50 Projects', () => readStatus([projectRow], { hasNextPage: true }), /more than 50 Projects/u],
+  ['an unreadable item in the configured Project', () => readStatus([{ ...projectRow, content: null }]), /unreadable/u],
+  [
+    'a duplicate item in the configured Project',
+    () => readStatus([projectRow, { ...projectRow, id: 'SECOND' }]),
+    /duplicate/u,
+  ],
+])('issue Project lookup refuses %s', async (_name, read, message) => {
+  await assert.rejects(read(), message);
+});
+
 test('guards run immediately before both Project mutation boundaries', async () => {
   const f = membershipFixture();
   const input = {
