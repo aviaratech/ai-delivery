@@ -621,6 +621,7 @@ async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArti
     if (
       review.id !== request.fromReviewId ||
       review.state !== 'APPROVED' ||
+      review.commit_id !== original.head.sha ||
       review.user?.login.toLowerCase() !== actor.toLowerCase() ||
       original.verdict !== 'approve' ||
       artifact.verdict !== 'approve' ||
@@ -630,7 +631,6 @@ async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArti
       original.reviewerIdentity !== artifact.reviewerIdentity ||
       !original.reviewBase ||
       !artifact.reviewBase ||
-      original.reuse ||
       original.head.sha === artifact.head.sha
     )
       throw new Error('Original comparison unavailable.');
