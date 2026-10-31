@@ -14,14 +14,12 @@ import {
   projectSettingsFromDeliveryConfig,
   readProjectDeliveryItems,
 } from './github/projectDelivery.js';
-import { resolveCheckout } from './github/repo.js';
 import { loadDeliveryContext } from './issue.js';
 import { parseJournalAttention } from './issueJournal.js';
-import { queueStatus } from './mergeQueue.js';
 import { hasDeliveryMergeTrailer, hasDeliveryPrMarker, readPrBoardFacts } from './pr.js';
 
 export type DeliveryBoardRequest = { repos: string[]; decisionLabels: string[] };
-export type BoardSection = 'humanAttention' | 'readyPrs' | 'blockedPrs' | 'staleIssues' | 'mergeQueue';
+export type BoardSection = 'humanAttention' | 'readyPrs' | 'blockedPrs' | 'staleIssues';
 export interface BoardRow {
   repository: string;
   id: string;
@@ -60,8 +58,6 @@ export interface BoardRepository {
   readyPrs: PrBoardFacts[];
   blockedPrs: PrBoardFacts[];
   staleIssues: BoardRow[];
-  mergeQueue: BoardRow[];
-  queueScope: { host: 'this-host'; baseRef: string | null };
   coverage: Record<BoardSection, BoardCoverage>;
   diagnostics: Array<{ scope: string; code: string }>;
   metrics: { opened: BoardMetric; merged: BoardMetric };
@@ -78,7 +74,6 @@ const boardSections: ReadonlyArray<readonly [BoardSection, string]> = [
   ['readyPrs', 'Ready PRs'],
   ['blockedPrs', 'Blocked PRs'],
   ['staleIssues', 'Stale In Progress issues (72h)'],
-  ['mergeQueue', 'Merge queue (this-host)'],
 ];
 
 function singleLine(value: string): string {
@@ -126,7 +121,7 @@ export function renderDeliveryBoard(result: DeliveryBoardResult): string {
             `${section}:${scope.status}, unknown ${scope.unknownRows.length}${scope.reasons[0] ? `, ${scope.reasons[0]}` : ''}`,
           ];
     });
-    return `${repo.repository}: ${repo.access}; 7d opened ${metricText(repo.metrics.opened)}, merged ${metricText(repo.metrics.merged)}; queue this-host${repo.queueScope.baseRef ? `/${singleLine(repo.queueScope.baseRef)}` : ''}${gaps.length ? `; ${gaps.join('; ')}` : '; coverage complete'}`;
+    return `${repo.repository}: ${repo.access}; 7d opened ${metricText(repo.metrics.opened)}, merged ${metricText(repo.metrics.merged)}${gaps.length ? `; ${gaps.join('; ')}` : '; coverage complete'}`;
   });
   function render(titles: boolean, visible: number): string {
     let remaining = visible;
@@ -247,14 +242,11 @@ function emptyRepository(repository: string): BoardRepository {
     readyPrs: [],
     blockedPrs: [],
     staleIssues: [],
-    mergeQueue: [],
-    queueScope: { host: 'this-host', baseRef: null },
     coverage: {
       humanAttention: coverage(),
       readyPrs: coverage(),
       blockedPrs: coverage(),
       staleIssues: coverage(),
-      mergeQueue: coverage(),
     },
     diagnostics: [],
     metrics: { opened: metric(), merged: metric() },
@@ -828,53 +820,9 @@ export async function collectDeliveryBoard(
       for (const issue of nativeIssues) gap(result, retain, 'staleIssues', code(error), issue.row, true);
       result.diagnostics.push({ scope: 'project', code: code(error) });
     }
-    try {
-      signal?.throwIfAborted();
-      if (!context) throw new DeliveryError('Queue context unavailable.');
-      const root = resolveCheckout({
-        repository,
-        launchDirectory: execution.repoRoot,
-        checkoutRoots: settings.checkoutRoots,
-        canonical: true,
-      });
-      const queue = await queueStatus(context, { root, ...(signal === undefined ? {} : { signal }) });
-      signal?.throwIfAborted();
-      retain(queue.baseRef);
-      result.queueScope.baseRef = queue.baseRef;
-      const entries = queue.entries
-        .filter((entry) => entry.state !== 'merged' && entry.state !== 'removed')
-        .map((entry) => ({
-          repository,
-          id: entry.prId,
-          number: entry.prNumber,
-          issueNumber: entry.issueNumber,
-          url: `https://github.com/${repository}/pull/${entry.prNumber}`,
-          title: '',
-          state: entry.state,
-          headSha: entry.head,
-          reasons: [
-            `queue-${entry.state}`,
-            ...(queue.halted ? ['queue-halted'] : []),
-            ...(queue.pending ? ['queue-pending'] : []),
-          ],
-        }));
-      retain(entries);
-      result.mergeQueue = entries;
-      result.coverage.mergeQueue.observed = result.mergeQueue.length;
-    } catch (error) {
-      signal?.throwIfAborted();
-      gap(result, retain, 'mergeQueue', code(error), undefined, true);
-      result.diagnostics.push({ scope: 'host-queue', code: code(error) });
-    }
     result.metrics.opened = await usage(readContext, repositoryId, repository, 'opened', asOf, retain, signal);
     result.metrics.merged = await usage(readContext, repositoryId, repository, 'merged', asOf, retain, signal);
-    for (const rows of [
-      result.humanAttention,
-      result.readyPrs,
-      result.blockedPrs,
-      result.staleIssues,
-      result.mergeQueue,
-    ])
+    for (const rows of [result.humanAttention, result.readyPrs, result.blockedPrs, result.staleIssues])
       rows.sort((a, b) => a.number - b.number);
   }
   signal?.throwIfAborted();

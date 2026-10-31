@@ -21,7 +21,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import * as githubClients from '../github/client.js';
-import * as verification from '../verification.js';
 import { IssueFields, renderIssueBody } from '../issueContract.js';
 import { digestBytes, digestValue } from '../delivery/common.js';
 import { createAiDeliveryMcpServer } from '../mcp/index.js';
@@ -512,12 +511,8 @@ export function inertTarget(
         },
       },
     };
-    let queueRead: ((query: string, variables: Record<string, unknown>) => unknown) | undefined;
-    const extraRestorers: (() => void)[] = [];
     const graphql = async (query: string, variables: Record<string, unknown> = {}): Promise<unknown> => {
       record(query.match(/(?:query|mutation)\s+(\w+)/u)?.[1] ?? 'relationships', variables);
-      const queueValue = queueRead?.(query, variables);
-      if (queueValue !== undefined) return queueValue;
       if (query.includes('ProjectDeliveryIssueItems'))
         return issueProjectItemsResponse(
           variables,
@@ -696,15 +691,7 @@ export function inertTarget(
         const response = await client.callTool(
           { name, arguments: name === 'delivery_board' ? args : { repo: 'example/widget', ...args } },
           undefined,
-          {
-            signal: connectionSignal,
-            ...(name !== 'issue_pr_merge_queue_run'
-              ? {}
-              : {
-                  resetTimeoutOnProgress: true,
-                  onprogress: (progress) => observations.push({ queueProgress: progress }),
-                }),
-          },
+          { signal: connectionSignal },
         );
         connectionSignal.throwIfAborted();
         const text = (response.content as { text: string }[])[0]?.text ?? '';
@@ -777,7 +764,6 @@ export function inertTarget(
           );
         assert.equal(inert, true, 'A public route imported consumer policy');
       } finally {
-        for (const restore of extraRestorers.reverse()) restore();
         restoreGlobals();
       }
     };
@@ -821,12 +807,6 @@ export function inertTarget(
       connect,
       assertInert,
       dispose,
-      setQueueRead: (read: NonNullable<typeof queueRead>) => {
-        queueRead = read;
-      },
-      restoreQueuePort: (restore: () => void) => {
-        extraRestorers.push(restore);
-      },
     };
   } catch (error) {
     try {
@@ -839,369 +819,4 @@ export function inertTarget(
     }
     throw error;
   }
-}
-
-/** Real owned Git objects; only remote Git transport, GitHub HTTP and auth are synthetic. */
-export function queueScenario(f: ReturnType<typeof inertTarget>, count = 3) {
-  const remote = join(f.base, 'queue-remote.git');
-  const author = join(f.base, 'queue-author');
-  fixtureGit(f.base, 'clone', '--bare', '--no-hardlinks', f.root, remote);
-  fixtureGit(f.base, 'clone', '--no-hardlinks', remote, author);
-  const prs = Array.from({ length: count }, (_, i) => {
-    const number = 23 + i,
-      issueNumber = 17 + i,
-      ref = `issue/${issueNumber}`;
-    fixtureGit(author, 'checkout', '-B', ref, f.head);
-    writeFileSync(join(author, `entry-${i}.txt`), `entry ${i}\n`);
-    fixtureGit(author, 'add', '.');
-    fixtureGit(author, 'commit', '-qm', `Fictional PR ${number}`);
-    const head = fixtureGit(author, 'rev-parse', 'HEAD');
-    fixtureGit(author, 'push', remote, `${head}:refs/heads/${ref}`);
-    return { number, issueNumber, ref, head, merged: false, merge: null as string | null, nativeReady: true };
-  });
-  const settingsPath = join(f.base, 'user.json');
-  const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
-  writeFileSync(
-    settingsPath,
-    JSON.stringify({ ...settings, mergeQueueApprovers: { 'example/widget': ['maintainer'] } }),
-  );
-  const approve = (numbers = prs.map((p) => p.number)) => {
-    const c = f.addComment(
-      800000 + f.comments.length,
-      `ai-delivery merge approval v1\nrepository: example/widget\npull-requests: ${numbers.join(',')}\nconditions: current-native-eligibility,current-queue-checks,predecessors-merged\nheads: current-native-eligible\nexpires: 2099-01-01T00:00:00Z`,
-      false,
-      numbers[0],
-    );
-    c.user = { id: 43, login: 'maintainer', type: 'User' };
-    return c;
-  };
-  const approval = approve();
-  const events: string[] = [],
-    checked: string[] = [];
-  const failed = new Set<number>();
-  const controls = {
-    strict: false,
-    freshNativeAfterRefresh: false,
-    missing: false,
-    wrongSource: false,
-    partial: false,
-    loseMergeAck: false,
-    losePushAck: false,
-    outsideAtMerge: false,
-    pendingChecks: false,
-    loseCommentAck: false,
-    approvalFault: '' as '' | 'pagination' | 'wrong-target' | 'read-error',
-    unreadableApprovalIds: new Set<string>(),
-    pendingFor: new Set<number>(),
-    reviewDecision: 'APPROVED' as string | null,
-  };
-  const main = () => fixtureGit(remote, 'rev-parse', 'refs/heads/main');
-  const object = (sha: string) => ({
-    sha,
-    tree: { sha: fixtureGit(remote, 'rev-parse', `${sha}^{tree}`) },
-    parents: fixtureGit(remote, 'show', '-s', '--format=%P', sha)
-      .split(' ')
-      .filter(Boolean)
-      .map((sha) => ({ sha })),
-  });
-  const selected = (number: number) => {
-    const pr = prs.find((p) => p.number === number);
-    assert.ok(pr);
-    return pr;
-  };
-  const behind = (head: string) => {
-    try {
-      fixtureGit(remote, 'merge-base', '--is-ancestor', main(), head);
-      return false;
-    } catch {
-      return true;
-    }
-  };
-  const refresh = (number: number, change = false) => {
-    const pr = selected(number);
-    fixtureGit(author, 'fetch', remote, 'main');
-    fixtureGit(author, 'checkout', pr.ref);
-    fixtureGit(author, 'merge', '--no-edit', main());
-    if (change) {
-      writeFileSync(join(author, 'owner-change.txt'), 'external owner change\n');
-      fixtureGit(author, 'add', '.');
-      fixtureGit(author, 'commit', '-qm', 'External owner head update');
-    }
-    pr.head = fixtureGit(author, 'rev-parse', 'HEAD');
-    if (controls.freshNativeAfterRefresh) pr.nativeReady = false;
-    fixtureGit(author, 'push', remote, `${pr.head}:refs/heads/${pr.ref}`);
-    events.push(`owner.refresh:${number}`);
-  };
-  const qualifyNative = (number: number, expectedHead: string) => {
-    const pr = selected(number);
-    assert.equal(pr.head, expectedHead);
-    pr.nativeReady = true;
-    events.push(`owner.checks-review:${number}:${expectedHead}`);
-  };
-  const outside = () => {
-    const tree = object(main()).tree.sha;
-    const sha = fixtureGit(remote, 'commit-tree', tree, '-p', main(), '-m', 'Outside writer');
-    fixtureGit(remote, 'update-ref', 'refs/heads/main', sha);
-    events.push('outside.move');
-  };
-  const request = f.rest.request;
-  Object.assign(f.rest, {
-    request: async (route: string, input: Record<string, unknown>) => {
-      if (route.includes('/rules/branches/'))
-        return {
-          status: 200,
-          headers: controls.partial ? { link: 'next' } : {},
-          data: [
-            {
-              type: 'required_status_checks',
-              parameters: { required_status_checks: [{ context: 'checks', integration_id: 7 }] },
-            },
-          ],
-        };
-      if (route.endsWith('/protection'))
-        return {
-          status: 200,
-          headers: {},
-          data: { required_status_checks: { checks: [{ context: 'checks', app_id: 7 }], contexts: ['checks'] } },
-        };
-      return request(route, input);
-    },
-  });
-  Object.assign(f.rest.git, {
-    getRef: async ({ ref }: { ref: string }) => {
-      f.calls.push({ name: 'git.getRef', input: { ref } });
-      let sha: string;
-      try {
-        sha = fixtureGit(remote, 'rev-parse', '--verify', `refs/${ref}`);
-      } catch {
-        throw Object.assign(new Error('Not found'), { status: 404 });
-      }
-      return { data: { ref: `refs/${ref}`, object: { type: 'commit', sha } } };
-    },
-    getCommit: async ({ commit_sha }: { commit_sha: string }) => ({ data: object(commit_sha) }),
-  });
-  Object.assign(f.rest.pulls, {
-    get: async ({ pull_number }: { pull_number: number }) => {
-      const pr = selected(pull_number);
-      const state = controls.strict && behind(pr.head) ? 'behind' : pr.nativeReady ? 'clean' : 'blocked';
-      if (state === 'behind') events.push(`native.BEHIND:${pr.number}`);
-      return {
-        data: {
-          number: pr.number,
-          node_id: `PR${pr.number}`,
-          changed_files: 1,
-          title: `Fictional PR ${pr.number}`,
-          body: `Closes #${pr.issueNumber}`,
-          html_url: `https://github.com/example/widget/pull/${pr.number}`,
-          state: pr.merged ? 'closed' : 'open',
-          draft: false,
-          merged: pr.merged,
-          merge_commit_sha: pr.merge,
-          mergeable: true,
-          mergeable_state: state,
-          user: { login: 'operator' },
-          head: { sha: pr.head, ref: pr.ref, repo: { full_name: 'example/widget' } },
-          base: { sha: main(), ref: 'main', repo: { full_name: 'example/widget' } },
-        },
-      };
-    },
-    merge: async ({ pull_number, sha, merge_method }: { pull_number: number; sha: string; merge_method: string }) => {
-      f.calls.push({ name: 'pulls.merge', input: { pull_number, sha, merge_method } });
-      const pr = selected(pull_number);
-      assert.equal(sha, pr.head);
-      assert.equal(merge_method, 'squash');
-      assert.equal(pr.merged, false);
-      assert.equal(pr.nativeReady, true, 'Native checks/review must qualify the current owner head');
-      if (controls.strict) assert.equal(behind(pr.head), false, 'Native strict protection must accept the owner head');
-      if (controls.outsideAtMerge) {
-        controls.outsideAtMerge = false;
-        outside();
-      }
-      const tree = fixtureGit(remote, 'merge-tree', '--write-tree', main(), pr.head).split('\n')[0]!;
-      pr.merge = fixtureGit(remote, 'commit-tree', tree, '-p', main(), '-m', `Native squash ${pr.number}`);
-      fixtureGit(remote, 'update-ref', 'refs/heads/main', pr.merge);
-      pr.merged = true;
-      events.push(`native.merge:${pr.number}`);
-      if (controls.loseMergeAck) {
-        controls.loseMergeAck = false;
-        throw new Error('Synthetic lost native acknowledgement');
-      }
-      return { data: { merged: true, sha: pr.merge } };
-    },
-  });
-  Object.assign(f.rest.checks, {
-    listForRef: async ({ ref }: { ref: string }) => {
-      checked.push(ref);
-      const names = fixtureGit(remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/ai-delivery/queue/')
-        .split('\n')
-        .filter(Boolean);
-      const name = names.find((n) => fixtureGit(remote, 'rev-parse', n) === ref);
-      assert.ok(name, 'A required check read must use a published queue SHA');
-      const number = Number(name.split('/').at(-1));
-      const pending = controls.pendingChecks || controls.pendingFor.has(number);
-      if (controls.missing) return { status: 200, headers: {}, data: { total_count: 0, check_runs: [] } };
-      return {
-        status: 200,
-        headers: {},
-        data: {
-          total_count: 1,
-          check_runs: [
-            {
-              id: 100,
-              head_sha: ref,
-              name: 'checks',
-              app: { id: controls.wrongSource ? 8 : 7 },
-              status: pending ? 'in_progress' : 'completed',
-              conclusion: pending ? null : failed.has(number) ? 'failure' : 'success',
-              started_at: '2026-01-01T00:00:00Z',
-              completed_at: '2026-01-01T00:01:00Z',
-            },
-          ],
-        },
-      };
-    },
-  });
-  Object.assign(f.rest.repos, {
-    getCombinedStatusForRef: async ({ ref }: { ref: string }) => ({
-      status: 200,
-      headers: {},
-      data: { sha: ref, total_count: 0, statuses: [], state: 'success' },
-    }),
-  });
-  f.setQueueRead((query, variables) => {
-    const pr = prs.find((p) => p.number === Number(variables.number));
-    const nativeComment = (c: (typeof f.comments)[number]) => {
-      const number = Number(c.issue_url.split('/').at(-1));
-      return {
-        __typename: 'IssueComment',
-        id: c.node_id,
-        body: c.body,
-        author: { __typename: c.user.type, id: `USER${c.user.id}`, login: c.user.login },
-        repository: { id: 'REPO', nameWithOwner: 'example/widget' },
-        pullRequest: { id: `PR${number}`, number: controls.approvalFault === 'wrong-target' ? number + 100 : number },
-        createdAt: c.created_at,
-        updatedAt: c.updated_at,
-        lastEditedAt: c.lastEditedAt,
-        editor: c.editor,
-        isMinimized: c.isMinimized,
-      };
-    };
-    if (query.includes('DeliveryQueueApprovalNode')) {
-      if (controls.unreadableApprovalIds.has(String(variables.id))) throw new Error('Synthetic selective read failure');
-      const c = f.comments.find((c) => c.node_id === variables.id);
-      return { node: c ? nativeComment(c) : null };
-    }
-    if (query.includes('DeliveryQueueApprovalComments') && pr) {
-      if (controls.approvalFault === 'read-error') throw new Error('Synthetic private diagnostic');
-      const all = f.comments.filter((c) => c.issue_url.endsWith(`/issues/${pr.number}`));
-      const start = variables.cursor ? Number(variables.cursor) : 0;
-      return {
-        repository: {
-          id: 'REPO',
-          nameWithOwner: 'example/widget',
-          pullRequest: {
-            id: `PR${pr.number}`,
-            number: pr.number,
-            comments: {
-              totalCount: all.length + (controls.approvalFault === 'pagination' ? 1 : 0),
-              nodes: all.slice(start, start + 100).map(nativeComment),
-              pageInfo: { hasNextPage: start + 100 < all.length, endCursor: String(start + 100) },
-            },
-          },
-        },
-      };
-    }
-    if (query.includes('DeliveryClosingIssues') && pr)
-      return {
-        repository: {
-          nameWithOwner: 'example/widget',
-          pullRequest: {
-            id: `PR${pr.number}`,
-            number: pr.number,
-            closingIssuesReferences: {
-              nodes: [
-                {
-                  __typename: 'Issue',
-                  id: `ISSUE${pr.issueNumber}`,
-                  number: pr.issueNumber,
-                  repository: { id: 'REPO', nameWithOwner: 'example/widget' },
-                },
-              ],
-              pageInfo: { hasNextPage: false, endCursor: null },
-            },
-          },
-        },
-      };
-    if (query.includes('DeliveryReviewDecision') && pr)
-      return {
-        repository: {
-          pullRequest: {
-            headRefOid: pr.head,
-            reviewDecision: pr.nativeReady ? controls.reviewDecision : 'REVIEW_REQUIRED',
-          },
-        },
-      };
-    return undefined;
-  });
-  const auth = vi
-    .spyOn(githubClients, 'withAuthorGitToken')
-    .mockImplementation(async (_clients, callback) => callback('fictional-queue-token'));
-  const createComment = f.rest.issues.createComment;
-  Object.assign(f.rest.issues, {
-    createComment: async (input: Parameters<typeof createComment>[0]) => {
-      const result = await createComment(input);
-      if (controls.loseCommentAck) {
-        controls.loseCommentAck = false;
-        throw new Error('Synthetic lost comment acknowledgement');
-      }
-      return result;
-    },
-  });
-  const launch = verification.withRuntimeSetupWriter;
-  const transport = vi
-    .spyOn(verification, 'withRuntimeSetupWriter')
-    .mockImplementation(async (root, operation, scope) => {
-      events.push(`writer:${root}`);
-      return launch(
-        root,
-        (runner) =>
-          operation({
-            ...runner,
-            run: async (argv, ...args) => {
-              const command = argv.map((a) => (a === 'https://github.com/example/widget.git' ? remote : a));
-              const result = await runner.run(command, ...args);
-              if (argv.includes('push')) {
-                events.push('git.push');
-                if (controls.losePushAck) {
-                  controls.losePushAck = false;
-                  throw new Error('Synthetic lost Git acknowledgement');
-                }
-              }
-              return result;
-            },
-          }),
-        scope,
-      );
-    });
-  f.restoreQueuePort(() => {
-    transport.mockRestore();
-    auth.mockRestore();
-  });
-  return {
-    approval,
-    approve,
-    remote,
-    author,
-    prs,
-    controls,
-    events,
-    checked,
-    failed,
-    main,
-    object,
-    refresh,
-    qualifyNative,
-    outside,
-    selected,
-  };
 }

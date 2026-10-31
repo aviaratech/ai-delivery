@@ -93,11 +93,10 @@ test('two-repo board collects five sections with observed-null readiness and one
   for (const r of result.repositories) {
     assert.equal(r.access, 'readable');
     assert.deepEqual(
-      [r.humanAttention.length, r.readyPrs.length, r.blockedPrs.length, r.staleIssues.length, r.mergeQueue.length],
-      [5, 5, 5, 5, 5],
+      [r.humanAttention.length, r.readyPrs.length, r.blockedPrs.length, r.staleIssues.length],
+      [5, 5, 5, 5],
     );
-    rows +=
-      r.humanAttention.length + r.readyPrs.length + r.blockedPrs.length + r.staleIssues.length + r.mergeQueue.length;
+    rows += r.humanAttention.length + r.readyPrs.length + r.blockedPrs.length + r.staleIssues.length;
     assert.ok(r.readyPrs.every((pr) => pr.ready && pr.review.observed === true && pr.review.reviewDecision === null));
     assert.equal(r.humanAttention.find((i) => i.number === 5)?.journal.state, 'clear');
     assert.ok(r.humanAttention.find((i) => i.number === 5)?.labels.includes('needs-decision'));
@@ -111,14 +110,13 @@ test('two-repo board collects five sections with observed-null readiness and one
       r.staleIssues.some((i) => i.number === 6),
       'exact 72-hour boundary is stale',
     );
-    assert.equal(r.queueScope.host, 'this-host');
     assert.equal(r.metrics.opened.marked, 2);
     assert.equal(r.metrics.opened.total, 3);
     assert.equal(r.metrics.opened.percentage, (100 * 2) / 3);
     assert.equal(r.metrics.merged.marked, 1);
     assert.equal(r.metrics.merged.total, 3, 'merged PRs created before the window remain in the denominator');
   }
-  assert.equal(rows, 50);
+  assert.equal(rows, 40);
   assert.equal(f.calls.operations.ProjectDeliveryItems, 6);
   f.assertReadOnly();
   assert.doesNotMatch(
@@ -152,7 +150,6 @@ test('Project query count does not multiply between one and fifty selected issue
         ProjectDeliveryItems: 6,
         perItemStatusReads: 0,
         nativeWrites: 0,
-        queueChanges: 0,
         targetExecutions: 0,
       }),
     );
@@ -160,14 +157,13 @@ test('Project query count does not multiply between one and fifty selected issue
   }
 });
 
-test('read-only Project visibility is sufficient for stale and host queue observations', async () => {
+test('read-only Project visibility is sufficient for stale observations', async () => {
   const collect = collector();
   const f = deliveryBoardReplay({ readOnlyProject: true });
   const result = await collect(request(), f.execution);
   assert.equal(result.complete, true);
   for (const r of result.repositories) {
     assert.equal(r.staleIssues.length, 5);
-    assert.equal(r.mergeQueue.length, 5);
   }
   f.assertReadOnly();
 });
@@ -186,7 +182,6 @@ test('repo denial and Project-only denial preserve independent readable sections
     assert.equal(alpha.metrics.opened.complete, true);
     if (projectDenied) {
       assert.equal(alpha.coverage.staleIssues.status, 'unavailable');
-      assert.equal(alpha.coverage.mergeQueue.status, 'unavailable');
       assert.equal(beta.readyPrs.length, 5);
       assert.equal(beta.metrics.merged.complete, true);
     } else {
@@ -315,18 +310,15 @@ test('search gaps, duplicate IDs, unknown commits and retained-data limits do no
   }
 });
 
-test('complete zero denominators are n/a and a valid missing queue is observed empty on this host', async () => {
+test('complete zero denominators are n/a', async () => {
   const collect = collector();
-  const f = deliveryBoardReplay({ emptyMetrics: true, queue: 'missing' });
+  const f = deliveryBoardReplay({ emptyMetrics: true });
   const result = await collect(request(), f.execution);
   for (const r of result.repositories) {
     assert.deepEqual(
       [r.metrics.opened.marked, r.metrics.opened.total, r.metrics.opened.percentage, r.metrics.opened.complete],
       [0, 0, null, true],
     );
-    assert.equal(r.mergeQueue.length, 0);
-    assert.equal(r.coverage.mergeQueue.status, 'complete');
-    assert.equal(r.queueScope.host, 'this-host');
   }
   f.assertReadOnly();
 });
@@ -388,7 +380,7 @@ test('unavailable PR facts make coverage partial while observed blocked facts re
   }
 });
 
-test('Project reuse requires matching verified principals and rejected contexts never read queues', async () => {
+test('Project reuse requires matching verified principals', async () => {
   const collect = collector();
   const cases: BoardReplayOptions[] = [
     { contextPrincipal: 'changed' },
@@ -401,32 +393,10 @@ test('Project reuse requires matching verified principals and rejected contexts 
     const beta = result.repositories[1]!;
     assert.equal(result.complete, false);
     assert.equal(beta.coverage.staleIssues.status, 'unavailable');
-    assert.equal(beta.coverage.mergeQueue.status, 'unavailable');
-    assert.equal(f.calls.queueReads, 1, 'only alpha supplies a validated queue context');
     assert.equal(f.calls.operations.ProjectDeliveryItems, 6);
     assert.equal(beta.humanAttention.length, 5);
     assert.equal(beta.readyPrs.length, 5);
     assert.equal(beta.metrics.opened.complete, true);
-    f.assertReadOnly();
-    f.dispose();
-  }
-  const f = deliveryBoardReplay({ projectCursorRepeats: true });
-  const result = await collect(request(), f.execution);
-  assert.ok(result.repositories.every((repo) => repo.coverage.mergeQueue.status === 'complete'));
-  assert.equal(f.calls.queueReads, 2, 'a later Project inventory failure preserves validated queue contexts');
-  f.assertReadOnly();
-});
-
-test('unsafe, corrupt or unresolved host queues are unavailable without repair or setup', async () => {
-  const collect = collector();
-  for (const queue of ['corrupt', 'unsafe', 'no-checkout'] as const) {
-    const f = deliveryBoardReplay({ queue });
-    const result = await collect(request(), f.execution);
-    for (const r of result.repositories) {
-      assert.equal(r.mergeQueue.length, 0);
-      assert.equal(r.coverage.mergeQueue.status, 'unavailable');
-      assert.equal(r.readyPrs.length, 5);
-    }
     f.assertReadOnly();
     f.dispose();
   }
@@ -527,14 +497,12 @@ async function nativeBoardCli(args: string[]) {
 }
 
 function compactBoardAssertions(value: string): void {
-  for (const heading of [/Human attention/u, /Ready PRs/u, /Blocked PRs/u, /Stale/u, /merge queue/iu])
-    assert.match(value, heading);
+  for (const heading of [/Human attention/u, /Ready PRs/u, /Blocked PRs/u, /Stale/u]) assert.match(value, heading);
   for (const repository of boardReplayRepos) assert.ok(value.includes(repository));
   assert.ok(value.includes('2/3') && value.includes('1/3'));
-  assert.match(value, /this.host/iu);
   assert.equal(
     (value.match(/https:\/\/github\.com\/example\/(?:alpha|beta)\/(?:issues|pull)\/\d+/gu) ?? []).length,
-    50,
+    40,
   );
 }
 
@@ -634,13 +602,7 @@ test('compact rendering drops titles then records omissions without mutating ful
   const f = deliveryBoardReplay({ unreadableRepository: boardReplayRepos[1]! });
   const result = await collector()(request(), f.execution);
   for (const repository of result.repositories) {
-    for (const rows of [
-      repository.humanAttention,
-      repository.readyPrs,
-      repository.blockedPrs,
-      repository.staleIssues,
-      repository.mergeQueue,
-    ])
+    for (const rows of [repository.humanAttention, repository.readyPrs, repository.blockedPrs, repository.staleIssues])
       for (const row of rows) {
         row.title = 'long title '.repeat(1000);
         row.url += `?proof=${'x'.repeat(500)}`;
@@ -654,15 +616,14 @@ test('compact rendering drops titles then records omissions without mutating ful
   assert.match(compact, /unreadable|unavailable|unknown/iu);
   assert.deepEqual(result, original);
   const oversizedMetadata = structuredClone(result);
-  oversizedMetadata.repositories[0]!.queueScope.baseRef = 'branch'.repeat(1000);
+  oversizedMetadata.repositories[0]!.repository = `example/${'alpha'.repeat(1000)}`;
   const aggregate = rendered(oversizedMetadata);
   assert.ok(aggregate.length + 1 < 4000 && JSON.stringify(aggregate).length < 4000);
   assert.match(aggregate, /repository details omitted/iu);
   assert.match(aggregate, /unreadable 1/iu);
   assert.match(aggregate, /coverage unavailable/iu);
   const knownRows = oversizedMetadata.repositories.reduce(
-    (sum, repo) =>
-      sum + [repo.humanAttention, repo.readyPrs, repo.blockedPrs, repo.staleIssues, repo.mergeQueue].flat().length,
+    (sum, repo) => sum + [repo.humanAttention, repo.readyPrs, repo.blockedPrs, repo.staleIssues].flat().length,
     0,
   );
   assert.equal(
@@ -701,7 +662,7 @@ test('real compact omissions preserve their identities and unknown coverage in b
   assert.equal(cliFull.status, 0, cliFull.stderr);
   const full = JSON.parse(cliFull.stdout) as DeliveryBoardResult;
   const rows = full.repositories.flatMap((repo) =>
-    [repo.humanAttention, repo.readyPrs, repo.blockedPrs, repo.staleIssues, repo.mergeQueue].flat(),
+    [repo.humanAttention, repo.readyPrs, repo.blockedPrs, repo.staleIssues].flat(),
   );
   const omitted = rows.filter((row) => !cliCompact.stdout.includes(row.url));
   assert.ok(omitted.length > 0);

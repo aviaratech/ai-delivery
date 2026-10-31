@@ -29,24 +29,6 @@ function configurationIssueMessages(
 }
 
 const Name = z.string().trim().min(1);
-const MergeQueueApprovers = z
-  .record(
-    z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u),
-    z.array(
-      z
-        .string()
-        .max(39)
-        .regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u),
-    ),
-  )
-  .superRefine((repositories, context) => {
-    const names = Object.keys(repositories).map((name) => name.toLowerCase());
-    if (new Set(names).size !== names.length)
-      context.addIssue({ code: 'custom', message: 'Queue approver repositories must be unique.' });
-    for (const [repository, logins] of Object.entries(repositories))
-      if (new Set(logins.map((login) => login.toLowerCase())).size !== logins.length)
-        context.addIssue({ code: 'custom', path: [repository], message: 'Queue approver logins must be unique.' });
-  });
 export const WipLimits = z
   .array(
     z.strictObject({
@@ -325,7 +307,6 @@ export type GitHubDeliveryConfig = Pick<DeliveryConfig, 'roles' | 'repository' |
   credentialKeyReferences?: readonly string[];
   schemaVersion: 'ai-delivery.github@1';
   wipLimits?: WipLane[] | undefined;
-  mergeQueueApprovers?: Record<string, string[]> | undefined;
 };
 export interface LoadedGitHubConfig {
   config: GitHubDeliveryConfig;
@@ -336,7 +317,6 @@ export interface LoadedGitHubConfig {
 const UserSettingsSchema = z
   .strictObject({
     wipLimits: WipLimits.optional(),
-    mergeQueueApprovers: MergeQueueApprovers.optional(),
     schemaVersion: z.literal('ai-delivery.user@1'),
     roles: z.strictObject({
       author: AuthorRole,
@@ -405,7 +385,6 @@ export interface LoadedDeliverySettings {
   credentialKeyReferences?: readonly string[];
   environment?: NodeJS.ProcessEnv;
   wipLimits?: WipLane[] | undefined;
-  mergeQueueApprovers?: Record<string, string[]> | undefined;
   roles: DeliveryConfig['roles'];
   configPath: string;
   overrides: DeliveryOverrides;
@@ -478,15 +457,7 @@ export async function loadDeliverySettings(
     throw new DeliveryError(`Invalid user configuration ${path}: ${details}`);
   }
   const sourceDigest = digestValue(result.data);
-  const {
-    roles,
-    reviewerProfiles,
-    checkoutRoots,
-    wipLimits,
-    mergeQueueApprovers,
-    schemaVersion: _schema,
-    ...overrides
-  } = result.data;
+  const { roles, reviewerProfiles, checkoutRoots, wipLimits, schemaVersion: _schema, ...overrides } = result.data;
   const credentialKeyReferences = [
     ...new Set(
       [roles.author, roles.reviewer, ...Object.values(reviewerProfiles ?? {})].flatMap((role) =>
@@ -545,7 +516,6 @@ export async function loadDeliverySettings(
     roles,
     checkoutRoots,
     ...(wipLimits === undefined ? {} : { wipLimits }),
-    ...(mergeQueueApprovers === undefined ? {} : { mergeQueueApprovers }),
     configPath: path,
     overrides,
     sourceDigest,
@@ -615,7 +585,6 @@ export async function loadDeliveryConfig(
       ? {}
       : { credentialKeyReferences: settings.credentialKeyReferences }),
     ...(settings.wipLimits === undefined ? {} : { wipLimits: settings.wipLimits }),
-    ...(settings.mergeQueueApprovers === undefined ? {} : { mergeQueueApprovers: settings.mergeQueueApprovers }),
     schemaVersion: 'ai-delivery.github@1',
     repository: routing.repository,
     roles: settings.roles,

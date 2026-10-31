@@ -1,6 +1,6 @@
 # ai-delivery
 
-ai-delivery handles **GitHub issues, pull requests, independent reviews, guarded merges and the merge queue** through a CLI, stdio MCP server and Codex/Claude Code plugin. GitHub owns relationships, Project tracking, checks and review eligibility. Hosts prepare worktrees, run checks, commit, push and clean up.
+ai-delivery handles **GitHub issues, pull requests, independent reviews and guarded merges** through a CLI, stdio MCP server and Codex/Claude Code plugin. GitHub owns relationships, Project tracking, checks and review eligibility. Hosts prepare worktrees, run checks, commit, push and clean up.
 
 Explicit `--repo owner/name` or MCP `repo: "owner/name"` works outside Git. Without it, the checkout's `origin` selects the repository. Only `github.com` is supported. The runtime reads operator-owned JSON; it never executes a consuming repository's policy or checks.
 
@@ -76,33 +76,28 @@ For partial delivery, `--non-closing` requires a canonical `References owner/rep
 
 ## Command and tool map
 
-These are all executable routes; groups/help flags are omitted. A dash means no matching surface. Compatibility/setup routes remain shipped; this documentation change removes no functionality. Use each route's `--help` and the published MCP schema for inputs.
+These are all executable routes; groups/help flags are omitted. A dash means no matching surface. Use each route's `--help` and the published MCP schema for inputs.
 
-| Charter/job | CLI | MCP |
-| --- | --- | --- |
-| Issues: create/start | `create`, `start` | `issue_create`, `issue_start` |
-| Issues: find/read | `list`, `search`, `info`, `ready:check` | `issue_list`, `issue_search`, `issue_info`, `issue_ready_check` |
-| Issues: edit/batch | `update`, `batch:update` | `issue_update`, `issue_batch_update` |
-| Issues: relationships | `parent`, `blockers`, `subissues` | — |
-| Issues: journals | — | `issue_comment` |
-| Issues: attention/health | `board`, `health` | `delivery_board`, `delivery_health` |
-| Issues: Project reconciliation | `board:reconcile` | `board_reconcile` |
-| Pull requests | `pr:create`, `pr:info` | `issue_pr_create`, `issue_pr_info` |
-| Pull requests: observations | `pr:list`, `pr:checks` | — |
-| Reviews: artifact | `pr:review` | `issue_pr_review` |
-| Reviews: profile/verdict | `review doctor`, `review submit` | — |
-| Merges/completion | `pr:merge`, `finish` | `issue_pr_merge`, `issue_finish` |
-| Merge queue: enqueue | `merge queue add` | `issue_pr_merge` with `queue: true` |
-| Merge queue: observe/drive | `merge queue status`, `merge queue run` | `issue_pr_merge_queue_status`, `issue_pr_merge_queue_run` |
-| Delivery support: plugin | `plugin install`, `plugin doctor`, `plugin preview`, `plugin update`, `plugin rollback`, `plugin remove` | — |
-| Delivery support: controller | `runtime:stage`, `runtime:admit` | `runtime_stage`, `runtime_admit` |
-| Issues: retained transitions | `worktree:transition:inspect`, `worktree:transition:apply` | `issue_worktree_transition_inspect`, `issue_worktree_transition_apply` |
-| Issues: offline migration plan | `migrate:legacy-issues` | — |
-| All: setup/transport | `config:resolve`, `mcp:serve` | — |
+| Charter/job                    | CLI                                                                                                      | MCP                                                                    |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Issues: create/start           | `create`, `start`                                                                                        | `issue_create`, `issue_start`                                          |
+| Issues: find/read              | `list`, `search`, `info`, `ready:check`                                                                  | `issue_list`, `issue_search`, `issue_info`, `issue_ready_check`        |
+| Issues: edit/batch             | `update`, `batch:update`                                                                                 | `issue_update`, `issue_batch_update`                                   |
+| Issues: relationships          | `parent`, `blockers`, `subissues`                                                                        | —                                                                      |
+| Issues: journals               | —                                                                                                        | `issue_comment`                                                        |
+| Issues: attention/health       | `board`, `health`                                                                                        | `delivery_board`, `delivery_health`                                    |
+| Issues: Project reconciliation | `board:reconcile`                                                                                        | `board_reconcile`                                                      |
+| Pull requests                  | `pr:create`, `pr:info`                                                                                   | `issue_pr_create`, `issue_pr_info`                                     |
+| Pull requests: observations    | `pr:list`, `pr:checks`                                                                                   | —                                                                      |
+| Reviews: artifact              | `pr:review`                                                                                              | `issue_pr_review`                                                      |
+| Reviews: profile/verdict       | `review doctor`, `review submit`                                                                         | —                                                                      |
+| Merges/completion              | `pr:merge`, `finish`                                                                                     | `issue_pr_merge`, `issue_finish`                                       |
+| Delivery support: plugin       | `plugin install`, `plugin doctor`, `plugin preview`, `plugin update`, `plugin rollback`, `plugin remove` | —                                                                      |
+| Issues: retained transitions   | `worktree:transition:inspect`, `worktree:transition:apply`                                               | `issue_worktree_transition_inspect`, `issue_worktree_transition_apply` |
+| Issues: offline migration plan | `migrate:legacy-issues`                                                                                  | —                                                                      |
+| All: setup/transport           | `config:resolve`, `mcp:serve`                                                                            | —                                                                      |
 
 The contract is `ai-delivery.mcp@2`; [tool schemas](src/mcp/tools.ts) and CLI `--help` supply complete inputs. Results retain warnings, history and recovery fields; MCP `verbose: true` or CLI `--json --verbose` requests full payloads. Journal `status` is prose, separate from Project Status.
-
-The host-local queue needs required CI on its predicted queue SHAs; no hosted queue-SHA qualification is bundled. Standing queue approval never supplies App review or bypasses GitHub protection.
 
 ## Upgrade a host
 
@@ -110,17 +105,17 @@ Choose an explicitly qualified version; the historical **0.3.35** example was ch
 
 Installed metadata, separate doctor startup and the active conversation's loaded MCP version are distinct. Record unexposed loaded versions as unverified. Follow the host's activation guidance and preserve active jobs before an operator-approved restart. Windows command credential sources and protected-file permission equivalence remain unqualified.
 
-## Plugin installation and explicit runtime setup
+## Plugin installation
 
 Legacy standalone MCP support lasts at least **two subsequent stable releases and 90 days** after a qualified migration first ships; that anchor remains unknown. Preview/doctor do not qualify migration or start that clock. Migration apply, registration retirement and settings rollback remain unavailable; see [#116](https://github.com/aviaratech/ai-delivery/issues/116). Public npm/local-catalog distribution does not establish plugin-directory admission.
 
-Explicit controller staging/admission retain exact archive/source/routing and prior-byte checks; installation does not admit a controller or adopt custody. Default sampled limits are **1 GiB RSS, 512 MiB output, 256 MiB free disk**; retained logs default to **1 MiB**, maximum **8 MiB**. These are sampled stop thresholds, not OS ceilings. Unsupported historical policy bindings refuse transitions; use the original controller.
+Unsupported historical policy bindings refuse transitions; use the original controller.
 
 ## Contributor checks and release
 
 [CONTRIBUTING.md](CONTRIBUTING.md) owns pinned tooling, focused local checks, full GitHub checks and release procedures. Ordinary PR checks exclude release installations/archive cases; fast/focused success never qualifies a package. Supply the actual Node26 consumer executable through `AI_DELIVERY_NODE26_EXECUTABLE` where required.
 
-Release still requires the exact mandatory archive inventory, complete release/consumer/cleanup proof, confidentiality review and TruffleHog scanning. A dry inventory, historical archive skip, fixture install, inert repack or wrapper is not current archive/native-adoption proof. Publication consumes the independently accepted source/version/digest and original successful artifact; verify actual registry bytes, integrity, cryptographic provenance and `latest` afterward. Never replace missing proof with a later rerun.
+Release still requires the exact mandatory archive inventory, complete release/consumer/cleanup proof, confidentiality review and TruffleHog scanning. A dry inventory, fixture install, inert repack or wrapper is not current archive/native-adoption proof. Publication consumes the independently accepted source/version/digest and original successful artifact; verify actual registry bytes, integrity, cryptographic provenance and `latest` afterward. Never replace missing proof with a later rerun.
 
 Release is manual, main-only and uses npm trusted publishing. A packaged README edit changes the release candidate: retain accepted archives and independently qualify the new exact source/archive before dispatching.
 

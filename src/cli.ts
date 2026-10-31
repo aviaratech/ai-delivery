@@ -181,69 +181,6 @@ for (const action of ['install', 'doctor', 'preview', 'update', 'rollback', 'rem
 }
 
 program
-  .command('runtime:stage')
-  .description('Stage a reviewed archive in a private directory; does not activate or admit it')
-  .requiredOption('--archive <path>')
-  .requiredOption('--archive-sha256 <digest>')
-  .requiredOption('--package-version <version>')
-  .requiredOption('--source-commit <sha>')
-  .requiredOption('--config-digest <digest>')
-  .requiredOption('--runtime-directory <path>')
-  .option('--native-plugin-root <path>', 'Bind the exact reviewed native plugin root')
-  .option('--max-aggregate-rss-bytes <bytes>', 'Sampled controller plus children RSS limit')
-  .option('--max-new-output-bytes <bytes>', 'Owned stage and metadata output limit')
-  .option('--min-free-disk-bytes <bytes>', 'Required free disk headroom')
-  .option('--max-captured-output-bytes <bytes>', 'Retained command log cap; defaults to 1 MiB')
-  .option('--authorize-stage', 'Explicit authority to stage this reviewed archive')
-  .action(async (o: Record<string, string | boolean>) =>
-    run('runtime_stage', {
-      authority: o.authorizeStage === true ? 'runtime:stage' : '',
-      archivePath: o.archive,
-      expectedArchiveSha256: o.archiveSha256,
-      packageVersion: o.packageVersion,
-      expectedSourceCommit: o.sourceCommit,
-      expectedConfigDigest: o.configDigest,
-      runtimeDirectory: o.runtimeDirectory,
-      ...(o.nativePluginRoot === undefined ? {} : { nativePluginRoot: o.nativePluginRoot }),
-      ...(['maxAggregateRssBytes', 'maxNewOutputBytes', 'minFreeDiskBytes', 'maxCapturedOutputBytes'].some(
-        (key) => o[key] !== undefined,
-      )
-        ? {
-            resourceBounds: {
-              maxAggregateRssBytes: Number(o.maxAggregateRssBytes ?? 1024 ** 3),
-              minFreeDiskBytes: Number(o.minFreeDiskBytes ?? 256 * 1024 ** 2),
-              maxNewOutputBytes: Number(o.maxNewOutputBytes ?? 512 * 1024 ** 2),
-              maxCapturedOutputBytes: Number(o.maxCapturedOutputBytes ?? 1024 ** 2),
-            },
-          }
-        : {}),
-    }),
-  );
-
-program
-  .command('runtime:admit')
-  .description('Explicitly publish the existing admission for an exact completed stage')
-  .requiredOption('--stage-id <digest>')
-  .requiredOption('--source-commit <sha>')
-  .requiredOption('--config-digest <digest>')
-  .requiredOption('--runtime-directory <path>')
-  .option('--expected-prior <digest>', 'SHA-256 of the exact current private admission bytes')
-  .option('--expected-absent', 'Explicitly require no current admission')
-  .option('--authorize-admit', 'Explicit authority for the final admission write')
-  .action(async (o: Record<string, string | boolean>) => {
-    if ((o.expectedPrior === undefined) === (o.expectedAbsent !== true))
-      throw new Error('Choose exactly one of --expected-prior or --expected-absent.');
-    return run('runtime_admit', {
-      authority: o.authorizeAdmit === true ? 'runtime:admit' : '',
-      stageId: o.stageId,
-      expectedSourceCommit: o.sourceCommit,
-      expectedConfigDigest: o.configDigest,
-      runtimeDirectory: o.runtimeDirectory,
-      expectedPriorAdmissionSha256: o.expectedAbsent === true ? null : o.expectedPrior,
-    });
-  });
-
-program
   .command('create')
   .requiredOption('--title <title>')
   .option('--fields-file <path>', 'UTF-8 JSON typed fields; explicit CLI fields take precedence')
@@ -742,19 +679,6 @@ program
       process.exitCode = 1;
     }
   });
-const mergeQueue = program.command('merge').command('queue').description('Host-local canonical repository merge queue');
-mergeQueue
-  .command('add <pr>')
-  .option('--issue <number>')
-  .action((pr: string, o: { issue?: string }) =>
-    run('issue_pr_merge', {
-      prNumber: int(pr),
-      ...(o.issue === undefined ? {} : { issueNumber: int(o.issue) }),
-      queue: true,
-    }),
-  );
-mergeQueue.command('status').action(() => run('issue_pr_merge_queue_status', {}));
-mergeQueue.command('run').action(() => run('issue_pr_merge_queue_run', {}));
 
 for (const [command, tool] of [
   ['pr:merge', 'issue_pr_merge'],

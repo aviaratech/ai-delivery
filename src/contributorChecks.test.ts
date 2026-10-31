@@ -251,17 +251,10 @@ test('PR reports exclude release identities while scoped release reports require
     assert.equal(pr.total, files.length);
     assert.deepEqual(pr.skips, []);
     assert.equal(pr.laneExcluded.length, checks.RELEASE_CASES.length);
-    const release = checks.analyzeTests(
-      report(true),
-      files,
-      f.cwd,
-      'SETUP_INTERRUPTION_RECEIPT SETUP_CLI_PHASE_RECEIPT',
-      {},
-      'release',
-    );
+    const release = checks.analyzeTests(report(true), files, f.cwd, '', {}, 'release');
     assert.equal(release.passed, checks.RELEASE_CASES.filter((test) => test.kind === 'mandatory').length);
     assert.equal(release.skips.length, checks.RELEASE_CASES.filter((test) => test.kind !== 'mandatory').length);
-    for (const failure of ['missing', 'duplicate', 'unexpected', 'failed', 'pr-executed', 'historical-input']) {
+    for (const failure of ['missing', 'duplicate', 'unexpected', 'failed', 'pr-executed']) {
       const data = report(failure !== 'pr-executed');
       const tests = data.testResults[0]!.assertionResults;
       if (failure === 'missing') tests.shift();
@@ -273,15 +266,7 @@ test('PR reports exclude release identities while scoped release reports require
       data.numTotalTests = cases.length;
       data.numPassedTests = cases.filter((test) => test.status === 'passed').length;
       assert.throws(
-        () =>
-          checks.analyzeTests(
-            data,
-            files,
-            f.cwd,
-            '',
-            failure === 'historical-input' ? { AI_DELIVERY_REAL_PACKAGE_ARCHIVE: '/explicit-historical-input' } : {},
-            failure === 'pr-executed' ? 'pr' : 'release',
-          ),
+        () => checks.analyzeTests(data, files, f.cwd, '', {}, failure === 'pr-executed' ? 'pr' : 'release'),
         failure,
       );
     }
@@ -434,7 +419,7 @@ function directFocus(f: ReturnType<typeof fixture>, title: string, env: Record<s
       join(repository, 'node_modules/vitest/vitest.mjs'),
       'run',
       '--mode=compiled',
-      'dist/setup.test.js',
+      'dist/lifecycle.test.js',
       ...workerArgs,
       '-t',
       title,
@@ -461,38 +446,6 @@ test(
     }
   },
 );
-
-test('historical archive input cannot override direct-focus PR exclusion', { tags: ['release'] }, () => {
-  const f = fixture();
-  const title =
-    'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer';
-  try {
-    for (const lane of ['absent', 'pr']) {
-      const run = directFocus(
-        f,
-        title,
-        {
-          ...(lane === 'pr' ? { AI_DELIVERY_TEST_LANE: lane } : {}),
-          AI_DELIVERY_REAL_PACKAGE_ARCHIVE: join(f.base, 'explicit-unavailable-historical-input'),
-        },
-        lane,
-      );
-      assert.equal(run.result.status, 0, run.result.stderr.slice(-1500));
-      const report = JSON.parse(readFileSync(run.reportPath, 'utf8')) as TestReport;
-      const selected = report.testResults
-        .flatMap((file) => file.assertionResults)
-        .find((test) => test.fullName === title);
-      assert.ok(selected && ['pending', 'skipped'].includes(selected.status));
-      assert.ok(selected.tags?.includes('release'));
-      assert.ok(
-        readFileSync(run.loaded, 'utf8').trim().split('\n').length >= 2,
-        'The controlled guard must reach the forked worker.',
-      );
-    }
-  } finally {
-    f.cleanup();
-  }
-});
 
 test('direct release focus rejects invalid contracts before any npm launch', { tags: ['release'] }, () => {
   const f = fixture();
@@ -975,51 +928,6 @@ test('toolchain preflight rejects absent/inaccessible/wrong consumer before gate
   } finally {
     f.cleanup();
   }
-});
-
-test('release helper skips require every mapped parent, native receipt and exact identity', () => {
-  const cwd = '/synthetic/repo';
-  for (const [file, receipt] of [
-    ['dist/setup.test.js', 'SETUP_INTERRUPTION_RECEIPT'],
-    ['dist/setupCli.test.js', 'SETUP_CLI_PHASE_RECEIPT'],
-  ] as const) {
-    const data = passingReport(cwd, [file]);
-    const assertions = checks.RELEASE_CASES.filter((entry) => entry.file === file).map((entry) => ({
-      fullName: entry.title,
-      status: entry.kind === 'mandatory' ? 'passed' : 'pending',
-    }));
-    data.testResults[0]!.assertionResults = assertions;
-    data.numTotalTests = assertions.length;
-    data.numPassedTests = assertions.filter((entry) => entry.status === 'passed').length;
-    const result = checks.analyzeTests(data, [file], cwd, receipt, {}, 'release');
-    assert.equal(result.parentLaunchedHelperProved, true);
-    assert.equal(result.skips.filter((entry) => entry.kind === 'parent-launched-helper').length, 1);
-    assert.throws(() => checks.analyzeTests(data, [file], cwd, '', {}, 'release'), /proof is missing/u);
-    assert.throws(
-      () => checks.analyzeTests(data, ['dist/other.test.js'], cwd, receipt, {}, 'release'),
-      /unexpected file/u,
-    );
-    const helper = assertions.find((entry) => entry.fullName.includes(' child'))!;
-    const title = helper.fullName;
-    helper.fullName = 'unexpected conditional skip';
-    assert.throws(
-      () => checks.analyzeTests(data, [file], cwd, receipt, {}, 'release'),
-      /Required release identity is missing/u,
-    );
-    helper.fullName = title;
-    assertions.push({ fullName: 'unexpected conditional skip', status: 'pending' });
-    data.numTotalTests++;
-    assert.ok(
-      checks
-        .analyzeTests(data, [file], cwd, receipt, {}, 'release')
-        .laneExcluded.some((entry) => entry.title === 'unexpected conditional skip'),
-      'Unowned regular cases remain excluded from release proof.',
-    );
-  }
-  assert.throws(
-    () => checks.analyzeTests({ success: true, numTotalTests: 0, numPassedTests: 0, testResults: [] }, [], cwd, ''),
-    /Zero tests/u,
-  );
 });
 
 test(

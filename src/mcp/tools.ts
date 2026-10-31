@@ -160,20 +160,12 @@ const SearchText = z
   .max(256)
   .regex(/^[^"\\\r\n]+$/u);
 
-const RuntimeController = {
-  repo: Repo,
-  identity: z.string().min(1).optional(),
-  expectedSourceCommit: z.string().regex(/^[a-f0-9]{40}$/u),
-  expectedConfigDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-  runtimeDirectory: z.string().min(1),
-};
-
 export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'delivery_board',
     commandName: 'board',
     description:
-      'Read human attention, native PR readiness, stale In Progress issues, this-host merge queues and seven-day delivery marker fractions for explicit repositories. Partial observations are data, never merge authority.',
+      'Read human attention, native PR readiness, stale In Progress issues and seven-day delivery marker fractions for explicit repositories. Partial observations are data, never merge authority.',
     inputSchema: z.strictObject({
       repos: z.array(Repo.unwrap()).min(1),
       decisionLabels: z.array(z.string().min(1)).optional(),
@@ -208,47 +200,6 @@ export const AI_DELIVERY_MCP_TOOLS = [
             ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message });
       })
       .meta(JOURNAL_SCHEMA_METADATA),
-  },
-  {
-    name: 'runtime_stage',
-    commandName: 'runtime:stage',
-    description: 'Explicitly stage a reviewed local public archive without host activation or admission',
-    inputSchema: z.strictObject({
-      ...RuntimeController,
-      authority: z.literal('runtime:stage'),
-      archivePath: z.string().min(1),
-      expectedArchiveSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-      packageVersion: z.string().regex(/^\d+\.\d+\.\d+$/u),
-      nativePluginRoot: z.string().min(1).optional(),
-      resourceBounds: z
-        .strictObject({
-          maxAggregateRssBytes: z.number().int().positive().safe(),
-          minFreeDiskBytes: z.number().int().positive().safe(),
-          maxNewOutputBytes: z.number().int().positive().safe(),
-          maxCapturedOutputBytes: z
-            .number()
-            .int()
-            .positive()
-            .safe()
-            .max(8 * 1024 ** 2)
-            .optional(),
-        })
-        .optional(),
-    }),
-  },
-  {
-    name: 'runtime_admit',
-    commandName: 'runtime:admit',
-    description: 'Explicitly admit an exact completed stage with prior-byte compare-and-swap and reconciliation',
-    inputSchema: z.strictObject({
-      ...RuntimeController,
-      authority: z.literal('runtime:admit'),
-      stageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-      expectedPriorAdmissionSha256: z
-        .string()
-        .regex(/^sha256:[a-f0-9]{64}$/u)
-        .nullable(),
-    }),
   },
   {
     name: 'issue_create',
@@ -410,14 +361,13 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_pr_merge',
     commandName: 'pr:merge',
-    description: 'Guarded exact-head merge, or durable host-local queue admission with queue:true',
+    description: 'Guarded exact-head merge',
     inputSchema: z
       .strictObject({
         repo: Repo,
         verbose: Verbose,
         issueNumber: Positive.optional(),
         prNumber: Positive,
-        queue: z.boolean().optional(),
         nonClosing: z.boolean().optional(),
         reviewedHeadSha: z
           .string()
@@ -426,34 +376,10 @@ export const AI_DELIVERY_MCP_TOOLS = [
         strategy: z.enum(['merge', 'squash', 'rebase']).optional(),
         dryRun: z.boolean().optional(),
       })
-      .superRefine((input, ctx) => {
-        if (
-          input.queue === true &&
-          [input.nonClosing, input.reviewedHeadSha, input.strategy, input.dryRun].some((v) => v !== undefined)
-        )
-          ctx.addIssue({
-            code: 'custom',
-            message: 'Queue requests cannot include direct-merge options; remove those options or omit queue.',
-          });
-        if (input.queue !== true && input.issueNumber === undefined)
-          ctx.addIssue({
-            code: 'custom',
-            path: ['issueNumber'],
-            message: 'Direct merge is missing its issue number; provide issueNumber.',
-          });
+      .refine((input) => input.issueNumber !== undefined, {
+        path: ['issueNumber'],
+        message: 'Direct merge is missing its issue number; provide issueNumber.',
       }),
-  },
-  {
-    name: 'issue_pr_merge_queue_status',
-    commandName: 'merge queue status',
-    description: 'Observe the host-local canonical repository queue without advancing it',
-    inputSchema: z.strictObject({ repo: Repo, verbose: Verbose }),
-  },
-  {
-    name: 'issue_pr_merge_queue_run',
-    commandName: 'merge queue run',
-    description: 'Drive the host-local merge queue in the foreground until completed, cancelled or halted',
-    inputSchema: z.strictObject({ repo: Repo, verbose: Verbose }),
   },
   {
     name: 'issue_finish',

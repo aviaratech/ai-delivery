@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { addWorktreeEntry, listWorktreesStrict, removeWorktreeEntry } from './services/worktreeRegistry.js';
 import { describe, it } from 'vitest';
 import { ISSUE_CLI_DATA_DIR } from './utils/filesystem.js';
-import { publishPr, mergePr, finishIssue, prChecks, queueChecks, queuePr } from './pr.js';
+import { publishPr, mergePr, finishIssue, prChecks, queueChecks } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
 import { recordedBaseDrift, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
@@ -499,43 +499,6 @@ for (const appId of [null, 7]) {
       if (appId !== null) assert.match(result.reason, /source/iu);
     });
   }
-}
-
-for (const mode of ['pagination', 'issue-type', 'pr-id']) {
-  it(`queue issue derivation refuses incomplete or inconsistent native ${mode}`, async () => {
-    const { context } = fixture();
-    const original = context.clients.graphql;
-    let first = true;
-    Object.assign(context.clients, {
-      graphql: async (query: string, variables: Record<string, unknown>) => {
-        if (query.includes('DeliveryClosingIssues') && first) {
-          first = false;
-          return {
-            repository: {
-              nameWithOwner: 'example/widget',
-              pullRequest: {
-                id: mode === 'pr-id' ? 'OTHER' : 'PR23',
-                number: 23,
-                closingIssuesReferences: {
-                  nodes: [
-                    {
-                      __typename: mode === 'issue-type' ? 'PullRequest' : 'Issue',
-                      id: 'ISSUE',
-                      number: 17,
-                      repository: { id: 'REPO', nameWithOwner: 'example/widget' },
-                    },
-                  ],
-                  pageInfo: mode === 'pagination' ? { endCursor: null } : { hasNextPage: false, endCursor: null },
-                },
-              },
-            },
-          };
-        }
-        return original(query, variables);
-      },
-    });
-    await assert.rejects(queuePr(context, 23), /complete|identity|issue/iu);
-  });
 }
 
 it('preserves legacy required contexts alongside pinned checks and requires the latest exact-SHA source', async () => {
