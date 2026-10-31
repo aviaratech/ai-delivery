@@ -11,6 +11,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { IssueFields, renderIssueBody } from './issueContract.js';
+import { syncIssueProjectStatus } from './github/projectDelivery.js';
 
 function batchFixture() {
   const rows = new Map(
@@ -80,6 +81,7 @@ function batchFixture() {
       priorityFieldId: 'PRIORITY',
       statusFieldId: 'STATUS',
       statusOptionIds: { Todo: 'TODO', 'In Progress': 'ACTIVE', Blocked: 'BLOCKED', Done: 'DONE' },
+      reviewOptionId: 'REVIEW',
       settings: {
         number: 1,
         title: 'Delivery',
@@ -301,13 +303,15 @@ function batchFixture() {
                 fieldValueByName: {
                   name: statuses.get(n),
                   optionId:
-                    statuses.get(n) === 'Active'
-                      ? 'ACTIVE'
-                      : statuses.get(n) === 'Shipped'
-                        ? 'DONE'
-                        : statuses.get(n) === 'Waiting'
-                          ? 'BLOCKED'
-                          : 'TODO',
+                    statuses.get(n) === 'In Review'
+                      ? 'REVIEW'
+                      : statuses.get(n) === 'Active'
+                        ? 'ACTIVE'
+                        : statuses.get(n) === 'Shipped'
+                          ? 'DONE'
+                          : statuses.get(n) === 'Waiting'
+                            ? 'BLOCKED'
+                            : 'TODO',
                 },
               })),
           );
@@ -339,13 +343,15 @@ function batchFixture() {
               fieldValueByName: {
                 name: statuses.get(number),
                 optionId:
-                  statuses.get(number) === 'Active'
-                    ? 'ACTIVE'
-                    : statuses.get(number) === 'Shipped'
-                      ? 'DONE'
-                      : statuses.get(number) === 'Waiting'
-                        ? 'BLOCKED'
-                        : 'TODO',
+                  statuses.get(number) === 'In Review'
+                    ? 'REVIEW'
+                    : statuses.get(number) === 'Active'
+                      ? 'ACTIVE'
+                      : statuses.get(number) === 'Shipped'
+                        ? 'DONE'
+                        : statuses.get(number) === 'Waiting'
+                          ? 'BLOCKED'
+                          : 'TODO',
               },
             },
           };
@@ -1117,4 +1123,23 @@ test('closing an issue whose archived Project item already shows Done reports ap
   const result = await runBatch({ items: [{ issueNumber: 1, state: 'closed', closeReason: 'not_planned' }] });
   assert.equal(f.rows.get(1)!.state, 'closed');
   assert.deepEqual(result.summary, { total: 1, applied: 1, planned: 0, unchanged: 0, failed: 0, rateLimits: [] });
+});
+
+// #65: GitHub's PR-linked workflow may move an issue to Project #4's optional In Review option.
+test('an In Review item reads as active work, survives In Progress and moves to Done on close', async () => {
+  const f = batchFixture();
+  f.statuses.set(1, 'In Review');
+  const info = await issue.issueInfo(f.context, 1);
+  assert.equal(info.projectStatus, 'In Progress');
+  assert.equal(info.inReview, true);
+  await syncIssueProjectStatus({
+    configuration: f.context.projectConfiguration!,
+    graphql: f.context.clients.graphql,
+    issueNodeId: 'ISSUE1',
+    org: 'example',
+    status: 'In Progress',
+  });
+  assert.equal(f.statuses.get(1), 'In Review');
+  await runBatch({ items: [{ issueNumber: 1, state: 'closed', closeReason: 'completed' }] });
+  assert.equal(f.statuses.get(1), 'Shipped');
 });

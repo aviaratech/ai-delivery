@@ -4,6 +4,8 @@ import type { DeliveryConfig } from '../config/deliveryConfig.js';
 import { CollectionLimitError, DeliveryError } from '../errors.js';
 
 export const PROJECT_DELIVERY_STATUSES = ['Todo', 'In Progress', 'Blocked', 'Done'] as const;
+/** Optional Project option that GitHub's PR-linked workflow sets. It reads as active work and is never written (#65). */
+export const PROJECT_REVIEW_STATUS = 'In Review';
 
 export interface ProjectDeliverySettings {
   number: number;
@@ -29,6 +31,7 @@ export interface ProjectDeliveryConfiguration {
   settings: ProjectDeliverySettings;
   statusFieldId: string;
   statusOptionIds: Record<ProjectDeliveryStatus, string>;
+  reviewOptionId?: string;
   title: string;
   writable: boolean;
 }
@@ -41,6 +44,7 @@ export interface ProjectDeliveryRestoreReadback {
 export interface ProjectDeliveryStatusReadback {
   itemId: string;
   status: ProjectDeliveryStatus;
+  review?: true;
 }
 
 interface ProjectDeliveryInput {
@@ -61,6 +65,7 @@ interface ProjectDeliveryItem {
   id: string;
   status: null | ProjectDeliveryStatus;
   statusOptionId: null | string;
+  review?: true;
 }
 
 export async function archiveIssueProjectItem(
@@ -126,7 +131,7 @@ export async function getIssueProjectStatus(
   if (item.archived) return null;
   if (item.status === null && item.statusOptionId === null) return null;
   const status = requireItemStatus(item, configuration);
-  return { itemId: item.id, status };
+  return { itemId: item.id, status, ...(item.review ? { review: true as const } : {}) };
 }
 
 /** The Status an archived item keeps; null when the item is absent, active or unset. */
@@ -346,7 +351,11 @@ export function resolveProjectDeliveryConfiguration(
   if (statusField.__typename !== 'ProjectV2SingleSelectField' || statusField.isIssueField !== false) {
     throw new DeliveryError('Project Status must be the sole Project-owned single-select workflow field.');
   }
-  const statusOptions = readOptions(statusField.options, `Project ${settings.statusField}`);
+  const allStatusOptions = readOptions(statusField.options, `Project ${settings.statusField}`);
+  const reviewOptions = allStatusOptions.filter((option) => option.name === PROJECT_REVIEW_STATUS);
+  const statusOptions = allStatusOptions.filter((option) => option.name !== PROJECT_REVIEW_STATUS);
+  if (reviewOptions.length > 1)
+    throw new DeliveryError(`Project ${settings.statusField} repeats ${PROJECT_REVIEW_STATUS}.`);
   assertExactOptionSet({
     expected: PROJECT_DELIVERY_STATUSES.map((status) => settings.statuses[status]),
     fieldName: `Project ${settings.statusField}`,
@@ -367,6 +376,7 @@ export function resolveProjectDeliveryConfiguration(
     settings,
     statusFieldId: requireString(statusField.id, 'GitHub omitted the Project Status field id.'),
     statusOptionIds,
+    ...(reviewOptions[0] ? { reviewOptionId: reviewOptions[0].id } : {}),
     title: settings.title,
     writable: project.viewerCanUpdate === true,
   };
@@ -818,17 +828,22 @@ function parseProjectItem(
   const fieldValue = item.fieldValueByName;
   let status: null | ProjectDeliveryStatus = null;
   let statusOptionId: null | string = null;
+  let review = false;
   if (fieldValue !== null && fieldValue !== undefined) {
     const statusRecord = requireRecord(fieldValue, 'GitHub returned invalid Project Status readback.');
     const name = requireString(statusRecord.name, 'GitHub omitted Project Status name.');
     const optionId = requireString(statusRecord.optionId, 'GitHub omitted Project Status option id.');
     const statuses = configuration.settings.statuses;
-    const canonicalStatus = PROJECT_DELIVERY_STATUSES.find((candidate) => statuses[candidate] === name);
-    if (canonicalStatus === undefined || configuration.statusOptionIds[canonicalStatus] !== optionId) {
+    review = name === PROJECT_REVIEW_STATUS && optionId === configuration.reviewOptionId;
+    const canonicalStatus = review
+      ? 'In Progress'
+      : PROJECT_DELIVERY_STATUSES.find((candidate) => statuses[candidate] === name);
+    if (canonicalStatus === undefined || (!review && configuration.statusOptionIds[canonicalStatus] !== optionId)) {
       throw new DeliveryError(`GitHub returned unsupported Project Status ${name}.`);
     }
     status = canonicalStatus;
-    statusOptionId = optionId;
+    // In Review counts as In Progress everywhere, so a desired In Progress never overwrites it.
+    statusOptionId = review ? configuration.statusOptionIds['In Progress'] : optionId;
   }
   return {
     archived: item.isArchived === true,
@@ -836,6 +851,7 @@ function parseProjectItem(
     id: requireString(item.id, 'GitHub omitted the delivery Project item id.'),
     status,
     statusOptionId,
+    ...(review ? { review: true as const } : {}),
   };
 }
 

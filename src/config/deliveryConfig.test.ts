@@ -718,6 +718,14 @@ describe('portable delivery configuration', () => {
           ),
         /not writable/u,
       );
+      const withReview = (count: number) => {
+        const project = syntheticProject(config);
+        const status = project.fields.nodes[0] as { options: { id: string; name: string }[] };
+        for (let index = 0; index < count; index++) status.options.push({ id: `R${index}`, name: 'In Review' });
+        return resolveProjectDeliveryConfiguration(project, { settings: projectSettingsFromDeliveryConfig(config) });
+      };
+      assert.equal(withReview(1).reviewOptionId, 'R0');
+      assert.throws(() => withReview(2), /repeats In Review/u);
       git(['init', '--quiet', temp]);
       writeFileSync(join(temp, 'policy.mjs'), 'export const contract = "RepositoryDeliveryPolicy@1";\n');
       writeFileSync(
