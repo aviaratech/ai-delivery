@@ -3,10 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createRequire, findPackageJSON } from 'node:module';
 import { types } from 'node:util';
 import {
-  closeSync,
   existsSync,
-  fsyncSync,
-  openSync,
   unlinkSync,
   lstatSync,
   mkdirSync,
@@ -24,21 +21,16 @@ import { z } from 'zod';
 
 import { assertPrivateFile } from './delivery/common.js';
 import {
-  createRepositoryStageAggregate,
   digestBytes,
   digestValue,
-  RepositoryClassificationReceiptSchema,
-  RepositoryStageAggregateSchema,
-  RepositoryStageReceiptSchema,
   writeRepositoryCommandOutput,
   type RepositoryClassificationReceipt,
   type RepositoryStageAggregate,
   type RepositoryStageReceipt,
 } from './delivery/legacy.js';
 import { DeliveryError } from './errors.js';
-import { gitCommonDir, gitRoot } from './git.js';
-import { withLock } from './utils/lockfile.js';
-import { ensurePrivateDirectoryDurably, writePrivateJsonFileAtomically } from './utils/atomicJson.js';
+import { gitCommonDir } from './git.js';
+import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 export interface VerificationRun {
   aggregate: RepositoryStageAggregate;
@@ -896,207 +888,6 @@ export function assertWorktreeTransitionWriterQuiescent(worktreePath: string, by
   }
 }
 
-async function withVerificationWriter<T>(
-  root: string,
-  operation: (writer: VerificationWriter) => Promise<T>,
-  transition?: WorktreeTransitionWriterLeaseInput,
-  commonDirectory?: string,
-  refuseUnresolvedSourcePhase = false,
-): Promise<T> {
-  const digest = worktreeDigest(root);
-  const path = join(commonDirectory ?? gitCommonDir(root), 'ai-delivery', 'writers@1', `${digest.slice(7)}.json`);
-  ensurePrivateDirectoryDurably(dirname(path));
-  return withLock(path, {
-    projectRoot: root,
-    timeout: 200,
-    ...(transition?.onLockReleaseError === undefined ? {} : { onReleaseError: transition.onLockReleaseError }),
-    ...(transition?.onLockCompromised === undefined ? {} : { onCompromised: transition.onLockCompromised }),
-    operation: async () => {
-      await assertNoUnsealedSourcePhase(commonDirectory ?? gitCommonDir(root), digest, refuseUnresolvedSourcePhase);
-      const snapshot = processSnapshot();
-      const owner = snapshot.get(process.pid);
-      if (owner === undefined || owner.status.startsWith('Z'))
-        throw new DeliveryError('Verification writer identity is unknown.');
-      let previousBytes: Buffer | undefined;
-      if (transition) {
-        try {
-          lstatSync(path);
-          previousBytes = assertPrivateFile(path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        }
-      } else if (existsSync(path)) previousBytes = assertPrivateFile(path);
-      if (transition) assertWorktreeTransitionWriterQuiescent(root, previousBytes);
-      if (previousBytes !== undefined && !transition) {
-        const previous = WriterStateSchema.parse(JSON.parse(previousBytes.toString('utf8')));
-        if (previous.worktreeDigest !== digest)
-          throw new DeliveryError('Verification writer belongs to another worktree.');
-        const priorOwner = snapshot.get(previous.owner.pid);
-        if (priorOwner?.identity === previous.owner.identity && !priorOwner.status.startsWith('Z'))
-          throw new DeliveryError('A live verification writer still owns this worktree.');
-        if (previous.command.phase === 'starting')
-          throw new DeliveryError('Interrupted writer has unknown command ownership; reconcile before retrying.');
-        if (previous.command.phase === 'running') {
-          const state: OwnedProcessState = {
-            rootPid: previous.command.root.pid,
-            rootIdentity: previous.command.root.identity,
-            sampled: true,
-            tracked: new Map(
-              previous.command.tracked.map((member) => [member.pid, { ...member, ppid: 0, rssBytes: 0, status: '' }]),
-            ),
-          };
-          terminateOwnedProcesses(state);
-          await confirmOwnedCleanup(state);
-          reportVerificationProgress({
-            state: 'recovered',
-            stageId: 'writer',
-            completedStages: 0,
-            reusedStages: 0,
-            remainingStages: 0,
-            elapsedMs: 0,
-            reason: 'Recorded interrupted command cleanup confirmed; compatible completed stages remain available.',
-          });
-        }
-      }
-      if (transition) {
-        await transition.beforeClaim({
-          previousBytes: previousBytes === undefined ? undefined : Buffer.from(previousBytes),
-          owner: { pid: owner.pid, identity: owner.identity },
-        });
-      }
-      let state: Omit<z.infer<typeof WriterStateSchema>, 'stateId'> = {
-        schemaVersion: 'ai-delivery.verification-writer@1',
-        writerId: transition?.writerId ?? randomUUID(),
-        worktreeDigest: digest,
-        owner: { pid: owner.pid, identity: owner.identity },
-        command: { phase: 'idle' },
-      };
-      const persist = (command: typeof state.command): void => {
-        state = { ...state, command };
-        writePrivateJsonFileAtomically(path, { ...state, stateId: digestValue(state) });
-      };
-      if (transition) {
-        const bytes = Buffer.from(`${JSON.stringify({ ...state, stateId: digestValue(state) }, null, 2)}\n`);
-        await transition.recordClaim(Buffer.from(bytes));
-        let actual: Buffer | undefined;
-        try {
-          lstatSync(path);
-          actual = assertPrivateFile(path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        }
-        if (
-          (actual === undefined) !== (previousBytes === undefined) ||
-          (actual !== undefined && previousBytes !== undefined && !actual.equals(previousBytes))
-        )
-          throw new DeliveryError('Writer changed after transition intent preservation.');
-      }
-      persist({ phase: 'idle' });
-      const writer: VerificationWriter = {
-        starting: () => persist({ phase: 'starting' }),
-        observed: (owned) => {
-          if (owned.rootIdentity === undefined) throw new DeliveryError('Cannot persist an unknown command owner.');
-          persist({
-            phase: 'running',
-            root: { pid: owned.rootPid, identity: owned.rootIdentity },
-            tracked: [...owned.tracked.values()].map(({ pid, identity, pgid }) => ({ pid, identity, pgid })),
-          });
-        },
-        idle: () => persist({ phase: 'idle' }),
-        assertQuiescent: () => {
-          const current = WriterStateSchema.parse(JSON.parse(assertPrivateFile(path).toString('utf8')));
-          if (current.writerId !== state.writerId || current.command.phase !== 'idle')
-            throw new DeliveryError('Verification writer command quiescence is not confirmed.');
-        },
-      };
-      const releaseWriter = async (): Promise<void> => {
-        const bytes = assertPrivateFile(path);
-        const current = WriterStateSchema.parse(JSON.parse(bytes.toString('utf8')));
-        if (current.writerId !== state.writerId) throw new DeliveryError('Verification writer ownership changed.');
-        if (current.command.phase === 'idle') {
-          if (transition) {
-            await transition.recordRelease(Buffer.from(bytes));
-            if (!assertPrivateFile(path).equals(bytes))
-              throw new DeliveryError('Writer changed before recorded release.');
-          }
-          unlinkSync(path);
-          if (transition) {
-            const descriptor = openSync(dirname(path), 'r');
-            try {
-              fsyncSync(descriptor);
-            } finally {
-              closeSync(descriptor);
-            }
-            try {
-              lstatSync(path);
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-              await transition.afterRelease?.();
-              return;
-            }
-            throw new DeliveryError('Writer absence is not confirmed after recorded release.');
-          }
-        }
-      };
-      try {
-        await transition?.afterClaim?.(Buffer.from(assertPrivateFile(path)));
-        return await operation(writer);
-      } finally {
-        await releaseWriter();
-      }
-    },
-  });
-}
-
-/** @internal Hold the existing writer lock while reading a sealed transition; never claim or recover its slot. */
-export async function withWorktreeTransitionWriterAbsent<T>(
-  repoRoot: string,
-  worktreePath: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const path = join(
-    gitCommonDir(repoRoot),
-    'ai-delivery',
-    'writers@1',
-    `${worktreeDigest(worktreePath).slice(7)}.json`,
-  );
-  return withLock(path, {
-    projectRoot: repoRoot,
-    timeout: 200,
-    operation: async () => {
-      await assertNoUnsealedSourcePhase(gitCommonDir(repoRoot), worktreeDigest(worktreePath));
-      try {
-        lstatSync(path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        return operation();
-      }
-      throw new DeliveryError('Sealed transition writer absence postcondition drifted.');
-    },
-  });
-}
-
-/** @internal Check-only lease for the explicit transition owner; never recovers or signals old commands. */
-export async function withWorktreeTransitionWriterLease<T>(
-  input: WorktreeTransitionWriterLeaseInput,
-  operation: () => Promise<T>,
-): Promise<T> {
-  z.uuid().parse(input.writerId);
-  const repository = gitRoot(input.repoRoot);
-  const subject = input.worktreePath === undefined ? repository : resolve(input.worktreePath);
-  return withVerificationWriter(
-    subject,
-    async (writer) => {
-      writer.assertQuiescent();
-      const result = await operation();
-      writer.assertQuiescent();
-      return result;
-    },
-    input,
-    gitCommonDir(repository),
-  );
-}
-
 function worktreeDigest(root: string): string {
   return digestValue(resolve(root));
 }
@@ -1169,76 +960,6 @@ export function retainedWorktreeTransitionDependencyManifests(
   distDirectory: string,
 ): { source: string; digest: string }[] {
   return producerContent(realpathSync(distDirectory)).dependencies.map(([source, digest]) => ({ source, digest }));
-}
-
-/** @internal Original manifests validate as history and cannot authorize current verification. */
-export function readWorktreeTransitionRun(bytes: Buffer): VerificationRun {
-  return parseRun(JSON.parse(bytes.toString('utf8')) as unknown);
-}
-
-function parseRun(value: unknown): VerificationRun {
-  if (typeof value !== 'object' || value === null || Array.isArray(value))
-    throw new DeliveryError('Invalid run manifest.');
-  const input = value as Record<string, unknown>;
-  const classification = RepositoryClassificationReceiptSchema.parse(input.classification);
-  const aggregate = RepositoryStageAggregateSchema.parse(input.aggregate);
-  const stageReceipts = RepositoryStageReceiptSchema.array().parse(input.stageReceipts);
-  if (!['ai-delivery.run@1', 'ai-delivery.run@2', 'ai-delivery.run@3'].includes(String(input.schemaVersion)))
-    throw new DeliveryError('Run manifest schema version is unsupported.');
-  if (input.schemaVersion === 'ai-delivery.run@1' && input.resources !== undefined)
-    throw new DeliveryError('Historical run manifest has unexpected resource evidence.');
-  const resources = input.resources === undefined ? undefined : ResourceSummarySchema.parse(input.resources);
-  if (input.schemaVersion === 'ai-delivery.run@2' && resources === undefined)
-    throw new DeliveryError('Historical bounded run lacks resource evidence.');
-  const writer =
-    input.schemaVersion === 'ai-delivery.run@3'
-      ? z
-          .strictObject({
-            worktreeDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-            producerDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-          })
-          .parse(input.writer)
-      : undefined;
-  const content = {
-    aggregate,
-    classification,
-    completedAt: input.completedAt,
-    ...(resources === undefined ? {} : { resources }),
-    ...(writer === undefined ? {} : { writer }),
-    schemaVersion: input.schemaVersion,
-    stageReceipts,
-  };
-  if (
-    typeof input.completedAt !== 'string' ||
-    input.manifestId !== digestValue(content) ||
-    createRepositoryStageAggregate({ classification, receipts: stageReceipts }).aggregateId !== aggregate.aggregateId
-  )
-    throw new DeliveryError('Run manifest identity or aggregate is invalid.');
-  return { ...content, completedAt: input.completedAt, manifestId: input.manifestId } as VerificationRun;
-}
-
-function reportVerificationProgress(input: {
-  state: 'running' | 'reused' | 'completed' | 'failed' | 'recovered';
-  stageId: string;
-  commandLabel?: string;
-  completedStages: number;
-  remainingStages: number;
-  reusedStages: number;
-  elapsedMs: number;
-  capturedOutputBytes?: number;
-  sampledAggregateRssBytes?: number;
-  sampledFreeDiskBytes?: number;
-  sampledNewOutputBytes?: number;
-  ownedProcessCount?: number;
-  reason?: string;
-  completedCommands?: number;
-  remainingCommands?: number;
-  reusedCommands?: number;
-  executedCommandsPerSecond?: number;
-  lastCompletedWorkAgeMs?: number;
-  commandElapsedMs?: number;
-}): void {
-  process.stderr.write(`ai-delivery.verify ${JSON.stringify(input)}\n`);
 }
 
 export function runStageCommand(
@@ -1642,135 +1363,12 @@ const IssueSourcePhaseInputSchema = z.strictObject({
   completionArtifacts: z.array(z.string().min(1)),
   reconciliation: SourceReconciliationSchema.optional(),
 });
-const SourceBindingSchema = IssueSourcePhaseInputSchema.omit({ environment: true }).extend({
-  environmentDigest: SourceDigest,
-});
-const SourcePhaseBaselineSchema = z.strictObject({
-  roots: z.array(z.string().min(1)).min(1),
-  files: z.array(z.tuple([z.string(), z.number().int().nonnegative().safe()])),
-  links: z.array(
-    z.tuple([z.string(), z.strictObject({ identity: z.string(), target: z.string(), missing: z.boolean() })]),
-  ),
-  baselineId: SourceDigest,
-});
 const SourcePhaseCommandResultSchema = z.strictObject({
   index: z.number().int().nonnegative().safe(),
   outputDigest: SourceDigest.nullable(),
   outputBytes: z.number().int().nonnegative().safe(),
   status: z.enum(['complete', 'failed']),
 });
-const SourcePhaseResultSchema = z.strictObject({
-  source: SourceSnapshotSchema,
-  artifacts: z.array(SourceFileSchema),
-  newOutputBytes: z.number().int().nonnegative().safe(),
-  writerReleased: z.literal(true),
-  lockReleased: z.literal(true),
-});
-const SourcePhaseRecordSchema = z
-  .strictObject({
-    schemaVersion: z.literal('ai-delivery.source-phase@1'),
-    phaseId: SourceDigest,
-    recordId: SourceDigest,
-    worktreeDigest: SourceDigest,
-    bindingDigest: SourceDigest,
-    authorizationDigest: SourceDigest,
-    status: z.enum(['preparing', 'intent', 'complete', 'failed-quiescent', 'rejected-before-work', 'unresolved']),
-    writerId: z.uuid(),
-    binding: SourceBindingSchema.optional(),
-    baseline: SourcePhaseBaselineSchema.optional(),
-    allocation: SourceBoundsSchema.optional(),
-    owner: z.strictObject({ pid: z.number().int().positive().safe(), identity: z.string().min(1) }),
-    bootstrapFiles: z.array(z.tuple([z.string(), z.number().int().nonnegative().safe()])),
-    bootstrapBytes: z.number().int().nonnegative().safe(),
-    capturedBytes: z.number().int().nonnegative().safe(),
-    nextCommandIndex: z.number().int().nonnegative().safe(),
-    commands: z.array(SourcePhaseCommandResultSchema),
-    claimDigest: SourceDigest.optional(),
-    releaseDigest: SourceDigest.optional(),
-    preparationArtifact: SourceFileSchema.optional(),
-    writerArtifact: SourceFileSchema.optional(),
-    producerDigest: SourceDigest.optional(),
-    actor: z
-      .strictObject({
-        identity: z.string().min(1),
-        actorLogin: z.string().min(1),
-        credentialIdentity: z.string().min(1),
-      })
-      .optional(),
-    retainedArtifacts: z.array(SourceFileSchema).optional(),
-    retainedPredecessors: z.array(z.strictObject({ phaseId: SourceDigest, recordId: SourceDigest })),
-    reconciliation: SourceReconciliationSchema.optional(),
-    result: SourcePhaseResultSchema.optional(),
-    failure: z
-      .strictObject({
-        operation: z.string().optional(),
-        accounting: z.string().optional(),
-        cleanup: z.string().optional(),
-        writerRelease: z.string().optional(),
-        lockRelease: z.string().optional(),
-      })
-      .optional(),
-  })
-  .superRefine((record, context) => {
-    const { recordId, ...content } = record;
-    if (recordId !== digestValue(content) || record.phaseId !== record.bindingDigest)
-      context.addIssue({ code: 'custom', message: 'Source-phase record identity is invalid.' });
-    if (record.binding !== undefined && digestValue(record.binding) !== record.bindingDigest)
-      context.addIssue({ code: 'custom', message: 'Source-phase input binding is invalid.' });
-    if (record.baseline !== undefined) {
-      const { baselineId, ...baseline } = record.baseline;
-      if (baselineId !== digestValue(baseline))
-        context.addIssue({ code: 'custom', message: 'Source-phase baseline is invalid.' });
-    }
-    if (
-      record.status === 'rejected-before-work' &&
-      (record.commands.length !== 0 || record.nextCommandIndex !== 0 || record.capturedBytes !== 0)
-    )
-      context.addIssue({ code: 'custom', message: 'Rejected source-phase input cannot contain executed work.' });
-    if (
-      record.status === 'complete' &&
-      (record.result === undefined ||
-        record.baseline === undefined ||
-        record.binding === undefined ||
-        record.failure !== undefined)
-    )
-      context.addIssue({ code: 'custom', message: 'Source-phase completion is incomplete.' });
-    if (
-      record.status === 'complete' &&
-      (record.commands.length !== record.binding?.commands.length ||
-        record.nextCommandIndex !== record.commands.length ||
-        record.commands.some((command, index) => command.index !== index || command.status !== 'complete'))
-    )
-      context.addIssue({
-        code: 'custom',
-        message: 'Source-phase completion does not contain its exact successful command graph.',
-      });
-  });
-
-async function assertNoUnsealedSourcePhase(common: string, subject: string, refuseUnresolved = false): Promise<void> {
-  const directory = join(common, 'ai-delivery', 'receipts', 'source-phase@1', subject.slice(7));
-  let names: string[];
-  try {
-    const stat = lstatSync(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink())
-      throw new DeliveryError('Source-phase admission metadata is not a canonical directory.');
-    names = readdirSync(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  if (names.length > 100_000) throw new DeliveryError('Source-phase admission exceeded its entry bound.');
-  for (const name of names) {
-    const record = SourcePhaseRecordSchema.parse(JSON.parse(assertPrivateFile(join(directory, name)).toString('utf8')));
-    if (record.worktreeDigest !== subject || name !== `${record.phaseId.slice(7)}.json`)
-      throw new DeliveryError('Source-phase admission record belongs to another input or worktree.');
-    if (record.status === 'preparing' || record.status === 'intent')
-      throw new DeliveryError('An unsealed source phase still excludes another worktree writer.');
-    if (refuseUnresolved && record.status === 'unresolved')
-      throw new DeliveryError('Unresolved source phase requires owning reconciliation before another attempt.');
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-}
 
 export type IssueSourcePhaseInput = z.input<typeof IssueSourcePhaseInputSchema> & { signal?: AbortSignal };
 export interface IssueSourcePhaseContext {

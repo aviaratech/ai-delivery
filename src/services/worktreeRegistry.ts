@@ -6,7 +6,6 @@ import {
   assertPrivateFile,
   CoordinateSchema,
   DigestSchema,
-  RepositorySchema,
   digestBytes,
   stableJson,
   writeCreateOnly,
@@ -14,7 +13,6 @@ import {
 import { digestValue } from '../delivery/index.js';
 import { gitCommonDir } from '../git.js';
 import { RuntimeAdmissionSchema } from './deliveryAdmission.js';
-import type { WorktreeTransitionPlan } from '../worktreeTransition.js';
 import { logInfo, logWarn } from '../logger.js';
 import { ensureDataDirectory, ISSUE_CLI_DATA_DIR } from '../utils/filesystem.js';
 import {
@@ -221,67 +219,8 @@ function ownerPath(root: string, entry: WorktreeEntry): string {
   return join(gitCommonDir(root), 'ai-delivery', 'worktree-owners', `${id}.json`);
 }
 
-function assertNoIncompleteWorktreeTransition(entry: WorktreeEntry, root: string): void {
-  if (entry.type !== 'issue' || entry.issueNumber === undefined) return;
-  const path = join(
-    gitCommonDir(root),
-    'ai-delivery',
-    'worktree-owners',
-    `issue-${String(entry.issueNumber)}.transition.json`,
-  );
-  try {
-    lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw new Error('Worktree transition is incomplete or unreadable.');
-  }
-  try {
-    const intent = JSON.parse(assertPrivateFile(path).toString('utf8')) as {
-      schemaVersion: string;
-      intentId: string;
-      plan: WorktreeTransitionPlan;
-    };
-    const { intentId, ...content } = intent;
-    const { planId, ...planContent } = intent.plan;
-    if (
-      intent.schemaVersion !== 'ai-delivery.worktree-transition-intent@1' ||
-      intentId !== digestValue(content) ||
-      planId !== digestValue(planContent) ||
-      intent.plan.repoRoot !== resolve(root) ||
-      intent.plan.row.issueNumber !== entry.issueNumber
-    )
-      throw new Error('Invalid transition intent.');
-    if (intent.plan.purpose === 'merged-cleanup')
-      throw new Error('Worktree transition is terminal and cannot authorize ordinary source operations.');
-    const completionPath = join(`${path}.evidence`, 'completion.json');
-    const completion = JSON.parse(assertPrivateFile(completionPath).toString('utf8')) as {
-      schemaVersion: string;
-      planId: string;
-      intentId: string;
-      completed: boolean;
-      completionId: string;
-    };
-    const { completionId, ...completionContent } = completion;
-    if (
-      completion.schemaVersion !== 'ai-delivery.worktree-transition-completion@1' ||
-      completion.planId !== planId ||
-      completion.intentId !== intentId ||
-      completion.completed !== true ||
-      completionId !== digestValue(completionContent) ||
-      JSON.stringify(ownerContent(entry)) !== JSON.stringify(ownerContent(intent.plan.row as WorktreeEntry))
-    )
-      throw new Error('Invalid transition completion.');
-    return;
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('transition is terminal')) throw error;
-    throw new Error('Worktree transition is incomplete or unreadable; resume its exact approved plan.');
-  }
-}
-
 /** An immutable witness separates new rows from legacy rows in the same canonical registry. */
 export function assertAiDeliveryWorktreeOwner(entry: WorktreeEntry, root: string): void {
-  if (entry.issueNumber !== undefined) assertNoInvestigationCompletion(entry.issueNumber, root);
-  assertNoIncompleteWorktreeTransition(entry, root);
   if (entry.issueNumber !== undefined && pendingCommittedContinuation(entry.issueNumber, root))
     throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
   assertOwnerWitness(entry, root);
@@ -301,36 +240,14 @@ function assertOwnerWitness(entry: WorktreeEntry, root: string): void {
   }
 }
 
-/** Ordinary source mutations also refuse terminal/pending issue intent after the row was removed. */
+/** Ordinary source mutations refuse a pending committed continuation. */
 export function assertIssueWorktreeTransitionAdmission(
   issueNumber: number,
   root: string,
   committedRecovery = false,
 ): void {
-  assertNoInvestigationCompletion(issueNumber, root);
   if (pendingCommittedContinuation(issueNumber, root) && !committedRecovery)
     throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
-  const path = join(
-    gitCommonDir(root),
-    'ai-delivery',
-    'worktree-owners',
-    `issue-${String(issueNumber)}.transition.json`,
-  );
-  try {
-    lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw new Error('Worktree transition is incomplete or unreadable.');
-  }
-  let row: WorktreeEntry;
-  try {
-    row = (JSON.parse(assertPrivateFile(path).toString('utf8')) as { plan: { row: WorktreeEntry } }).plan.row;
-    if (row.type !== 'issue' || row.issueNumber !== issueNumber)
-      throw new Error('Transition embedded issue identity disagrees.');
-  } catch {
-    throw new Error('Worktree transition is incomplete or unreadable.');
-  }
-  assertNoIncompleteWorktreeTransition(row, root);
 }
 
 function writeWorktreeOwner(entry: WorktreeEntry, root: string, transition = false): void {
@@ -428,7 +345,6 @@ export async function withCommittedContinuationRegistry<T>(
           throw new Error('Committed continuation requires one exact canonical issue row.');
         if (registry.worktrees.some((other) => other !== row && registryIdentitiesOverlap(other, row)))
           throw new Error('Committed continuation overlaps another canonical owner.');
-        assertNoIncompleteWorktreeTransition(row, root);
         assertOwnerWitness(row, root);
         return { registry, row };
       };
@@ -512,105 +428,6 @@ export async function withCommittedContinuationRegistry<T>(
   });
 }
 
-/** @internal The explicit transition owner holds the existing registry lock through its exact planned mutation. */
-export async function withWorktreeTransitionRegistry<T>(
-  plan: WorktreeTransitionPlan,
-  operation: (input: {
-    current: WorktreeEntry | undefined;
-    writeOwner(this: void): void;
-    commitRow(this: void): WorktreeEntry;
-    removeRow(this: void): void;
-  }) => Promise<T>,
-): Promise<T> {
-  const root = plan.repoRoot;
-  if (pendingCommittedContinuation(plan.row.issueNumber, root))
-    throw new Error('Committed continuation is pending or incomplete; resume supported develop.');
-  ensureRegistryDirectory(root);
-  return withLock(REGISTRY_PATH, {
-    projectRoot: root,
-    timeout: 5000,
-    operation: async () => {
-      const registry = loadRegistryStrict(root);
-      const matches = registry.worktrees.filter(
-        (entry) => entry.type === 'issue' && entry.issueNumber === plan.row.issueNumber,
-      );
-      if (matches.length > 1) throw new Error('Transition has duplicate canonical issue rows.');
-      if (
-        registry.worktrees.some(
-          (entry) => !matches.includes(entry) && registryIdentitiesOverlap(entry, plan.row as WorktreeEntry),
-        )
-      )
-        throw new Error('Transition conflicts with another canonical registry path, branch or PR identity.');
-      let current = matches[0];
-      const original: WorktreeEntry = {
-        ...plan.row,
-        ...(plan.row.prNumber === undefined ? {} : { prNumber: plan.row.prNumber }),
-      } as WorktreeEntry;
-      const replacement: WorktreeEntry =
-        plan.purpose === 'active-resume'
-          ? original
-          : {
-              ...original,
-              prNumber: plan.terminalPrNumber!,
-              status: 'merged',
-            };
-      if (
-        current !== undefined &&
-        ![original, replacement].some((allowed) => stableJson(current) === stableJson(allowed))
-      )
-        throw new Error('Transition canonical row drifted.');
-      const intentPath = join(
-        gitCommonDir(root),
-        'ai-delivery',
-        'worktree-owners',
-        `issue-${String(plan.row.issueNumber)}.transition.json`,
-      );
-      const requireIntent = () => {
-        const intent = JSON.parse(assertPrivateFile(intentPath).toString('utf8')) as { plan?: { planId?: string } };
-        if (intent.plan?.planId !== plan.planId) throw new Error('Transition lacks its exact durable intent.');
-      };
-      return operation({
-        current,
-        writeOwner: () => {
-          requireIntent();
-          writeWorktreeOwner(replacement, root, true);
-        },
-        commitRow: () => {
-          requireIntent();
-          if (current === undefined) throw new Error('Transition cannot recreate a removed canonical row.');
-          registry.worktrees.splice(registry.worktrees.indexOf(current), 1, replacement);
-          current = replacement;
-          saveRegistryStrict(root, registry);
-          return replacement;
-        },
-        removeRow: () => {
-          requireIntent();
-          if (
-            plan.purpose !== 'merged-cleanup' ||
-            plan.disposition !== 'remove' ||
-            plan.retainedHoldCommentIds.length !== 0
-          )
-            throw new Error('Transition lacks explicit unheld terminal source disposition.');
-          if (current !== undefined) {
-            registry.worktrees.splice(registry.worktrees.indexOf(current), 1);
-            saveRegistryStrict(root, registry);
-            current = undefined;
-          }
-        },
-      });
-    },
-  });
-}
-
-/** @internal Validate the existing immutable witness without granting ordinary terminal admission. */
-export function assertTransitionOwnerWitness(plan: WorktreeTransitionPlan): void {
-  const row = plan.row as WorktreeEntry;
-  const content = ownerContent(row);
-  const stored = JSON.parse(assertPrivateFile(ownerPath(plan.repoRoot, row)).toString('utf8')) as unknown;
-  if (stableJson(stored) !== stableJson({ ...content, ownerId: digestValue(content) }))
-    throw new Error('Sealed transition owner witness drifted.');
-}
-
 /**
  * The only recovery transition for a worktree that remained active after its
  * delivery completed elsewhere. Callers must establish the terminal delivery
@@ -656,7 +473,6 @@ export async function addWorktreeEntry(entry: WorktreeEntry, projectRoot?: strin
       logWarn(LOCK_RETRY_MESSAGE);
     },
     operation: () => {
-      assertNoIncompleteWorktreeTransition(normalizedEntry, root);
       const registry = loadRegistryStrict(root);
 
       const collisions = registry.worktrees.filter((existing) => registryIdentitiesOverlap(existing, normalizedEntry));
@@ -1257,278 +1073,3 @@ function saveRegistryStrict(root: string, registry: WorktreeRegistry): void {
 }
 
 /** Current, prospective custody is separate from legacy producer/policy transitions. */
-export const InvestigationPreparationSchema = z
-  .strictObject({
-    schemaVersion: z.literal('ai-delivery.investigation-preparation@1'),
-    preparationId: DigestSchema,
-    repository: RepositorySchema,
-    repoRoot: z.string().min(1),
-    row: ContinuationRowSchema,
-    head: CoordinateSchema,
-    physical: z.strictObject({
-      device: z.number().int().nonnegative().safe(),
-      inode: z.number().int().nonnegative().safe(),
-      gitDirectory: z.string().min(1),
-      gitDevice: z.number().int().nonnegative().safe(),
-      gitInode: z.number().int().nonnegative().safe(),
-    }),
-    operator: z.strictObject({
-      actorLogin: z.string().min(1),
-      credentialIdentity: z.string().regex(/^user:[1-9]\d*$/u),
-    }),
-    reviewerActor: z.string().min(1),
-  })
-  .superRefine(({ preparationId, ...content }, ctx) => {
-    if (
-      preparationId !== digestValue(content) ||
-      content.row.status !== 'active' ||
-      content.row.prNumber !== undefined ||
-      content.row.branch !== `issue/${String(content.row.issueNumber)}` ||
-      content.row.path !== join(content.repoRoot, '.worktrees', `issue-${String(content.row.issueNumber)}`) ||
-      content.operator.actorLogin.toLowerCase() === content.reviewerActor.toLowerCase()
-    )
-      ctx.addIssue({ code: 'custom', message: 'Investigation preparation identity is invalid.' });
-  });
-export type InvestigationPreparation = z.infer<typeof InvestigationPreparationSchema>;
-
-const InvestigationIntentSchema = z
-  .strictObject({
-    schemaVersion: z.literal('ai-delivery.investigation-completion-intent@1'),
-    intentId: DigestSchema,
-    preparationId: DigestSchema,
-    resultDigest: DigestSchema,
-    authorityCommentId: z.number().int().positive().safe(),
-    acceptanceCommentId: z.number().int().positive().safe(),
-    registryBeforeimage: DigestSchema,
-    authorityDigest: DigestSchema,
-  })
-  .superRefine(({ intentId, ...content }, ctx) => {
-    if (intentId !== digestValue(content))
-      ctx.addIssue({ code: 'custom', message: 'Investigation intent is corrupt.' });
-  });
-const InvestigationCompletionSchema = z
-  .strictObject({
-    schemaVersion: z.literal('ai-delivery.investigation-completion@1'),
-    completionId: DigestSchema,
-    intentId: DigestSchema,
-    preparationId: DigestSchema,
-    completed: z.literal(true),
-  })
-  .superRefine(({ completionId, ...content }, ctx) => {
-    if (completionId !== digestValue(content))
-      ctx.addIssue({ code: 'custom', message: 'Investigation completion is corrupt.' });
-  });
-function investigationDirectory(root: string, issueNumber: number): string {
-  return join(gitCommonDir(root), 'ai-delivery', 'investigations', String(issueNumber));
-}
-function assertNoInvestigationCompletion(issueNumber: number, root: string): void {
-  const path = join(investigationDirectory(root, issueNumber), 'intent.json');
-  try {
-    lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  throw new Error('Investigation completion is pending or terminal; resume only its exact completion.');
-}
-function readInvestigationJson(path: string): unknown {
-  return JSON.parse(assertPrivateFile(path, { maxBytes: 1024 * 1024 }).toString('utf8')) as unknown;
-}
-export function readInvestigationPreparation(root: string, issueNumber: number): InvestigationPreparation | undefined {
-  const path = join(investigationDirectory(root, issueNumber), 'preparation.json');
-  try {
-    lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
-  const preparation = InvestigationPreparationSchema.parse(readInvestigationJson(path));
-  if (preparation.repoRoot !== root || preparation.row.issueNumber !== issueNumber)
-    throw new Error('Investigation preparation belongs to another repository or issue.');
-  return preparation;
-}
-export function readInvestigationAcknowledgement(root: string, issueNumber: number) {
-  return z
-    .strictObject({ commentId: z.number().int().positive().safe(), url: z.url(), body: z.string().min(1) })
-    .parse(readInvestigationJson(join(investigationDirectory(root, issueNumber), 'acknowledgement.json')));
-}
-function prepareInvestigationDirectory(root: string, issueNumber: number): string {
-  const directory = investigationDirectory(root, issueNumber);
-  const common = gitCommonDir(root);
-  for (const path of [join(common, 'ai-delivery'), join(common, 'ai-delivery', 'investigations'), directory]) {
-    try {
-      const metadata = lstatSync(path);
-      if (!metadata.isDirectory() || metadata.isSymbolicLink())
-        throw new Error('Investigation custody directory is unsafe.');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
-  ensurePrivateDirectoryDurably(directory);
-  return directory;
-}
-function assertInvestigationRegistry(root: string): void {
-  const directory = join(root, ISSUE_CLI_DATA_DIR);
-  const metadata = lstatSync(directory);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('Canonical registry directory is unsafe.');
-  const path = join(root, REGISTRY_PATH);
-  if (existsSync(path)) {
-    const file = lstatSync(path);
-    if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1)
-      throw new Error('Canonical registry file is unsafe.');
-  }
-}
-function investigationRow(
-  registry: WorktreeRegistry,
-  preparation: InvestigationPreparation,
-): WorktreeEntry | undefined {
-  const matches = registry.worktrees.filter((entry) => registryIdentitiesOverlap(entry, preparation.row));
-  if (matches.length > 1 || (matches[0] !== undefined && stableJson(matches[0]) !== stableJson(preparation.row)))
-    throw new Error('Investigation conflicts with canonical registry custody.');
-  return matches[0];
-}
-
-/** Explicit prospective registration; never adopts a legacy row or replaces its baseline. */
-export async function registerInvestigationCustody(
-  raw: InvestigationPreparation,
-  acknowledge: () => Promise<unknown>,
-): Promise<void> {
-  const preparation = InvestigationPreparationSchema.parse(raw);
-  const root = preparation.repoRoot;
-  const issueNumber = preparation.row.issueNumber;
-  assertIssueWorktreeTransitionAdmission(issueNumber, root);
-  ensureRegistryDirectory(root);
-  assertInvestigationRegistry(root);
-  await withLock(REGISTRY_PATH, {
-    projectRoot: root,
-    timeout: 5000,
-    operation: async () => {
-      assertIssueWorktreeTransitionAdmission(issueNumber, root);
-      const registry = loadRegistryStrict(root);
-      const prior = readInvestigationPreparation(root, issueNumber);
-      if (prior === undefined && registry.worktrees.some((entry) => registryIdentitiesOverlap(entry, preparation.row)))
-        throw new Error('Legacy custody cannot be adopted as a current investigation.');
-      const row = investigationRow(registry, preparation);
-      if (prior !== undefined && stableJson(prior) !== stableJson(preparation))
-        throw new Error('Investigation baseline cannot be replaced.');
-      const directory = prepareInvestigationDirectory(root, issueNumber);
-      writeCreateOnly(join(directory, 'preparation.json'), Buffer.from(stableJson(preparation)));
-      const acknowledgement = await acknowledge();
-      writeCreateOnly(join(directory, 'acknowledgement.json'), Buffer.from(stableJson(acknowledgement)));
-      writeWorktreeOwner(preparation.row, root);
-      if (row === undefined) {
-        registry.worktrees.push(preparation.row);
-        saveRegistryStrict(root, registry);
-      }
-      if (investigationRow(loadRegistryStrict(root), preparation) === undefined)
-        throw new Error('Investigation registration readback is missing.');
-    },
-  });
-}
-
-/** The same canonical lock owns evidence preservation, non-force removal, and row commit. */
-export async function completeInvestigationCustody(input: {
-  preparation: InvestigationPreparation;
-  result: Buffer;
-  authorityCommentId: number;
-  acceptanceCommentId: number;
-  dryRun: boolean;
-  authorize: () => Promise<unknown>;
-  assertSource: (allowAbsent: boolean) => void;
-  removeSource: () => void;
-}): Promise<{ completed: boolean; replayed: boolean; receiptPath?: string }> {
-  const preparation = InvestigationPreparationSchema.parse(input.preparation);
-  const root = preparation.repoRoot;
-  const issueNumber = preparation.row.issueNumber;
-  ensureRegistryDirectory(root);
-  assertInvestigationRegistry(root);
-  return withLock(REGISTRY_PATH, {
-    projectRoot: root,
-    timeout: 5000,
-    operation: async () => {
-      if (stableJson(readInvestigationPreparation(root, issueNumber)) !== stableJson(preparation))
-        throw new Error('Investigation preparation drifted.');
-      // Legacy transition/continuation custody remains a separate mandatory fence.
-      assertNoIncompleteWorktreeTransition(preparation.row, root);
-      if (pendingCommittedContinuation(issueNumber, root)) throw new Error('Committed continuation is incomplete.');
-      assertOwnerWitness(preparation.row, root);
-      const directory = investigationDirectory(root, issueNumber);
-      const intentPath = join(directory, 'intent.json');
-      const completionPath = join(directory, 'completion.json');
-      const intent = existsSync(intentPath)
-        ? InvestigationIntentSchema.parse(readInvestigationJson(intentPath))
-        : undefined;
-      const completion = existsSync(completionPath)
-        ? InvestigationCompletionSchema.parse(readInvestigationJson(completionPath))
-        : undefined;
-      const registry = loadRegistryStrict(root);
-      const row = investigationRow(registry, preparation);
-      if (row === undefined && intent === undefined)
-        throw new Error('Investigation row disappeared without a removal intent.');
-      if (
-        completion !== undefined &&
-        (intent === undefined ||
-          row !== undefined ||
-          completion.intentId !== intent.intentId ||
-          completion.preparationId !== preparation.preparationId)
-      )
-        throw new Error('Investigation completion custody is inconsistent.');
-      const resultDigest = digestBytes(input.result);
-      if (
-        intent !== undefined &&
-        (intent.preparationId !== preparation.preparationId ||
-          intent.resultDigest !== resultDigest ||
-          intent.authorityCommentId !== input.authorityCommentId ||
-          intent.acceptanceCommentId !== input.acceptanceCommentId)
-      )
-        throw new Error('Resume requires the same exact investigation intent and evidence.');
-      if (intent !== undefined)
-        for (const digest of [intent.resultDigest, intent.registryBeforeimage, intent.authorityDigest])
-          if (digestBytes(assertPrivateFile(join(directory, `${digest.slice(7)}.bin`))) !== digest)
-            throw new Error('Preserved investigation evidence changed.');
-      input.assertSource(intent !== undefined);
-      const authority = await input.authorize();
-      input.assertSource(intent !== undefined);
-      if (input.dryRun) return { completed: false, replayed: intent !== undefined };
-      if (completion !== undefined) return { completed: true, replayed: true, receiptPath: completionPath };
-      let accepted = intent;
-      if (accepted === undefined) {
-        const registryBytes = readFileSync(join(root, REGISTRY_PATH));
-        const authorityBytes = Buffer.from(stableJson(authority));
-        for (const bytes of [input.result, registryBytes, authorityBytes]) {
-          const digest = digestBytes(bytes);
-          writeCreateOnly(join(directory, `${digest.slice(7)}.bin`), bytes, digest);
-        }
-        const content = {
-          schemaVersion: 'ai-delivery.investigation-completion-intent@1' as const,
-          preparationId: preparation.preparationId,
-          resultDigest,
-          authorityCommentId: input.authorityCommentId,
-          acceptanceCommentId: input.acceptanceCommentId,
-          registryBeforeimage: digestBytes(registryBytes),
-          authorityDigest: digestBytes(authorityBytes),
-        };
-        accepted = InvestigationIntentSchema.parse({ ...content, intentId: digestValue(content) });
-        writeCreateOnly(intentPath, Buffer.from(stableJson(accepted)));
-      }
-      // A fresh intent never turns unexplained absence into authorized recovery.
-      input.assertSource(intent !== undefined);
-      input.removeSource();
-      input.assertSource(true);
-      if (row !== undefined) {
-        registry.worktrees.splice(registry.worktrees.indexOf(row), 1);
-        saveRegistryStrict(root, registry);
-      }
-      if (investigationRow(loadRegistryStrict(root), preparation) !== undefined)
-        throw new Error('Investigation registry removal readback failed.');
-      const content = {
-        schemaVersion: 'ai-delivery.investigation-completion@1' as const,
-        intentId: accepted.intentId,
-        preparationId: preparation.preparationId,
-        completed: true as const,
-      };
-      writeCreateOnly(completionPath, Buffer.from(stableJson({ ...content, completionId: digestValue(content) })));
-      return { completed: true, replayed: intent !== undefined, receiptPath: completionPath };
-    },
-  });
-}

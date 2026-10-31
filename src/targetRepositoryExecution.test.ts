@@ -20,7 +20,6 @@ type Route = {
   verify?: (value: Record<string, unknown>) => void;
   before?: (f: Fixture) => void | Promise<void>;
 };
-const digest = `sha256:${'0'.repeat(64)}`;
 function inputFile(f: Fixture, name: string, value: unknown): string {
   const path = join(f.base, name);
   writeFileSync(path, JSON.stringify(value));
@@ -172,35 +171,6 @@ const routes: Route[] = [
     input: () => ({ issueNumber: 17, prNumber: 23 }),
     cli: () => ['finish', '--issue', '17', '--pr', '23'],
     witness: 'issues.update',
-  },
-  {
-    name: 'issue_worktree_transition_inspect',
-    input: () => ({ issueNumber: 17, purpose: 'active-resume' }),
-    cli: () => ['worktree:transition:inspect', '--issue', '17', '--purpose', 'active-resume'],
-    verify: (value) => assert.deepEqual(value.blockers, ['Expected one canonical legacy issue row.']),
-  },
-  {
-    name: 'issue_worktree_transition_apply',
-    input: (f) => ({
-      authority: 'worktree:transition',
-      planPath: join(f.root, 'ai-delivery.config.mjs'),
-      expectedPlanId: digest,
-      relinquishmentCommentId: 1,
-      acceptanceCommentId: 2,
-    }),
-    cli: (f) => [
-      'worktree:transition:apply',
-      '--plan',
-      join(f.root, 'ai-delivery.config.mjs'),
-      '--plan-id',
-      digest,
-      '--relinquishment-comment',
-      '1',
-      '--acceptance-comment',
-      '2',
-      '--authorize-transition',
-    ],
-    refusal: /Unexpected token.*import.*JSON/u,
   },
 ];
 

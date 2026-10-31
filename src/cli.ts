@@ -239,19 +239,8 @@ program
   .option('--parent <number>')
   .option('--branch <branch>')
   .option('--resume-created')
-  .option('--investigation-worktree <path>', 'Prospectively register an already linked host-created investigation')
-  .option('--expected-head <sha>', 'Exact unchanged initial commit for investigation registration')
-  .action(async (o: Record<string, string | boolean>) => {
-    if (o.investigationWorktree !== undefined || o.expectedHead !== undefined) {
-      if (Object.keys(o).some((key) => !['issue', 'investigationWorktree', 'expectedHead'].includes(key)))
-        throw new Error('Investigation registration cannot create or change issue/branch metadata.');
-      return run('issue_start', {
-        issueNumber: int(o.issue as string),
-        investigationWorktree: o.investigationWorktree,
-        expectedHeadSha: o.expectedHead,
-      });
-    }
-    return run('issue_start', {
+  .action(async (o: Record<string, string | boolean>) =>
+    run('issue_start', {
       issueNumber: int(o.issue as string),
       request: o.request,
       requestId: o.requestId,
@@ -268,8 +257,8 @@ program
       parentIssueNumber: int(o.parent as string),
       branch: o.branch,
       resumeCreated: o.resumeCreated === true,
-    });
-  });
+    }),
+  );
 
 for (const name of ['list', 'search'] as const) {
   program
@@ -684,99 +673,33 @@ for (const [command, tool] of [
   ['pr:merge', 'issue_pr_merge'],
   ['finish', 'issue_finish'],
 ] as const) {
-  const mergeCommand = program.command(command).requiredOption('--issue <number>');
-  if (command === 'pr:merge') mergeCommand.requiredOption('--pr <number>');
-  else mergeCommand.option('--pr <number>');
-  mergeCommand
+  program
+    .command(command)
+    .requiredOption('--issue <number>')
+    .requiredOption('--pr <number>')
     .option('--strategy <method>')
     .option('--reviewed-head <sha>')
     .option('--non-closing', 'Retain the referenced issue OPEN; finish refuses this mode')
-    .option('--dry-run');
-  if (command === 'finish')
-    mergeCommand
-      .option('--investigation', 'Complete an unchanged prospectively registered investigation')
-      .option('--result <path>', 'Durable independently reviewed result outside the removable worktree')
-      .option('--authority-comment <number>', 'Exact native operator removal authority comment')
-      .option('--acceptance-comment <number>', 'Exact configured-App result acceptance comment');
-  mergeCommand.action(
-    async (o: {
-      issue: string;
-      pr?: string;
-      strategy?: string;
-      reviewedHead?: string;
-      dryRun?: boolean;
-      nonClosing?: boolean;
-      investigation?: boolean;
-      result?: string;
-      authorityComment?: string;
-      acceptanceComment?: string;
-    }) => {
-      if (o.investigation === true) {
-        if (
-          o.pr !== undefined ||
-          o.strategy !== undefined ||
-          o.reviewedHead !== undefined ||
-          o.nonClosing !== undefined
-        )
-          throw new Error('Investigation completion cannot accept PR or merge options.');
-        return run(tool, {
+    .option('--dry-run')
+    .action(
+      async (o: {
+        issue: string;
+        pr: string;
+        strategy?: string;
+        reviewedHead?: string;
+        dryRun?: boolean;
+        nonClosing?: boolean;
+      }) =>
+        run(tool, {
           issueNumber: int(o.issue),
-          investigation: true,
-          resultPath: o.result,
-          authorityCommentId: int(o.authorityComment),
-          acceptanceCommentId: int(o.acceptanceComment),
+          prNumber: int(o.pr),
+          strategy: o.strategy,
+          reviewedHeadSha: o.reviewedHead,
           dryRun: o.dryRun === true,
-        });
-      }
-      if (o.result !== undefined || o.authorityComment !== undefined || o.acceptanceComment !== undefined)
-        throw new Error('Investigation evidence requires --investigation.');
-      return run(tool, {
-        issueNumber: int(o.issue),
-        prNumber: int(o.pr),
-        strategy: o.strategy,
-        reviewedHeadSha: o.reviewedHead,
-        dryRun: o.dryRun === true,
-        nonClosing: o.nonClosing,
-      });
-    },
-  );
+          nonClosing: o.nonClosing,
+        }),
+    );
 }
-program
-  .command('worktree:transition:inspect')
-  .requiredOption('--issue <number>')
-  .requiredOption('--purpose <purpose>', 'active-resume or merged-cleanup')
-  .option('--disposition <disposition>', 'retain (default) or explicitly unheld remove')
-  .option('--terminal-pr <number>')
-  .option('--retained-holds <comment-ids>', 'Comma-separated native retained-hold comment IDs')
-  .option('--retained-admission <path>')
-  .option('--retained-archive <path>')
-  .action(async (o: Record<string, string | undefined>) =>
-    run('issue_worktree_transition_inspect', {
-      issueNumber: int(o.issue),
-      purpose: o.purpose,
-      ...(o.disposition === undefined ? {} : { disposition: o.disposition }),
-      ...(o.terminalPr === undefined ? {} : { terminalPrNumber: int(o.terminalPr) }),
-      ...(o.retainedHolds === undefined ? {} : { retainedHoldCommentIds: ints(o.retainedHolds) }),
-      ...(o.retainedAdmission === undefined ? {} : { retainedAdmissionPath: o.retainedAdmission }),
-      ...(o.retainedArchive === undefined ? {} : { retainedArchivePath: o.retainedArchive }),
-    }),
-  );
-program
-  .command('worktree:transition:apply')
-  .requiredOption('--plan <path>')
-  .requiredOption('--plan-id <digest>')
-  .requiredOption('--relinquishment-comment <id>')
-  .requiredOption('--acceptance-comment <id>')
-  .option('--authorize-transition', 'Explicit authority for this exact independently accepted plan')
-  .action(async (o: Record<string, string | boolean>) =>
-    run('issue_worktree_transition_apply', {
-      authority: o.authorizeTransition === true ? 'worktree:transition' : '',
-      planPath: o.plan,
-      expectedPlanId: o.planId,
-      relinquishmentCommentId: Number(o.relinquishmentComment),
-      acceptanceCommentId: Number(o.acceptanceComment),
-    }),
-  );
 program
   .command('migrate:legacy-issues')
   .requiredOption('--input-file <path>', 'Offline legacy issue inventory JSON')

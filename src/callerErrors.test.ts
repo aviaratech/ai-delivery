@@ -86,10 +86,7 @@ for (const [tool, input, message, code, path] of cases) {
         error.issues.slice(0, 1).map(({ message, code, path }) => ({ message, code, path })),
         [{ message, code, path }],
       );
-      assert.deepEqual(
-        error.issues.slice(1).map(({ code, path }) => ({ code, path })),
-        tool === 'issue_start' ? [{ code: 'custom', path: [] }] : [],
-      );
+      assert.deepEqual(error.issues.slice(1), []);
       return true;
     });
     const server = createAiDeliveryMcpServer({ repoRoot: '/unrelated', repo: 'example/widget' });

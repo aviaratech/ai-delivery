@@ -22,7 +22,6 @@ const AUTHOR_COMMANDS = new Set([
   'pr:merge',
   'worktree',
   'worktree:create',
-  'worktree:transition:apply',
   'worktrees:cleanup',
   'pr:checkout',
 ]);

@@ -78,24 +78,23 @@ For partial delivery, `--non-closing` requires a canonical `References owner/rep
 
 These are all executable routes; groups/help flags are omitted. A dash means no matching surface. Use each route's `--help` and the published MCP schema for inputs.
 
-| Charter/job                    | CLI                                                                                                      | MCP                                                                    |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Issues: create/start           | `create`, `start`                                                                                        | `issue_create`, `issue_start`                                          |
-| Issues: find/read              | `list`, `search`, `info`, `ready:check`                                                                  | `issue_list`, `issue_search`, `issue_info`, `issue_ready_check`        |
-| Issues: edit/batch             | `update`, `batch:update`                                                                                 | `issue_update`, `issue_batch_update`                                   |
-| Issues: relationships          | `parent`, `blockers`, `subissues`                                                                        | —                                                                      |
-| Issues: journals               | —                                                                                                        | `issue_comment`                                                        |
-| Issues: attention/health       | `board`, `health`                                                                                        | `delivery_board`, `delivery_health`                                    |
-| Issues: Project reconciliation | `board:reconcile`                                                                                        | `board_reconcile`                                                      |
-| Pull requests                  | `pr:create`, `pr:info`                                                                                   | `issue_pr_create`, `issue_pr_info`                                     |
-| Pull requests: observations    | `pr:list`, `pr:checks`                                                                                   | —                                                                      |
-| Reviews: artifact              | `pr:review`                                                                                              | `issue_pr_review`                                                      |
-| Reviews: profile/verdict       | `review doctor`, `review submit`                                                                         | —                                                                      |
-| Merges/completion              | `pr:merge`, `finish`                                                                                     | `issue_pr_merge`, `issue_finish`                                       |
-| Delivery support: plugin       | `plugin install`, `plugin doctor`, `plugin preview`, `plugin update`, `plugin rollback`, `plugin remove` | —                                                                      |
-| Issues: retained transitions   | `worktree:transition:inspect`, `worktree:transition:apply`                                               | `issue_worktree_transition_inspect`, `issue_worktree_transition_apply` |
-| Issues: offline migration plan | `migrate:legacy-issues`                                                                                  | —                                                                      |
-| All: setup/transport           | `config:resolve`, `mcp:serve`                                                                            | —                                                                      |
+| Charter/job | CLI | MCP |
+| --- | --- | --- |
+| Issues: create/start | `create`, `start` | `issue_create`, `issue_start` |
+| Issues: find/read | `list`, `search`, `info`, `ready:check` | `issue_list`, `issue_search`, `issue_info`, `issue_ready_check` |
+| Issues: edit/batch | `update`, `batch:update` | `issue_update`, `issue_batch_update` |
+| Issues: relationships | `parent`, `blockers`, `subissues` | — |
+| Issues: journals | — | `issue_comment` |
+| Issues: attention/health | `board`, `health` | `delivery_board`, `delivery_health` |
+| Issues: Project reconciliation | `board:reconcile` | `board_reconcile` |
+| Pull requests | `pr:create`, `pr:info` | `issue_pr_create`, `issue_pr_info` |
+| Pull requests: observations | `pr:list`, `pr:checks` | — |
+| Reviews: artifact | `pr:review` | `issue_pr_review` |
+| Reviews: profile/verdict | `review doctor`, `review submit` | — |
+| Merges/completion | `pr:merge`, `finish` | `issue_pr_merge`, `issue_finish` |
+| Delivery support: plugin | `plugin install`, `plugin doctor`, `plugin preview`, `plugin update`, `plugin rollback`, `plugin remove` | — |
+| Issues: offline migration plan | `migrate:legacy-issues` | — |
+| All: setup/transport | `config:resolve`, `mcp:serve` | — |
 
 The contract is `ai-delivery.mcp@2`; [tool schemas](src/mcp/tools.ts) and CLI `--help` supply complete inputs. Results retain warnings, history and recovery fields; MCP `verbose: true` or CLI `--json --verbose` requests full payloads. Journal `status` is prose, separate from Project Status.
 
@@ -108,8 +107,6 @@ Installed metadata, separate doctor startup and the active conversation's loaded
 ## Plugin installation
 
 Legacy standalone MCP support lasts at least **two subsequent stable releases and 90 days** after a qualified migration first ships; that anchor remains unknown. Preview/doctor do not qualify migration or start that clock. Migration apply, registration retirement and settings rollback remain unavailable; see [#116](https://github.com/aviaratech/ai-delivery/issues/116). Public npm/local-catalog distribution does not establish plugin-directory admission.
-
-Unsupported historical policy bindings refuse transitions; use the original controller.
 
 ## Contributor checks and release
 

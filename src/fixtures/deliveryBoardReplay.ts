@@ -21,7 +21,6 @@ import * as githubClients from '../github/client.js';
 import * as issueOwner from '../issue.js';
 import type { DeliveryContext } from '../issue.js';
 import { renderJournal, type JournalInput } from '../issueJournal.js';
-import * as worktreeOwner from '../worktree.js';
 import * as projectOwner from '../github/projectDelivery.js';
 import { fixtureGit } from './inertTarget.js';
 import { syntheticDiscoveryClients, syntheticDiscoveryConfig, syntheticOverrides } from './discovery.js';
@@ -695,10 +694,6 @@ export function deliveryBoardReplay(options: BoardReplayOptions = {}) {
   vi.spyOn(projectOwner, 'getIssueProjectStatus').mockImplementation(async () => {
     calls.perItemStatusReads++;
     throw new Error('Per-item Project lookup forbidden');
-  });
-  vi.spyOn(worktreeOwner, 'prepareIssueWorktree').mockImplementation(async () => {
-    calls.setupCalls++;
-    throw new Error('Checkout setup forbidden');
   });
   const execution: ExecutionContext = { settings, repoRoot: base };
   const assertReadOnly = () => {
