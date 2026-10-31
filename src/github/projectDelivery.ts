@@ -129,6 +129,18 @@ export async function getIssueProjectStatus(
   return { itemId: item.id, status };
 }
 
+/** The Status an archived item keeps; null when the item is absent, active or unset. */
+export async function getArchivedIssueProjectStatus(
+  input: ProjectDeliveryInput,
+): Promise<null | ProjectDeliveryStatus> {
+  const configuration =
+    input.configuration ??
+    (await getProjectDeliveryConfiguration({ ...input, settings: requireProjectSettings(input.settings) }));
+  const item = await findIssueProjectItem({ ...input, configuration });
+  if (item === null || !item.archived || (item.status === null && item.statusOptionId === null)) return null;
+  return requireItemStatus(item, configuration);
+}
+
 export async function getProjectDeliveryConfiguration(input: {
   graphql: typeof GraphQLType;
   org: string;

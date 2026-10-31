@@ -34,9 +34,15 @@ export function requireDeferralPatch(value: { defer?: IssueDeferralData; undefer
 
 /** Drafts permit incomplete requirements, but never secret-bearing public content. */
 export const IssueFields = z.strictObject({
-  title: Text,
+  title: Text.describe(
+    'Ready issues need 10–80 characters naming the specific change, with no "Bug:" or "[Task]" prefix.',
+  ),
   issueType: Text.optional(),
-  points: z.number().int().optional(),
+  points: z
+    .number()
+    .int()
+    .optional()
+    .describe("Ready non-epic issues need Points 1–8 from the Points field's options (usually 1, 2, 3, 5 or 8)."),
   epic: z.literal(true).optional(),
   problem: Text.default(''),
   outcome: Text.default(''),
@@ -48,7 +54,8 @@ export const IssueFields = z.strictObject({
     .default({ components: [], files: [], evidence: [] }),
   bug: z
     .strictObject({ steps: Strings, expected: Text, actual: Text, reproducibility: Text, environment: Text })
-    .optional(),
+    .optional()
+    .describe('Required when issueType is Bug: non-empty steps, expected, actual, reproducibility and environment.'),
   draft: z.boolean().default(false),
   deferral: IssueDeferral.optional(),
   legacyBody: Text.optional(),

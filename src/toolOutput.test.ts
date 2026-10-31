@@ -163,6 +163,40 @@ test('verbose belongs to the batch envelope and cannot alter an individual write
   ).toThrow();
 });
 
+test('published write schemas state the limits that refuse a write', async () => {
+  const server = createAiDeliveryMcpServer({ repoRoot: '/synthetic' });
+  const client = new Client({ name: 'schema-limits-synthetic', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const { tools } = await client.listTools();
+  await client.close();
+  await server.close();
+  const published = (name: string) => JSON.stringify(tools.find((tool) => tool.name === name));
+  for (const name of ['issue_create', 'issue_update', 'issue_batch_update']) {
+    expect(published(name)).toContain('10–80 characters');
+    expect(published(name)).toContain('1, 2, 3, 5 or 8');
+    expect(published(name)).toContain('Required when issueType is Bug');
+  }
+  expect(published('issue_comment')).toContain('progress: done, decisionNeeded and non-empty evidence');
+  expect(published('issue_comment')).toContain('HTTPS link with a public DNS hostname');
+});
+
+test('compact batch output reports each item once', () => {
+  const item = {
+    issueNumber: 17,
+    status: 'applied',
+    changes: { state: 'closed', closeReason: 'not_planned' },
+    readback: issue,
+    relatedReadback: { ...issue, closeReason: 'not_planned' },
+  };
+  const value = { dryRun: false, results: Array.from({ length: 10 }, () => item), summary: { total: 10 } };
+  const compact = JSON.stringify(projectToolOutput('issue_batch_update', value));
+  expect(compact).not.toContain('relatedReadback');
+  expect(compact.length).toBeLessThanOrEqual(10 * 600);
+  expect(projectToolOutput('issue_batch_update', value, true)).toBe(value);
+});
+
 test('compact output preserves recovery inputs, fields and diagnostics without mutating evidence', () => {
   const value = {
     status: 'update-incomplete',

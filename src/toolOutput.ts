@@ -12,7 +12,8 @@ function compact(value: unknown): unknown {
   if (typeof value !== 'object' || value === null) return value;
   return Object.fromEntries(
     Object.entries(value).flatMap(([key, item]) => {
-      if (['body', 'routing', 'conversion', 'bodyTransition'].includes(key)) return [];
+      // relatedReadback repeats readback plus the verified changes (#240: 10 closes returned 195 KB).
+      if (['body', 'routing', 'conversion', 'bodyTransition', 'relatedReadback'].includes(key)) return [];
       // Recovery inputs and diagnostics are actionable data, never presentation copies.
       if (['recovery', 'safeResume', 'warnings', 'failures', 'fields'].includes(key)) return [[key, item]];
       if (key === 'reviewRoute' && typeof item === 'object' && item !== null) {
