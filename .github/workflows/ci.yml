@@ -15,6 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Depth 2 keeps the PR merge commit's base parent for the release-lane selection.
+          fetch-depth: 2
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -29,9 +31,17 @@ jobs:
       - name: Pin npm
         run: npm install --global npm@11.19.0
       - name: Install and check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
-          npm run checks -- --results-dir "$RUNNER_TEMP/ai-delivery-check-results"
+          # A PR that touches a release case's file runs the release lane, whose producer is the PR checks.
+          lane=checks
+          if [ "$EVENT_NAME" = pull_request ]; then
+            lane=$(node --input-type=module -e "import { execFileSync } from 'node:child_process'; import { touchesReleaseCases } from './scripts/checks.mjs'; const paths = execFileSync('git', ['diff', '--no-renames', '--name-only', '-z', 'HEAD^1', 'HEAD'], { encoding: 'utf8' }).split('\0'); console.log(touchesReleaseCases(paths) ? 'checks:release' : 'checks');")
+          fi
+          echo "Running npm run $lane"
+          npm run "$lane" -- --results-dir "$RUNNER_TEMP/ai-delivery-check-results"
       - name: Retain PR producer and interrupted check evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
