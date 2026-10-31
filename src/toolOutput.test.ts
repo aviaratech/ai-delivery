@@ -243,7 +243,7 @@ test.each([[], ['--json'], ['--verbose'], ['--json', '--verbose']].map((flags) =
       ],
       { encoding: 'utf8' },
     );
-    expect(result.status, result.stderr).toBe(0);
+    expect(result.status, result.stderr).toBe(1); // THROWAWAY: proves PR CI runs this release case.
     expect(result.stderr).toBe('');
     const full = flags.includes('--json') && flags.includes('--verbose');
     if (full) expect(result.stdout).toBe(JSON.stringify(results.issue_update, null, 2) + '\n');
