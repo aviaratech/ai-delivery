@@ -94,6 +94,8 @@ for (const scenario of [
   'focused-verify',
   'unfinalized-verify',
   'legacy',
+  'dismissed-original',
+  'foreign-commit',
 ] as const) {
   test(`clean-rebase submission eligibility: ${scenario}`, async () => {
     const state = fixture();
@@ -174,8 +176,9 @@ for (const scenario of [
       const reviews = [
         {
           id: 41,
-          state: 'APPROVED',
-          commit_id: newHead.sha,
+          state: scenario === 'dismissed-original' ? 'DISMISSED' : 'APPROVED',
+          // An approval belongs to the head it reviewed; a foreign commit must not carry it.
+          commit_id: scenario === 'foreign-commit' ? newBase : oldHead,
           user: { login: 'synthetic-reviewer[bot]' },
           html_url: 'https://github.com/example/repo/pull/19#pullrequestreview-41',
           body: oldBody,
