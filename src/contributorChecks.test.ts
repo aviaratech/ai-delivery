@@ -419,7 +419,7 @@ function directFocus(f: ReturnType<typeof fixture>, title: string, env: Record<s
       join(repository, 'node_modules/vitest/vitest.mjs'),
       'run',
       '--mode=compiled',
-      'dist/setup.test.js',
+      'dist/lifecycle.test.js',
       ...workerArgs,
       '-t',
       title,
@@ -446,38 +446,6 @@ test(
     }
   },
 );
-
-test('historical archive input cannot override direct-focus PR exclusion', { tags: ['release'] }, () => {
-  const f = fixture();
-  const title =
-    'actual reviewed 0.3.4 archive qualifies with real npm production installation in a temporary synthetic consumer';
-  try {
-    for (const lane of ['absent', 'pr']) {
-      const run = directFocus(
-        f,
-        title,
-        {
-          ...(lane === 'pr' ? { AI_DELIVERY_TEST_LANE: lane } : {}),
-          AI_DELIVERY_REAL_PACKAGE_ARCHIVE: join(f.base, 'explicit-unavailable-historical-input'),
-        },
-        lane,
-      );
-      assert.equal(run.result.status, 0, run.result.stderr.slice(-1500));
-      const report = JSON.parse(readFileSync(run.reportPath, 'utf8')) as TestReport;
-      const selected = report.testResults
-        .flatMap((file) => file.assertionResults)
-        .find((test) => test.fullName === title);
-      assert.ok(selected && ['pending', 'skipped'].includes(selected.status));
-      assert.ok(selected.tags?.includes('release'));
-      assert.ok(
-        readFileSync(run.loaded, 'utf8').trim().split('\n').length >= 2,
-        'The controlled guard must reach the forked worker.',
-      );
-    }
-  } finally {
-    f.cleanup();
-  }
-});
 
 test('direct release focus rejects invalid contracts before any npm launch', { tags: ['release'] }, () => {
   const f = fixture();

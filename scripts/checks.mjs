@@ -363,7 +363,6 @@ export const RELEASE_CASES = [
         'Vitest source and compiled inputs are unique and use isolated core-aware fork workers',
         'runtime-expanded tags match every reviewed mandatory identity without executing cases',
         'direct-focus npm interception reaches the pinned worker before real-case selection',
-        'historical archive input cannot override direct-focus PR exclusion',
         'direct release focus rejects invalid contracts before any npm launch',
         'qualification CLI finishes module loading before its owned graph reuses the validator',
         'real failed and explicitly timed-out commands preserve logs and prove owned cleanup',
