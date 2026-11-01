@@ -76,7 +76,7 @@ const Tracking = {
   labels: Labels.optional(),
   milestone: Positive.optional(),
   parentIssueNumber: Positive.optional(),
-  points: Positive.optional(),
+  points: Positive.optional().describe(IssueFields.shape.points.description ?? ''),
   priority: z.string().min(1).optional(),
   repo: z
     .string()
@@ -87,7 +87,8 @@ const Tracking = {
     .string()
     .trim()
     .min(1, 'Issue title is empty; enter a title.')
-    .max(256, 'Issue title exceeds 256 characters; shorten the title.'),
+    .max(256, 'Issue title exceeds 256 characters; shorten the title.')
+    .describe(IssueFields.shape.title.description ?? ''),
 };
 const NormalStart = z.strictObject({
   ...Tracking,
@@ -192,7 +193,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_start',
     commandName: 'start',
-    description: 'Start a linked issue',
+    description:
+      'Start a linked issue. Prefer issueNumber of an open issue that already meets the ready contract: title, Points and, for Bug issues, the bug fields (see issue_create). A new issue from title or request cannot carry bug fields.',
     inputSchema: NormalStart,
   },
   {

@@ -79,6 +79,9 @@ export function missingJournalFields(input: Record<string, unknown>): string[] {
     .map(([key]) => key);
 }
 
+const onlyFor = (kind: string, what = 'non-empty text') =>
+  `Required ${what} when kind is ${kind}; omit for every other kind.`;
+
 // MCP requires an object schema; the same variant validator enforces kind-specific fields.
 export const JournalInputSchema = z
   .strictObject({
@@ -88,13 +91,13 @@ export const JournalInputSchema = z
       .describe(
         'Select a journal kind and provide its required fields: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps.',
       ),
-    outcome: Text.optional(),
-    done: z.array(Text).min(1).optional(),
-    decisionNeeded: Text.optional(),
-    decision: Text.optional().describe('Required non-empty text when kind is decision; omit for every other kind.'),
-    rationale: Text.optional().describe('Required non-empty text when kind is decision; omit for every other kind.'),
-    blocker: Text.optional(),
-    resolution: Text.optional(),
+    outcome: Text.optional().describe(onlyFor('start')),
+    done: z.array(Text).min(1).optional().describe(onlyFor('progress', 'non-empty list')),
+    decisionNeeded: Text.optional().describe(onlyFor('progress')),
+    decision: Text.optional().describe(onlyFor('decision')),
+    rationale: Text.optional().describe(onlyFor('decision')),
+    blocker: Text.optional().describe(onlyFor('blocker')),
+    resolution: Text.optional().describe(onlyFor('blocker')),
     acceptance: z
       .array(
         z.strictObject(
@@ -103,8 +106,9 @@ export const JournalInputSchema = z
         ),
       )
       .min(1)
-      .optional(),
-    followUps: z.array(Text).optional(),
+      .optional()
+      .describe(onlyFor('closeout', 'non-empty list of criterion and evidence')),
+    followUps: z.array(Text).optional().describe(onlyFor('closeout', 'list, empty when none')),
   })
   .superRefine((input, ctx) => {
     const parsed = JournalVariants.safeParse(input);
