@@ -19,8 +19,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
-import { assertPrivateFile } from './delivery/common.js';
-import { digestBytes, digestValue, writeRepositoryCommandOutput } from './delivery/legacy.js';
+import { assertPrivateFile, digestBytes, digestValue, writeCreateOnly } from './delivery/common.js';
 import { DeliveryError } from './errors.js';
 import { gitCommonDir } from './git.js';
 import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
@@ -879,6 +878,13 @@ export function retainedWorktreeTransitionDependencyManifests(
   return producerContent(realpathSync(distDirectory)).dependencies.map(([source, digest]) => ({ source, digest }));
 }
 
+function writeCommandOutput(bytes: Buffer, commonDir: string): string {
+  const digest = digestBytes(bytes);
+  const path = join(commonDir, 'ai-delivery', 'verification@1', 'command-output', `${digest.slice(7)}.bin`);
+  writeCreateOnly(path, bytes, digest);
+  return digest;
+}
+
 export function runStageCommand(
   repoRoot: string,
   argv: readonly string[],
@@ -956,7 +962,7 @@ export function runStageCommand(
       try {
         const bytes = Buffer.concat([...stdout, ...stderr]);
         if (execution?.failedOutput) return execution.failedOutput(bytes);
-        return ` Command output ${writeRepositoryCommandOutput({ bytes, gitCommonDir: gitCommonDir(repoRoot) })}.${observation}`;
+        return ` Command output ${writeCommandOutput(bytes, gitCommonDir(repoRoot))}.${observation}`;
       } catch (error) {
         return ` Command output persistence failed (${error instanceof Error ? error.message : String(error)}).${observation}`;
       }

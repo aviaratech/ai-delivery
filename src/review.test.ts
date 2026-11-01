@@ -8,7 +8,7 @@ import { test } from 'vitest';
 
 import type { DeliveryConfig } from './config/deliveryConfig.js';
 import { recordedReassociation, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
-import { digestValue, type RepositoryClassificationReceipt } from './delivery/legacy.js';
+import { digestValue } from './delivery/common.js';
 import { createDeliveryGitHubClients, withAuthorGitToken } from './github/client.js';
 import type { DeliveryContext } from './issue.js';
 import { preflightReviewRoute } from './pr.js';
@@ -21,7 +21,6 @@ import {
 } from './review.js';
 
 const head = { sha: 'a'.repeat(40), tree: 'b'.repeat(40) };
-const publicationEvidenceId = `sha256:${'c'.repeat(64)}`;
 const marker = (id: string) => `<!-- ai-delivery-review-artifact: ${id} -->`;
 
 const verdictInput = () => ({
@@ -374,9 +373,7 @@ function fixture(
       },
     },
   } as unknown as DeliveryContext;
-  const classification = { head: fixtureHead, changedPaths: ['change.ts'] } as RepositoryClassificationReceipt;
-  const submit = () =>
-    submitReview({ artifact, classification, context, issueNumber: 17, prNumber: 19, publicationEvidenceId });
+  const submit = () => submitReview({ artifact, context, issueNumber: 17, prNumber: 19 });
   return {
     root,
     context,
