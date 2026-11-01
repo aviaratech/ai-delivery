@@ -20,7 +20,6 @@ import {
 } from './review.js';
 import { serveAiDeliveryMcp } from './mcp/index.js';
 import type { AiDeliveryMcpToolName } from './mcp/tools.js';
-import { planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
 import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
 import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch, ProjectStatusPatch } from './issueContract.js';
@@ -676,13 +675,6 @@ program
     }
   });
 
-program
-  .command('migrate:legacy-issues')
-  .requiredOption('--input-file <path>', 'Offline legacy issue inventory JSON')
-  .action((o: { inputFile: string }) => {
-    const report = planOfflineLegacyIssueMigration(JSON.parse(readFileSync(o.inputFile, 'utf8')) as unknown);
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  });
 program
   .command('config:resolve')
   .description('Read the effective GitHub destination and admission digest')

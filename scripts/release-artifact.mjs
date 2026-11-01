@@ -276,7 +276,6 @@ export function validateBundle(bundle, inputs) {
       'production-install',
       'production-closure',
       'cli-version',
-      'cli-json',
       'exports-node24',
       'library-node26',
       'packaged-mcp',

@@ -293,23 +293,6 @@ const cliOnly: {
   { command: 'pr:checks', args: () => ['pr:checks', '--pr', '23'], witness: 'checks.listForRef' },
   { command: 'config:resolve', args: () => ['config:resolve'], witness: 'appActorLogin' },
   {
-    command: 'migrate:legacy-issues',
-    args: (f) => [
-      'migrate:legacy-issues',
-      '--input-file',
-      inputFile(f, 'migration.json', {
-        issues: [
-          {
-            number: 17,
-            body: 'node consumer-trap.cjs',
-            labels: [],
-            existingNative: { points: 2, issueType: 'Task', blockedBy: [] },
-          },
-        ],
-      }),
-    ],
-  },
-  {
     command: 'review',
     variant: 'doctor',
     args: () => ['review', 'doctor', '--identity', 'reviewer'],

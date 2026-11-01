@@ -316,11 +316,6 @@ export const RELEASE_CASES = [
     kind: 'mandatory',
   },
   {
-    file: 'dist/genericCompatibility.test.js',
-    title: 'legacy CLI emits an offline plan without modifying its input',
-    kind: 'mandatory',
-  },
-  {
     file: 'dist/toolOutput.test.js',
     title: 'actual CLI output flags []',
     kind: 'mandatory',

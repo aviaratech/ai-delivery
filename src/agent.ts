@@ -39,7 +39,6 @@ export {
   replaceParentIssue,
   hasNativeSubIssues,
 } from './github/relationships.js';
-export { normalizeLegacyIssue, planOfflineLegacyIssueMigration } from './services/legacyIssueMigration.js';
 export { withVerificationFilesystemFixture } from './verification.js';
 
 export { discoverDeliveryRouting } from './github/discovery.js';

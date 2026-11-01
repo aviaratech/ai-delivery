@@ -95,27 +95,6 @@ const scenarios: Scenario[] = [
       assert.equal((v.reviewRoute as { reviewer: { actorLogin: string } }).reviewer.actorLogin, 'reviewer[bot]');
     },
   },
-  {
-    name: 'CLI offline migration',
-    mode: 'cli',
-    args: ['migrate:legacy-issues'],
-    verify: (v) => {
-      assert.equal(v.schemaVersion, 'ai-delivery.legacy-issue-migration@1');
-      assert.equal(v.validated, 0);
-      const plans = v.plans as {
-        number: number;
-        body: string;
-        native: { points: number; issueType: string };
-        retiredLabels: string[];
-      }[];
-      assert.equal(plans.length, 1);
-      assert.equal(plans[0]!.number, 17);
-      assert.equal(plans[0]!.native.points, 2);
-      assert.equal(plans[0]!.native.issueType, 'Task');
-      assert.match(plans[0]!.body, /node consumer-trap.cjs/u);
-      assert.deepEqual(plans[0]!.retiredLabels, ['effort:s', 'type:task']);
-    },
-  },
   { name: 'public agent export', mode: 'direct', args: [], witness: 'issues.get', verify: info },
   { name: 'fresh public MCP', mode: 'mcp', args: [], witness: 'issues.get', verify: info },
   ...(['install', 'doctor', 'update', 'rollback', 'remove'] as const).map((action) => ({

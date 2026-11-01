@@ -432,7 +432,6 @@ export function validateConsumer(input, contract, candidate) {
     'production-install',
     'production-closure',
     'cli-version',
-    'cli-json',
     'exports-node24',
     'library-node26',
     'packaged-mcp',
