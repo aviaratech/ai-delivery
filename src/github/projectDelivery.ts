@@ -18,11 +18,6 @@ export interface ProjectDeliverySettings {
 
 export type ProjectDeliveryStatus = (typeof PROJECT_DELIVERY_STATUSES)[number];
 
-export interface ProjectDeliveryArchiveReadback {
-  archived: true;
-  itemId: string;
-}
-
 export interface ProjectDeliveryConfiguration {
   pointsFieldId: string;
   priorityFieldId: string;
@@ -34,11 +29,6 @@ export interface ProjectDeliveryConfiguration {
   reviewOptionId?: string;
   title: string;
   writable: boolean;
-}
-
-export interface ProjectDeliveryRestoreReadback {
-  archived: false;
-  itemId: string;
 }
 
 export interface ProjectDeliveryStatusReadback {
@@ -66,47 +56,6 @@ interface ProjectDeliveryItem {
   status: null | ProjectDeliveryStatus;
   statusOptionId: null | string;
   review?: true;
-}
-
-export async function archiveIssueProjectItem(
-  input: ProjectDeliveryInput,
-): Promise<null | ProjectDeliveryArchiveReadback> {
-  const configuration =
-    input.configuration ??
-    (await getProjectDeliveryConfiguration({
-      ...input,
-      settings: requireProjectSettings(input.settings),
-      requireWritable: true,
-    }));
-  assertWritableConfiguration(configuration);
-  const item = await findIssueProjectItem({ ...input, configuration });
-  if (item === null) return null;
-  if (item.archived) return { archived: true, itemId: item.id };
-
-  const response: unknown = await input.graphql(
-    `
-      mutation ArchiveProjectDeliveryItem($projectId: ID!, $itemId: ID!) {
-        archiveProjectV2Item(input: { projectId: $projectId, itemId: $itemId }) {
-          item { id isArchived }
-        }
-      }
-    `,
-    { itemId: item.id, projectId: configuration.projectId },
-  );
-  const record = requireRecord(response, 'GitHub returned invalid Project archive evidence.');
-  const payload = requireRecord(record.archiveProjectV2Item, 'GitHub omitted Project archive payload.');
-  const archivedItem = requireRecord(payload.item, 'GitHub omitted the archived Project item.');
-  if (archivedItem.id !== item.id || archivedItem.isArchived !== true) {
-    throw new DeliveryError('Project archive mutation did not return the exact archived item.');
-  }
-  await readBackProjectArchiveState({
-    archived: true,
-    configuration,
-    graphql: input.graphql,
-    issueNodeId: input.issueNodeId,
-    itemId: item.id,
-  });
-  return { archived: true, itemId: item.id };
 }
 
 export async function getIssueProjectStatus(
@@ -384,47 +333,6 @@ export function resolveProjectDeliveryConfiguration(
   };
 }
 
-export async function restoreIssueProjectItem(
-  input: ProjectDeliveryInput,
-): Promise<null | ProjectDeliveryRestoreReadback> {
-  const configuration =
-    input.configuration ??
-    (await getProjectDeliveryConfiguration({
-      ...input,
-      settings: requireProjectSettings(input.settings),
-      requireWritable: true,
-    }));
-  assertWritableConfiguration(configuration);
-  const item = await findIssueProjectItem({ ...input, configuration });
-  if (item === null) return null;
-  if (!item.archived) return { archived: false, itemId: item.id };
-
-  const response: unknown = await input.graphql(
-    `
-      mutation RestoreProjectDeliveryItem($projectId: ID!, $itemId: ID!) {
-        unarchiveProjectV2Item(input: { projectId: $projectId, itemId: $itemId }) {
-          item { id isArchived }
-        }
-      }
-    `,
-    { itemId: item.id, projectId: configuration.projectId },
-  );
-  const record = requireRecord(response, 'GitHub returned invalid Project restore evidence.');
-  const payload = requireRecord(record.unarchiveProjectV2Item, 'GitHub omitted Project restore payload.');
-  const restoredItem = requireRecord(payload.item, 'GitHub omitted the restored Project item.');
-  if (restoredItem.id !== item.id || restoredItem.isArchived !== false) {
-    throw new DeliveryError('Project restore mutation did not return the exact active item.');
-  }
-  await readBackProjectArchiveState({
-    archived: false,
-    configuration,
-    graphql: input.graphql,
-    issueNodeId: input.issueNodeId,
-    itemId: item.id,
-  });
-  return { archived: false, itemId: item.id };
-}
-
 /** Read-only preflight; the later synchronization still checks for archive races. */
 export async function assertIssueProjectWritable(
   input: ProjectDeliveryInput & { preserveArchived?: boolean },
@@ -605,89 +513,6 @@ function assertWritableConfiguration(configuration: ProjectDeliveryConfiguration
   }
 }
 
-async function fetchProjectDeliveryItemNodes(
-  input: Omit<ProjectDeliveryInput, 'issueNodeId'> & {
-    configuration: ProjectDeliveryConfiguration;
-    strictProjection?: boolean;
-  },
-): Promise<unknown[]> {
-  const nodes: unknown[] = [];
-  let cursor: null | string = null;
-  let hasNextPage = true;
-  const seenCursors = new Set<string>();
-  let pages = 0;
-  if (input.maxPages !== undefined && (!Number.isSafeInteger(input.maxPages) || input.maxPages <= 0))
-    throw new DeliveryError('Project item page budget must be positive.');
-
-  while (hasNextPage) {
-    if (input.maxPages !== undefined && pages >= input.maxPages)
-      throw new CollectionLimitError({
-        collection: 'project-items',
-        pagesRequested: pages,
-        rowsObserved: nodes.length,
-        limit: input.maxPages,
-      });
-    pages++;
-    const response: unknown = await input.graphql(
-      `
-        query ProjectDeliveryItems($org: String!, $number: Int!, $cursor: String, $statusField: String!) {
-          organization(login: $org) {
-            projectV2(number: $number) {
-              id
-              number
-              items(first: 100, after: $cursor, archivedStates: [ARCHIVED, NOT_ARCHIVED]) {
-                nodes {
-                  id
-                  isArchived
-                  content { __typename ... on Issue { id number repository { nameWithOwner } } ... on PullRequest { id } ... on DraftIssue { id } }
-                  fieldValueByName(name: $statusField) {
-                    ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
-                  }
-                }
-                pageInfo { endCursor hasNextPage }
-              }
-            }
-          }
-        }
-      `,
-      {
-        cursor,
-        number: input.configuration.projectNumber,
-        org: input.org,
-        statusField: input.configuration.settings.statusField,
-      },
-    );
-    const record = requireRecord(response, 'GitHub returned invalid delivery Project item evidence.');
-    if (input.strictProjection && 'errors' in record)
-      throw new DeliveryError('GitHub returned partial Project item evidence.');
-    const organization = requireRecord(record.organization, 'GitHub omitted the delivery Project organization.');
-    const project = requireRecord(organization.projectV2, 'GitHub omitted the delivery Project.');
-    if (
-      (input.capacityRead || input.strictProjection) &&
-      (project.id !== input.configuration.projectId || project.number !== input.configuration.projectNumber)
-    )
-      throw new DeliveryError('WIP capacity Project identity disagrees with the configured Project.');
-    const items = requireRecord(project.items, 'GitHub omitted delivery Project items.');
-    if (!Array.isArray(items.nodes)) {
-      throw new DeliveryError('GitHub returned invalid delivery Project items.');
-    }
-    nodes.push(...(items.nodes as unknown[]));
-    const pageInfo = requireRecord(items.pageInfo, 'GitHub omitted delivery Project item pagination.');
-    if (
-      ((input.capacityRead || input.strictProjection) && typeof pageInfo.hasNextPage !== 'boolean') ||
-      (input.capacityRead && pageInfo.endCursor !== null && typeof pageInfo.endCursor !== 'string')
-    )
-      throw new DeliveryError('WIP capacity Project pagination is incomplete.');
-    hasNextPage = pageInfo.hasNextPage === true;
-    const nextCursor = typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null;
-    assertAdvancingCursor({ cursor, hasNextPage, nextCursor, seenCursors, surface: 'item' });
-    if (nextCursor !== null) seenCursors.add(nextCursor);
-    cursor = nextCursor;
-  }
-
-  return nodes;
-}
-
 /** Reads the issue's own Project items (one request) instead of paging the whole board. */
 async function findIssueProjectItem(
   input: ProjectDeliveryInput & { configuration: ProjectDeliveryConfiguration },
@@ -742,73 +567,6 @@ async function findIssueProjectItem(
   return matches[0] ?? null;
 }
 
-export interface ProjectItemObservation extends ProjectDeliveryItem {
-  projectId: string;
-  projectNumber: number;
-  contentKind: 'issue' | 'draft' | 'pull-request';
-  statusRead: 'verified' | 'unset' | 'unreadable';
-  statusName: string | null;
-  repository?: string;
-  issueNumber?: number;
-}
-
-/** Complete, strict reconciliation projection over the same Project pagination owner. */
-export async function readProjectDeliveryItems(input: {
-  graphql: typeof GraphQLType;
-  org: string;
-  configuration: ProjectDeliveryConfiguration;
-  maxPages: number;
-}): Promise<ProjectItemObservation[]> {
-  const observations: ProjectItemObservation[] = [];
-  const ids = new Set<string>();
-  for (const raw of await fetchProjectDeliveryItemNodes({ ...input, strictProjection: true })) {
-    const record = requireRecord(raw, 'GitHub returned invalid Project membership.');
-    if (typeof record.isArchived !== 'boolean') throw new DeliveryError('Project archive projection is incomplete.');
-    const content = requireRecord(record.content, 'Project content is unreadable; absence cannot be proved.');
-    const kind = content.__typename;
-    if (kind !== 'Issue' && kind !== 'DraftIssue' && kind !== 'PullRequest')
-      throw new DeliveryError('Project content type is unreadable.');
-    // Membership identity is independent of whether this item's Status is usable.
-    let item = parseProjectItem({ ...record, fieldValueByName: null }, input.configuration);
-    if (!item || ids.has(item.id)) throw new DeliveryError('Project item identity is missing or repeated.');
-    let statusRead: ProjectItemObservation['statusRead'] = record.fieldValueByName === null ? 'unset' : 'unreadable';
-    const rawStatus = isRecord(record.fieldValueByName) ? record.fieldValueByName : null;
-    const safeText = (value: unknown): string | null =>
-      typeof value === 'string' && value.length > 0 && value.length <= 512 ? value : null;
-    const statusName = safeText(rawStatus?.name);
-    if (record.fieldValueByName !== undefined && record.fieldValueByName !== null) {
-      try {
-        item = parseProjectItem(record, input.configuration)!;
-        statusRead = 'verified';
-      } catch {
-        item.statusOptionId = safeText(rawStatus?.optionId);
-      }
-    }
-    ids.add(item.id);
-    const identity = {
-      ...item,
-      projectId: input.configuration.projectId,
-      projectNumber: input.configuration.projectNumber,
-      statusRead,
-      statusName,
-    };
-    if (kind === 'Issue') {
-      const repository = requireString(
-        requireRecord(content.repository, 'Project issue repository is unreadable.').nameWithOwner,
-        'Project issue repository is missing.',
-      );
-      if (
-        !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository) ||
-        !Number.isSafeInteger(content.number) ||
-        Number(content.number) <= 0
-      )
-        throw new DeliveryError('Project issue identity is invalid.');
-      observations.push({ ...identity, contentKind: 'issue', repository, issueNumber: Number(content.number) });
-    } else observations.push({ ...identity, contentKind: kind === 'DraftIssue' ? 'draft' : 'pull-request' });
-  }
-  return observations;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -855,44 +613,6 @@ function parseProjectItem(
     statusOptionId,
     ...(review ? { review: true as const } : {}),
   };
-}
-
-async function readBackProjectArchiveState(input: {
-  archived: boolean;
-  configuration: ProjectDeliveryConfiguration;
-  graphql: typeof GraphQLType;
-  issueNodeId: string;
-  itemId: string;
-}): Promise<void> {
-  const response: unknown = await input.graphql(
-    `
-      query ${input.archived ? 'Archived' : 'Restored'}ProjectDeliveryItemReadback($itemId: ID!) {
-        node(id: $itemId) {
-          ... on ProjectV2Item {
-            id
-            isArchived
-            project { id number }
-            content { ... on Issue { id } }
-          }
-        }
-      }
-    `,
-    { itemId: input.itemId },
-  );
-  const state = input.archived ? 'archived' : 'restored';
-  const record = requireRecord(response, `GitHub returned invalid ${state} Project item readback.`);
-  const node = requireRecord(record.node, `GitHub omitted ${state} Project item readback.`);
-  const project = requireRecord(node.project, `GitHub omitted ${state} Project identity readback.`);
-  const content = requireRecord(node.content, `GitHub omitted ${state} Project item content readback.`);
-  if (
-    node.id !== input.itemId ||
-    node.isArchived !== input.archived ||
-    project.id !== input.configuration.projectId ||
-    project.number !== input.configuration.projectNumber ||
-    content.id !== input.issueNodeId
-  ) {
-    throw new DeliveryError(`Project ${state} readback did not report the exact issue item.`);
-  }
 }
 
 export async function readBackProjectItem(input: {

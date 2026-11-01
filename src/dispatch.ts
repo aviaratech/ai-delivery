@@ -1,12 +1,4 @@
 import { issueView, prView } from './readView.js';
-import { deliveryHealth, type DeliveryHealthRequest } from './services/deliveryHealthService.js';
-import { collectDeliveryBoard, parseDeliveryBoardRequest } from './deliveryBoard.js';
-import {
-  boardReconcile,
-  boardReconcileGap,
-  parseBoardReconcileRequest,
-  incompleteBoardReconcile,
-} from './services/boardReconcileService.js';
 import { loadDeliverySettings, type LoadedDeliverySettings } from './config/deliveryConfig.js';
 import { DeliveryError } from './errors.js';
 import { digestValue } from './delivery/common.js';
@@ -282,40 +274,6 @@ export async function executeTool(
 ): Promise<unknown> {
   const definition = getAiDeliveryMcpTool(name);
   if (!definition) throw new DeliveryError(`Unknown ai-delivery tool ${name}.`);
-  if (name === 'delivery_board')
-    return collectDeliveryBoard(parseDeliveryBoardRequest(definition.inputSchema.parse(raw)), execution);
-  if (name === 'board_reconcile') {
-    let request = parseBoardReconcileRequest(raw);
-    if (execution.repo !== undefined) {
-      if (request.repo !== undefined && request.repo.toLowerCase() !== execution.repo.trim().toLowerCase())
-        throw new DeliveryError('Tool and execution repository selectors disagree.');
-      request = parseBoardReconcileRequest({ ...request, repo: execution.repo });
-    }
-    if (request.mode === 'apply' && execution.personalAuth === true)
-      throw new DeliveryError(
-        'Board apply forbids the legacy personal-auth development override; use the configured author.',
-      );
-    let repository = request.repositories[0]!;
-    let checkoutRoots: readonly string[] = [];
-    const contexts: Awaited<ReturnType<typeof loadDeliveryContext>>[] = [];
-    try {
-      const settings = await loadDeliverySettings();
-      checkoutRoots = settings.checkoutRoots;
-      for (const selected of request.repositories) {
-        repository = selected;
-        contexts.push(
-          await contextFor({ ...execution, repoRoot: '', repo: selected }, definition.commandName, 'author', 20, false),
-        );
-      }
-    } catch (error) {
-      const failure = boardReconcileGap(repository, 'context', error);
-      return incompleteBoardReconcile(request, failure);
-    }
-    return boardReconcile(contexts, request, {
-      checkoutRoots,
-      ...(execution.signal === undefined ? {} : { signal: execution.signal }),
-    });
-  }
   const { repo: selected, verbose: _verbose, ...input } = definition.inputSchema.parse(raw) as Record<string, unknown>;
   if (selected !== undefined && execution.repo !== undefined && selected !== execution.repo)
     throw new DeliveryError('Tool and execution repository selectors disagree.');
@@ -330,8 +288,6 @@ export async function executeTool(
     name === 'issue_pr_review' ? 'reviewer' : 'author',
   );
   switch (name) {
-    case 'delivery_health':
-      return deliveryHealth(context, { ...input, repo: repo! } as DeliveryHealthRequest);
     case 'issue_comment':
       return commentIssue(context, input as JournalInput);
     case 'issue_create':

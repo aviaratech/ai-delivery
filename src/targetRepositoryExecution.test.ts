@@ -39,34 +39,6 @@ const journal = {
 };
 const routes: Route[] = [
   {
-    name: 'delivery_board',
-    input: () => ({ repos: ['example/widget'], verbose: true }),
-    cli: () => ['board', '--repos', 'example/widget', '--json'],
-    witness: 'issues.listForRepo',
-    verify: (value) => assert.equal(value.schemaVersion, 'ai-delivery.board@1'),
-  },
-  {
-    name: 'board_reconcile',
-    input: (f) => ({
-      repositories: ['example/widget'],
-      checkouts: [{ repository: 'example/widget', issueNumber: 17, path: f.root }],
-    }),
-    cli: (f) => [
-      'board:reconcile',
-      '--repositories',
-      'example/widget',
-      '--checkouts-file',
-      inputFile(f, 'checkouts.json', [{ repository: 'example/widget', issueNumber: 17, path: f.root }]),
-    ],
-    witness: 'issues.listForRepo',
-  },
-  {
-    name: 'delivery_health',
-    input: () => ({ from: '2026-01-01T00:00:00Z', to: '2026-01-04T00:00:00Z', maxIssues: 1 }),
-    cli: () => ['health', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-04T00:00:00Z', '--max-issues', '1'],
-    witness: 'issues.listForRepo',
-  },
-  {
     name: 'issue_comment',
     input: () => journal,
     witness: 'issues.getComment',
@@ -232,7 +204,7 @@ for (const route of routes) {
         await route.before?.(f);
         // A schema/authentication failure must never masquerade as owner coverage.
         AI_DELIVERY_MCP_TOOLS.find((tool) => tool.name === route.name)!.inputSchema.parse({
-          ...(route.name === 'delivery_board' ? {} : { repo: 'example/widget' }),
+          repo: 'example/widget',
           ...route.input(f),
         });
         if (surface === 'MCP') {

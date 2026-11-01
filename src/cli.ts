@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createDeliveryGitHubClients } from './github/client.js';
 import { appCredentialSource, loadDeliverySettings } from './config/deliveryConfig.js';
@@ -25,8 +25,6 @@ import { managePlugin } from './pluginInstaller.js';
 import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch, ProjectStatusPatch } from './issueContract.js';
 import { NativeIssueDateFields } from './github/nativeIssueMetadata.js';
 import { DeliveryError } from './errors.js';
-import { parseBoardReconcileRequest } from './services/boardReconcileService.js';
-import { renderDeliveryBoard, type DeliveryBoardResult } from './deliveryBoard.js';
 
 const program = new Command();
 program
@@ -109,15 +107,6 @@ function run(name: AiDeliveryMcpToolName, input: Record<string, unknown>): Promi
 }
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-function reconciliationFile(path: string): unknown {
-  const limit = 16 * 1024 * 1024;
-  const stat = statSync(path);
-  if (!stat.isFile() || stat.size > limit)
-    throw new DeliveryError('Reconciliation files must be regular UTF-8 JSON files of at most 16 MiB.');
-  const bytes = readFileSync(path);
-  if (bytes.byteLength > limit) throw new DeliveryError('Reconciliation files exceed 16 MiB.');
-  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown;
 }
 
 const plugin = program.command('plugin').description('Manage the ai-delivery native plugin');
@@ -373,54 +362,6 @@ program
   );
 
 program
-  .command('board')
-  .description('Read delivery attention and readiness for explicit repositories')
-  .requiredOption('--repos <owner/repo,...>', 'Explicit GitHub repositories, separated by commas')
-  .option('--decision-labels <label,...>', 'Additional labels that signal human attention')
-  .option('--json', 'Print the complete board as JSON')
-  .action(async (options: { repos: string; decisionLabels?: string; json?: boolean }) => {
-    // Preserve empty selectors and control characters for the common validator.
-    const result = (await executeTool(
-      'delivery_board',
-      { repos: options.repos.split(','), decisionLabels: options.decisionLabels?.split(',') },
-      execution(),
-    )) as DeliveryBoardResult;
-    if (options.json || program.opts<{ json?: boolean }>().json) print(result);
-    else process.stdout.write(`${renderDeliveryBoard(result)}\n`);
-  });
-
-program
-  .command('board:reconcile')
-  .description('Plan or apply bounded Project reconciliation for explicit repositories')
-  .requiredOption('--repositories <owner/repo...>', '1–10 explicit GitHub repositories')
-  .option('--checkouts-file <path>', 'UTF-8 JSON checkout selectors for dry-run')
-  .option('--dry-run', 'Collect a plan without writes (default)')
-  .option('--apply', 'Apply the retained original plan')
-  .option('--plan-file <path>', 'Original complete reconciliation plan JSON')
-  .option('--prior-result-file <path>', 'Optional prior result JSON for the exact original plan')
-  .action(
-    async (options: {
-      repositories: string[];
-      checkoutsFile?: string;
-      dryRun?: boolean;
-      apply?: boolean;
-      planFile?: string;
-      priorResultFile?: string;
-    }) => {
-      if (options.dryRun && options.apply) throw new DeliveryError('Choose either --dry-run or --apply.');
-      const request = parseBoardReconcileRequest({
-        repositories: options.repositories,
-        ...(execution().repo === undefined ? {} : { repo: execution().repo }),
-        mode: options.apply ? 'apply' : 'dry-run',
-        ...(options.checkoutsFile === undefined ? {} : { checkouts: reconciliationFile(options.checkoutsFile) }),
-        ...(options.planFile === undefined ? {} : { plan: reconciliationFile(options.planFile) }),
-        ...(options.priorResultFile === undefined ? {} : { priorResult: reconciliationFile(options.priorResultFile) }),
-      });
-      return run('board_reconcile', request);
-    },
-  );
-
-program
   .command('batch:update')
   .description('Plan or apply 1–50 current-repository issue updates with ordered readback')
   .requiredOption('--items-file <path>', 'UTF-8 JSON array of complete issue_update inputs')
@@ -432,25 +373,6 @@ program
     }),
   );
 
-program
-  .command('health')
-  .requiredOption('--from <utc>', 'Inclusive UTC ISO timestamp')
-  .requiredOption('--to <utc>', 'Exclusive UTC ISO timestamp')
-  .option('--max-issues <number>')
-  .option('--max-timeline-pages <number>')
-  .option('--max-project-pages <number>')
-  .option('--oldest-limit <number>')
-  .action(async (o: Record<string, string>) =>
-    run('delivery_health', {
-      repo: execution().repo,
-      from: o.from,
-      to: o.to,
-      maxIssues: int(o.maxIssues),
-      maxTimelinePages: int(o.maxTimelinePages),
-      maxProjectPages: int(o.maxProjectPages),
-      oldestLimit: int(o.oldestLimit),
-    }),
-  );
 program
   .command('info')
   .requiredOption('--issue <number>')

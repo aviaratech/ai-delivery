@@ -235,7 +235,6 @@ test('compact output preserves recovery inputs, fields and diagnostics without m
   expect(compact.failures).toEqual([warning]);
   expect(JSON.stringify(value)).toBe(before);
   expect(projectToolOutput('issue_update', value, true)).toBe(value);
-  expect(projectToolOutput('board_reconcile', value)).toBe(value);
 });
 
 test.each([[], ['--json'], ['--verbose'], ['--json', '--verbose']].map((flags) => ({ flags })))(

@@ -1,7 +1,5 @@
 import { z } from 'zod';
 import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
-import { DeliveryHealthInput } from '../services/deliveryHealthService.js';
-import { BoardReconcileInput } from '../services/boardReconcileService.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema, JOURNAL_SCHEMA_METADATA } from '../issueJournal.js';
 import {
@@ -126,30 +124,6 @@ const SearchText = z
   .regex(/^[^"\\\r\n]+$/u);
 
 export const AI_DELIVERY_MCP_TOOLS = [
-  {
-    name: 'delivery_board',
-    commandName: 'board',
-    description:
-      'Read human attention, native PR readiness, stale In Progress issues and seven-day delivery marker fractions for explicit repositories. Partial observations are data, never merge authority.',
-    inputSchema: z.strictObject({
-      repos: z.array(Repo.unwrap()).min(1),
-      decisionLabels: z.array(z.string().min(1)).optional(),
-      verbose: Verbose,
-    }),
-  },
-  {
-    name: 'board_reconcile',
-    commandName: 'board:reconcile',
-    description:
-      'Plan or apply bounded Project membership and proven Status reconciliation for 1–10 explicit repositories. Retain the original plan and optional prior result for recovery; unknown activity and metadata suggestions never authorize writes.',
-    inputSchema: BoardReconcileInput,
-  },
-  {
-    name: 'delivery_health',
-    commandName: 'health',
-    description: 'Read bounded native delivery health for an explicit repository and UTC window',
-    inputSchema: DeliveryHealthInput,
-  },
   {
     name: 'issue_comment',
     commandName: 'comment',

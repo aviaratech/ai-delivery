@@ -129,7 +129,7 @@ test('Node 26 packed public exports load from a consumer', { tags: ['release'] }
     import('@aviaratech/ai-delivery'), import('@aviaratech/ai-delivery/agent'),
     import('@aviaratech/ai-delivery/delivery'), import('@aviaratech/ai-delivery/mcp'),
   ]);
-  assert.equal(root.deliveryHealth, agent.deliveryHealth);
+  assert.equal(root.executeTool, agent.executeTool);
   assert.equal(typeof agent.verifyIssue, 'undefined');
   assert.equal(typeof delivery.loadValidRepositoryDeliveryEvidence, 'undefined');
   assert.equal(typeof mcp.createAiDeliveryMcpServer, 'function');

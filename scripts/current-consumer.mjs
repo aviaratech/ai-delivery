@@ -778,12 +778,12 @@ const EXPORT_PROBE = `import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';import {createHash} from 'node:crypto';import {fileURLToPath} from 'node:url';
 const root=await import('@aviaratech/ai-delivery');const agent=await import('@aviaratech/ai-delivery/agent');
 const delivery=await import('@aviaratech/ai-delivery/delivery');const mcp=await import('@aviaratech/ai-delivery/mcp');
-assert.equal(root.deliveryHealth,agent.deliveryHealth);
+assert.equal(root.executeTool,agent.executeTool);
 assert.equal(typeof agent.verifyIssue,'undefined');assert.equal(typeof delivery.loadValidRepositoryDeliveryEvidence,'undefined');
 assert.equal(typeof mcp.createAiDeliveryMcpServer,'function');
-assert.equal(typeof agent.deliveryHealth,'function');
+assert.equal(typeof agent.executeTool,'function');
 const entryUrl=import.meta.resolve('@aviaratech/ai-delivery/agent');
-console.log(JSON.stringify({runtime:process.version,exports:['.','./agent','./delivery','./mcp'],deliveryHealth:{module:'./agent',exportName:'deliveryHealth',type:typeof agent.deliveryHealth,entryUrl,entrySha256:createHash('sha256').update(readFileSync(fileURLToPath(entryUrl))).digest('hex')}}));`;
+console.log(JSON.stringify({runtime:process.version,exports:['.','./agent','./delivery','./mcp'],agentExport:{module:'./agent',exportName:'executeTool',type:typeof agent.executeTool,entryUrl,entrySha256:createHash('sha256').update(readFileSync(fileURLToPath(entryUrl))).digest('hex')}}));`;
 
 export const MCP_PROBE = `import assert from 'node:assert/strict';import {spawn} from 'node:child_process';
 import {createRequire} from 'node:module';import {fileURLToPath} from 'node:url';
@@ -1034,13 +1034,13 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
         ];
         for (const [phase, executable, version] of exportChecks) {
           const proof = record(parseJsonOutput(await run(phase, executable, [exportsPath], probeEnv)));
-          const health = record(proof.deliveryHealth, 'schema');
+          const health = record(proof.agentExport, 'schema');
           const agentMember = candidate.inventory.find((member) => member.path === 'dist/agent.js');
           requireProof(
             proof.runtime === version &&
               JSON.stringify(proof.exports) === JSON.stringify(EXPORTS) &&
               health.module === './agent' &&
-              health.exportName === 'deliveryHealth' &&
+              health.exportName === 'executeTool' &&
               health.type === 'function' &&
               fileURLToPath(string(health.entryUrl, 'schema')) === join(installed, 'dist/agent.js') &&
               agentMember !== undefined &&

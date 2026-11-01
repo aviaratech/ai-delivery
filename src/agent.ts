@@ -43,6 +43,3 @@ export {
 export { discoverDeliveryRouting } from './github/discovery.js';
 export type { DeliveryRouting, DiscoveryClients } from './github/discovery.js';
 export type { DeliveryOverrides, DeliveryPolicySettings, LoadedDeliverySettings } from './config/deliveryConfig.js';
-
-export { deliveryHealth } from './services/deliveryHealthService.js';
-export type { DeliveryHealthRequest } from './services/deliveryHealthService.js';
