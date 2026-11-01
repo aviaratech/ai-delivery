@@ -31,44 +31,6 @@ export interface VerificationResourceBounds {
   outputRoots?: readonly string[];
 }
 
-const ResourceSummarySchema = z
-  .strictObject({
-    bounds: z.strictObject({
-      maxAggregateRssBytes: z.number().int().positive().safe(),
-      maxNewOutputBytes: z.number().int().positive().safe().optional(),
-      minFreeDiskBytes: z.number().int().positive().safe(),
-      outputRoots: z.array(z.string().min(1)).min(1).optional(),
-    }),
-    maxSampledAggregateRssBytes: z.number().int().nonnegative().safe().nullable(),
-    maxSampledNewOutputBytes: z.number().int().nonnegative().safe().nullable(),
-    minSampledFreeDiskBytes: z.number().int().nonnegative().safe().nullable(),
-    observation: z.literal('sampled'),
-    outputBaselineId: z
-      .string()
-      .regex(/^sha256:[a-f0-9]{64}$/u)
-      .optional(),
-    processCoverage: z.literal('observed-processes-only'),
-    sampleCount: z.number().int().nonnegative().safe(),
-  })
-  .superRefine((value, ctx) => {
-    if (
-      (value.maxSampledAggregateRssBytes !== null &&
-        value.maxSampledAggregateRssBytes > value.bounds.maxAggregateRssBytes) ||
-      (value.maxSampledNewOutputBytes !== null &&
-        value.bounds.maxNewOutputBytes !== undefined &&
-        value.maxSampledNewOutputBytes > value.bounds.maxNewOutputBytes) ||
-      (value.minSampledFreeDiskBytes !== null && value.minSampledFreeDiskBytes < value.bounds.minFreeDiskBytes) ||
-      (value.sampleCount > 0 &&
-        (value.maxSampledAggregateRssBytes === null || value.minSampledFreeDiskBytes === null)) ||
-      (value.bounds.maxNewOutputBytes !== undefined &&
-        value.sampleCount > 0 &&
-        value.maxSampledNewOutputBytes === null) ||
-      (value.bounds.maxNewOutputBytes !== undefined) !== (value.outputBaselineId !== undefined)
-    )
-      ctx.addIssue({ code: 'custom', message: 'Resource samples do not satisfy their declared bounds.' });
-  });
-export type VerificationResourceSummary = z.infer<typeof ResourceSummarySchema>;
-
 interface ResourceSample {
   aggregateRssBytes: number;
   freeDiskBytes: number;
@@ -871,13 +833,6 @@ export function retainedWorktreeTransitionProducerDigest(distDirectory: string):
   return producerDigest(realpathSync(distDirectory));
 }
 
-/** @internal Preserve the same dependency manifests that participate in the existing producer digest. */
-export function retainedWorktreeTransitionDependencyManifests(
-  distDirectory: string,
-): { source: string; digest: string }[] {
-  return producerContent(realpathSync(distDirectory)).dependencies.map(([source, digest]) => ({ source, digest }));
-}
-
 function writeCommandOutput(bytes: Buffer, commonDir: string): string {
   const digest = digestBytes(bytes);
   const path = join(commonDir, 'ai-delivery', 'verification@1', 'command-output', `${digest.slice(7)}.bin`);
@@ -1217,99 +1172,3 @@ export function runStageCommand(
     });
   });
 }
-
-const SourceDigest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
-const SourceSha = z.string().regex(/^[a-f0-9]{40}$/u);
-const SourceArtifactSchema = z.strictObject({ path: z.string().min(1), digest: SourceDigest });
-const SourceFileSchema = SourceArtifactSchema.extend({
-  device: z.number().int().nonnegative().safe(),
-  inode: z.number().int().nonnegative().safe(),
-  uid: z.number().int().nonnegative().safe(),
-  mode: z.number().int().nonnegative().safe(),
-});
-const SourceCommandSchema = z.strictObject({
-  argv: z.array(z.string()).min(1),
-  cwd: z.string().min(1),
-  executable: SourceFileSchema,
-});
-const SourceSnapshotSchema = z.strictObject({
-  head: SourceSha,
-  indexTree: SourceSha,
-  branch: z.string().min(1),
-  configDigest: SourceDigest,
-  dirty: z.array(z.strictObject({ path: z.string().min(1), digest: SourceDigest.nullable() })),
-});
-const SourceBoundsSchema = z.strictObject({
-  maxAggregateRssBytes: z.number().int().positive().safe(),
-  maxNewOutputBytes: z.number().int().positive().safe(),
-  minFreeDiskBytes: z.number().int().positive().safe(),
-  outputRoots: z.array(z.string().min(1)).min(1),
-});
-const SourceReconciliationSchema = z.strictObject({
-  phaseId: SourceDigest,
-  recordId: SourceDigest,
-  baselineId: SourceDigest.optional(),
-  authorizationDigest: SourceDigest,
-});
-const IssueSourcePhaseInputSchema = z.strictObject({
-  repoRoot: z.string().min(1),
-  issueNumber: z.number().int().positive().safe(),
-  identity: z.string().min(1),
-  rowDigest: SourceDigest,
-  controller: z.strictObject({
-    head: SourceSha,
-    configDigest: SourceDigest,
-    admissionId: SourceDigest,
-    runtimeEntryPath: z.string().min(1),
-    packageVersion: z.string().min(1),
-    archiveDigest: SourceDigest,
-  }),
-  source: SourceSnapshotSchema.extend({
-    path: z.string().min(1),
-    effect: z.discriminatedUnion('kind', [
-      z.strictObject({ kind: z.literal('preserve') }),
-      z.strictObject({
-        kind: z.literal('commitOnce'),
-        parent: SourceSha,
-        tree: SourceSha,
-        configDigest: SourceDigest.optional(),
-      }),
-    ]),
-  }),
-  caller: SourceArtifactSchema,
-  authorization: SourceArtifactSchema,
-  inputs: z.array(SourceArtifactSchema),
-  commands: z.array(SourceCommandSchema).min(1),
-  commandGraphDigest: SourceDigest,
-  environment: z.strictObject({ digest: SourceDigest, overrides: z.record(z.string(), z.string().nullable()) }),
-  bounds: SourceBoundsSchema,
-  completionArtifacts: z.array(z.string().min(1)),
-  reconciliation: SourceReconciliationSchema.optional(),
-});
-const SourcePhaseCommandResultSchema = z.strictObject({
-  index: z.number().int().nonnegative().safe(),
-  outputDigest: SourceDigest.nullable(),
-  outputBytes: z.number().int().nonnegative().safe(),
-  status: z.enum(['complete', 'failed']),
-});
-
-export type IssueSourcePhaseInput = z.input<typeof IssueSourcePhaseInputSchema> & { signal?: AbortSignal };
-export interface IssueSourcePhaseContext {
-  readonly phaseId: string;
-  readonly signal: AbortSignal;
-  readonly source: Readonly<Omit<z.infer<typeof SourceSnapshotSchema>, 'dirty'>> & {
-    readonly dirty: readonly Readonly<{ path: string; digest: string | null }>[];
-  };
-  readonly controller: Readonly<z.infer<typeof IssueSourcePhaseInputSchema>['controller']>;
-  readonly actor: Readonly<{ identity: string; actorLogin: string; credentialIdentity: string }>;
-  readonly inputs: readonly Readonly<z.infer<typeof SourceArtifactSchema>>[];
-  readonly run: (index: number) => Promise<Buffer>;
-}
-const IssueSourcePhaseReceiptSchema = z.strictObject({
-  status: z.literal('complete'),
-  phaseId: SourceDigest,
-  recordId: SourceDigest,
-  source: SourceSnapshotSchema,
-  commands: z.array(SourcePhaseCommandResultSchema),
-});
-export type IssueSourcePhaseReceipt = z.infer<typeof IssueSourcePhaseReceiptSchema>;

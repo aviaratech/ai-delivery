@@ -24,32 +24,11 @@ export const logInfo = (message: string) => {
   console.error(chalk.blue(formatTerminalLogLine('info', message)));
 };
 
-export const logSuccess = (message: string) => {
-  if (logsSuppressed) {
-    return;
-  }
-  console.error(chalk.green(formatTerminalLogLine('success', message)));
-};
-
 export const logWarn = (message: string) => {
   if (logsSuppressed) {
     return;
   }
   console.warn(chalk.yellow(formatTerminalLogLine('warning', message)));
-};
-
-export const logError = (message: string) => {
-  // Errors are never suppressed: they go to stderr, which cannot corrupt JSON
-  // stdout or the MCP stdio protocol. A nonzero exit with no diagnostic is
-  // worse than stderr noise.
-  console.error(chalk.red(formatTerminalLogLine('error', message)));
-};
-
-export const logProgress = (message: string): void => {
-  if (logsSuppressed) {
-    return;
-  }
-  process.stderr.write(`${chalk.cyan(formatTerminalLogLine('progress', message))}\n`);
 };
 
 export type CLIErrorCode =
@@ -93,19 +72,5 @@ export const formatError = (error: unknown): string => {
     return JSON.stringify(error);
   } catch {
     return String(error);
-  }
-};
-
-export const handleCommandError = (error: unknown): void => {
-  logError(error instanceof CLIError ? error.message : formatError(error));
-  if (error instanceof CLIError && typeof error.hint === 'string' && error.hint.trim().length > 0) {
-    const hintLine = `💡 Recovery: ${error.hint}`;
-    if (logsSuppressed) {
-      // logInfo is silenced in MCP mode; route the
-      // recovery hint to stderr so failures stay diagnosable.
-      console.error(chalk.blue(formatTerminalLogLine('info', hintLine)));
-    } else {
-      logInfo(hintLine);
-    }
   }
 };

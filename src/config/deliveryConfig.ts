@@ -1,9 +1,7 @@
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
-
-import { git } from '../git.js';
 
 import { DeliveryError } from '../errors.js';
 import { digestValue } from '../delivery/common.js';
@@ -392,39 +390,6 @@ export interface LoadedDeliverySettings {
   sourceDigest: string;
 }
 
-/** The optional file contains choices, never a required copy of GitHub metadata. */
-export function readDeliveryOverrides(repositoryRoot: string): {
-  overrides: DeliveryOverrides;
-  bytes: Buffer;
-  path: string | null;
-} {
-  const root = realpathSync(repositoryRoot);
-  const path = join(root, DELIVERY_CONFIG_FILE);
-  try {
-    lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
-      return { overrides: {}, bytes: Buffer.alloc(0), path: null };
-    throw new DeliveryError(`Unable to read ${DELIVERY_CONFIG_FILE}.`);
-  }
-  if (!isWithin(root, realpathSync(path)))
-    throw new DeliveryError(`${DELIVERY_CONFIG_FILE} must stay within the repository root.`);
-  try {
-    git(root, 'ls-files', '--error-unmatch', '--', DELIVERY_CONFIG_FILE);
-  } catch {
-    throw new DeliveryError(`${DELIVERY_CONFIG_FILE} must be source-controlled for historical parsing.`);
-  }
-  const bytes = readFileSync(path);
-  try {
-    const raw: unknown = JSON.parse(bytes.toString('utf8')) as unknown;
-    return { overrides: OverridesSchema.parse(raw), bytes, path };
-  } catch {
-    throw new DeliveryError(
-      `Invalid ${DELIVERY_CONFIG_FILE}; expected optional ai-delivery.config@2 routing overrides. Migrate authentication and command settings to the policy module's deliverySettings export.`,
-    );
-  }
-}
-
 /** Only operator-owned JSON supplies settings. Target repository files are never loaded. */
 export async function loadDeliverySettings(
   _repositoryRoot?: string,
@@ -649,11 +614,4 @@ export function resolveDeliveryRoleCredentials(input: {
     throw new DeliveryError(`Invalid GitHub App ID for ${role} role (${names.appId}).`);
   }
   return { appId: values.appId, installationId, privateKeyPath: values.privateKeyPath };
-}
-
-function isWithin(root: string, path: string): boolean {
-  const relation = relative(root, path);
-  return (
-    relation !== '..' && !relation.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && !isAbsolute(relation)
-  );
 }

@@ -14,17 +14,7 @@ import type { ProjectDeliveryStatus, ProjectDeliveryStatusReadback } from './git
 import { replaceParentIssue } from './github/relationships.js';
 import type { DeliveryContext } from './issue.js';
 import { IssueFields, renderIssueBody } from './issueContract.js';
-import {
-  CLIError,
-  handleCommandError,
-  logDebug,
-  logError,
-  logInfo,
-  logProgress,
-  logSuccess,
-  logWarn,
-  setLogsSuppressed,
-} from './logger.js';
+import { logDebug, logInfo, logWarn, setLogsSuppressed } from './logger.js';
 
 // Project/field metadata is unrelated to stream routing. Keep these provider
 // adapters local while exercising real parent linking, issue start and dispatch.
@@ -343,13 +333,9 @@ test('all enabled diagnostics preserve their content on stderr', () => {
   try {
     logDebug('debug proof');
     logInfo('info proof');
-    logSuccess('success proof');
     logWarn('warning proof');
-    logError('error proof');
-    logProgress('progress proof');
-    handleCommandError(new CLIError('failure proof', { hint: 'retry proof' }));
     assert.equal(capture.output.stdout, '');
-    for (const message of ['debug', 'info', 'success', 'warning', 'error', 'progress', 'failure', 'retry']) {
+    for (const message of ['debug', 'info', 'warning']) {
       assert.match(capture.output.stderr, new RegExp(`${message} proof`, 'u'));
     }
   } finally {
@@ -357,21 +343,16 @@ test('all enabled diagnostics preserve their content on stderr', () => {
   }
 });
 
-test('MCP suppression still silences diagnostics while retaining errors and recovery hints on stderr', () => {
+test('MCP suppression silences diagnostics', () => {
   vi.stubEnv('DEBUG', 'true');
   setLogsSuppressed(true);
   const capture = captureStreams();
   try {
     logDebug('hidden');
     logInfo('hidden');
-    logSuccess('hidden');
     logWarn('hidden');
-    logProgress('hidden');
-    handleCommandError(new CLIError('visible error', { hint: 'visible recovery' }));
     assert.equal(capture.output.stdout, '');
     assert.doesNotMatch(capture.output.stderr, /hidden/u);
-    assert.match(capture.output.stderr, /visible error/u);
-    assert.match(capture.output.stderr, /visible recovery/u);
   } finally {
     capture.restore();
   }
