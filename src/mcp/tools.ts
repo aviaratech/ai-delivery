@@ -219,7 +219,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_pr_create',
     commandName: 'pr:create',
     description:
-      'Create or reuse an issue-closing PR from any directory using repo, issueNumber and a pushed head. Restore a missing closing link on reuse.',
+      'Create or reuse a PR from any directory using repo, issueNumber and a pushed head. By default it closes the issue and restores a missing closing link on reuse. nonClosing opens a draft that references the issue and leaves it open. expectedHeadSha refuses a different pushed head.',
     inputSchema: z
       .strictObject({
         repo: Repo,
@@ -227,14 +227,12 @@ export const AI_DELIVERY_MCP_TOOLS = [
         issueNumber: Positive,
         prNumber: Positive.optional(),
         nonClosing: z.boolean().optional(),
-        reconcileNonClosingReference: z.boolean().optional(),
         expectedHeadSha: z
           .string()
-          .regex(/^[a-f0-9]{40}$/u)
-          .optional(),
-        expectedBaseSha: z
-          .string()
-          .regex(/^[a-f0-9]{40}$/u)
+          .regex(
+            /^[a-f0-9]{40}$/u,
+            'expectedHeadSha must be a full 40-character commit SHA; pass the pushed head or omit it.',
+          )
           .optional(),
         body: z.string().min(1, 'PR body is empty; enter a body or omit it to use the default body.').optional(),
         draft: z.boolean().optional(),
@@ -247,17 +245,6 @@ export const AI_DELIVERY_MCP_TOOLS = [
       .refine(
         (input) => input.head === undefined || input.headBranch === undefined || input.head === input.headBranch,
         'PR head selectors disagree; use the same branch for head and headBranch.',
-      )
-      .refine(
-        (input) =>
-          input.reconcileNonClosingReference === true
-            ? input.nonClosing === true &&
-              input.draft !== false &&
-              input.body !== undefined &&
-              input.expectedHeadSha !== undefined &&
-              input.expectedBaseSha !== undefined
-            : input.expectedHeadSha === undefined && input.expectedBaseSha === undefined,
-        'Reference reconciliation requires explicit nonClosing, DRAFT, body and exact head/base; SHA inputs require the action.',
       ),
   },
   {
