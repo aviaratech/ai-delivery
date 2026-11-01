@@ -275,3 +275,41 @@ for (const mode of ['partial', 'epic'] as const) {
     }
   });
 }
+
+// Nov 1 2026 (#277): aviaratech/ai has about 3,900 issues and PRs, so the retry search never reached a short page.
+test('MCP create with a fresh opId on a busy repository creates, and a same-opId retry reuses it', async ({
+  signal,
+}) => {
+  const f = inertTarget(signal);
+  const originalList = f.rest.issues.listForRepo;
+  const filler = (page: number, size: number) =>
+    Array.from({ length: size }, (_, index) => ({
+      number: 1000 + page * 100 + index,
+      title: 'Unrelated work',
+      body: 'No create marker.',
+      state: 'open',
+      user: { login: 'operator' },
+      ...(index % 2 === 0 ? { pull_request: {} } : {}),
+    }));
+  f.rest.issues.listForRepo = async (input) => {
+    const page = input.page ?? 1;
+    const head = page === 1 ? (await originalList(input)).data.filter((row) => row.number === 17) : [];
+    return {
+      data: [...head.map((row) => ({ ...row, user: { login: 'operator' } })), ...filler(page, 100 - head.length)],
+    } as Awaited<ReturnType<typeof originalList>>;
+  };
+  const originalGet = f.rest.issues.get;
+  f.rest.issues.get = async (input) => ({ data: { ...(await originalGet(input)).data, user: { login: 'operator' } } });
+  const input = { ...fixtureFields, opId: 'synthetic-busy-repo' };
+  const connection = await f.connect();
+  try {
+    const first = await connection.call('issue_create', input);
+    assert.notEqual(first.response.isError, true, first.text);
+    assert.equal(first.value?.created && (first.value.created as { number: number }).number, 17);
+    const retry = await connection.call('issue_create', input);
+    assert.notEqual(retry.response.isError, true, retry.text);
+    assert.equal(f.calls.filter((call) => call.name === 'issues.create').length, 1);
+  } finally {
+    await f.dispose(connection);
+  }
+});

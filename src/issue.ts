@@ -552,16 +552,24 @@ export async function createIssue(
     const key = digestValue({ repository: config.repository.toLowerCase(), actor: actor.toLowerCase(), opId });
     const marker = `<!-- ai-delivery-create: ${key} intent: ${originalIntent} -->`;
     const matches: (typeof prior)[] = [];
+    // A partial create is retried soon after, so it sits in the newest 2,000 items. Older items cannot hold it.
     for (let page = 1; page <= Math.min(20, context.readPageLimit ?? 20); page++) {
-      const batch = (await clients.rest.issues.listForRepo({ ...repo, state: 'all', page, per_page: 100 })).data;
+      const batch = (
+        await clients.rest.issues.listForRepo({
+          ...repo,
+          state: 'all',
+          sort: 'created',
+          direction: 'desc',
+          page,
+          per_page: 100,
+        })
+      ).data;
       matches.push(
         ...batch.filter(
           (row) => !('pull_request' in row) && row.body?.includes(`<!-- ai-delivery-create: ${key} intent:`),
         ),
       );
       if (batch.length < 100) break;
-      if (page === Math.min(20, context.readPageLimit ?? 20))
-        throw new DeliveryError('Create retry search exceeds the bounded readback window; reconcile the known issue.');
     }
     if (matches.length > 1) throw new DeliveryError('Conflicting issues claim the same create opId.');
     prior = matches[0];
