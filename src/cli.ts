@@ -8,7 +8,6 @@ import { z } from 'zod';
 
 import { printCommandError, printCommandResult } from './cliResult.js';
 import { contextFor, executeTool, type ExecutionContext } from './dispatch.js';
-import { listIssueSubissues } from './issue.js';
 import { listPrs, preflightReviewRoute, prChecks, submitFormalReview } from './pr.js';
 import {
   assertReviewVerdictTarget,
@@ -381,29 +380,6 @@ program
   .command('ready:check')
   .requiredOption('--issue <number>')
   .action(async (o: { issue: string }) => run('issue_ready_check', { issueNumber: int(o.issue) }));
-for (const field of ['parent', 'blockers'] as const) {
-  program
-    .command(field)
-    .requiredOption('--issue <number>')
-    .action(async (o: { issue: string }) => {
-      const info = (await executeTool('issue_info', { issueNumber: int(o.issue) }, execution())) as {
-        parentIssueNumber: number | null;
-        blockedBy: number[];
-      };
-      print(
-        field === 'parent'
-          ? { issueNumber: int(o.issue), parentIssueNumber: info.parentIssueNumber }
-          : { issueNumber: int(o.issue), blockedBy: info.blockedBy },
-      );
-    });
-}
-program
-  .command('subissues')
-  .requiredOption('--issue <number>')
-  .action(async (o: { issue: string }) => {
-    const context = await contextFor(execution(), 'subissues');
-    print({ issueNumber: int(o.issue), subissues: await listIssueSubissues(context, Number(o.issue)) });
-  });
 program
   .command('pr:create')
   .description('Create or reuse an issue-closing PR from a pushed --head, from any directory.')
