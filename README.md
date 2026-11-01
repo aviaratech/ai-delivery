@@ -83,7 +83,6 @@ These are all executable routes; groups/help flags are omitted. A dash means no 
 | Issues: create/start        | `create`, `start`                                                                                        | `issue_create`, `issue_start`                                   |
 | Issues: find/read           | `list`, `search`, `info`, `ready:check`                                                                  | `issue_list`, `issue_search`, `issue_info`, `issue_ready_check` |
 | Issues: edit/batch          | `update`, `batch:update`                                                                                 | `issue_update`, `issue_batch_update`                            |
-| Issues: relationships       | `parent`, `blockers`, `subissues`                                                                        | —                                                               |
 | Issues: journals            | —                                                                                                        | `issue_comment`                                                 |
 | Pull requests               | `pr:create`, `pr:info`                                                                                   | `issue_pr_create`, `issue_pr_info`                              |
 | Pull requests: observations | `pr:list`, `pr:checks`                                                                                   | —                                                               |

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'vitest';
-import { publishPr, prChecks, queueChecks } from './pr.js';
+import { publishPr, prChecks } from './pr.js';
 import type { DeliveryContext } from './issue.js';
 import { digestValue } from './delivery/common.js';
 import * as prReaders from './pr.js';
@@ -74,7 +74,7 @@ for (const mode of [
   'inactive-ruleset',
   'wrong-source',
 ]) {
-  it(`queue discovers ruleset-only required checks with ${mode} visibility`, async () => {
+  it(`pr:checks discovers ruleset-only required checks with ${mode} visibility`, async () => {
     const { context } = fixture();
     const rule = {
       type: 'required_status_checks',
@@ -125,30 +125,8 @@ for (const mode of [
         };
       },
     });
-    const reads: string[] = [];
-    let appId = 7,
-      checkSha = head;
     Object.assign(context.clients.rest.checks, {
-      listForRef: async ({ ref }: { ref: string }) => {
-        reads.push(ref);
-        return {
-          status: 200,
-          headers: {},
-          data: {
-            total_count: 1,
-            check_runs: [
-              {
-                id: 10,
-                name: 'checks',
-                head_sha: checkSha,
-                app: { id: appId },
-                status: 'completed',
-                conclusion: 'success',
-              },
-            ],
-          },
-        };
-      },
+      listForRef: async () => ({ status: 200, headers: {}, data: { total_count: 0, check_runs: [] } }),
     });
     Object.assign(context.clients.rest.repos, {
       getCombinedStatusForRef: async () => ({
@@ -157,76 +135,16 @@ for (const mode of [
         data: { sha: head, total_count: 0, statuses: [] },
       }),
     });
-    const result = await queueChecks(context, 'main', head);
-    if (mode !== 'complete') {
-      assert.equal(result.state, 'waiting');
-      assert.deepEqual(reads, []);
-    } else {
-      assert.equal(result.state, 'passed');
-      assert.deepEqual(reads, [head]);
-      assert.deepEqual(result.proof, [{ name: 'checks', appId: 7, id: 10 }]);
-      appId = 8;
-      assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
-      appId = 7;
-      checkSha = 'e'.repeat(40);
-      assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
-    }
+    const result = await prChecks(context, 23);
+    assert.equal(result.requiredCheckDiscovery, mode === 'complete' ? 'complete' : 'partial');
+    assert.deepEqual(
+      result.requiredChecks.map((check) => check.name),
+      mode === 'partial-rules' ? [] : ['checks'],
+    );
   });
 }
 
-for (const appId of [null, 7]) {
-  for (const state of ['success', 'failure', 'error', 'pending', 'unknown']) {
-    it(`queue evaluates a same-name ${state} status alongside a successful ${appId === null ? 'wildcard' : 'App-pinned'} run`, async () => {
-      const { context } = fixture();
-      Object.assign(context.clients.rest, {
-        request: async (route: string) => ({
-          status: 200,
-          headers: {},
-          data: route.endsWith('/protection')
-            ? { required_status_checks: { checks: [{ context: 'checks', app_id: appId }] } }
-            : [],
-        }),
-      });
-      Object.assign(context.clients.rest.checks, {
-        listForRef: async () => ({
-          status: 200,
-          headers: {},
-          data: {
-            total_count: 1,
-            check_runs: [
-              { id: 10, name: 'checks', head_sha: head, app: { id: 7 }, status: 'completed', conclusion: 'success' },
-            ],
-          },
-        }),
-      });
-      Object.assign(context.clients.rest.repos, {
-        getCombinedStatusForRef: async () => ({
-          status: 200,
-          headers: {},
-          data: {
-            sha: head,
-            total_count: 1,
-            statuses: [{ id: 20, context: 'checks', state, creator: { id: 7, login: 'checks[bot]' } }],
-          },
-        }),
-      });
-      const result = await queueChecks(context, 'main', head);
-      assert.equal(
-        result.state,
-        appId !== null
-          ? 'waiting'
-          : state === 'success'
-            ? 'passed'
-            : ['failure', 'error'].includes(state)
-              ? 'failed'
-              : 'waiting',
-      );
-      if (appId !== null) assert.match(result.reason, /source/iu);
-    });
-  }
-}
-
-it('preserves legacy required contexts alongside pinned checks and requires the latest exact-SHA source', async () => {
+it('pr:checks merges legacy required contexts with pinned checks', async () => {
   const { context } = fixture();
   const check = {
     id: 10,
@@ -265,13 +183,6 @@ it('preserves legacy required contexts alongside pinned checks and requires the 
     (await prChecks(context, 23)).requiredChecks.map((c) => c.name),
     ['legacy', 'pinned'],
   );
-  assert.equal((await queueChecks(context, 'main', head)).state, 'passed');
-  runs = [{ ...check, app: { id: 8 } }];
-  assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
-  runs = [check, { ...check, id: 11, status: 'in_progress', conclusion: null }];
-  assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
-  runs = [{ ...check, head_sha: 'e'.repeat(40) }];
-  assert.equal((await queueChecks(context, 'main', head)).state, 'waiting');
 });
 
 function fixture(

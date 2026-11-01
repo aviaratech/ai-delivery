@@ -258,9 +258,6 @@ const cliOnly: {
   witness?: string;
   before?: (f: Fixture) => void;
 }[] = [
-  { command: 'parent', args: () => ['parent', '--issue', '17'], witness: 'issues.get' },
-  { command: 'blockers', args: () => ['blockers', '--issue', '17'], witness: 'issues.get' },
-  { command: 'subissues', args: () => ['subissues', '--issue', '17'], witness: 'issues.listSubIssues' },
   { command: 'pr:list', args: () => ['pr:list'], witness: 'pulls.list' },
   { command: 'pr:checks', args: () => ['pr:checks', '--pr', '23'], witness: 'checks.listForRef' },
   { command: 'config:resolve', args: () => ['config:resolve'], witness: 'appActorLogin' },

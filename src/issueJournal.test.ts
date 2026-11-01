@@ -10,7 +10,7 @@ import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import * as issue from './issue.js';
 import type { DeliveryContext } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import { JournalInputSchema, renderJournal, acceptanceCriteria, issueFollowUps } from './issueJournal.js';
+import { JournalInputSchema, renderJournal, acceptanceCriteria } from './issueJournal.js';
 import { executeTool } from './dispatch.js';
 import * as configuration from './config/deliveryConfig.js';
 import * as githubClients from './github/client.js';
@@ -341,7 +341,6 @@ test('automatic closeout selects acceptance checkboxes and declared follow-ups w
   const body =
     '## Outcome\nShip.\n\n## Acceptance Criteria\n- [ ] Validation works\n- [x] Recovery works\n\n## Follow-ups\n- Track post-release adoption: https://github.com/example/widget/issues/24\n\n## Non-goals\n- [ ] Not an acceptance criterion';
   assert.deepEqual(acceptanceCriteria(body), ['Validation works', 'Recovery works']);
-  assert.deepEqual(issueFollowUps(body), ['Track post-release adoption: https://github.com/example/widget/issues/24']);
 });
 
 test('closeout accepts every readiness heading level and stops at the next heading', () => {
@@ -350,7 +349,6 @@ test('closeout accepts every readiness heading level and stops at the next headi
       const heading = `${' '.repeat(indent)}${'#'.repeat(level)}`;
       const body = `${heading}\tAcceptance Criteria\n-[ ] Compact bullet\n*\t[X]\tTabbed bullet\n+ [x] Checked bullet\n###### Other section\n- [ ] Excluded\n${heading} Follow-ups\n- [ ] Deferred work\n# Other section\n- Excluded`;
       assert.deepEqual(acceptanceCriteria(body), ['Compact bullet', 'Tabbed bullet', 'Checked bullet']);
-      assert.deepEqual(issueFollowUps(body), ['Deferred work']);
     }
   }
 });

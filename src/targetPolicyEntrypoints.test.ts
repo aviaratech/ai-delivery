@@ -33,27 +33,6 @@ const info = (v: Record<string, unknown>) => {
 const scenarios: Scenario[] = [
   { name: 'CLI info', mode: 'cli', args: ['info', '--issue', '17'], witness: 'issues.get', verify: info },
   {
-    name: 'CLI parent wrapper',
-    mode: 'cli',
-    args: ['parent', '--issue', '17'],
-    witness: 'issues.get',
-    verify: (v) => assert.deepEqual(v, { issueNumber: 17, parentIssueNumber: 11 }),
-  },
-  {
-    name: 'CLI blocker wrapper',
-    mode: 'cli',
-    args: ['blockers', '--issue', '17'],
-    witness: 'issues.get',
-    verify: (v) => assert.deepEqual(v, { issueNumber: 17, blockedBy: [13] }),
-  },
-  {
-    name: 'CLI-only subissues',
-    mode: 'cli',
-    args: ['subissues', '--issue', '17'],
-    witness: 'issues.listSubIssues',
-    verify: (v) => assert.deepEqual(v, { issueNumber: 17, subissues: [18, 19] }),
-  },
-  {
     name: 'CLI direct PR selector',
     mode: 'cli',
     args: ['pr:info', '--pr', '23'],

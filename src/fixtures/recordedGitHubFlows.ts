@@ -1,19 +1,6 @@
 // Public GitHub response projections; see recordedGitHubFlows.md for hashes,
 // redaction, missing-field semantics and explicitly synthetic transitions.
 
-/** Synthetic native IssueComment refusal projections, not captured live approvals. */
-export const syntheticStandingApprovalRefusals = [
-  { kind: 'non-approver', reason: 'not a configured approver' },
-  { kind: 'expired', reason: 'expired' },
-  { kind: 'same-second-edit', reason: 'was edited after posting' },
-  { kind: 'missing-edit-proof', reason: 'missing native' },
-  { kind: 'unknown-condition', reason: 'conditions' },
-  { kind: 'duplicate-pr', reason: 'unique' },
-  { kind: 'wrong-repository', reason: 'different repository' },
-  { kind: 'missing-predecessor', reason: 'FIFO prefix' },
-  { kind: 'minimized', reason: 'minimized' },
-] as const;
-
 export const recordedZeroApproval = {
   repository: {
     pullRequest: {
@@ -30,50 +17,6 @@ export const recordedZeroApproval = {
           isAdminEnforced: true,
           requiresApprovingReviews: true,
         },
-      },
-    },
-  },
-} as const;
-
-export const recordedBaseDrift = {
-  before: {
-    repository: {
-      defaultBranchRef: {
-        target: {
-          oid: '3759b8e124a0c0979d5341fe6f0a202f08bc57e4',
-        },
-      },
-      pullRequest: {
-        state: 'OPEN',
-        isDraft: false,
-        headRefOid: '47cb7643c494c44bdecdfe8ca7449c7b3b884aaa',
-        baseRefOid: '3759b8e124a0c0979d5341fe6f0a202f08bc57e4',
-        mergeable: 'MERGEABLE',
-        mergeStateStatus: 'CLEAN',
-        reviewDecision: 'APPROVED',
-        mergedAt: null,
-        autoMergeRequest: null,
-      },
-    },
-  },
-  after: {
-    repository: {
-      defaultBranchRef: {
-        target: {
-          oid: 'd26873a8c214221d9e2bca23ebe6c15259a963f6',
-          tree: {
-            oid: 'ef1b9ca51232408b16d51f3d972fe104b76f959a',
-          },
-        },
-      },
-      pullRequest: {
-        state: 'OPEN',
-        headRefOid: '47cb7643c494c44bdecdfe8ca7449c7b3b884aaa',
-        baseRefOid: '3759b8e124a0c0979d5341fe6f0a202f08bc57e4',
-        mergeable: 'UNKNOWN',
-        mergeStateStatus: 'UNKNOWN',
-        reviewDecision: 'APPROVED',
-        mergedAt: null,
       },
     },
   },

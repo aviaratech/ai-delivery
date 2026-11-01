@@ -182,18 +182,6 @@ export function acceptanceCriteria(body: string): string[] {
     .filter(Boolean);
 }
 
-export function issueFollowUps(body: string): string[] {
-  return journalSection(body, ['follow-ups', 'follow ups'])
-    .map(
-      (line) =>
-        line
-          .trimStart()
-          .match(/^[-*+]\s*(?:\[[ xX]\][ \t])?(.*)$/u)?.[1]
-          ?.trim() ?? '',
-    )
-    .filter(Boolean);
-}
-
 // Match readiness's ATX heading boundaries without changing its separate contract owner.
 function journalSection(body: string, headings: string[]): string[] {
   const heading = (line: string) =>

@@ -62,51 +62,6 @@ export function nativeIssueSettingsFromDeliveryConfig(config: Pick<DeliveryConfi
   };
 }
 
-export function validateConfiguredNativeTracking(input: {
-  blockedBy?: readonly number[];
-  config: Pick<DeliveryConfig, 'native'>;
-  issueNumber?: number;
-  issueType: string;
-  milestone?: number;
-  parentIssueNumber?: number;
-  points: number;
-  priority: string;
-}): void {
-  const { config } = input;
-  if (!config.native.issueTypes.includes(input.issueType)) {
-    throw new DeliveryError(`Unsupported native issue type ${input.issueType}.`);
-  }
-  const settings = nativeIssueSettingsFromDeliveryConfig(config);
-  if (!settings.points.values.includes(input.points)) {
-    throw new DeliveryError(`Unsupported native ${settings.points.name} value.`);
-  }
-  if (!settings.priority.values.includes(input.priority)) {
-    throw new DeliveryError(`Unsupported native ${settings.priority.name} value.`);
-  }
-  for (const [name, value] of [
-    ['milestone', input.milestone],
-    ['parent', input.parentIssueNumber],
-    ...(input.blockedBy ?? []).map((value) => ['blocker', value] as const),
-  ] as const) {
-    assertPositiveNativeNumber(name, value);
-  }
-  if (
-    input.issueNumber !== undefined &&
-    (input.parentIssueNumber === input.issueNumber || (input.blockedBy ?? []).includes(input.issueNumber))
-  ) {
-    throw new DeliveryError('An issue cannot be its own parent or blocker.');
-  }
-  if (new Set(input.blockedBy ?? []).size !== (input.blockedBy ?? []).length) {
-    throw new DeliveryError('Native blockers must be unique.');
-  }
-}
-
-function assertPositiveNativeNumber(name: string, value: number | undefined): void {
-  if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
-    throw new DeliveryError(`Native ${name} must be a positive issue or milestone number.`);
-  }
-}
-
 const apiHeaders = { 'X-GitHub-Api-Version': NATIVE_ISSUE_API_VERSION } as const;
 
 export async function clearConfiguredNativeIssuePoints(input: {

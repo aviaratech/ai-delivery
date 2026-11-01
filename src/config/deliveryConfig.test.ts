@@ -17,7 +17,6 @@ import {
   parseConfiguredNativeIssueMetadata,
   resolveNativeIssueFieldCatalog,
   setConfiguredNativeIssueMetadata,
-  validateConfiguredNativeTracking,
 } from '../github/nativeIssueMetadata.js';
 import {
   PROJECT_DELIVERY_STATUSES,
@@ -604,18 +603,6 @@ describe('portable delivery configuration', () => {
           ),
           { points: selectedPoints, priority: selectedPriority },
         );
-        assert.doesNotThrow(() => {
-          validateConfiguredNativeTracking({
-            blockedBy: [17],
-            config: loaded.config,
-            issueNumber: 20,
-            issueType: 'Defect',
-            milestone: 3,
-            parentIssueNumber: 15,
-            points: selectedPoints,
-            priority: selectedPriority,
-          });
-        });
       }
     } finally {
       rmSync(temp, { force: true, recursive: true });
@@ -786,9 +773,6 @@ describe('portable delivery configuration', () => {
           .error ?? '',
         /personal-token override/u,
       );
-      assert.throws(() => {
-        validateConfiguredNativeTracking({ config, issueType: 'Task', points: 3, priority: 'High' });
-      }, /Unsupported native Estimate/u);
     } finally {
       rmSync(temp, { force: true, recursive: true });
     }

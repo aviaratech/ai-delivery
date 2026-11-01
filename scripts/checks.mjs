@@ -184,14 +184,10 @@ export const RELEASE_CASES = [
     {
       file: 'dist/targetPolicyEntrypoints.test.js',
       titles: [
-        'CLI blocker wrapper leaves edited consumer policy inert in a fresh native process',
-        'CLI blocker wrapper leaves tracked consumer policy inert in a fresh native process',
         'CLI direct PR selector leaves edited consumer policy inert in a fresh native process',
         'CLI direct PR selector leaves tracked consumer policy inert in a fresh native process',
         'CLI info leaves edited consumer policy inert in a fresh native process',
         'CLI info leaves tracked consumer policy inert in a fresh native process',
-        'CLI parent wrapper leaves edited consumer policy inert in a fresh native process',
-        'CLI parent wrapper leaves tracked consumer policy inert in a fresh native process',
         'CLI plugin doctor dry-run leaves edited consumer policy inert in a fresh native process',
         'CLI plugin doctor dry-run leaves tracked consumer policy inert in a fresh native process',
         'CLI plugin install dry-run leaves edited consumer policy inert in a fresh native process',
@@ -212,8 +208,6 @@ export const RELEASE_CASES = [
         'CLI-only checks leaves tracked consumer policy inert in a fresh native process',
         'CLI-only routing preflight leaves edited consumer policy inert in a fresh native process',
         'CLI-only routing preflight leaves tracked consumer policy inert in a fresh native process',
-        'CLI-only subissues leaves edited consumer policy inert in a fresh native process',
-        'CLI-only subissues leaves tracked consumer policy inert in a fresh native process',
         'fresh public MCP leaves edited consumer policy inert in a fresh native process',
         'fresh public MCP leaves tracked consumer policy inert in a fresh native process',
         'public agent export leaves edited consumer policy inert in a fresh native process',
