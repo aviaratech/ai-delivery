@@ -191,8 +191,6 @@ export const RELEASE_CASES = [
         'CLI direct PR selector leaves tracked consumer policy inert in a fresh native process',
         'CLI info leaves edited consumer policy inert in a fresh native process',
         'CLI info leaves tracked consumer policy inert in a fresh native process',
-        'CLI offline migration leaves edited consumer policy inert in a fresh native process',
-        'CLI offline migration leaves tracked consumer policy inert in a fresh native process',
         'CLI parent wrapper leaves edited consumer policy inert in a fresh native process',
         'CLI parent wrapper leaves tracked consumer policy inert in a fresh native process',
         'CLI plugin doctor dry-run leaves edited consumer policy inert in a fresh native process',

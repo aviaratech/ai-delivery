@@ -221,23 +221,7 @@ for (const kind of ['tracked', 'edited'] as const satisfies readonly EntrypointP
           }
           writeFileSync(f.policy, f.selected);
           f.assertInert();
-          let args = [...scenario.args];
-          if (scenario.name === 'CLI offline migration') {
-            const inventory = join(f.base, 'legacy.json');
-            writeFileSync(
-              inventory,
-              JSON.stringify({
-                issues: [
-                  {
-                    number: 17,
-                    body: 'Verification prose: node consumer-trap.cjs and npm run trap.',
-                    labels: ['effort:s', 'type:task'],
-                  },
-                ],
-              }),
-            );
-            args.push('--input-file', inventory);
-          }
+          const args = [...scenario.args];
           negative = run(
             { root: f.root, report: join(f.base, 'negative.json'), head: f.head, mode: scenario.mode, args },
             scenario.mode === 'cli' ? cli : driver,
