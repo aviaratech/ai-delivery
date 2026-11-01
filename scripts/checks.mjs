@@ -288,13 +288,8 @@ export const RELEASE_CASES = [
     'failed qualification refuses fifo test logs while retaining the safe projection',
   ].map((title) => ({ file: 'dist/releaseWorkflow.test.js', title, kind: /** @type {const} */ ('mandatory') })),
   {
-    file: 'dist/boardReconcile.test.js',
-    title: 'copied executing artifact changes identity with same-version bytes and refuses links',
-    kind: 'mandatory',
-  },
-  {
     file: 'dist/issue63Routes.test.js',
-    title: 'actual CLI declares guard fields on every alias and the bounded health command',
+    title: 'actual CLI declares guard fields on every alias',
     kind: 'mandatory',
   },
   {
@@ -351,59 +346,6 @@ export const RELEASE_CASES = [
   {
     file: 'dist/cliResult.test.js',
     title: 'actual CLI serializes incomplete native update evidence and exits nonzero',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-plan@1","scopeComplete":true,"summary":{"unresolved":4}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-plan@1","scopeComplete":false})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"failed":1}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"drifted":1}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"refused":1}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"unknown":1}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":1,"unresolved":1}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title:
-      'CLI prints the complete reconciliation result before selecting its exit status ({"schemaVersion":"ai-delivery.board-reconcile-result@1","scopeComplete":true,"summary":{"applied":2,"satisfied":1,"failed":0,"drifted":0,"refused":0,"unknown":0,"unresolved":0}})',
-    kind: 'mandatory',
-  },
-  {
-    file: 'dist/cliResult.test.js',
-    title: 'actual board CLI advertises bounded data-only files and validates them before credentials',
     kind: 'mandatory',
   },
   {

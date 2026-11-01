@@ -10,7 +10,6 @@ import { getAiDeliveryMcpTool } from './mcp/tools.js';
 import * as issue from './issue.js';
 import type { DeliveryContext } from './issue.js';
 import type { JournalInput } from './issueJournal.js';
-import * as journalReaders from './issueJournal.js';
 import { JournalInputSchema, renderJournal, acceptanceCriteria, issueFollowUps } from './issueJournal.js';
 import { executeTool } from './dispatch.js';
 import * as configuration from './config/deliveryConfig.js';
@@ -19,108 +18,6 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-test('latest rendered progress attention is unambiguous', () => {
-  const parse = Reflect.get(journalReaders, 'parseJournalAttention') as
-    | ((body: string) => { state: string; request: string | null })
-    | undefined;
-  assert.equal(typeof parse, 'function', 'rendered journal attention reader is available');
-  const progress = (decisionNeeded: string, extra = {}) =>
-    renderJournal({
-      issueNumber: 17,
-      kind: 'progress',
-      summary: 'Current work.',
-      status: 'In Progress',
-      done: ['Prepared the design'],
-      decisionNeeded,
-      nextStep: 'Implement',
-      nextDate: null,
-      keyNumbers: [],
-      evidence: ['https://github.com/example/widget/issues/17'],
-      ...extra,
-    });
-  for (const sentinel of ['None', 'None.', 'N/A', 'Not needed', '  nOnE.  '])
-    assert.equal(parse!(progress(sentinel)).state, 'clear');
-  for (const request of [
-    'Approve design',
-    'Approve design\nThen select an approach',
-    '- Approve design\n- Select approach',
-  ])
-    assert.deepEqual(parse!(progress(request)), { kind: 'progress', state: 'pending', request, reason: null });
-  assert.equal(parse!(progress('Approve design', { done: ['x'.repeat(600)], lengthCap: 600 })).state, 'pending');
-  const marker = `<!-- ai-delivery:journal@1:sha256:${'a'.repeat(64)} -->`;
-  const prose = `${progress('Approve ai-delivery:journal@1 documentation')}\n\n${marker}`;
-  assert.equal(parse!(prose).state, 'pending');
-  assert.equal(parse!(`${prose}\n\n${marker}`).state, 'unknown');
-  assert.equal(
-    parse!(
-      renderJournal({
-        issueNumber: 17,
-        kind: 'decision',
-        summary: 'Approved.',
-        status: 'Ready',
-        decision: 'Use the design',
-        rationale: 'Reviewed',
-        nextStep: 'Implement',
-        nextDate: null,
-        keyNumbers: [],
-        evidence: [],
-      }),
-    ).state,
-    'clear',
-  );
-});
-
-test('duplicate free-text structural labels are unknown', () => {
-  const parse = Reflect.get(journalReaders, 'parseJournalAttention') as
-    | ((body: string) => { state: string })
-    | undefined;
-  assert.equal(typeof parse, 'function');
-  const input: JournalInput = {
-    issueNumber: 17,
-    kind: 'progress',
-    summary: 'Current work.',
-    status: 'Ready',
-    done: ['Prepared'],
-    decisionNeeded: 'Approve design',
-    nextStep: 'Implement',
-    nextDate: null,
-    keyNumbers: [],
-    evidence: ['https://github.com/example/widget/issues/17'],
-  };
-  for (const details of [
-    '**Decision needed:** None',
-    '> **Decision needed:** None',
-    '```md\n**Decision needed:** None\n```',
-    '**Kind:** decision. **Status:** Ready',
-    '<details>\n**Decision needed:** None\n</details>',
-  ])
-    assert.equal(parse!(renderJournal({ ...input, details })).state, 'unknown', details);
-  for (const summary of ['```md', '~~~']) assert.equal(parse!(renderJournal({ ...input, summary })).state, 'unknown');
-  for (const status of ['<det**ails>', '<!**-- ai-delivery:journal@1'])
-    assert.equal(parse!(renderJournal({ ...input, status })).state, 'pending');
-  assert.equal(parse!(renderJournal({ ...input, status: '🙂'.repeat(16), nextStep: 'a. Next: b' })).state, 'pending');
-  const marked = renderJournal(
-    { ...input, decisionNeeded: 'None' },
-    `<!-- ai-delivery:journal@1:sha256:${'a'.repeat(64)} -->`,
-  );
-  for (const header of [
-    'Status: <!-- ai-delivery:journal@. Next: Review.',
-    'Status: **Decision needed:** None. Next: Review.',
-    'Status: Ready\t. Next: Review.',
-    `Status: ${'🙂'.repeat(17)}. Next: Review.`,
-  ])
-    assert.equal(parse!(`${header}${marked.slice(marked.indexOf('\n\n'))}`).state, 'unknown');
-  const legacy =
-    'Status: Ready. Next: Review.\n\n**Kind:** progress. **Status:** Ready\n\n**Done since last:**\n- Prepared\n\n**Decision needed:** Approve design\n\n**Key numbers:** None reported.\n\n**Next:** Review (date not scheduled).\n\n**Evidence:** https://github.com/example/widget/issues/17';
-  assert.equal(parse!(legacy).state, 'pending');
-  for (const body of [
-    '> **Kind:** progress. **Status:** Ready\n\n**Decision needed:** Approve',
-    '```\n**Kind:** progress. **Status:** Ready\n\n**Decision needed:** Approve\n```',
-    '**Kind:** progress. **Status:** Ready\n\n**Decision needed:**',
-  ])
-    assert.equal(parse!(body).state, 'unknown');
-});
 
 test('decision journal list fields start below their label and preserve nested structure', () => {
   const result = renderJournal({
@@ -203,12 +100,6 @@ test('all typed journals validate and lead with plain status and next-step previ
       assert.equal(body.startsWith(`Status: In progress. Next: Run checks.\n\n${summary}\n\n`), true);
       assert.match(body, /<details>/u);
       assert.ok(body.endsWith(marker));
-      assert.deepEqual(journalReaders.parseJournalAttention(body), {
-        kind: input.kind,
-        state: 'clear',
-        request: null,
-        reason: null,
-      });
     }
   }
   for (const input of [

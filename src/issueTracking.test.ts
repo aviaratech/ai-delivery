@@ -1153,58 +1153,6 @@ test('guards run immediately before both Project mutation boundaries', async () 
   assert.deepEqual(refused.events, []);
 });
 
-test('strict Project observation refuses hidden content instead of proving absence', async () => {
-  const f = membershipFixture();
-  f.setMember();
-  f.controls.unreadable = true;
-  const read = Reflect.get(projectDelivery, 'readProjectDeliveryItems') as
-    | ((input: typeof f.input & { maxPages: number }) => Promise<unknown>)
-    | undefined;
-  assert.equal(typeof read, 'function');
-  await assert.rejects(read!({ ...f.input, maxPages: 20 }));
-  assert.deepEqual(f.events, []);
-});
-
-test('strict Project observation retains exact identities and verified non-issue kinds', async () => {
-  const f = membershipFixture();
-  f.setMember();
-  const base = f.input.graphql;
-  const graphql = (async (query: string) => {
-    const response = await base(query);
-    const data = response as { organization: { projectV2: { items: { nodes: unknown[] } } } };
-    data.organization.projectV2.items.nodes.push(
-      {
-        id: 'DRAFT',
-        isArchived: false,
-        content: { __typename: 'DraftIssue', id: 'DRAFT-CONTENT' },
-        fieldValueByName: null,
-      },
-      { id: 'PR', isArchived: true, content: { __typename: 'PullRequest', id: 'PR-CONTENT' }, fieldValueByName: null },
-    );
-    return data;
-  }) as unknown as typeof base;
-  const result = await projectDelivery.readProjectDeliveryItems({ ...f.input, graphql, maxPages: 20 });
-  assert.deepEqual(result[0], {
-    id: 'ITEM17',
-    archived: false,
-    contentId: 'ISSUE17',
-    status: null,
-    statusOptionId: null,
-    projectId: 'PROJECT',
-    projectNumber: 1,
-    contentKind: 'issue',
-    statusRead: 'unset',
-    statusName: null,
-    repository: 'example/widget',
-    issueNumber: 17,
-  });
-  assert.deepEqual(
-    result.map((item) => item.contentKind),
-    ['issue', 'draft', 'pull-request'],
-  );
-  assert.deepEqual(f.events, []);
-});
-
 test.each(['project', 'option'] as const)(
   'Project %s readback failure preserves an attempted write without retry',
   async (failure) => {

@@ -688,11 +688,9 @@ export function inertTarget(
       const [ct, st] = InMemoryTransport.createLinkedPair();
       const call = async (name: string, args: Record<string, unknown>) => {
         connectionSignal.throwIfAborted();
-        const response = await client.callTool(
-          { name, arguments: name === 'delivery_board' ? args : { repo: 'example/widget', ...args } },
-          undefined,
-          { signal: connectionSignal },
-        );
+        const response = await client.callTool({ name, arguments: { repo: 'example/widget', ...args } }, undefined, {
+          signal: connectionSignal,
+        });
         connectionSignal.throwIfAborted();
         const text = (response.content as { text: string }[])[0]?.text ?? '';
         observations.push({ publicTool: name, arguments: args, isError: response.isError === true, text });

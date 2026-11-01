@@ -4,27 +4,7 @@ import { projectToolOutput } from './toolOutput.js';
 
 /** Keep a recoverable start failure machine-readable while signalling shell failure. */
 export function printCommandResult(command: string, value: unknown, verbose = false): void {
-  process.stdout.write(
-    `${JSON.stringify(projectToolOutput(command, value, verbose), null, command === 'board_reconcile' ? undefined : 2)}\n`,
-  );
-  if (command === 'board_reconcile' && typeof value === 'object' && value !== null) {
-    if ('scopeComplete' in value && value.scopeComplete === false) process.exitCode = 1;
-    if (
-      'schemaVersion' in value &&
-      value.schemaVersion === 'ai-delivery.board-reconcile-result@1' &&
-      'summary' in value &&
-      typeof value.summary === 'object' &&
-      value.summary !== null
-    ) {
-      const summary = value.summary as Record<string, unknown>;
-      if (
-        ['failed', 'drifted', 'refused', 'unknown', 'unresolved'].some(
-          (key) => typeof summary[key] === 'number' && summary[key] > 0,
-        )
-      )
-        process.exitCode = 1;
-    }
-  }
+  process.stdout.write(`${JSON.stringify(projectToolOutput(command, value, verbose), null, 2)}\n`);
   if (
     command === 'issue_batch_update' &&
     typeof value === 'object' &&
