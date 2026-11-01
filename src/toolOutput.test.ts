@@ -178,6 +178,24 @@ test('published write schemas state the limits that refuse a write', async () =>
     expect(published(name)).toContain('1, 2, 3, 5 or 8');
     expect(published(name)).toContain('Ready Bug issues need');
   }
+  for (const limit of ['10–80 characters', '1, 2, 3, 5 or 8', 'the bug fields'])
+    expect(published('issue_start')).toContain(limit);
+  const comment = tools.find((tool) => tool.name === 'issue_comment')!.inputSchema.properties as Record<
+    string,
+    { description?: string }
+  >;
+  for (const [field, kind] of Object.entries({
+    outcome: 'start',
+    done: 'progress',
+    decisionNeeded: 'progress',
+    decision: 'decision',
+    rationale: 'decision',
+    blocker: 'blocker',
+    resolution: 'blocker',
+    acceptance: 'closeout',
+    followUps: 'closeout',
+  }))
+    expect(comment[field]?.description).toContain(`when kind is ${kind}`);
   expect(published('issue_comment')).toContain('progress: done, decisionNeeded and non-empty evidence');
   expect(published('issue_comment')).toContain('HTTPS link with a public DNS hostname');
 });

@@ -315,6 +315,19 @@ test('normal-start recovery preserves legacy rendering across repeated exact ret
   assert.equal(f.comments.length, 1);
 });
 
+test('starting an existing issue checks readiness once before the Status write, not three times', async () => {
+  const f = fixture();
+  const get = f.context.clients.rest.issues.get;
+  let reads = 0;
+  f.context.clients.rest.issues.get = (async (...args: Parameters<typeof get>) => {
+    reads += 1;
+    return get(...args);
+  }) as typeof get;
+  const result = await startTrackedIssue(f.context, { issueNumber: 17 });
+  assert.equal('branch' in result && result.branch, 'issue/17');
+  assert.ok(reads <= 6, `issue read ${String(reads)} times`);
+});
+
 test.each([{ points: 4 }, { issueType: 'Feature' }])(
   'normal-start retry refuses changed contract metadata %j before native writes',
   async (patch) => {

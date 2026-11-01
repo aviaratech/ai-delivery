@@ -1427,14 +1427,13 @@ async function assertProjectTransition(
   if (request.status === 'Todo' && targets.some((x) => x.state === 'open'))
     throw new DeliveryError('Unresolved native blockers prevent Todo; resolve the blockers first.');
   if (request.status === 'In Progress') {
-    const ready = await readyCheck(context, plan.input.issueNumber);
-    if (!ready.ready) throw new IssueValidationError(ready.failures);
     if (target.state !== 'open') throw new DeliveryError('In Progress requires an open issue; inspect native state.');
     await assertIssueStartCapacity(context, plan.input.issueNumber, plan.input.overrideReason, recordOverride);
-    const current = await issueInfo(context, plan.input.issueNumber);
-    if (current.state !== 'open') throw new DeliveryError('In Progress requires an open issue; inspect native state.');
-    const finalReady = await readyCheck(context, plan.input.issueNumber);
-    if (!finalReady.ready) throw new IssueValidationError(finalReady.failures);
+    await assertReadyAndOpen(
+      context,
+      plan.input.issueNumber,
+      'In Progress requires an open issue; inspect native state.',
+    );
   }
 }
 
@@ -2912,10 +2911,18 @@ export async function startIssueBranch(context: DeliveryContext, issueNumber: nu
   return { issueNumber, issueUrl: issue.html_url, branch: name, headSha: base, reused: false };
 }
 
+/** One live read, right before a Status write: the issue is still open and still meets the ready contract. */
+async function assertReadyAndOpen(context: DeliveryContext, issueNumber: number, closedMessage: string) {
+  let state: string | undefined;
+  const ready = await readyCheck(context, issueNumber, ({ info }) => {
+    state = info.state;
+  });
+  if (!ready.ready) throw new IssueValidationError(ready.failures);
+  if (state !== 'open') throw new DeliveryError(closedMessage);
+}
+
 /** Recheck native eligibility before an explicit start changes its selected Project. */
 export async function startIssueProject(context: DeliveryContext, issueNumber: number, overrideReason?: string) {
-  const readiness = await readyCheck(context, issueNumber);
-  if (!readiness.ready) throw new IssueValidationError(readiness.failures);
   const issue = (await context.clients.rest.issues.get({ ...context.repo, issue_number: issueNumber })).data;
   if (issue.number !== issueNumber || 'pull_request' in issue || issue.state !== 'open' || !issue.node_id)
     throw new DeliveryError('Start requires the requested open GitHub issue before Project synchronization.');
@@ -2927,13 +2934,8 @@ export async function startIssueProject(context: DeliveryContext, issueNumber: n
     settings: projectSettingsFromDeliveryConfig(context.config),
     status: 'In Progress',
     beforeAdvance: async () => {
-      const eligible = await readyCheck(context, issueNumber);
-      if (!eligible.ready) throw new IssueValidationError(eligible.failures);
       await assertIssueStartCapacity(context, issueNumber, overrideReason, true);
-      const current = await issueInfo(context, issueNumber);
-      if (current.state !== 'open') throw new DeliveryError('Start requires the requested open issue.');
-      const finalEligibility = await readyCheck(context, issueNumber);
-      if (!finalEligibility.ready) throw new IssueValidationError(finalEligibility.failures);
+      await assertReadyAndOpen(context, issueNumber, 'Start requires the requested open issue.');
     },
   });
 }
