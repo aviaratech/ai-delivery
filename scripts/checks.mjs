@@ -59,17 +59,6 @@ export const RELEASE_CASES = [
   },
   ...[
     {
-      file: 'dist/delivery/delivery.test.js',
-      titles: [
-        'explicit component policy reuses compatible stages across heads and invalidates dependencies',
-        'missing policy, wrong repository, changed config and stale head fail closed',
-        'missing stage, corrupt artifact/output and blocked merge or wrong approval fail closed',
-        'separate processes can read and reuse shared output during publication and after publisher interruption',
-        'separate processes durably create shared writer directories and reject a raced non-directory',
-        'synthetic exact delivery, private checkpoint resume and phase evidence',
-      ],
-    },
-    {
       file: 'dist/pluginAuthProbe.test.js',
       titles: [
         'authentication cancellation confirms cleanup of a hanging gh descendant and withholds output',

@@ -9,7 +9,7 @@ import type {
   LoadedDeliverySettings,
 } from './config/deliveryConfig.js';
 import { loadDeliveryConfig, WipLimits, type WipLane } from './config/deliveryConfig.js';
-import { digestValue } from './delivery/legacy.js';
+import { digestValue } from './delivery/common.js';
 import {
   CollectionLimitError,
   DeliveryError,

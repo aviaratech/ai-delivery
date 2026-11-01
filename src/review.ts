@@ -1,20 +1,12 @@
-import { basename, join } from 'node:path';
+import { basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 
-import type { DeliveryConfig } from './config/deliveryConfig.js';
-import { assertPrivateFile } from './delivery/common.js';
-import {
-  digestValue,
-  RepositoryApprovalBindingSchema,
-  type RepositoryApprovalBinding,
-  type RepositoryClassificationReceipt,
-} from './delivery/legacy.js';
+import { assertPrivateFile, digestValue } from './delivery/common.js';
 import { DeliveryError } from './errors.js';
-import { git, gitCommonDir, gitExitCode } from './git.js';
+import { git, gitExitCode } from './git.js';
 import { GIT_EXECUTABLE, gitEnvironment, inertGitArguments } from './gitProcess.js';
 import type { DeliveryContext } from './issue.js';
-import { writePrivateJsonFileAtomically } from './utils/atomicJson.js';
 
 const Sha = z.string().regex(/^[a-f0-9]{40}$/u);
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
@@ -194,33 +186,6 @@ export const ReviewArtifactSchema = z
     }
   });
 export type ReviewArtifact = z.infer<typeof ReviewArtifactSchema>;
-
-export const SubmittedReviewReceiptSchema = z
-  .object({
-    artifact: ReviewArtifactSchema,
-    completedAt: z.iso.datetime(),
-    githubReviewId: z.number().int().positive(),
-    githubReviewUrl: z.url(),
-    headSha: Sha,
-    login: z.string().min(1),
-    prNumber: z.number().int().positive(),
-    publicationEvidenceId: Digest,
-    receiptId: Digest,
-    schemaVersion: z.literal('ai-delivery.review-receipt@1'),
-    state: z.literal('APPROVED'),
-  })
-  .strict()
-  .superRefine((receipt, ctx) => {
-    const { receiptId, ...content } = receipt;
-    if (
-      receiptId !== digestValue(content) ||
-      receipt.headSha !== receipt.artifact.head.sha ||
-      (receipt.artifact.prNumber !== null && receipt.artifact.prNumber !== receipt.prNumber)
-    ) {
-      ctx.addIssue({ code: 'custom', message: 'Submitted review receipt is not bound to its artifact.' });
-    }
-  });
-export type SubmittedReviewReceipt = z.infer<typeof SubmittedReviewReceiptSchema>;
 
 export interface RequiredReviewState {
   observed?: boolean;
@@ -429,14 +394,6 @@ async function readGitHubPrPaths(
   return files.sort();
 }
 
-export async function readGitHubPrScopeHash(
-  context: DeliveryContext,
-  prNumber: number,
-  changedFiles: number,
-): Promise<string> {
-  return digestValue(await readGitHubPrPaths(context, prNumber, changedFiles));
-}
-
 export async function readGitHubReviewBase(context: DeliveryContext, prNumber: number, expectedHead: string) {
   const pr = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
   if (
@@ -454,75 +411,6 @@ export async function readGitHubReviewBase(context: DeliveryContext, prNumber: n
     })
   ).data;
   return ReviewBase.parse({ baseSha: pr.base.sha, mergeBaseSha: comparison.merge_base_commit.sha });
-}
-
-export function reviewArtifactApproval(input: {
-  artifact: ReviewArtifact;
-  classification: RepositoryClassificationReceipt;
-  config: Pick<DeliveryConfig, 'roles'>;
-  issueNumber: number;
-  prNumber?: number;
-}): RepositoryApprovalBinding {
-  const { artifact, classification, config } = input;
-  ReviewArtifactSchema.parse(artifact);
-  if (
-    artifact.verdict !== 'approve' ||
-    artifact.issueNumber !== input.issueNumber ||
-    artifact.authorIdentity !== config.roles.author.identity ||
-    artifact.reviewerIdentity !== config.roles.reviewer.identity ||
-    artifact.head.sha !== classification.head.sha ||
-    artifact.head.tree !== classification.head.tree ||
-    artifact.diffScopeHash !== digestValue(classification.changedPaths) ||
-    (input.prNumber !== undefined && artifact.prNumber !== null && artifact.prNumber !== input.prNumber)
-  ) {
-    throw new DeliveryError('Independent review artifact is stale, foreign, rejected, or covers another scope.');
-  }
-  return RepositoryApprovalBindingSchema.parse({
-    authorIdentity: artifact.authorIdentity,
-    diffScopeHash: artifact.diffScopeHash,
-    head: artifact.head,
-    result: 'approved',
-    reviewerIdentity: artifact.reviewerIdentity,
-    reviewReceiptId: artifact.artifactId,
-  });
-}
-
-function receiptPath(repoRoot: string, issueNumber: number, headSha: string): string {
-  return join(gitCommonDir(repoRoot), 'ai-delivery', 'reviews', String(issueNumber), `${headSha}.json`);
-}
-
-function prepublicationPath(repoRoot: string, issueNumber: number, headSha: string): string {
-  return join(gitCommonDir(repoRoot), 'ai-delivery', 'reviews', String(issueNumber), `${headSha}.prepublication.json`);
-}
-
-export function savePrepublicationArtifact(input: {
-  artifact: ReviewArtifact;
-  classification: RepositoryClassificationReceipt;
-  config: Pick<DeliveryConfig, 'roles'>;
-  issueNumber: number;
-  repoRoot: string;
-}): void {
-  if (input.artifact.prNumber !== null) throw new DeliveryError('Prepublication review must have a null PR number.');
-  reviewArtifactApproval(input);
-  writePrivateJsonFileAtomically(
-    prepublicationPath(input.repoRoot, input.issueNumber, input.artifact.head.sha),
-    input.artifact,
-  );
-}
-
-export function loadPrepublicationArtifact(
-  repoRoot: string,
-  issueNumber: number,
-  headSha: string,
-): ReviewArtifact | null {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(assertPrivateFile(prepublicationPath(repoRoot, issueNumber, headSha)).toString('utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw new DeliveryError('Stored prepublication review is unreadable.');
-  }
-  return ReviewArtifactSchema.parse(raw);
 }
 
 async function listAllReviews(context: DeliveryContext, prNumber: number) {
@@ -546,8 +434,6 @@ interface ReviewSubmissionInput {
   issueNumber: number;
   prNumber: number;
   dryRun?: boolean;
-  publicationEvidenceId?: string;
-  classification?: RepositoryClassificationReceipt;
 }
 export interface GitHubReviewReceipt {
   artifact: ReviewArtifact;
@@ -882,40 +768,5 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
       error instanceof DeliveryError ? error.message : 'Review post-submission readback is unavailable.',
       known,
     );
-  }
-}
-
-export function loadSubmittedReview(
-  repoRoot: string,
-  issueNumber: number,
-  headSha: string,
-): SubmittedReviewReceipt | null {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(assertPrivateFile(receiptPath(repoRoot, issueNumber, headSha)).toString('utf8')) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw new DeliveryError('Stored review receipt is unreadable.');
-  }
-  return SubmittedReviewReceiptSchema.parse(raw);
-}
-
-export async function assertSubmittedReviewCurrent(
-  context: DeliveryContext,
-  receipt: SubmittedReviewReceipt,
-): Promise<void> {
-  SubmittedReviewReceiptSchema.parse(receipt);
-  const review = (await listAllReviews(context, receipt.prNumber)).find(
-    (candidate) => candidate.id === receipt.githubReviewId,
-  );
-  if (
-    !review ||
-    review.state !== 'APPROVED' ||
-    review.commit_id !== receipt.headSha ||
-    review.user?.login !== receipt.login ||
-    review.html_url !== receipt.githubReviewUrl ||
-    parseGitHubReviewArtifact(review.body).artifactId !== receipt.artifact.artifactId
-  ) {
-    throw new DeliveryError('GitHub exact-head review no longer matches the stored receipt.');
   }
 }
