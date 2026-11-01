@@ -1034,17 +1034,17 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
         ];
         for (const [phase, executable, version] of exportChecks) {
           const proof = record(parseJsonOutput(await run(phase, executable, [exportsPath], probeEnv)));
-          const health = record(proof.agentExport, 'schema');
+          const agentEntry = record(proof.agentExport, 'schema');
           const agentMember = candidate.inventory.find((member) => member.path === 'dist/agent.js');
           requireProof(
             proof.runtime === version &&
               JSON.stringify(proof.exports) === JSON.stringify(EXPORTS) &&
-              health.module === './agent' &&
-              health.exportName === 'executeTool' &&
-              health.type === 'function' &&
-              fileURLToPath(string(health.entryUrl, 'schema')) === join(installed, 'dist/agent.js') &&
+              agentEntry.module === './agent' &&
+              agentEntry.exportName === 'executeTool' &&
+              agentEntry.type === 'function' &&
+              fileURLToPath(string(agentEntry.entryUrl, 'schema')) === join(installed, 'dist/agent.js') &&
               agentMember !== undefined &&
-              health.entrySha256 === agentMember.sha256,
+              agentEntry.entrySha256 === agentMember.sha256,
             'schema',
             'Public export proof differs',
           );
