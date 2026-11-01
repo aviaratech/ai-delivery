@@ -915,7 +915,6 @@ async function readRequiredCheckNames(context: PrReadContext, base: string) {
     sources,
   );
   const names = new Set<string>();
-  const required = new Map<string, { name: string; appId: number | null }>();
   let complete = true;
   for (const [index, result] of sources.entries()) {
     if (index === 1 && (confirmedUnprotected || confirmedRulesetOnly)) continue;
@@ -972,12 +971,10 @@ async function readRequiredCheckNames(context: PrReadContext, base: string) {
           names.add(check.context);
           const selected = index === 0 ? check.integration_id : check.app_id;
           if (selected !== undefined && selected !== null && selected !== -1 && selected <= 0) complete = false;
-          const appId = selected === undefined || selected === null || selected === -1 ? null : selected;
-          required.set(JSON.stringify([check.context, appId]), { name: check.context, appId });
         }
     }
   }
-  return { names: [...names].sort(), complete, required: [...required.values()] };
+  return { names: [...names].sort(), complete };
 }
 
 export async function prChecks(context: DeliveryContext, prNumber: number) {

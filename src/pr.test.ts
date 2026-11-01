@@ -57,6 +57,134 @@ it('PR markers require their exact canonical footer', () => {
     assert.equal(bodyMarker!(body), false, body);
 });
 
+const head = 'a'.repeat(40);
+
+for (const mode of [
+  'complete',
+  'generic-404',
+  'forbidden',
+  'unreadable-repository',
+  'wrong-repository',
+  'no-write',
+  'wrong-branch',
+  'missing-summary',
+  'partial-rules',
+  'partial-rulesets',
+  'mismatched-ruleset',
+  'inactive-ruleset',
+  'wrong-source',
+]) {
+  it(`pr:checks discovers ruleset-only required checks with ${mode} visibility`, async () => {
+    const { context } = fixture();
+    const rule = {
+      type: 'required_status_checks',
+      ruleset_id: 41,
+      ruleset_source_type: 'Repository',
+      ruleset_source: mode === 'wrong-source' ? 'elsewhere/widget' : 'example/widget',
+      parameters: { required_status_checks: [{ context: 'checks', integration_id: 7 }] },
+    };
+    Object.assign(context.clients.rest, {
+      request: async (route: string) => {
+        if (route.endsWith('/protection'))
+          throw mode === 'generic-404'
+            ? { status: 404 }
+            : mode === 'forbidden'
+              ? { status: 403 }
+              : { status: 404, response: { status: 404, data: { message: 'Branch not protected' } } };
+        if (route.includes('/rules/branches/'))
+          return { status: 200, headers: mode === 'partial-rules' ? { link: 'next' } : {}, data: [rule] };
+        if (route.endsWith('/rulesets'))
+          return {
+            status: 200,
+            headers: mode === 'partial-rulesets' ? { link: 'next' } : {},
+            data: [
+              {
+                id: mode === 'mismatched-ruleset' ? 42 : 41,
+                source_type: 'Repository',
+                source: 'example/widget',
+                enforcement: mode === 'inactive-ruleset' ? 'disabled' : 'active',
+              },
+            ],
+          };
+        if (route.endsWith('/branches/{branch}'))
+          return {
+            status: 200,
+            data: {
+              name: mode === 'wrong-branch' ? 'other' : 'main',
+              protected: true,
+              ...(mode === 'missing-summary' ? {} : { protection: { enabled: false } }),
+            },
+          };
+        if (mode === 'unreadable-repository') throw { status: 403 };
+        return {
+          status: 200,
+          data: {
+            full_name: mode === 'wrong-repository' ? 'elsewhere/widget' : 'example/widget',
+            permissions: { push: mode !== 'no-write' },
+          },
+        };
+      },
+    });
+    Object.assign(context.clients.rest.checks, {
+      listForRef: async () => ({ status: 200, headers: {}, data: { total_count: 0, check_runs: [] } }),
+    });
+    Object.assign(context.clients.rest.repos, {
+      getCombinedStatusForRef: async () => ({
+        status: 200,
+        headers: {},
+        data: { sha: head, total_count: 0, statuses: [] },
+      }),
+    });
+    const result = await prChecks(context, 23);
+    assert.equal(result.requiredCheckDiscovery, mode === 'complete' ? 'complete' : 'partial');
+    assert.deepEqual(
+      result.requiredChecks.map((check) => check.name),
+      mode === 'partial-rules' ? [] : ['checks'],
+    );
+  });
+}
+
+it('pr:checks merges legacy required contexts with pinned checks', async () => {
+  const { context } = fixture();
+  const check = {
+    id: 10,
+    name: 'pinned',
+    head_sha: head,
+    app: { id: 7 },
+    status: 'completed',
+    conclusion: 'success' as string | null,
+  };
+  let runs = [check];
+  Object.assign(context.clients.rest, {
+    request: async (route: string) => ({
+      status: 200,
+      headers: {},
+      data: route.endsWith('/protection')
+        ? { required_status_checks: { checks: [{ context: 'pinned', app_id: 7 }], contexts: ['pinned', 'legacy'] } }
+        : [],
+    }),
+  });
+  Object.assign(context.clients.rest.checks, {
+    listForRef: async () => ({ status: 200, headers: {}, data: { total_count: runs.length, check_runs: runs } }),
+  });
+  Object.assign(context.clients.rest.repos, {
+    getCombinedStatusForRef: async () => ({
+      status: 200,
+      headers: {},
+      data: {
+        sha: head,
+        state: 'success',
+        total_count: 1,
+        statuses: [{ id: 20, context: 'legacy', state: 'success' }],
+      },
+    }),
+  });
+  assert.deepEqual(
+    (await prChecks(context, 23)).requiredChecks.map((c) => c.name),
+    ['legacy', 'pinned'],
+  );
+});
+
 function fixture(
   state: string | null = 'clean',
   option: {
