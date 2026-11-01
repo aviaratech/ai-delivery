@@ -19,10 +19,7 @@ export async function captureAuthenticationProbe(
       cwd,
       argv,
       cancellation.signal,
-      undefined,
       { maxAggregateRssBytes: 1024 ** 3, minFreeDiskBytes: 256 * 1024 ** 2, maxNewOutputBytes: 1024 * 1024 },
-      undefined,
-      undefined,
       {
         starting: () => {},
         observed: () => {},

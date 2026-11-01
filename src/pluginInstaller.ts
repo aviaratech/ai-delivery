@@ -688,10 +688,7 @@ async function command(
     cwd,
     [binary, ...args],
     signal,
-    undefined,
     { maxAggregateRssBytes: 1024 ** 3, minFreeDiskBytes: 256 * 1024 ** 2, maxNewOutputBytes: 512 * 1024 ** 2 },
-    undefined,
-    undefined,
     {
       starting: () => publish?.({ phase: 'starting' }),
       observed: (owned) =>
