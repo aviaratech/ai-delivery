@@ -32,8 +32,8 @@ function availableDiskBytes(path: string): bigint {
 
 function freeDiskBytes(repoRoot: string): number {
   const available = availableDiskBytes(repoRoot);
-  if (available > BigInt(Number.MAX_SAFE_INTEGER)) throw new DeliveryError('Free disk observation overflowed.');
-  return Number(available);
+  // Some filesystems (AWS EFS) report more free bytes than a safe integer; the bound only needs a floor.
+  return Number(available < BigInt(Number.MAX_SAFE_INTEGER) ? available : BigInt(Number.MAX_SAFE_INTEGER));
 }
 
 interface ObservedProcess {

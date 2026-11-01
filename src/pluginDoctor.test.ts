@@ -92,10 +92,7 @@ vi.mock('./verification.js', async (original) => ({
     _root: string,
     args: string[],
     _signal: AbortSignal,
-    _a: unknown,
-    _b: unknown,
-    _c: unknown,
-    _d: unknown,
+    _bounds: unknown,
     writer: { idle(): void } | undefined,
     options: {
       environment: Record<string, string | undefined>;
