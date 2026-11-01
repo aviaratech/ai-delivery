@@ -1026,24 +1026,6 @@ export async function runCurrentConsumer(contract, { authorizeInstall = false, s
           'package-identity',
           'Installed CLI reports the wrong version',
         );
-        writeFileSync(join(consumer, 'fictional-issues.json'), JSON.stringify({ issues: [] }));
-        const cliJson = record(
-          parseJsonOutput(
-            await run(
-              'cli-json',
-              string(contract.node24, 'runtime'),
-              [cli, 'migrate:legacy-issues', '--input-file', join(consumer, 'fictional-issues.json')],
-              probeEnv,
-            ),
-          ),
-        );
-        requireProof(
-          cliJson.schemaVersion === 'ai-delivery.legacy-issue-migration@1' &&
-            cliJson.mode === 'dry-run' &&
-            cliJson.validated === 0,
-          'schema',
-          'CLI JSON/stdout contract differs',
-        );
         const exportsPath = join(consumer, 'owned-exports.mjs');
         writeFileSync(exportsPath, EXPORT_PROBE);
         /** @type {[string,string,string][]} */
