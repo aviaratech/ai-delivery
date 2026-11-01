@@ -27,7 +27,6 @@ import {
 } from '../github/projectDelivery.js';
 import { resolveDeliveryRepo } from '../github/repo.js';
 import {
-  readDeliveryOverrides,
   loadDeliveryConfig,
   loadDeliverySettings,
   parseDeliveryConfig,
@@ -687,13 +686,6 @@ describe('portable delivery configuration', () => {
       };
       assert.equal(withReview(1).reviewOptionId, 'R0');
       assert.throws(() => withReview(2), /repeats In Review/u);
-      git(['init', '--quiet', temp]);
-      writeFileSync(join(temp, 'policy.mjs'), 'export const contract = "RepositoryDeliveryPolicy@1";\n');
-      writeFileSync(
-        join(temp, 'ai-delivery.config.json'),
-        JSON.stringify(syntheticOverrides(parseDeliveryConfig(base))),
-      );
-      assert.throws(() => readDeliveryOverrides(temp), /must be source-controlled/u);
       assert.throws(
         () => resolveDeliveryRoleCredentials({ config, env: {}, role: 'author' }),
         /Missing GitHub App credentials for author/u,

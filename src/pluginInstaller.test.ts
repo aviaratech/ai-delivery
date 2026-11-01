@@ -20,11 +20,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as atomicJson from './utils/atomicJson.js';
 import * as pluginTools from '@aviaratech/ai-plugin-tools';
-import {
-  processSnapshot,
-  retainedWorktreeTransitionProducerDigest,
-  retainedWorktreeTransitionDependencyManifests,
-} from './verification.js';
+import { processSnapshot, retainedWorktreeTransitionProducerDigest } from './verification.js';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { PassThrough } from 'node:stream';
 
@@ -1979,31 +1975,17 @@ function producerDependencyFixture(esm = true) {
 
 test.each([true, false])('producer discovery preserves inert full-byte transitive manifests (ESM-only=%s)', (esm) => {
   const { dist, paths } = producerDependencyFixture(esm);
-  const expected = paths
-    .map((source) => ({
-      source,
-      digest: `sha256:${createHash('sha256').update(readFileSync(source)).digest('hex')}`,
-    }))
-    .sort((a, b) => a.source.localeCompare(b.source));
-  assert.deepEqual(retainedWorktreeTransitionDependencyManifests(dist), expected);
   const before = retainedWorktreeTransitionProducerDigest(dist);
   writeFileSync(paths[2]!, `${readFileSync(paths[2]!, 'utf8')}\n`);
   assert.notEqual(retainedWorktreeTransitionProducerDigest(dist), before);
-  assert.equal(
-    retainedWorktreeTransitionDependencyManifests(dist).find(({ source }) => source === paths[2])!.digest,
-    `sha256:${createHash('sha256').update(readFileSync(paths[2]!)).digest('hex')}`,
-  );
 });
 
 test('producer discovery refuses missing transitive dependencies and mismatched ESM identity', () => {
   const { dist, paths } = producerDependencyFixture();
   rmSync(dirname(paths[2]!), { recursive: true });
-  assert.throws(() => retainedWorktreeTransitionDependencyManifests(dist), { code: 'MODULE_NOT_FOUND' });
+  assert.throws(() => retainedWorktreeTransitionProducerDigest(dist), { code: 'MODULE_NOT_FOUND' });
   writeFileSync(paths[1]!, JSON.stringify({ name: 'different-identity', exports: { '.': { import: './entry.js' } } }));
-  assert.throws(
-    () => retainedWorktreeTransitionDependencyManifests(dist),
-    /Producer dependency identity is unavailable/u,
-  );
+  assert.throws(() => retainedWorktreeTransitionProducerDigest(dist), /Producer dependency identity is unavailable/u);
 });
 
 // Independent golden bytes captured from a4808e1 catalogDocuments before toolkit substitution.

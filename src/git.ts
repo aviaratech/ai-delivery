@@ -6,11 +6,6 @@ import { GIT_EXECUTABLE, inertGitArguments, gitEnvironment } from './gitProcess.
 
 import { DeliveryError } from './errors.js';
 
-export interface GitCoordinate {
-  sha: string;
-  tree: string;
-}
-
 export function git(cwd: string, ...args: string[]): string {
   try {
     return execFileSync(GIT_EXECUTABLE, [...inertGitArguments(cwd), ...args], {
@@ -40,21 +35,6 @@ export function gitExitCode(cwd: string, ...args: string[]): number {
 
 export function gitCommonDir(cwd: string): string {
   return realpathSync(resolve(cwd, git(cwd, 'rev-parse', '--git-common-dir')));
-}
-
-export function coordinate(cwd: string, ref = 'HEAD'): GitCoordinate {
-  const sha = git(cwd, 'rev-parse', '--verify', ref);
-  const tree = git(cwd, 'rev-parse', `${sha}^{tree}`);
-  if (!/^[a-f0-9]{40}$/u.test(sha) || !/^[a-f0-9]{40}$/u.test(tree)) {
-    throw new DeliveryError('Git coordinate is not a SHA-1 commit and tree.');
-  }
-  return { sha, tree };
-}
-
-export function assertClean(cwd: string): void {
-  if (git(cwd, 'status', '--porcelain', '--untracked-files=all') !== '') {
-    throw new DeliveryError('Delivery requires an exact clean worktree.');
-  }
 }
 
 export function changedPaths(cwd: string, baseSha: string, headSha: string): string[] {

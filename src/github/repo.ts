@@ -1,5 +1,3 @@
-import { readdirSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
 import { GIT_EXECUTABLE, inertGitArguments, gitEnvironment } from '../gitProcess.js';
 
 import { spawnSync } from 'node:child_process';
@@ -11,10 +9,6 @@ import { DeliveryError } from '../errors.js';
 export interface RepoCoordinates {
   owner: string;
   repo: string;
-}
-
-export function formatRepoCoordinates(repo: RepoCoordinates): string {
-  return `${repo.owner}/${repo.repo}`;
 }
 
 export function resolveDeliveryRepo(
@@ -76,76 +70,4 @@ export function resolveRepoFromRemote(repoRoot: string, selectedRemote?: string)
     throw new DeliveryError('The selected Git remote must be a github.com repository URL.');
   }
   return { owner: match[1], repo: match[2] };
-}
-
-/** No process-wide checkout binding: select an origin-matched clone on each local call. */
-export function resolveCheckout(input: {
-  repository: string;
-  launchDirectory: string;
-  checkoutRoots: string[];
-  canonical?: boolean;
-}): string {
-  const matches = (path: string): string | null => {
-    try {
-      const remote = resolveRepoFromRemote(path, 'origin');
-      if (formatRepoCoordinates(remote).toLowerCase() !== input.repository.toLowerCase()) return null;
-      const result = spawnSync(GIT_EXECUTABLE, [...inertGitArguments(path), 'rev-parse', '--show-toplevel'], {
-        env: gitEnvironment(),
-        cwd: path,
-        encoding: 'utf8',
-        maxBuffer: 1024 * 1024,
-      });
-      return result.status === 0 ? realpathSync(result.stdout.trim()) : null;
-    } catch {
-      return null;
-    }
-  };
-  const current = input.canonical ? null : matches(input.launchDirectory);
-  if (current) return current;
-  const candidates = new Set<string>();
-  for (const root of input.checkoutRoots) {
-    const direct = matches(root);
-    if (direct) {
-      candidates.add(direct);
-      continue;
-    }
-    let entries;
-    try {
-      entries = readdirSync(root, { withFileTypes: true });
-    } catch {
-      throw new DeliveryError(`Checkout root is unreadable: ${root}`);
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-      const path = matches(join(root, entry.name));
-      if (path) candidates.add(path);
-    }
-  }
-  if (input.canonical) {
-    const common = new Map<string, string>();
-    for (const path of candidates) {
-      const result = spawnSync(
-        GIT_EXECUTABLE,
-        [...inertGitArguments(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-        {
-          env: gitEnvironment(),
-          cwd: path,
-          encoding: 'utf8',
-          maxBuffer: 1024 * 1024,
-        },
-      );
-      if (result.status !== 0) throw new DeliveryError('Canonical queue Git directory is unavailable.');
-      common.set(realpathSync(result.stdout.trim()), path);
-    }
-    if (common.size !== 1)
-      throw new DeliveryError(
-        'Select exactly one canonical configured clone; independent matching clones are ambiguous.',
-      );
-    return [...common.values()][0]!;
-  }
-  if (candidates.size !== 1)
-    throw new DeliveryError(
-      `Repository ${input.repository} has ${candidates.size === 0 ? 'no matching' : 'ambiguous'} checkout; select its checkout with --repo-root or configure checkoutRoots.`,
-    );
-  return [...candidates][0]!;
 }

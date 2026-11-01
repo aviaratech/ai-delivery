@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, unlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, unlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it, vi } from 'vitest';
@@ -217,30 +217,6 @@ afterEach(() => {
 });
 
 describe('per-call repository selection', () => {
-  it('selects matching origins A → B → A, prefers a matching current checkout and refuses ambiguous clones', () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'delivery-checkouts-')));
-    const clone = (name: string, repo: string) => {
-      const path = join(root, name);
-      execFileSync('git', ['init', '-q', path]);
-      execFileSync('git', ['remote', 'add', 'origin', `https://github.com/${repo}.git`], { cwd: path });
-      return path;
-    };
-    try {
-      const a = clone('a', 'example/a'),
-        b = clone('b', 'example/b');
-      const input = { launchDirectory: root, checkoutRoots: [root] };
-      assert.equal(repository.resolveCheckout({ ...input, repository: 'example/a' }), a);
-      assert.equal(repository.resolveCheckout({ ...input, repository: 'example/b' }), b);
-      assert.equal(repository.resolveCheckout({ ...input, repository: 'example/a' }), a);
-      clone('a-duplicate', 'example/a');
-      assert.throws(() => repository.resolveCheckout({ ...input, repository: 'example/a' }), /ambiguous/u);
-      assert.equal(repository.resolveCheckout({ ...input, repository: 'example/a', launchDirectory: a }), a);
-      assert.throws(() => repository.resolveCheckout({ ...input, repository: 'example/missing' }), /no matching/u);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   it('does not execute checkout filters or fsmonitor during local Git probes', () => {
     const root = mkdtempSync(join(tmpdir(), 'delivery-hostile-git-'));
     const sentinel = join(root, 'executed');
@@ -267,7 +243,7 @@ describe('per-call repository selection', () => {
       assert.equal(existsSync(sentinel), true, 'fixture filter must be executable before the protected probe');
       unlinkSync(sentinel);
       gitCommands.git(root, 'hash-object', '--path', 'change.txt', 'change.txt');
-      assert.throws(() => gitCommands.assertClean(root));
+      gitCommands.git(root, 'status', '--porcelain', '--untracked-files=all');
       assert.equal(existsSync(sentinel), false);
     } finally {
       rmSync(root, { recursive: true, force: true });

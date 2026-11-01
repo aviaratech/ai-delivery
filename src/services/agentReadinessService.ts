@@ -12,8 +12,6 @@ export interface AgentReadinessResult {
   warnings: IssueDiagnostic[];
   ready: boolean;
 }
-export type ReadinessFailureCode = string;
-
 /** Content validation is repository-independent; GitHub owns live eligibility. */
 export function evaluateAgentReadiness(input: {
   blockedBy?: readonly number[];
