@@ -27,9 +27,6 @@ const pageInfo = { hasNextPage: false, endCursor: null };
 const nonClosingCreation = {
   issueNumber: 17,
   nonClosing: true,
-  reconcileNonClosingReference: true,
-  expectedHeadSha: head,
-  expectedBaseSha: base,
   body: `References ${repo}#17\n\nImprove widget.`,
 };
 
@@ -1406,9 +1403,7 @@ describe('directory-independent exact-PR contract', () => {
         assert.match(creationHelp, /--base <branch>/u);
         assert.match(creationHelp, /Pushed remote head/u);
         assert.match(creationHelp, /--pr <number>/u);
-        assert.match(creationHelp, /--reconcile-non-closing-reference/u);
         assert.match(creationHelp, /--expected-head <sha>/u);
-        assert.match(creationHelp, /--expected-base <sha>/u);
         for (const command of ['pr:create', 'pr:info', 'pr:review']) {
           const modeHelp = execFileSync(process.execPath, [resolve('dist/cli.js'), command, '--help'], {
             cwd: root,
@@ -1822,7 +1817,7 @@ describe('explicit native non-closing reference delivery', () => {
 
   it('keeps new PR publication behind the exact pushed head and checks introduced messages first', async () => {
     const { context, state } = fixture(false, true);
-    await assert.rejects(publishPr(context, nonClosingCreation), /expected head/u);
+    await assert.rejects(publishPr(context, { ...nonClosingCreation, expectedHeadSha: head }), /not expectedHeadSha/u);
     state.linked = true;
     state.remoteHead = head;
     state.commitMessage = 'Fixes: example/widget#99';
@@ -2198,7 +2193,11 @@ describe('exact created intent and native reader bounds', () => {
       };
       await assert.rejects(publishPr(context, nonClosingCreation), /created PR #23.*differs from publication intent/u);
       assert.equal(state.creations, 1);
-      await assert.rejects(publishPr(context, nonClosingCreation));
+      const retry = await publishPr(context, nonClosingCreation).then(
+        () => 'reused',
+        () => 'refused',
+      );
+      assert.equal(retry, drift === 'title' || drift === 'draft' ? 'reused' : 'refused');
       assert.equal(state.creations, 1);
     });
   }
@@ -2328,7 +2327,7 @@ describe('explicit closing-reference reconciliation', () => {
       vi.spyOn(github, 'createDeliveryGitHubClients').mockResolvedValue(context.clients);
       await assert.rejects(
         publishPr(reviewerContext, { ...nonClosingCreation, ...(published ? { prNumber: 23 } : {}) }),
-        /configured authenticated author/u,
+        /configured author credentials/u,
       );
       assert.equal(state.creations + state.removals + state.promotions + state.updates, 0);
     });
@@ -2339,13 +2338,12 @@ describe('explicit closing-reference reconciliation', () => {
     await assert.rejects(publishPr(wrongSource, { ...nonClosingCreation, prNumber: 23 }), /configured.*author/u);
     assert.equal(state.creations + state.removals + state.promotions + state.updates, 0);
   });
-  it('refuses bare nonClosing before creating the linked-branch PR with supported prerequisites', async () => {
+  it('opens a bare nonClosing draft with the default reference body and removes the branch closing link', async () => {
     const { context, state } = pending();
-    await assert.rejects(
-      publishPr(context, { issueNumber: 17, nonClosing: true }),
-      /reconcile-non-closing-reference.*expected-head.*expected-base/u,
-    );
-    assert.equal(state.creations + state.removals, 0);
+    await publishPr(context, { issueNumber: 17, nonClosing: true });
+    assert.equal(state.body, `References ${repo}#17\n\n<!-- ai-delivery:pr@1 -->`);
+    assert.equal(state.creations, 1);
+    assert.equal(state.removals, 1);
   });
   it('creates one draft and removes only the exact manual closing pair before strict success', async () => {
     const { context, state } = pending();
@@ -2373,13 +2371,8 @@ describe('explicit closing-reference reconciliation', () => {
     assert.equal(state.removals, 0);
   });
   for (const change of [
-    { nonClosing: false },
     { draft: false },
-    { body: undefined },
-    { expectedHeadSha: undefined },
-    { expectedBaseSha: undefined },
     { expectedHeadSha: 'd'.repeat(40) },
-    { expectedBaseSha: 'd'.repeat(40) },
     { expectedHeadSha: 'bad' },
     { body: 'Closes #17' },
   ]) {
@@ -2389,11 +2382,12 @@ describe('explicit closing-reference reconciliation', () => {
       assert.equal(state.creations + state.removals + state.updates + state.promotions, 0);
     });
   }
-  it('does not infer removal authority from an implicitly matched existing PR', async () => {
+  it('removes the branch closing link from an implicitly matched draft without creating another', async () => {
     const { context, state } = pending(true);
     state.linked = true;
-    await assert.rejects(publishPr(context, nonClosingCreation), /explicit.*PR|--pr/u);
-    assert.equal(state.creations + state.removals, 0);
+    await publishPr(context, nonClosingCreation);
+    assert.equal(state.creations, 0);
+    assert.equal(state.removals, 1);
   });
   it('continues a caller-admitted exact pending PR without creating another', async () => {
     const { context, state } = pending(true);
@@ -2673,4 +2667,97 @@ describe('non-closing body update', () => {
     await assert.rejects(publishPr(context, { ...update, body: 'Closes #17' }), /closing directives/u);
     assert.equal(state.updates, 1);
   });
+});
+
+// Recorded issue_pr_create calls that failed on 0.3.37/0.3.38 hosts (#239). Repo, issue, branch,
+// SHA and body text are redacted to the fixture; keys, flags and body shape are as recorded.
+describe('recorded issue_pr_create failures open on the first call', () => {
+  async function callCreate(context: DeliveryContext, args: Record<string, unknown>) {
+    const root = mkdtempSync(join(tmpdir(), 'delivery-pr-replay-'));
+    vi.spyOn(settings, 'loadDeliverySettings').mockResolvedValue(
+      context.config as unknown as Awaited<ReturnType<typeof settings.loadDeliverySettings>>,
+    );
+    vi.spyOn(issues, 'loadDeliveryContext').mockResolvedValue(context);
+    const server = createAiDeliveryMcpServer({ repoRoot: root });
+    const client = new Client({ name: 'replay-fixture', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const result = await client.callTool({ name: 'issue_pr_create', arguments: { repo, ...args } });
+      return { isError: result.isError === true, text: JSON.stringify(result.content) };
+    } catch (error) {
+      return { isError: true, text: error instanceof Error ? error.message : String(error) };
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const closing = [
+    ['ai-delivery#257 Oct 31', { headBranch: 'issue/17', body: 'Closes #17.\n\nRedacted.' }],
+    ['ai#3889 Oct 31', { headBranch: 'issue/17', base: 'main', body: `Fixes ${repo}#17\n\nRedacted.` }],
+    ['ai#3894 Nov 1 (twice)', { headBranch: 'issue/17', body: `Fixes ${repo}#17\nRedacted.` }],
+    ['ai#3901 Nov 1', { headBranch: 'issue/17', body: `Fixes ${repo}#17\nRedacted.` }],
+    ['ai#3907 Nov 1', { headBranch: 'issue/17', body: `Fixes ${repo}#17\n\nRedacted.` }],
+  ] as const;
+  for (const [name, args] of closing)
+    it(`opens the closing PR from ${name} that pinned expectedHeadSha`, async () => {
+      const { context, state } = fixture(false);
+      state.remoteHead = head;
+      const result = await callCreate(context, {
+        issueNumber: 17,
+        title: 'Improve widget',
+        expectedHeadSha: head,
+        ...args,
+      });
+      assert.equal(result.isError, false, result.text);
+      assert.equal(state.creations, 1);
+    });
+
+  const nonClosing = [
+    ['ai#3907 Nov 1 after merged #3908', 'merged', { body: `Refs ${repo}#17 (stays open until the readout)` }],
+    ['ai-delivery#240 Nov 1 after closed #245', 'closed', { body: 'Refs #17 (AC1 and AC2). Leaves #17 open.' }],
+    ['ai#3700 Oct 26 with no earlier PR', 'none', { body: 'Redacted.' }],
+  ] as const;
+  for (const [name, earlier, args] of nonClosing)
+    it(`opens the non-closing draft from ${name} and keeps the issue open`, async () => {
+      const { context, state } = fixture(false, true);
+      state.linked = true;
+      state.remoteHead = head;
+      state.closingOnCreate = true;
+      if (earlier !== 'none') {
+        const old = {
+          ...(await context.clients.rest.pulls.get({ ...context.repo, pull_number: 23 })).data,
+          number: 22,
+          node_id: 'PR22',
+          html_url: `https://github.com/${repo}/pull/22`,
+          state: 'closed',
+          draft: false,
+          merged: earlier === 'merged',
+          body: 'Closes #17',
+        };
+        const { get } = context.clients.rest.pulls;
+        Object.assign(context.clients.rest.pulls, {
+          list: async (input: { state: string }) => ({
+            data: [...(input.state === 'open' ? [] : [{ number: 22 }]), ...(state.published ? [{ number: 23 }] : [])],
+          }),
+          get: async (input: { pull_number: number }) =>
+            input.pull_number === 22 ? { data: old } : get(input as never),
+        });
+      }
+      const result = await callCreate(context, {
+        issueNumber: 17,
+        headBranch: 'issue/17',
+        nonClosing: true,
+        title: 'Improve widget',
+        ...args,
+      });
+      assert.equal(result.isError, false, result.text);
+      assert.equal(state.creations, 1);
+      assert.equal(state.removals, 1);
+      assert.equal(state.draft, true);
+      assert.equal(state.manualClosing, false);
+      assert.equal(state.issueState, 'open');
+    });
 });

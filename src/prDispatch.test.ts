@@ -44,28 +44,21 @@ describe('validated PR mode dispatch', () => {
   const action = {
     ...ids,
     nonClosing: true,
-    reconcileNonClosingReference: true,
     expectedHeadSha: 'a'.repeat(40),
-    expectedBaseSha: 'b'.repeat(40),
     body: 'References example/widget#17',
   };
-  it('forwards the explicit exact-head/base action through the existing author owner', async () => {
+  it('forwards a non-closing head-pinned request through the existing author owner', async () => {
     const calls = routes();
     await executeTool('issue_pr_create', action, execution);
     assert.deepEqual(calls.create.mock.calls[0]![1], { ...action, draft: true, dryRun: false });
     assert.equal(calls.load.mock.calls[0]![0].role, 'author');
   });
   for (const change of [
-    { nonClosing: false },
-    { draft: false },
-    { body: undefined },
-    { expectedHeadSha: undefined },
-    { expectedBaseSha: undefined },
     { expectedHeadSha: 'bad' },
-    { reconcileNonClosingReference: 'true' },
-    { reconcileNonClosingReference: false },
+    { expectedBaseSha: 'b'.repeat(40) },
+    { reconcileNonClosingReference: true },
   ]) {
-    it(`rejects malformed or incompatible reference action ${JSON.stringify(change)} before credentials`, async () => {
+    it(`rejects malformed or removed input ${JSON.stringify(change)} before credentials`, async () => {
       const calls = routes();
       await assert.rejects(executeTool('issue_pr_create', { ...action, ...change }, execution));
       assert.equal(calls.load.mock.calls.length + calls.create.mock.calls.length, 0);
