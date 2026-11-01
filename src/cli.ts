@@ -385,13 +385,8 @@ program
   .description('Create or reuse an issue-closing PR from a pushed --head, from any directory.')
   .requiredOption('--issue <number>')
   .option('--pr <number>', 'Exact existing PR selector; never creates a replacement')
-  .option('--non-closing', 'Retain the issue OPEN using native non-closing reference proof')
-  .option(
-    '--reconcile-non-closing-reference',
-    'Explicit native closing-pair removal request; caller must hold exact authority and reconcile prior attempts',
-  )
-  .option('--expected-head <sha>', 'Exact source SHA for the explicit reference action')
-  .option('--expected-base <sha>', 'Exact default-base SHA for the explicit reference action')
+  .option('--non-closing', 'Open a draft PR that references the issue and leaves it open')
+  .option('--expected-head <sha>', 'Refuse unless the pushed head is this SHA')
   .option('--title <title>')
   .option('--body-file <path>')
   .option('--head <branch>', 'Pushed remote head; no ai-delivery branch or worktree setup required')
@@ -403,9 +398,7 @@ program
       issue: string;
       pr?: string;
       nonClosing?: boolean;
-      reconcileNonClosingReference?: boolean;
       expectedHead?: string;
-      expectedBase?: string;
       title?: string;
       bodyFile?: string;
       head?: string;
@@ -417,9 +410,7 @@ program
         issueNumber: int(o.issue),
         prNumber: int(o.pr),
         nonClosing: o.nonClosing,
-        reconcileNonClosingReference: o.reconcileNonClosingReference,
         expectedHeadSha: o.expectedHead,
-        expectedBaseSha: o.expectedBase,
         title: o.title,
         body: body(undefined, o.bodyFile),
         headBranch: o.head,

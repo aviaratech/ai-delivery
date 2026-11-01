@@ -72,7 +72,7 @@ GitHub's current required checks, counted reviews, blockers and merge eligibilit
 
 GitHub deletes the merged head branch; the host removes its own worktree.
 
-For partial delivery, `--non-closing` requires a canonical `References owner/repo#number` body and complete native evidence; a new linked-branch draft requires a separately authorized exact reference action. A complete executable child can close normally while its parent stays open.
+For partial delivery, `--non-closing` opens a draft whose body starts with `References owner/repo#number`. GitHub links a PR from an `issue/N` branch as closing, so the tool removes that link before it returns. A complete executable child can close normally while its parent stays open.
 
 ## Command and tool map
 
