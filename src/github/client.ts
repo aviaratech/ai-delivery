@@ -394,9 +394,6 @@ async function selectedPrivateKey(
           signal === undefined ? timeout.signal : AbortSignal.any([signal, timeout.signal]),
           undefined,
           undefined,
-          undefined,
-          undefined,
-          undefined,
           {
             environment: commandEnv,
             cwd: env.HOME ?? homedir(),

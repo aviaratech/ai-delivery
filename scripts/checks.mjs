@@ -48,7 +48,7 @@ export const FAST_GATES = ['format', 'lint', 'types'];
 export const RELEASE_CASES = [
   {
     file: 'dist/lifecycle.test.js',
-    title: 'Node 26 packed public exports preserve standalone and malformed-capability behavior',
+    title: 'Node 26 packed public exports load from a consumer',
     kind: 'mandatory',
   },
   {
@@ -136,7 +136,6 @@ export const RELEASE_CASES = [
     {
       file: 'dist/lifecycle.test.js',
       titles: [
-        'filesystem fixture helper runs standalone and fails closed on malformed capability',
         'readiness record capability is unavailable during a controlled partial publication',
         'readiness record pids is unavailable during a controlled partial publication',
       ],

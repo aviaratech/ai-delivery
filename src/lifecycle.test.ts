@@ -115,16 +115,13 @@ for (const name of ['capability', 'pids'])
     },
   );
 
-test(
-  'Node 26 packed public exports preserve standalone and malformed-capability behavior',
-  { tags: ['release'] },
-  () => {
-    const consumer = packedNode26Consumer();
-    execFileSync(
-      consumer.executable,
-      [
-        '-e',
-        `
+test('Node 26 packed public exports load from a consumer', { tags: ['release'] }, () => {
+  const consumer = packedNode26Consumer();
+  execFileSync(
+    consumer.executable,
+    [
+      '-e',
+      `
 (async () => {
   const assert = require('node:assert/strict');
   assert.equal(process.version, 'v26.2.0');
@@ -132,49 +129,15 @@ test(
     import('@aviaratech/ai-delivery'), import('@aviaratech/ai-delivery/agent'),
     import('@aviaratech/ai-delivery/delivery'), import('@aviaratech/ai-delivery/mcp'),
   ]);
-  assert.equal(root.withVerificationFilesystemFixture, agent.withVerificationFilesystemFixture);
+  assert.equal(root.deliveryHealth, agent.deliveryHealth);
   assert.equal(typeof agent.verifyIssue, 'undefined');
   assert.equal(typeof delivery.loadValidRepositoryDeliveryEvidence, 'undefined');
   assert.equal(typeof mcp.createAiDeliveryMcpServer, 'function');
   const manifest = JSON.parse(require('node:fs').readFileSync('package.json', 'utf8'));
   assert.deepEqual(Object.keys(manifest.exports).sort(), ['.', './agent', './delivery', './mcp']);
-  const prior = process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
-  delete process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
-  assert.equal(await agent.withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
-  process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE = '{}';
-  let executed = false;
-  await assert.rejects(agent.withVerificationFilesystemFixture(() => { executed = true; }), /invalid or stale/);
-  assert.equal(executed, false);
-  if (prior === undefined) delete process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE;
-  else process.env.AI_DELIVERY_OUTPUT_OBSERVATION_GATE = prior;
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `,
-      ],
-      { cwd: consumer.root, stdio: 'pipe' },
-    );
-  },
-);
-
-test(
-  'filesystem fixture helper runs standalone and fails closed on malformed capability',
-  { tags: ['release'] },
-  async () => {
-    const { withVerificationFilesystemFixture } = await import('./agent.js');
-    assert.equal(await withVerificationFilesystemFixture(() => 'standalone'), 'standalone');
-    const prior = process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
-    try {
-      process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = '{}';
-      let executed = false;
-      await assert.rejects(
-        withVerificationFilesystemFixture(() => {
-          executed = true;
-        }),
-        /invalid or stale/u,
-      );
-      assert.equal(executed, false);
-    } finally {
-      if (prior === undefined) delete process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'];
-      else process.env['AI_DELIVERY_OUTPUT_OBSERVATION_GATE'] = prior;
-    }
-  },
-);
+    ],
+    { cwd: consumer.root, stdio: 'pipe' },
+  );
+});
