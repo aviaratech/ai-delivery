@@ -373,6 +373,20 @@ program
   );
 
 program
+  .command('milestone:create')
+  .description('Create a repository milestone with an optional due date and description')
+  .requiredOption('--title <title>')
+  .option('--due-on <date>', 'ISO date, YYYY-MM-DD')
+  .option('--description <text>')
+  .action(async (o: { title: string; dueOn?: string; description?: string }) =>
+    run('milestone_create', {
+      title: o.title,
+      ...(o.dueOn === undefined ? {} : { dueOn: o.dueOn }),
+      ...(o.description === undefined ? {} : { description: o.description }),
+    }),
+  );
+
+program
   .command('info')
   .requiredOption('--issue <number>')
   .action(async (o: { issue: string }) => run('issue_info', { issueNumber: int(o.issue) }));

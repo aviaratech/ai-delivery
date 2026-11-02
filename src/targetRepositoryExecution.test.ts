@@ -124,6 +124,12 @@ const routes: Route[] = [
     witness: 'pulls.get',
   },
   {
+    name: 'milestone_create',
+    input: () => ({ title: 'R12', dueOn: '2026-11-27', description: 'Speed lane' }),
+    cli: () => ['milestone:create', '--title', 'R12', '--due-on', '2026-11-27', '--description', 'Speed lane'],
+    witness: 'issues.createMilestone',
+  },
+  {
     name: 'issue_pr_review',
     input: (f) => ({ issueNumber: 17, prNumber: 23, artifact: JSON.stringify(f.artifact) }),
     cli: (f) => ['pr:review', '--issue', '17', '--pr', '23', '--artifact', f.artifactPath],

@@ -2,6 +2,7 @@ import { issueView, prView } from './readView.js';
 import { loadDeliverySettings, type LoadedDeliverySettings } from './config/deliveryConfig.js';
 import { DeliveryError } from './errors.js';
 import { digestValue } from './delivery/common.js';
+import { createMilestone } from './milestone.js';
 import { evaluateCommandIdentityPolicy } from './github/commandIdentityPolicy.js';
 import {
   CreatedTrackingIssueError,
@@ -319,6 +320,12 @@ export async function executeTool(
         ...(input.base === undefined ? {} : { baseBranch: requireString(input, 'base') }),
         draft: input.draft !== false,
         dryRun: input.dryRun === true,
+      });
+    case 'milestone_create':
+      return createMilestone(context, {
+        title: requireString(input, 'title'),
+        ...(input.description === undefined ? {} : { description: requireString(input, 'description') }),
+        ...(input.dueOn === undefined ? {} : { dueOn: requireString(input, 'dueOn') }),
       });
     case 'issue_pr_info':
       return prView(context, input as { issueNumber?: number; prNumber?: number; nonClosing?: boolean });

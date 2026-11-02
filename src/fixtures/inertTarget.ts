@@ -224,6 +224,13 @@ export function inertTarget(
       html_url: 'https://github.com/example/widget/pull/23#pullrequestreview-99',
     };
     const reviews = [review];
+    const milestones: {
+      description: string | null;
+      due_on: string | null;
+      html_url: string;
+      number: number;
+      title: string;
+    }[] = [];
     const comments: {
       id: number;
       node_id: string;
@@ -420,6 +427,26 @@ export function inertTarget(
           return { data: input.page === 2 ? [issue(18)] : input.page === 3 ? [] : [issue()] };
         },
         listLabelsForRepo: async () => ({ data: [] }),
+        listMilestones: async (input: unknown) => {
+          record('issues.listMilestones', input);
+          return { data: milestones };
+        },
+        createMilestone: async (input: { description?: string; due_on?: string; title: string }) => {
+          record('issues.createMilestone', input);
+          const milestone = {
+            description: input.description ?? null,
+            due_on: input.due_on ?? null,
+            html_url: 'https://github.com/example/widget/milestone/1',
+            number: milestones.length + 1,
+            title: input.title,
+          };
+          milestones.push(milestone);
+          return { data: milestone };
+        },
+        getMilestone: async (input: { milestone_number: number }) => {
+          record('issues.getMilestone', input);
+          return { data: milestones.find((milestone) => milestone.number === input.milestone_number)! };
+        },
         listSubIssues: async (input: unknown) => {
           record('issues.listSubIssues', input);
           return { data: [] };
