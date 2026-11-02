@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
+import { ProjectTradeFields } from '../github/projectNumbers.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema, JOURNAL_SCHEMA_METADATA } from '../issueJournal.js';
 import {
@@ -29,6 +30,7 @@ const IssueUpdateInput = issueInputSchema(
     .strictObject({
       ...IssueWriteFields,
       ...NativeIssueDateFields,
+      ...ProjectTradeFields,
       status: IssueStatusPatch.optional(),
       projectStatus: ProjectStatusPatch.optional(),
       repo: Repo,

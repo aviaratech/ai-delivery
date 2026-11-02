@@ -34,12 +34,19 @@ import {
   getArchivedIssueProjectStatus,
   getIssueProjectStatus,
   assertIssueProjectWritable,
+  ensureIssueProjectMembership,
   getProjectDeliveryConfiguration,
   type ProjectDeliveryConfiguration,
   projectSettingsFromDeliveryConfig,
   syncIssueProjectStatus,
   readBackProjectItem,
 } from './github/projectDelivery.js';
+import {
+  projectTradePatch,
+  setProjectTradeNumbers,
+  type ProjectTradeKey,
+  type ProjectTradePatch,
+} from './github/projectNumbers.js';
 import {
   getNativeBlockerRelationships,
   hasNativeSubIssues,
@@ -1301,7 +1308,8 @@ export async function readIssueClosure(context: DeliveryContext, issueNumber: nu
   };
 }
 
-export interface UpdateIssueInput extends Omit<Partial<IssueFieldsInput>, 'deferral'>, NativeIssueDatePatch {
+export interface UpdateIssueInput
+  extends Omit<Partial<IssueFieldsInput>, 'deferral'>, NativeIssueDatePatch, ProjectTradePatch {
   defer?: IssueDeferralData;
   undefer?: true;
   status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
@@ -1327,6 +1335,8 @@ export interface UpdateIssueInput extends Omit<Partial<IssueFieldsInput>, 'defer
 }
 
 export interface UpdateIssueResult extends IssueInfo {
+  /** The Project trades/day numbers after the write, present when the update set either one. */
+  projectNumbers?: Record<ProjectTradeKey, number | null>;
   warnings: IssueDiagnostic[];
   conversion?: { priorBody: string; canonicalBody: string; diff: string };
   historyComment?: IssueCommentReadback;
@@ -1667,7 +1677,37 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
 type PreparedIssueUpdate = Awaited<ReturnType<typeof prepareIssueUpdate>>;
 
 export async function updateIssue(context: DeliveryContext, input: UpdateIssueInput): Promise<UpdateIssueResult> {
-  return applyIssueUpdate(context, await prepareIssueUpdate(context, input));
+  const { expectedTradesPerDay, measuredTradesPerDay, ...fields } = input;
+  const patch = projectTradePatch({ expectedTradesPerDay, measuredTradesPerDay });
+  if (Object.keys(patch).length === 0) return applyIssueUpdate(context, await prepareIssueUpdate(context, input));
+  const hasFields = Object.entries(fields).some(
+    ([key, value]) => value !== undefined && !['repo', 'issueNumber'].includes(key),
+  );
+  const updated: UpdateIssueResult = hasFields
+    ? await applyIssueUpdate(context, await prepareIssueUpdate(context, fields))
+    : { ...(await issueInfo(context, input.issueNumber)), warnings: [] };
+  const { clients, config, repo } = context;
+  const configuration = await getProjectDeliveryConfiguration({
+    graphql: clients.graphql,
+    org: config.native.organization,
+    requireWritable: true,
+    settings: projectSettingsFromDeliveryConfig(config),
+  });
+  const target = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
+  const membership = await ensureIssueProjectMembership({
+    configuration,
+    graphql: clients.graphql,
+    issueNodeId: target.node_id,
+    org: config.native.organization,
+    settings: projectSettingsFromDeliveryConfig(config),
+  });
+  const projectNumbers = await setProjectTradeNumbers({
+    graphql: clients.graphql,
+    itemId: membership.itemId,
+    patch,
+    projectId: configuration.projectId,
+  });
+  return { ...updated, projectNumbers };
 }
 
 async function applyIssueUpdate(
