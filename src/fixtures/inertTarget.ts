@@ -223,6 +223,7 @@ export function inertTarget(
       body: reviewBody,
       html_url: 'https://github.com/example/widget/pull/23#pullrequestreview-99',
     };
+    const tradeNumbers = new Map<string, number>();
     const reviews = [review];
     const comments: {
       id: number;
@@ -524,6 +525,26 @@ export function inertTarget(
         return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM17' } } };
       }
       if (query.includes('ProjectDeliveryItemReadback')) return { node: item() };
+      if (query.includes('ProjectNumberFields'))
+        return {
+          node: {
+            fields: {
+              nodes: [
+                { id: 'F_EXPECTED', name: 'Expected trades/day', dataType: 'NUMBER' },
+                { id: 'F_MEASURED', name: 'Measured trades/day', dataType: 'NUMBER' },
+              ],
+            },
+          },
+        };
+      if (query.includes('SetProjectNumber') || query.includes('ClearProjectNumber')) {
+        if (query.includes('SetProjectNumber')) tradeNumbers.set(String(variables.fieldId), Number(variables.value));
+        else tradeNumbers.delete(String(variables.fieldId));
+        return {};
+      }
+      if (query.includes('ProjectNumberReadback')) {
+        const number = (id: string) => (tradeNumbers.has(id) ? { number: tradeNumbers.get(id) } : null);
+        return { node: { expectedTradesPerDay: number('F_EXPECTED'), measuredTradesPerDay: number('F_MEASURED') } };
+      }
       if (query.includes('DeliveryStartBranch')) {
         state.linked = true;
         return { createLinkedBranch: { linkedBranch: { ref: { name: 'issue/17', target: { oid: head } } } } };
