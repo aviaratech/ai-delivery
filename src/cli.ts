@@ -23,6 +23,7 @@ import { PACKAGE_VERSION } from './version.js';
 import { managePlugin } from './pluginInstaller.js';
 import { IssueWriteSchema, IssueStatusPatch, IssueDeferralPatch, ProjectStatusPatch } from './issueContract.js';
 import { NativeIssueDateFields } from './github/nativeIssueMetadata.js';
+import { ProjectTradeFields } from './github/projectNumbers.js';
 import { DeliveryError } from './errors.js';
 
 const program = new Command();
@@ -90,6 +91,7 @@ function fields(file: string | undefined, overrides: Record<string, unknown>, up
   return {
     ...IssueWriteSchema.extend({
       ...NativeIssueDateFields,
+      ...(update ? ProjectTradeFields : {}),
       ...IssueDeferralPatch,
       status: IssueStatusPatch.optional(),
       ...(update ? { projectStatus: ProjectStatusPatch.optional() } : {}),

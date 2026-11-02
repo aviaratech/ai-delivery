@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
+import { ProjectTradeFields } from '../github/projectNumbers.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
 import { JournalInputSchema, JOURNAL_SCHEMA_METADATA } from '../issueJournal.js';
 import {
@@ -187,7 +188,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_update',
     commandName: 'update',
     description: 'Update native issue fields and exact relationship sets with readback',
-    inputSchema: IssueUpdateInput.safeExtend({ verbose: Verbose }),
+    inputSchema: IssueUpdateInput.safeExtend({ ...ProjectTradeFields, verbose: Verbose }),
   },
   {
     name: 'issue_batch_update',
