@@ -262,6 +262,19 @@ export const AI_DELIVERY_MCP_TOOLS = [
     }),
   },
   {
+    name: 'milestone_create',
+    commandName: 'milestone:create',
+    description:
+      'Create a repository milestone (title, optional ISO due date and description) with readback. Repeating the same call returns the milestone it made; a same-titled milestone with different details is refused.',
+    inputSchema: z.strictObject({
+      repo: Repo,
+      verbose: Verbose,
+      title: z.string().trim().min(1).max(256),
+      dueOn: z.iso.date().optional(),
+      description: z.string().max(10000).optional(),
+    }),
+  },
+  {
     name: 'issue_pr_review',
     commandName: 'pr:review',
     description: 'Submit one existing exact-head independent review with the reviewer App role',

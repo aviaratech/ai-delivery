@@ -16,6 +16,7 @@ const AUTHOR_COMMANDS = new Set([
   'start',
   'update',
   'batch:update',
+  'milestone:create',
   'pr:create',
   'worktree',
   'worktree:create',
