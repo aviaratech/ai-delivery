@@ -13,6 +13,8 @@ export interface MilestoneReadback {
   description: string;
   dueOn: string | null;
   number: number;
+  /** A repeat of the call can match a closed milestone, so say which. */
+  state: 'closed' | 'open';
   title: string;
   url: string;
 }
@@ -44,19 +46,20 @@ export async function createMilestone(
         ...context.repo,
         title: input.title,
         ...(input.description === undefined ? {} : { description: input.description }),
-        ...(dueOn === null ? {} : { due_on: `${dueOn}T00:00:00Z` }),
+        ...(dueOn === null ? {} : { due_on: `${dueOn}T12:00:00Z` }),
       })
     ).data;
   const readback = (await rest.issues.getMilestone({ ...context.repo, milestone_number: milestone.number })).data;
   if (readback.title !== input.title || !same(readback))
     throw new DeliveryError(
-      `Milestone #${milestone.number} readback differs from the requested title, description or due date.`,
+      `Milestone #${milestone.number} now exists with due date ${readback.due_on?.slice(0, 10) ?? 'none'} and does not match the request. Fix it on GitHub.`,
     );
   return {
     created: existing === undefined,
     description: readback.description ?? '',
     dueOn: readback.due_on?.slice(0, 10) ?? null,
     number: readback.number,
+    state: readback.state === 'closed' ? 'closed' : 'open',
     title: readback.title,
     url: readback.html_url,
   };

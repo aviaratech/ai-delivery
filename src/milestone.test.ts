@@ -6,6 +6,7 @@ import { createMilestone } from './milestone.js';
 
 interface FakeMilestone {
   description: string | null;
+  state?: 'closed' | 'open';
   due_on: string | null;
   html_url: string;
   number: number;
@@ -24,6 +25,7 @@ function fakeRepository(initial: FakeMilestone[] = [], options: { dropDueDate?: 
         due_on: options.dropDueDate === true ? null : (input.due_on ?? null),
         html_url: `https://github.com/aviaratech/ai/milestone/${milestones.length + 1}`,
         number: milestones.length + 1,
+        state: 'open',
         title: input.title,
       };
       milestones.push(milestone);
@@ -54,10 +56,11 @@ test('milestone_create makes a milestone with a due date and description and rea
     description: 'R12: speed lane',
     dueOn: '2026-11-27',
     number: 1,
+    state: 'open',
     title: 'R12',
     url: 'https://github.com/aviaratech/ai/milestone/1',
   });
-  assert.equal(repository.created[0]!.due_on, '2026-11-27T00:00:00Z');
+  assert.equal(repository.created[0]!.due_on, '2026-11-27T12:00:00Z');
 });
 
 test('repeating the same milestone_create returns the milestone it made and creates no second one', async () => {
@@ -85,7 +88,7 @@ test('a readback that lost the due date fails instead of reporting success', asy
   const repository = fakeRepository([], { dropDueDate: true });
   await assert.rejects(
     createMilestone(repository.context, { dueOn: '2026-11-27', title: 'R12' }),
-    /readback differs from the requested title, description or due date/u,
+    /Milestone #1 now exists with due date none and does not match the request/u,
   );
 });
 
@@ -95,4 +98,21 @@ test('the milestone_create tool takes a title, an ISO date and a description and
   assert.ok(tool.inputSchema.safeParse({ description: 'x', dueOn: '2026-11-27', title: 'R12' }).success);
   assert.equal(tool.inputSchema.safeParse({ dueOn: '11/27/2026', title: 'R12' }).success, false);
   assert.equal(tool.inputSchema.safeParse({ title: '  ' }).success, false);
+});
+
+test('a repeat that matches a closed milestone says it is closed', async () => {
+  const repository = fakeRepository([
+    {
+      description: null,
+      due_on: '2026-11-27T08:00:00Z',
+      html_url: 'https://example.test/3',
+      number: 3,
+      state: 'closed',
+      title: 'R12',
+    },
+  ]);
+  const result = await createMilestone(repository.context, { dueOn: '2026-11-27', title: 'R12' });
+  assert.equal(result.created, false);
+  assert.equal(result.state, 'closed');
+  assert.equal(repository.created.length, 0);
 });
