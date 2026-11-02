@@ -43,6 +43,7 @@ import {
 } from './github/projectDelivery.js';
 import {
   projectTradePatch,
+  readProjectTradeFieldIds,
   setProjectTradeNumbers,
   type ProjectTradeKey,
   type ProjectTradePatch,
@@ -1680,28 +1681,36 @@ export async function updateIssue(context: DeliveryContext, input: UpdateIssueIn
   const { expectedTradesPerDay, measuredTradesPerDay, ...fields } = input;
   const patch = projectTradePatch({ expectedTradesPerDay, measuredTradesPerDay });
   if (Object.keys(patch).length === 0) return applyIssueUpdate(context, await prepareIssueUpdate(context, input));
+  const { clients, config, repo } = context;
+  const settings = projectSettingsFromDeliveryConfig(config);
+  // Check the Project and its number fields before any issue field is written, so a missing field fails first.
+  const configuration = await getProjectDeliveryConfiguration({
+    graphql: clients.graphql,
+    org: config.native.organization,
+    requireWritable: true,
+    settings,
+  });
+  const fieldIds = await readProjectTradeFieldIds({
+    graphql: clients.graphql,
+    keys: Object.keys(patch) as ProjectTradeKey[],
+    projectId: configuration.projectId,
+  });
   const hasFields = Object.entries(fields).some(
     ([key, value]) => value !== undefined && !['repo', 'issueNumber'].includes(key),
   );
   const updated: UpdateIssueResult = hasFields
     ? await applyIssueUpdate(context, await prepareIssueUpdate(context, fields))
     : { ...(await issueInfo(context, input.issueNumber)), warnings: [] };
-  const { clients, config, repo } = context;
-  const configuration = await getProjectDeliveryConfiguration({
-    graphql: clients.graphql,
-    org: config.native.organization,
-    requireWritable: true,
-    settings: projectSettingsFromDeliveryConfig(config),
-  });
   const target = (await clients.rest.issues.get({ issue_number: input.issueNumber, ...repo })).data;
   const membership = await ensureIssueProjectMembership({
     configuration,
     graphql: clients.graphql,
     issueNodeId: target.node_id,
     org: config.native.organization,
-    settings: projectSettingsFromDeliveryConfig(config),
+    settings,
   });
   const projectNumbers = await setProjectTradeNumbers({
+    fieldIds,
     graphql: clients.graphql,
     itemId: membership.itemId,
     patch,

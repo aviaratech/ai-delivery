@@ -30,7 +30,6 @@ const IssueUpdateInput = issueInputSchema(
     .strictObject({
       ...IssueWriteFields,
       ...NativeIssueDateFields,
-      ...ProjectTradeFields,
       status: IssueStatusPatch.optional(),
       projectStatus: ProjectStatusPatch.optional(),
       repo: Repo,
@@ -189,7 +188,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_update',
     commandName: 'update',
     description: 'Update native issue fields and exact relationship sets with readback',
-    inputSchema: IssueUpdateInput.safeExtend({ verbose: Verbose }),
+    inputSchema: IssueUpdateInput.safeExtend({ ...ProjectTradeFields, verbose: Verbose }),
   },
   {
     name: 'issue_batch_update',
