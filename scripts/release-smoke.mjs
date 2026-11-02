@@ -39,6 +39,14 @@ export function releaseSmoke({ cli, version, now = () => new Date() }) {
 
 function main() {
   const args = process.argv.slice(2);
+  // A stray flag must not create and close a real issue.
+  if (args.length % 2 !== 0 || args.some((arg, index) => index % 2 === 0 && !['--repo', '--identity'].includes(arg))) {
+    process.stdout.write(
+      'FAIL release smoke: usage is node scripts/release-smoke.mjs [--repo owner/name] [--identity name]\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
   /** @param {string} name */
   const option = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
   const repo = option('--repo') ?? 'aviaratech/ai-delivery';
@@ -64,7 +72,8 @@ function main() {
         [entry, '--repo', repo, ...(identity === undefined ? [] : ['--identity', identity]), ...command],
         { cwd: work, encoding: 'utf8', timeout: 120_000 },
       );
-      if (run.status !== 0) throw new Error((run.stderr || run.stdout || 'the CLI failed').trim().split('\n')[0]);
+      if (run.status !== 0)
+        throw new Error(run.error?.message ?? ((run.stderr || run.stdout).trim().slice(0, 200) || 'the CLI failed'));
       return /** @type {Reply} */ (JSON.parse(run.stdout));
     };
     const result = releaseSmoke({ cli, version });
