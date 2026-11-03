@@ -126,9 +126,12 @@ export function renderJournal(raw: JournalInput, marker?: string): string {
       .replace(/[*_~`<>[\]\\]/gu, '')
       .replace(/\s+/gu, ' ')
       .trim();
-    const preview = plain.slice(0, 32);
+    if (plain.length <= 32) return plain;
+    // Keep whole words so the cut never reads as a different statement; one word longer than the bound is cut hard.
+    const space = plain.lastIndexOf(' ', 31);
+    const preview = plain.slice(0, space > 0 ? space : 31);
     const last = preview.charCodeAt(preview.length - 1);
-    return last >= 0xd800 && last <= 0xdbff ? preview.slice(0, -1) : preview;
+    return `${last >= 0xd800 && last <= 0xdbff ? preview.slice(0, -1) : preview}…`;
   };
   const field = (label: string, value: string): string =>
     `**${label}:**${/\n|^(?:[-*+]\s|\d+[.)]\s)/u.test(value) ? '\n' : ' '}${value}`;

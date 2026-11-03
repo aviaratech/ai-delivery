@@ -38,6 +38,30 @@ test('decision journal list fields start below their label and preserve nested s
   );
 });
 
+test('a cut status or next-step preview ends on a whole word and an ellipsis (ai#3550 comment 6596479566)', () => {
+  const first = (status: string, nextStep: string) =>
+    renderJournal({
+      issueNumber: 3550,
+      kind: 'progress',
+      summary: 'Weekly screen finished.',
+      status,
+      done: ['Screened 4,694 cells'],
+      decisionNeeded: 'None',
+      nextStep,
+      nextDate: '2026-11-09',
+      keyNumbers: [],
+      evidence: ['https://github.com/aviaratech/ai/issues/3550#issuecomment-6502461445'],
+    }).split('\n')[0];
+  assert.equal(
+    first(
+      'Finished 9:43 pm PT. Nothing is left running; the guard exits at its next 10-minute check.',
+      'Next weekly run Monday Nov 9: `scripts/weekly.sh 2026-11-09`.',
+    ),
+    'Status: Finished 9:43 pm PT. Nothing is…. Next: Next weekly run Monday Nov 9:….',
+  );
+  assert.equal(first('🙂'.repeat(40), 'Run checks'), `Status: ${'🙂'.repeat(15)}…. Next: Run checks.`);
+});
+
 test('published comment schema lists required fields for every journal kind', () => {
   const schema = z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema);
   assert.deepEqual(schema.anyOf, [
