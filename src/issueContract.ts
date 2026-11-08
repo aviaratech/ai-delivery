@@ -262,6 +262,13 @@ export function issueInputSchema<T extends z.ZodObject>(schema: T): T {
   });
 }
 
+/** One refusal for unknown keys on every tool: list what is accepted, never echo the unknown key (#140). */
+export function acceptedKeysError(issue: z.core.$ZodRawIssue): string | undefined {
+  if (issue.code !== 'unrecognized_keys') return undefined;
+  const shape = (issue.inst as z.ZodObject | undefined)?.shape;
+  return shape === undefined ? undefined : `Unknown argument key. Accepted keys: ${Object.keys(shape).join(', ')}.`;
+}
+
 function issueDiagnostics(issues: readonly (z.core.$ZodIssue | z.core.$ZodRawIssue)[]): IssueDiagnostic[] {
   const seen = new Set<string>();
   return issues
@@ -291,7 +298,7 @@ function issueDiagnostics(issues: readonly (z.core.$ZodIssue | z.core.$ZodRawIss
         code === 'points'
           ? 'Choose Points from 1 through 8; split a 13-point issue into sub-issues.'
           : issue.code === 'unrecognized_keys'
-            ? 'Remove unrecognized fields from ' + field + '.'
+            ? (acceptedKeysError(issue as z.core.$ZodRawIssue) ?? 'Remove unrecognized fields from ' + field + '.')
             : (issue.message ??
               (issue.code === 'invalid_type'
                 ? 'Provide a valid ' + issue.expected + ' value.'

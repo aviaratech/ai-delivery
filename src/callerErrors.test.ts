@@ -7,7 +7,10 @@ import { IssueValidationError } from './issueContract.js';
 import { executeTool } from './dispatch.js';
 import * as issues from './issue.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
-import type { AiDeliveryMcpToolName } from './mcp/tools.js';
+import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
+
+const accepted = (tool: AiDeliveryMcpToolName) =>
+  `Unknown argument key. Accepted keys: ${Object.keys(getAiDeliveryMcpTool(tool)!.inputSchema.shape).join(', ')}.`;
 
 const cases: [AiDeliveryMcpToolName, Record<string, unknown>, string, string, string[]][] = [
   ['issue_start', { title: '' }, 'Issue title is empty; enter a title.', 'too_small', ['title']],
@@ -53,6 +56,14 @@ const cases: [AiDeliveryMcpToolName, Record<string, unknown>, string, string, st
     'too_small',
     ['artifact'],
   ],
+  ...(['branch', 'bodyFile'] as const).map((key): (typeof cases)[number] => [
+    'issue_pr_create',
+    { issueNumber: 17, [key]: 'x' },
+    accepted('issue_pr_create'),
+    'unrecognized_keys',
+    [],
+  ]),
+  ['issue_create', { title: 'Valid title here', foo: 1 }, accepted('issue_create'), 'field.unknown', ['issue']],
 ];
 afterEach(() => vi.restoreAllMocks());
 

@@ -1359,13 +1359,7 @@ export async function publishPr(
   const explicit = input.prNumber === undefined ? undefined : await getPr(context, input.prNumber);
   const explicitPromotion = nonClosing && input.draft === false && input.headBranch !== undefined;
   const selectedMatches = explicitPromotion ? await matchingPrs(context, input.headBranch!, base, 'open') : undefined;
-  const branch = explicit
-    ? explicit.head.ref
-    : nonClosing
-      ? explicitPromotion && selectedMatches!.length > 0
-        ? input.headBranch!
-        : await issueBranch(context, input.issueNumber, input.headBranch)
-      : (input.headBranch ?? (await issueBranch(context, input.issueNumber)));
+  const branch = explicit ? explicit.head.ref : (input.headBranch ?? (await issueBranch(context, input.issueNumber)));
   if (input.headBranch !== undefined && branch !== input.headBranch)
     throw new DeliveryError('Explicit PR and head selectors disagree.');
   validBranch(branch);
