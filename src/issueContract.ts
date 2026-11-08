@@ -409,6 +409,9 @@ function section(body: string, names: string[]): string {
     .trim();
 }
 
+const REBUILD_HINT =
+  'The issue body was edited outside ai-delivery; send problem, outcome, acceptanceCriteria and outOfScope (plus bug for a Bug) in one issue_update to rebuild it.';
+
 /** Lenient conversion retains every legacy byte, and never invents verification or bug evidence. */
 export function parseIssueBody(
   body: string,
@@ -417,15 +420,12 @@ export function parseIssueBody(
   if (body.trimStart().startsWith(ISSUE_BODY_MARKER)) {
     const start = body.lastIndexOf(DATA_PREFIX);
     const end = body.indexOf(' -->', start);
-    if (start < 0 || end < 0)
-      throw new IssueValidationError([
-        hint('body.canonical', 'body', 'Restore the complete canonical issue data and generated body.'),
-      ]);
+    if (start < 0 || end < 0) throw new IssueValidationError([hint('body.canonical', 'body', REBUILD_HINT)]);
     let decoded: unknown;
     try {
       decoded = JSON.parse(body.slice(start + DATA_PREFIX.length, end));
     } catch {
-      throw new IssueValidationError([hint('body.canonical', 'body', 'Restore valid canonical issue data.')]);
+      throw new IssueValidationError([hint('body.canonical', 'body', REBUILD_HINT)]);
     }
     const result = validateIssue(decoded, false);
     if (!result.issue) throw new IssueValidationError(result.failures);
@@ -459,9 +459,7 @@ export function parseIssueBody(
       (legacyFormatting && renderIssueBody(result.issue, status, true) !== canonical) ||
       result.issue.title !== metadata.title
     )
-      throw new IssueValidationError([
-        hint('body.canonical', 'body', 'Update typed fields instead of editing only one copy of canonical content.'),
-      ]);
+      throw new IssueValidationError([hint('body.canonical', 'body', REBUILD_HINT)]);
     return {
       issue: result.issue,
       legacy: false,

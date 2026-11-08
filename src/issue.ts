@@ -1456,6 +1456,43 @@ async function assertProjectTransition(
   }
 }
 
+const BODY_FREE_KEYS = new Set([
+  ...'repo issueNumber state closeReason supersededBy preserveHistory overrideReason'.split(' '),
+  ...'projectStatus milestone labels priority startDate targetDate'.split(' '),
+  ...'expectedTradesPerDay measuredTradesPerDay'.split(' '),
+]);
+
+/** A full-content write replaces a body that fails the canonical parse; the old body goes to the history comment. */
+function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnType<typeof prepareIssueWrite> {
+  try {
+    return prepareIssueWrite(input, current);
+  } catch (error) {
+    if (
+      !(error instanceof IssueValidationError) ||
+      !error.failures.every((failure) => failure.code === 'body.canonical') ||
+      input.body !== undefined
+    )
+      throw error;
+    const full = {
+      ...input,
+      title: input.title ?? current.title,
+      points: input.points ?? current.points,
+      issueType: input.issueType ?? current.issueType ?? undefined,
+    };
+    const fields = Object.fromEntries(
+      Object.keys(IssueWriteFields).flatMap((key) => {
+        const value = full[key as keyof typeof full];
+        return value === undefined ? [] : [[key, value]];
+      }),
+    );
+    if (validateIssue(fields, true).failures.length) throw error;
+    const prepared = prepareIssueWrite(full, undefined);
+    prepared.body += issueTrackingFooter(current.body);
+    prepared.preserveHistory = input.preserveHistory ?? true;
+    return prepared;
+  }
+}
+
 async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueInput) {
   if (input.projectStatus !== undefined)
     input = { ...input, projectStatus: ProjectStatusPatch.parse(input.projectStatus) };
@@ -1464,17 +1501,11 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     Object.entries(input).every(
       ([key, value]) => value === undefined || ['repo', 'issueNumber', 'projectStatus', 'overrideReason'].includes(key),
     );
-  // Closing finished work leaves the body alone, so an old body need not meet today's ready contract.
-  const closeOnly =
-    input.state === 'closed' &&
-    input.closeReason !== undefined &&
-    Object.entries(input).every(
-      ([key, value]) =>
-        value === undefined ||
-        ['repo', 'issueNumber', 'state', 'closeReason', 'supersededBy', 'preserveHistory', 'overrideReason'].includes(
-          key,
-        ),
-    );
+  // Writes that carry no content leave the body alone, so an old body need not meet today's ready contract.
+  const definedKeys = Object.entries(input).flatMap(([key, value]) => (value === undefined ? [] : [key]));
+  const bodyFree =
+    definedKeys.every((key) => BODY_FREE_KEYS.has(key)) &&
+    definedKeys.some((key) => !['repo', 'issueNumber', 'preserveHistory', 'overrideReason'].includes(key));
   requireDeferralPatch({
     ...(input.defer === undefined ? {} : { defer: input.defer }),
     ...(input.undefer === undefined ? {} : { undefer: input.undefer }),
@@ -1510,7 +1541,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   const legacyNativeEdit =
     archivedItemId !== null && !currentContent.body.trimStart().startsWith('<!-- ai-delivery:issue@1 -->');
   const prepared: ReturnType<typeof prepareIssueWrite> =
-    legacyNativeEdit || projectOnly || closeOnly
+    legacyNativeEdit || projectOnly || bodyFree
       ? {
           issue: IssueFields.parse({ title: input.title ?? currentContent.title, draft: true }),
           body: currentContent.body,
@@ -1518,10 +1549,10 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
           preserveHistory: input.preserveHistory ?? false,
           warnings: [],
         }
-      : prepareIssueWrite(input, currentContent);
+      : rebuildableWrite(input, currentContent);
   input = {
     ...input,
-    ...(projectOnly || closeOnly ? {} : { body: prepared.body }),
+    ...(projectOnly || bodyFree ? {} : { body: prepared.body }),
     ...(prepared.statusOnly
       ? {}
       : {

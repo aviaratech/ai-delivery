@@ -7,7 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
 import { executeTool } from './dispatch.js';
-import { renderIssueBody } from './issueContract.js';
+import { parseIssueBody, renderIssueBody } from './issueContract.js';
 import * as github from './github/client.js';
 import { issue63Fixture } from './fixtures/issue63.js';
 import { syntheticDiscoveryClients, syntheticDiscoveryConfig } from './fixtures/discovery.js';
@@ -22,7 +22,7 @@ afterEach(() => {
 const execution = { repoRoot: '/unrelated', repo: 'example/widget' };
 const routes = ['dispatch', 'MCP'] as const;
 type Route = (typeof routes)[number];
-type Tool = 'issue_info' | 'issue_update';
+type Tool = 'issue_info' | 'issue_update' | 'issue_start';
 type NativeLabel = string | { name: string };
 
 function fixture(
@@ -359,12 +359,15 @@ const finishedBodies = [
   },
 ];
 for (const { name, points, edit } of finishedBodies) {
-  test(`MCP close with a reason skips the ready contract for ${name}`, async () => {
+  test(`MCP milestone and close writes skip the ready contract for ${name}`, async () => {
     const f = fixture([], null, { points, issueType: 'Task' });
     edit(f.native, f.ready);
     const before = { title: f.native.title, body: f.native.body };
     const api = await caller('MCP');
     try {
+      await api.call('issue_update', { issueNumber: 17, milestone: 8 });
+      assert.deepEqual(f.native.milestone, { id: 9000, number: 8 });
+      assert.deepEqual({ title: f.native.title, body: f.native.body }, before);
       await api.call('issue_update', { issueNumber: 17, state: 'closed', closeReason: 'completed' });
       assert.equal(f.native.state, 'closed');
       assert.deepEqual({ title: f.native.title, body: f.native.body }, before);
@@ -374,24 +377,63 @@ for (const { name, points, edit } of finishedBodies) {
   });
 }
 
-test('MCP edit that rewrites a hand-edited canonical body still refuses', async () => {
+const REPAIR =
+  'The issue body was edited outside ai-delivery; send problem, outcome, acceptanceCriteria and outOfScope (plus bug for a Bug) in one issue_update to rebuild it.';
+
+test('MCP content writes without a full rewrite refuse a hand-edited canonical body with the repair step', async () => {
   const f = fixture();
   finishedBodies[2]!.edit(f.native, f.ready);
   const api = await caller('MCP');
   try {
-    await assert.rejects(
-      api.call('issue_update', { issueNumber: 17, title: 'Rename the hand-edited issue' }),
-      /body\.canonical/u,
-    );
+    for (const patch of [{ title: 'Rename the hand-edited issue' }, { points: 3 }])
+      await assert.rejects(api.call('issue_update', { issueNumber: 17, ...patch }), (error: Error) => {
+        assert.match(error.message, /body\.canonical/u);
+        assert.ok(error.message.includes(REPAIR));
+        return true;
+      });
     await assert.rejects(
       api.call('issue_update', { issueNumber: 17, state: 'closed', closeReason: 'completed', title: 'Rename it' }),
       /body\.canonical/u,
     );
+    await assert.rejects(api.call('issue_start', { issueNumber: 17 }), /body\.canonical/u);
     assert.deepEqual(f.writes, []);
   } finally {
     await api.close();
   }
 });
+
+for (const dataComment of ['with', 'without'] as const) {
+  test(`MCP full-content write rebuilds a hand-edited canonical body ${dataComment} its issue-data comment`, async () => {
+    const f = fixture();
+    finishedBodies[2]!.edit(f.native, f.ready);
+    const footer = `\n\n<!-- ai-delivery-start-intent: sha256:${'a'.repeat(64)} -->\n<!-- ai-delivery-start: sha256:${'b'.repeat(64)} -->`;
+    f.native.body += footer;
+    if (dataComment === 'without') f.native.body = f.native.body.replace(/<!-- ai-delivery:issue-data@1 .*? -->/u, '');
+    const hand = f.native.body;
+    const content = {
+      problem: 'A hand-edited body blocked a rewrite.',
+      outcome: 'A full rewrite replaces the broken body.',
+      acceptanceCriteria: [{ behavior: 'The body parses again.', verifiedBy: 'issueInfoReadback test.' }],
+      outOfScope: ['Other writes.'],
+    };
+    const api = await caller('MCP');
+    try {
+      await api.call('issue_update', { issueNumber: 17, ...content });
+      const parsed = parseIssueBody(f.native.body, { title: f.native.title, points: 2, issueType: 'Task' });
+      assert.equal(parsed.legacy, false);
+      assert.equal(parsed.issue.problem, content.problem);
+      assert.equal(parsed.issue.outcome, content.outcome);
+      assert.deepEqual(parsed.issue.acceptanceCriteria, content.acceptanceCriteria);
+      assert.deepEqual(parsed.issue.outOfScope, content.outOfScope);
+      assert.ok(f.native.body.endsWith(footer));
+      assert.equal(f.comments.length, 1);
+      assert.ok(f.comments[0]!.body.includes('Hand-edited'));
+      assert.notEqual(f.native.body, hand);
+    } finally {
+      await api.close();
+    }
+  });
+}
 
 test('MCP explicit native metadata still updates and configured-value refusals write nothing', async () => {
   const f = fixture([], null, { points: null, issueType: null });
