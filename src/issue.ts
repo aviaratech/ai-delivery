@@ -1456,11 +1456,11 @@ async function assertProjectTransition(
   }
 }
 
-const BODY_FREE_KEYS = [
-  ...['repo', 'issueNumber', 'state', 'closeReason', 'supersededBy', 'preserveHistory', 'overrideReason'],
-  ...['projectStatus', 'milestone', 'labels', 'priority', 'startDate', 'targetDate'],
-  ...['expectedTradesPerDay', 'measuredTradesPerDay'],
-];
+const BODY_FREE_KEYS = new Set([
+  ...'repo issueNumber state closeReason supersededBy preserveHistory overrideReason'.split(' '),
+  ...'projectStatus milestone labels priority startDate targetDate'.split(' '),
+  ...'expectedTradesPerDay measuredTradesPerDay'.split(' '),
+]);
 
 /** A full-content write replaces a body that fails the canonical parse; the old body goes to the history comment. */
 function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnType<typeof prepareIssueWrite> {
@@ -1504,7 +1504,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   // Writes that carry no content leave the body alone, so an old body need not meet today's ready contract.
   const definedKeys = Object.entries(input).flatMap(([key, value]) => (value === undefined ? [] : [key]));
   const bodyFree =
-    definedKeys.every((key) => BODY_FREE_KEYS.includes(key)) &&
+    definedKeys.every((key) => BODY_FREE_KEYS.has(key)) &&
     definedKeys.some((key) => !['repo', 'issueNumber', 'preserveHistory', 'overrideReason'].includes(key));
   requireDeferralPatch({
     ...(input.defer === undefined ? {} : { defer: input.defer }),

@@ -420,10 +420,7 @@ export function parseIssueBody(
   if (body.trimStart().startsWith(ISSUE_BODY_MARKER)) {
     const start = body.lastIndexOf(DATA_PREFIX);
     const end = body.indexOf(' -->', start);
-    if (start < 0 || end < 0)
-      throw new IssueValidationError([
-        hint('body.canonical', 'body', REBUILD_HINT),
-      ]);
+    if (start < 0 || end < 0) throw new IssueValidationError([hint('body.canonical', 'body', REBUILD_HINT)]);
     let decoded: unknown;
     try {
       decoded = JSON.parse(body.slice(start + DATA_PREFIX.length, end));
@@ -439,10 +436,7 @@ export function parseIssueBody(
         /^- \*\*State:\*\* (Ready|Draft)\n- \*\*Last updated:\*\* (\S+) UTC\n- \*\*Next milestone:\*\* ([^\r\n]+)\n- \*\*Blockers:\*\* ([^\r\n]+)\n- \*\*Latest journal:\*\* ([^\r\n]+)$/u.exec(
           displayed,
         );
-      if (!match)
-        throw new IssueValidationError([
-          hint('body.canonical', 'status', REBUILD_HINT),
-        ]);
+      if (!match) throw new IssueValidationError([hint('body.canonical', 'status', REBUILD_HINT)]);
       status = requireIssueStatus(IssueStatus, {
         state: match[1],
         lastUpdated: match[2],
@@ -451,9 +445,7 @@ export function parseIssueBody(
         latestJournal: unescapeStatus(match[5]!),
       });
       if (status.state !== (result.issue.draft ? 'Draft' : 'Ready'))
-        throw new IssueValidationError([
-          hint('body.canonical', 'status', REBUILD_HINT),
-        ]);
+        throw new IssueValidationError([hint('body.canonical', 'status', REBUILD_HINT)]);
     }
     const footer = issueTrackingFooter(body);
     const canonical = footer ? body.slice(0, -footer.length) : body;
@@ -462,9 +454,7 @@ export function parseIssueBody(
       (legacyFormatting && renderIssueBody(result.issue, status, true) !== canonical) ||
       result.issue.title !== metadata.title
     )
-      throw new IssueValidationError([
-        hint('body.canonical', 'body', REBUILD_HINT),
-      ]);
+      throw new IssueValidationError([hint('body.canonical', 'body', REBUILD_HINT)]);
     return {
       issue: result.issue,
       legacy: false,
