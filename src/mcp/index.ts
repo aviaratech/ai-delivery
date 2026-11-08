@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { executeTool, type ExecutionContext } from '../dispatch.js';
 import { setLogsSuppressed } from '../logger.js';
 import { PACKAGE_VERSION } from '../version.js';
+import { acceptedKeysError } from '../issueContract.js';
 import { JOURNAL_SCHEMA_METADATA, missingJournalFields } from '../issueJournal.js';
 import { getIncompleteIssueUpdate } from '../issue.js';
 import { projectToolOutput } from '../toolOutput.js';
@@ -33,9 +34,7 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
         inputSchema:
           tool.name === 'issue_comment'
             ? z
-                .strictObject(tool.inputSchema.shape, {
-                  error: 'Invalid journal object. Provide only the advertised fields.',
-                })
+                .strictObject(tool.inputSchema.shape, { error: acceptedKeysError })
                 .partial()
                 .meta(JOURNAL_SCHEMA_METADATA)
             : tool.inputSchema,

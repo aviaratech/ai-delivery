@@ -83,7 +83,7 @@ test('the issue_update schema takes finite non-negative trades/day numbers and n
   const batch = getAiDeliveryMcpTool('issue_batch_update')!.inputSchema;
   assert.throws(
     () => batch.safeParse({ items: [{ issueNumber: 1, expectedTradesPerDay: 2 }] }),
-    /unrecognized fields/u,
+    /Unknown argument key\. Accepted keys/u,
   );
 });
 

@@ -12,6 +12,7 @@ import {
   IssueStatusPatch,
   ProjectStatusPatch,
   IssueDeferralPatch,
+  acceptedKeysError,
 } from '../issueContract.js';
 
 const Verbose = z.boolean().optional().describe('Return the full payload, including bodies, diffs and routing.');
@@ -27,31 +28,34 @@ const Repo = z
 export const AI_DELIVERY_MCP_CONTRACT_VERSION = 'ai-delivery.mcp@2' as const;
 const IssueUpdateInput = issueInputSchema(
   z
-    .strictObject({
-      ...IssueWriteFields,
-      ...NativeIssueDateFields,
-      status: IssueStatusPatch.optional(),
-      projectStatus: ProjectStatusPatch.optional(),
-      repo: Repo,
-      blockedBy: z.array(Positive).optional(),
-      blocks: z.array(Positive).optional(),
-      overrideReason: OverrideReason.optional(),
-      body: z.string().optional(),
-      issueNumber: Positive,
-      issueType: IssueWriteFields.issueType,
-      labels: Labels.optional(),
-      milestone: Positive.nullable().optional(),
-      parentIssueNumber: Positive.nullable().optional(),
-      park: z.literal(true).optional(),
-      ...IssueDeferralPatch,
-      points: IssueWriteFields.points,
-      priority: z.string().min(1).optional(),
-      state: z.enum(['open', 'closed']).optional(),
-      preserveHistory: z.boolean().optional(),
-      closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
-      supersededBy: Positive.optional(),
-      title: IssueWriteFields.title,
-    })
+    .strictObject(
+      {
+        ...IssueWriteFields,
+        ...NativeIssueDateFields,
+        status: IssueStatusPatch.optional(),
+        projectStatus: ProjectStatusPatch.optional(),
+        repo: Repo,
+        blockedBy: z.array(Positive).optional(),
+        blocks: z.array(Positive).optional(),
+        overrideReason: OverrideReason.optional(),
+        body: z.string().optional(),
+        issueNumber: Positive,
+        issueType: IssueWriteFields.issueType,
+        labels: Labels.optional(),
+        milestone: Positive.nullable().optional(),
+        parentIssueNumber: Positive.nullable().optional(),
+        park: z.literal(true).optional(),
+        ...IssueDeferralPatch,
+        points: IssueWriteFields.points,
+        priority: z.string().min(1).optional(),
+        state: z.enum(['open', 'closed']).optional(),
+        preserveHistory: z.boolean().optional(),
+        closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
+        supersededBy: Positive.optional(),
+        title: IssueWriteFields.title,
+      },
+      { error: acceptedKeysError },
+    )
     .superRefine((input, ctx) => {
       if (input.defer !== undefined && input.undefer !== undefined)
         ctx.addIssue({ code: 'custom', message: 'Choose defer or undefer, never both.', path: ['defer'] });
@@ -89,15 +93,18 @@ const Tracking = {
     .max(256, 'Issue title exceeds 256 characters; shorten the title.')
     .describe(IssueFields.shape.title.description ?? ''),
 };
-const NormalStart = z.strictObject({
-  ...Tracking,
-  title: Tracking.title.optional(),
-  issueNumber: Positive.optional(),
-  request: z.string().min(1).optional(),
-  requestId: z.string().trim().min(1).max(256).optional(),
-  resumeCreated: z.boolean().optional(),
-  branch: z.string().min(1).optional(),
-});
+const NormalStart = z.strictObject(
+  {
+    ...Tracking,
+    title: Tracking.title.optional(),
+    issueNumber: Positive.optional(),
+    request: z.string().min(1).optional(),
+    requestId: z.string().trim().min(1).max(256).optional(),
+    resumeCreated: z.boolean().optional(),
+    branch: z.string().min(1).optional(),
+  },
+  { error: acceptedKeysError },
+);
 const IssueListing = {
   repo: Repo,
   verbose: Verbose,
@@ -131,7 +138,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description:
       'Post a typed issue journal with authoritative comment readback. Provide the fields required by kind: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: non-empty decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps. Omit fields belonging to other kinds.',
     inputSchema: z
-      .strictObject({ ...JournalInputSchema.shape, repo: Repo, verbose: Verbose })
+      .strictObject({ ...JournalInputSchema.shape, repo: Repo, verbose: Verbose }, { error: acceptedKeysError })
       .superRefine(({ repo: _repo, verbose: _verbose, ...journal }, ctx) => {
         // Repository routing belongs to the MCP envelope, not the strict journal variants.
         const parsed = JournalInputSchema.safeParse(journal);
@@ -147,22 +154,25 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description: 'Create a native GitHub tracking issue with configured metadata and relationships',
     issueContract: ISSUE_JSON_SCHEMAS,
     inputSchema: issueInputSchema(
-      z.strictObject({
-        ...Tracking,
-        ...NativeIssueDateFields,
-        ...IssueWriteFields,
-        title: IssueFields.shape.title,
-        opId: z
-          .string()
-          .trim()
-          .min(1)
-          .max(256)
-          .optional()
-          .describe(
-            'Stable retry identity: repeat the same original arguments to complete a partial create without another issue.',
-          ),
-        status: CreateIssueStatus.optional(),
-      }),
+      z.strictObject(
+        {
+          ...Tracking,
+          ...NativeIssueDateFields,
+          ...IssueWriteFields,
+          title: IssueFields.shape.title,
+          opId: z
+            .string()
+            .trim()
+            .min(1)
+            .max(256)
+            .optional()
+            .describe(
+              'Stable retry identity: repeat the same original arguments to complete a partial create without another issue.',
+            ),
+          status: CreateIssueStatus.optional(),
+        },
+        { error: acceptedKeysError },
+      ),
     ),
   },
   {
@@ -176,13 +186,13 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_list',
     commandName: 'list',
     description: 'List repository issues with native filters, named organization fields and pagination',
-    inputSchema: z.strictObject({ ...IssueListing, query: SearchText.optional() }),
+    inputSchema: z.strictObject({ ...IssueListing, query: SearchText.optional() }, { error: acceptedKeysError }),
   },
   {
     name: 'issue_search',
     commandName: 'search',
     description: 'Search literal issue text in the selected repository with native filters and pagination',
-    inputSchema: z.strictObject({ ...IssueListing, query: SearchText }),
+    inputSchema: z.strictObject({ ...IssueListing, query: SearchText }, { error: acceptedKeysError }),
   },
   {
     name: 'issue_update',
@@ -195,12 +205,15 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'batch:update',
     description: 'Plan or apply 1–50 issue updates in one repository, with ordered partial results and readback',
     inputSchema: issueInputSchema(
-      z.strictObject({
-        repo: Repo,
-        verbose: Verbose,
-        items: z.array(IssueUpdateInput).min(1).max(50),
-        dryRun: z.boolean().optional(),
-      }),
+      z.strictObject(
+        {
+          repo: Repo,
+          verbose: Verbose,
+          items: z.array(IssueUpdateInput).min(1).max(50),
+          dryRun: z.boolean().optional(),
+        },
+        { error: acceptedKeysError },
+      ),
     ),
   },
   {
@@ -208,13 +221,16 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'info',
     description:
       'Read live GitHub issue metadata, relationships, Project status, linked PRs (state, checks, reviews) and the latest journal in one call. Child counts by default; verbose adds the body, routing and full child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
-    inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo, verbose: Verbose }),
+    inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo, verbose: Verbose }, { error: acceptedKeysError }),
   },
   {
     name: 'issue_ready_check',
     commandName: 'ready:check',
     description: 'Evaluate deterministic readiness from live native issue state',
-    inputSchema: z.strictObject({ issueNumber: Positive, repo: Tracking.repo, verbose: Verbose }),
+    inputSchema: z.strictObject(
+      { issueNumber: Positive, repo: Tracking.repo, verbose: Verbose },
+      { error: acceptedKeysError },
+    ),
   },
   {
     name: 'issue_pr_create',
@@ -222,27 +238,30 @@ export const AI_DELIVERY_MCP_TOOLS = [
     description:
       'Create or reuse a PR from any directory using repo, issueNumber and a pushed head. By default it closes the issue and restores a missing closing link on reuse. nonClosing opens a draft that references the issue and leaves it open. expectedHeadSha refuses a different pushed head.',
     inputSchema: z
-      .strictObject({
-        repo: Repo,
-        verbose: Verbose,
-        issueNumber: Positive,
-        prNumber: Positive.optional(),
-        nonClosing: z.boolean().optional(),
-        expectedHeadSha: z
-          .string()
-          .regex(
-            /^[a-f0-9]{40}$/u,
-            'expectedHeadSha must be a full 40-character commit SHA; pass the pushed head or omit it.',
-          )
-          .optional(),
-        body: z.string().min(1, 'PR body is empty; enter a body or omit it to use the default body.').optional(),
-        draft: z.boolean().optional(),
-        dryRun: z.boolean().optional(),
-        title: z.string().min(1, 'PR title is empty; enter a title or omit it to use the issue title.').optional(),
-        headBranch: z.string().min(1).optional(),
-        head: z.string().min(1).optional(),
-        base: z.string().min(1).optional(),
-      })
+      .strictObject(
+        {
+          repo: Repo,
+          verbose: Verbose,
+          issueNumber: Positive,
+          prNumber: Positive.optional(),
+          nonClosing: z.boolean().optional(),
+          expectedHeadSha: z
+            .string()
+            .regex(
+              /^[a-f0-9]{40}$/u,
+              'expectedHeadSha must be a full 40-character commit SHA; pass the pushed head or omit it.',
+            )
+            .optional(),
+          body: z.string().min(1, 'PR body is empty; enter a body or omit it to use the default body.').optional(),
+          draft: z.boolean().optional(),
+          dryRun: z.boolean().optional(),
+          title: z.string().min(1, 'PR title is empty; enter a title or omit it to use the issue title.').optional(),
+          headBranch: z.string().min(1).optional(),
+          head: z.string().min(1).optional(),
+          base: z.string().min(1).optional(),
+        },
+        { error: acceptedKeysError },
+      )
       .refine(
         (input) => input.head === undefined || input.headBranch === undefined || input.head === input.headBranch,
         'PR head selectors disagree; use the same branch for head and headBranch.',
@@ -253,41 +272,50 @@ export const AI_DELIVERY_MCP_TOOLS = [
     commandName: 'pr:info',
     description:
       "Inspect a PR by number or its GitHub-linked issue branch: state, merge state, checks, reviews and each linked issue's state, Project status and latest journal, in one call",
-    inputSchema: z.strictObject({
-      repo: Repo,
-      verbose: Verbose,
-      issueNumber: Positive.optional(),
-      prNumber: Positive.optional(),
-      nonClosing: z.boolean().optional(),
-    }),
+    inputSchema: z.strictObject(
+      {
+        repo: Repo,
+        verbose: Verbose,
+        issueNumber: Positive.optional(),
+        prNumber: Positive.optional(),
+        nonClosing: z.boolean().optional(),
+      },
+      { error: acceptedKeysError },
+    ),
   },
   {
     name: 'milestone_create',
     commandName: 'milestone:create',
     description:
       'Create a repository milestone (title, optional ISO due date and description) with readback. Repeating the same call returns the milestone it made; a same-titled milestone with different details is refused.',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      verbose: Verbose,
-      title: z.string().trim().min(1).max(256),
-      dueOn: z.iso.date().optional(),
-      description: z.string().max(10000).optional(),
-    }),
+    inputSchema: z.strictObject(
+      {
+        repo: Repo,
+        verbose: Verbose,
+        title: z.string().trim().min(1).max(256),
+        dueOn: z.iso.date().optional(),
+        description: z.string().max(10000).optional(),
+      },
+      { error: acceptedKeysError },
+    ),
   },
   {
     name: 'issue_pr_review',
     commandName: 'pr:review',
     description: 'Submit one existing exact-head independent review with the reviewer App role',
-    inputSchema: z.strictObject({
-      repo: Repo,
-      verbose: Verbose,
-      issueNumber: Positive,
-      prNumber: Positive,
-      nonClosing: z.boolean().optional(),
-      artifact: z.string().min(1, 'Review artifact is empty; provide the independent review artifact JSON.'),
-      identity: z.string().min(1).optional(),
-      dryRun: z.boolean().optional(),
-    }),
+    inputSchema: z.strictObject(
+      {
+        repo: Repo,
+        verbose: Verbose,
+        issueNumber: Positive,
+        prNumber: Positive,
+        nonClosing: z.boolean().optional(),
+        artifact: z.string().min(1, 'Review artifact is empty; provide the independent review artifact JSON.'),
+        identity: z.string().min(1).optional(),
+        dryRun: z.boolean().optional(),
+      },
+      { error: acceptedKeysError },
+    ),
   },
 ] as const;
 

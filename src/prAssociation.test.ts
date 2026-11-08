@@ -165,7 +165,7 @@ function fixture(published = true, nonClosing = false) {
       list: async () => ({ data: state.matchReadback ?? (state.published ? [{ number: 23 }] : []) }),
       create: async (input: { draft: boolean; head: string; body: string }) => {
         assert.equal(input.draft, state.expectedCreationDraft);
-        assert.equal(input.head, 'issue/17');
+        assert.equal(input.head, state.headRef);
         state.creations++;
         state.body = input.body;
         if (state.closingOnCreate) {
@@ -2644,13 +2644,26 @@ describe('first-call PR creation', () => {
     assert.equal(state.creations, 1);
   });
 
-  it('names an unlinked worktree branch and the step that publishes it', async () => {
+  it('opens from an explicit pushed head that nothing links to the issue', async () => {
     const { context, state } = fixture(false, true);
-    await assert.rejects(
-      publishPr(context, { ...nonClosingCreation, headBranch: 'claude/17-widget' }),
-      /Branch claude\/17-widget is not linked to issue #17 \(GitHub-linked: none\); push the work as issue\/17\./u,
-    );
-    assert.equal(state.creations, 0);
+    state.headRef = 'claude/17-widget';
+    state.remoteRef = 'refs/heads/claude/17-widget';
+    state.remoteHead = head;
+    const created = await publishPr(context, { ...nonClosingCreation, headBranch: 'claude/17-widget' });
+    assert.equal(created.prNumber, 23);
+    assert.equal(created.nonClosingVerified, true);
+    assert.equal(state.creations, 1);
+  });
+
+  it('opens from the explicit head beside a different linked branch', async () => {
+    const { context, state } = fixture(false, true);
+    state.linked = true;
+    state.headRef = 'issue/17-b';
+    state.remoteRef = 'refs/heads/issue/17-b';
+    state.remoteHead = head;
+    const created = await publishPr(context, { ...nonClosingCreation, headBranch: 'issue/17-b' });
+    assert.equal(created.prNumber, 23);
+    assert.equal(state.creations, 1);
   });
 });
 
