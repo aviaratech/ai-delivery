@@ -436,7 +436,10 @@ export function parseIssueBody(
         /^- \*\*State:\*\* (Ready|Draft)\n- \*\*Last updated:\*\* (\S+) UTC\n- \*\*Next milestone:\*\* ([^\r\n]+)\n- \*\*Blockers:\*\* ([^\r\n]+)\n- \*\*Latest journal:\*\* ([^\r\n]+)$/u.exec(
           displayed,
         );
-      if (!match) throw new IssueValidationError([hint('body.canonical', 'status', REBUILD_HINT)]);
+      if (!match)
+        throw new IssueValidationError([
+          hint('body.canonical', 'status', 'Restore the complete unambiguous status block.'),
+        ]);
       status = requireIssueStatus(IssueStatus, {
         state: match[1],
         lastUpdated: match[2],
@@ -445,7 +448,9 @@ export function parseIssueBody(
         latestJournal: unescapeStatus(match[5]!),
       });
       if (status.state !== (result.issue.draft ? 'Draft' : 'Ready'))
-        throw new IssueValidationError([hint('body.canonical', 'status', REBUILD_HINT)]);
+        throw new IssueValidationError([
+          hint('body.canonical', 'status', 'Status state must agree with the typed draft field.'),
+        ]);
     }
     const footer = issueTrackingFooter(body);
     const canonical = footer ? body.slice(0, -footer.length) : body;
