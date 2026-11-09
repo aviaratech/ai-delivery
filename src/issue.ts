@@ -1214,11 +1214,13 @@ export async function listIssues(
     )
       return null;
     if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) return null;
+    const readback = deferralReadback(current.body, current.title);
+    delete readback.builder; // list rows carry no builder; issue_info does
     const listed: ListedTrackingIssue = {
       ...(options.capacityRead
         ? { nodeId: current.node_id, fieldIds: Object.fromEntries(catalog.map((field) => [field.name, field.id])) }
         : {}),
-      ...deferralReadback(current.body, current.title),
+      ...readback,
       number: current.number,
       title: current.title,
       state: current.state,
@@ -1467,6 +1469,16 @@ const BODY_FREE_KEYS = new Set([
   ...'expectedTradesPerDay measuredTradesPerDay'.split(' '),
 ]);
 
+/** Top-level keys of a body's issue-data comment; empty when the comment is missing or unreadable. */
+function oldDataKeys(body: string): Set<string> {
+  const json = /<!-- ai-delivery:issue-data@1 (.*) -->/u.exec(body)?.[1];
+  try {
+    return new Set(json === undefined ? [] : Object.keys(JSON.parse(json) as object));
+  } catch {
+    return new Set();
+  }
+}
+
 /** A full-content write replaces a body that fails the canonical parse; the old body goes to the history comment. */
 function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnType<typeof prepareIssueWrite> {
   try {
@@ -1492,13 +1504,12 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
     if (validateIssue(fields, true).failures.length) throw error;
     const prepared = prepareIssueWrite(full, undefined);
     // The builder-ready fields can only be lost when the old body's data comment still carried them.
+    const carried = oldDataKeys(current.body);
     const reset = [
       'draft',
       'openQuestions',
       'context',
-      ...(['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) =>
-        current.body.includes(`"${key}":`),
-      ),
+      ...(['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) => carried.has(key)),
     ].filter((key) => input[key as keyof typeof input] === undefined);
     if (reset.length) {
       const message = `Rebuilt the hand-edited body (old one in the history comment); reset because not sent: ${reset.join(', ')}.`;

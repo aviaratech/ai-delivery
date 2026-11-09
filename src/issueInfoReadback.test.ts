@@ -492,6 +492,23 @@ test('MCP rebuild of a hand-edited body names builder-ready fields it carried bu
     });
     const [warning] = rebuiltWarnings(result);
     assert.match(warning!.message, /reset because not sent: builder\./u);
+    // A key quoted inside prose is not a carried field.
+    f.native.body = renderIssueBody({ ...f.ready, problem: 'Saw \\"proof\\": in a log.' }).replace(
+      '## Outcome',
+      '## Outcome edited',
+    );
+    const again = await api.call('issue_update', {
+      issueNumber: 17,
+      problem: 'A hand-edited body blocked a rewrite.',
+      outcome: 'A full rewrite replaces the broken body.',
+      acceptanceCriteria: [{ behavior: 'The body parses again.', verifiedBy: 'issueInfoReadback test.' }],
+      outOfScope: ['Other writes.'],
+      draft: false,
+      openQuestions: [],
+      context: { components: [], evidence: [], files: [] },
+    });
+    assert.deepEqual(rebuiltWarnings(again), []);
+    assert.equal(f.comments.length, 2, 'both writes rebuilt the body');
   } finally {
     await api.close();
   }
