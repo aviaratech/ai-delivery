@@ -182,10 +182,13 @@ function fixture(published = true, nonClosing = false) {
         state.events.push('draft-publication-replaces-branch-link');
         return { data: pr() };
       },
-      update: async (input: { body: string }) => {
+      update: async (input: { body?: string; title?: string }) => {
         state.updates++;
-        state.body = input.body;
-        state.nonClosing = input.body.startsWith('References ');
+        if (input.title !== undefined) state.title = input.title;
+        if (input.body !== undefined) {
+          state.body = input.body;
+          state.nonClosing = input.body.startsWith('References ');
+        }
         if (state.failUpdateAck) throw new Error('Transport lost after body update');
         return { data: pr() };
       },
@@ -555,6 +558,63 @@ describe('remote closing PR creation', () => {
     await publishPr(context, input);
     assert.equal(state.creations, 0);
     assert.equal(state.updates, 1);
+  });
+
+  describe('editing a closing PR', () => {
+    const input = { issueNumber: 17, headBranch: 'issue/17' };
+
+    it('replaces the body behind the closing line and reports it', async () => {
+      const { context, state } = fixture();
+      const result = await publishPr(context, { ...input, body: 'New explanation' });
+      assert.deepEqual(result.edited, ['body']);
+      assert.equal(state.body, 'Closes #17\n\nNew explanation');
+      assert.equal(state.updates, 1);
+    });
+
+    it('changes only the title and keeps the body', async () => {
+      const { context, state } = fixture();
+      const result = await publishPr(context, { ...input, title: 'Better title' });
+      assert.deepEqual(result.edited, ['title']);
+      assert.equal(state.title, 'Better title');
+      assert.equal(state.body, 'Closes #17');
+      assert.equal(state.updates, 1);
+    });
+
+    it('previews an edit without updating', async () => {
+      const { context, state } = fixture();
+      const result = await publishPr(context, { ...input, title: 'Better title', body: 'New', dryRun: true });
+      assert.deepEqual(result.edited, ['title', 'body']);
+      assert.equal(state.updates, 0);
+      assert.equal(state.title, 'Improve widget');
+    });
+
+    it('edits a draft once, then marks it ready', async () => {
+      const { context, state } = fixture();
+      state.draft = true;
+      await publishPr(context, { ...input, body: 'New explanation', draft: false });
+      assert.equal(state.draft, false);
+      assert.equal(state.updates, 1);
+      assert.equal(state.promotions, 1);
+    });
+
+    it('refuses a new title on a non-closing PR', async () => {
+      const { context, state } = fixture(true, true);
+      await assert.rejects(
+        publishPr(context, { issueNumber: 17, nonClosing: true, headBranch: 'issue/17', title: 'Better title' }),
+        /conflicts/u,
+      );
+      assert.equal(state.updates, 0);
+    });
+
+    it('reports a lost acknowledgement and does not repeat the applied edit', async () => {
+      const { context, state } = fixture();
+      state.failUpdateAck = true;
+      const edit = { ...input, body: 'New explanation' };
+      await assert.rejects(publishPr(context, edit), /uncertain/u);
+      state.failUpdateAck = false;
+      await publishPr(context, edit);
+      assert.equal(state.updates, 1);
+    });
   });
 
   it('names the missing closing line and exact repair call before independent review', async () => {

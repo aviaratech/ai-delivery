@@ -1396,6 +1396,9 @@ export async function publishPr(
     pr?.body,
   );
   const closingRepair = !nonClosing && pr !== undefined && !hasClosingLink(pr.body, input.issueNumber);
+  const titleEdit = !nonClosing && pr !== undefined && input.title !== undefined && pr.title !== input.title;
+  const bodyEdit = !nonClosing && pr !== undefined && !closingRepair && input.body !== undefined && pr.body !== body;
+  const edited = [...(titleEdit ? ['title' as const] : []), ...(bodyEdit ? ['body' as const] : [])];
   const transition = nonClosing && pr !== undefined && pr.body !== body;
   // A PR that already references the issue changes only its body; a closing PR converts (#238).
   const referenceUpdate = transition && hasReferenceBody(context, input.issueNumber, pr?.body);
@@ -1417,8 +1420,7 @@ export async function publishPr(
       pr.base.ref !== base ||
       pr.state !== 'open' ||
       pr.merged ||
-      (!transition && input.body !== undefined && pr.body !== input.body && pr.body !== body) ||
-      (input.title !== undefined && pr.title !== input.title))
+      (nonClosing && input.title !== undefined && pr.title !== input.title))
   )
     throw new DeliveryError('Existing remote PR conflicts with the requested branch, intent or state.');
   // Opening a closing PR needs only the author; review submission checks the reviewer App.
@@ -1437,6 +1439,7 @@ export async function publishPr(
   let pendingTransition = transition;
   let pendingClosingRepair = closingRepair;
   let expectedBody = pr?.body;
+  let expectedTitle = pr?.title;
   const transitionDraft = pr?.draft;
   let promotionApplied = false;
   let removalState: 'not attempted' | 'acknowledged' | 'uncertain' = 'not attempted';
@@ -1504,7 +1507,7 @@ export async function publishPr(
       current.user.login.toLowerCase() !== reviewRoute.author.actorLogin.toLowerCase() ||
       ((transition || closingRepair) && !promotionApplied && current.draft !== transitionDraft) ||
       current.body !== expectedBody ||
-      current.title !== existing!.title
+      current.title !== expectedTitle
     )
       throw new DeliveryError('Existing PR publication head, identity, intent or author readback drifted.');
     if (reconcileReference) await readReconciliation(current);
@@ -1584,6 +1587,7 @@ export async function publishPr(
             bodyTransition: pendingTransition,
           }
         : {}),
+      ...(edited.length ? { edited } : {}),
       headSha: ref.object.sha,
       headBranch: branch,
       baseBranch: base,
@@ -1613,6 +1617,25 @@ export async function publishPr(
       pendingTransition = false;
       expectedBody = body;
       pr = await readExisting();
+    }
+    if (edited.length) {
+      pr = await readExisting();
+      const number = pr.number;
+      try {
+        await context.clients.rest.pulls.update({
+          ...context.repo,
+          pull_number: number,
+          ...(titleEdit ? { title: input.title! } : {}),
+          ...(bodyEdit ? { body } : {}),
+        });
+        if (titleEdit) expectedTitle = input.title;
+        if (bodyEdit) expectedBody = body;
+        pr = await readExisting();
+      } catch (error) {
+        throw new DeliveryError(
+          `PR #${number} edit acknowledgement is uncertain; check it with issue_pr_info before calling again. ${error instanceof Error ? error.message : 'Unknown failure'}`,
+        );
+      }
     }
     if (input.draft === false && pr.draft) {
       pr = await readExisting();
@@ -1732,6 +1755,7 @@ export async function publishPr(
     headSha: pr.head.sha,
     state: pr.draft ? 'draft' : pr.state,
     ...(closingRepair ? { closingLinkAdded: true } : {}),
+    ...(edited.length ? { edited } : {}),
     ...(nonClosing ? { nonClosing: true, nonClosingVerified: true } : {}),
     ...(reconcileReference ? { referenceRemoval: removalState } : {}),
     ...(warnings.length ? { warnings } : {}),
