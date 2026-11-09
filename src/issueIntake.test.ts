@@ -1495,6 +1495,19 @@ test('draft-to-Ready without builder gives builder.missing; with builder it succ
   assert.match(f.live.body, /\*\*State:\*\* Ready/u);
 });
 
+test('a body replacement that turns a draft into Ready needs builder; park keeps it Draft', async () => {
+  const f = fixture();
+  f.live.body = renderIssueBody({ ...legacyReady(), draft: true });
+  const writes = f.writes.length;
+  const legacyBody = renderIssueBody(legacyReady());
+  await assert.rejects(updateIssue(f.context, { issueNumber: 17, body: legacyBody }), builderMissing);
+  assert.equal(f.writes.length, writes);
+  await updateIssue(f.context, { issueNumber: 17, body: legacyBody, park: true });
+  assert.match(f.live.body, /Draft — parked/u);
+  await updateIssue(f.context, { issueNumber: 17, body: renderIssueBody(ready()) });
+  assert.match(f.live.body, /\*\*State:\*\* Ready/u);
+});
+
 test('legacy Ready issues still update and rebuild without builder, and warn builder.unset', async () => {
   const f = fixture();
   f.live.body = renderIssueBody(legacyReady());

@@ -407,7 +407,8 @@ function prepareIssueWrite(
   );
   // Ready creates and draft-to-Ready updates need builder; content updates of legacy Ready issues never do.
   const requireBuilder =
-    input.requireBuilder === true || (currentParsed?.issue.draft === true && input.draft === false);
+    input.requireBuilder === true ||
+    (currentParsed?.issue.draft === true && input.park !== true && (input.draft ?? parsed.issue.draft) === false);
   const issue = requireIssue(
     {
       ...parsed.issue,
