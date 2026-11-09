@@ -381,7 +381,11 @@ function prepareIssueWrite(
   };
   const parsed: ReturnType<typeof parseIssueBody> =
     source === undefined ? { issue: IssueFields.parse({ title }), legacy: false } : parseIssueBody(source, metadata);
-  let legacyBody = currentParsed?.issue.legacyBody ?? parsed.issue.legacyBody;
+  // A handwritten body on an already-canonical issue replaces the preserved legacy body; it never appends to it.
+  let legacyBody =
+    input.body !== undefined && parsed.legacy && !currentLegacy
+      ? parsed.issue.legacyBody
+      : (currentParsed?.issue.legacyBody ?? parsed.issue.legacyBody);
   if (
     parsed.issue.legacyBody !== undefined &&
     legacyBody !== undefined &&
@@ -1469,8 +1473,7 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
   } catch (error) {
     if (
       !(error instanceof IssueValidationError) ||
-      !error.failures.every((failure) => failure.code === 'body.canonical') ||
-      input.body !== undefined
+      !error.failures.every((failure) => failure.code === 'body.canonical')
     )
       throw error;
     const full = {
