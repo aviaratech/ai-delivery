@@ -97,7 +97,7 @@ const routes: Route[] = [
     verify: (v) => {
       assert.equal(v.issueNumber, 17);
       assert.equal(v.points, 2);
-      assert.equal(v.worktree, null);
+      assert.equal('worktree' in v, false);
     },
   },
   {

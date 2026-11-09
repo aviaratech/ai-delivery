@@ -21,13 +21,18 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
     { name: 'ai-delivery', version: PACKAGE_VERSION },
     { instructions: SERVER_INSTRUCTIONS },
   );
-  const tools: readonly { name: string; description: string; inputSchema: z.ZodObject<z.ZodRawShape> }[] =
-    AI_DELIVERY_MCP_TOOLS;
+  const tools: readonly {
+    name: string;
+    description: string;
+    inputSchema: z.ZodObject<z.ZodRawShape>;
+    readOnly?: true;
+  }[] = AI_DELIVERY_MCP_TOOLS;
   for (const tool of tools) {
     server.registerTool(
       tool.name,
       {
         description: tool.description,
+        ...(tool.readOnly ? { annotations: { readOnlyHint: true } } : {}),
         // The SDK must leave journal kind refinements to the handler so missing
         // conditional fields receive a safe, actionable contract refusal. Unknown
         // property names stay private through a schema-local error message.
