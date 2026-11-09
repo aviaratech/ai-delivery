@@ -22,6 +22,8 @@ const PrNode = z.object({
   state: z.enum(['OPEN', 'CLOSED', 'MERGED']),
   isDraft: z.boolean(),
   mergeStateStatus: z.string(),
+  mergeCommit: z.object({ oid: z.string() }).nullable(),
+  mergedAt: z.string().nullable(),
   reviewDecision: z.string().nullable(),
   headRefOid: z.string(),
   latestReviews: z.object({
@@ -45,7 +47,7 @@ const PrNode = z.object({
     ),
   }),
 });
-const PR_FIELDS = `number url state isDraft mergeStateStatus reviewDecision headRefOid
+const PR_FIELDS = `number url state isDraft mergeStateStatus mergeCommit { oid } mergedAt reviewDecision headRefOid
   latestReviews(first: 10) { nodes { author { login } state commit { oid } } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
     __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state }
@@ -69,6 +71,8 @@ export function summarizePr(raw: unknown) {
     state: pr.state.toLowerCase(),
     draft: pr.isDraft,
     mergeState: pr.mergeStateStatus.toLowerCase(),
+    mergeCommit: pr.mergeCommit?.oid ?? null,
+    mergedAt: pr.mergedAt,
     checks: {
       state: pr.commits.nodes[0]?.commit.statusCheckRollup?.state.toLowerCase() ?? 'none',
       failing: named.filter((c) => c.done && !c.ok).map((c) => c.name),
@@ -219,8 +223,16 @@ export async function prView(
   const others = await Promise.all(
     summary.closes.filter((number) => number !== input.issueNumber).map((number) => readIssueBrief(context, number)),
   );
-  const { checks, reviews, mergeState } = summary;
-  return { ...info, mergeState, checks, reviews, issues: [...(given ? [given] : []), ...others] };
+  const { checks, reviews, mergeState, mergeCommit, mergedAt } = summary;
+  return {
+    ...info,
+    mergeState,
+    mergeCommit,
+    mergedAt,
+    checks,
+    reviews,
+    issues: [...(given ? [given] : []), ...others],
+  };
 }
 
 export const PR_SUMMARY_QUERY = `query ReadPrSummary($owner: String!, $repo: String!, $number: Int!) {

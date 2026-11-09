@@ -1,6 +1,6 @@
 /**
  * Public GitHub responses for aviaratech/ai-delivery, recorded on 2026-10-31 through the exact queries in
- * readView.ts (`ISSUE_LINKS_QUERY` for issue 233, `PR_SUMMARY_QUERY` for PR 235). The bodies are unmodified;
+ * readView.ts (`ISSUE_LINKS_QUERY` for issue 233, `PR_SUMMARY_QUERY` for PR 235). The bodies are unmodified except that PR 235 also carries `mergeCommit` and `mergedAt` from `gh pr view 235` (Nov 8);
  * `data` is removed because the GraphQL client already unwraps it. Failing, pending and stale-review cases in
  * readView.test.ts are labeled synthetic edits of these.
  */
@@ -34,6 +34,8 @@ export const recordedIssue233Links = {
               state: 'MERGED',
               isDraft: false,
               mergeStateStatus: 'UNKNOWN',
+              mergeCommit: { oid: '4e649fb4f613a9cba0b0604c98bb6275d8c40a04' },
+              mergedAt: '2026-10-30T19:48:46Z',
               reviewDecision: 'APPROVED',
               headRefOid: 'bc9bbf9fe154c5e9c13366a94527edccd07b805b',
               latestReviews: {
@@ -92,6 +94,8 @@ export const recordedPr235Summary = {
       state: 'MERGED',
       isDraft: false,
       mergeStateStatus: 'UNKNOWN',
+      mergeCommit: { oid: '4e649fb4f613a9cba0b0604c98bb6275d8c40a04' },
+      mergedAt: '2026-10-30T19:48:46Z',
       reviewDecision: 'APPROVED',
       headRefOid: 'bc9bbf9fe154c5e9c13366a94527edccd07b805b',
       latestReviews: {

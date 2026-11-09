@@ -22,9 +22,18 @@ test('a merged, approved PR reports state, passing checks and a current approval
     state: 'merged',
     draft: false,
     mergeState: 'unknown',
+    mergeCommit: '4e649fb4f613a9cba0b0604c98bb6275d8c40a04',
+    mergedAt: '2026-10-30T19:48:46Z',
     checks: { state: 'success', failing: [], pending: [] },
     reviews: { decision: 'approved', latest: [{ by: 'at-gpt-reviewer', state: 'approved', current: true }] },
   });
+});
+
+test('an open PR has no merge commit or merge time; a node without the field is refused', () => {
+  const open = { ...pr235, state: 'OPEN', mergeCommit: null, mergedAt: null };
+  assert.deepEqual([summarizePr(open).mergeCommit, summarizePr(open).mergedAt], [null, null]);
+  const { mergeCommit: _omitted, ...missing } = pr235;
+  assert.throws(() => summarizePr(missing));
 });
 
 // Synthetic edits of the recorded PR: GitHub's own states, changed one field at a time.
@@ -162,6 +171,8 @@ test('a linked issue keeps the In Review flag of its Project item', async () => 
     view.issues.map((issue) => [issue.number, issue.projectStatus, 'inReview' in issue ? issue.inReview : undefined]),
     [[233, 'In Progress', true]],
   );
+  assert.equal(view.mergeCommit, '4e649fb4f613a9cba0b0604c98bb6275d8c40a04');
+  assert.equal(view.mergedAt, '2026-10-30T19:48:46Z');
 });
 
 test('journals lists every typed journal oldest first with its full body', () => {
