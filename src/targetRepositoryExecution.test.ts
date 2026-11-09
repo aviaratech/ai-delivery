@@ -7,7 +7,7 @@ import { Command } from 'commander';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { beforeAll, test, vi } from 'vitest';
-import { fixtureFields, inertTarget } from './fixtures/inertTarget.js';
+import { createFields, fixtureFields, inertTarget } from './fixtures/inertTarget.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './mcp/tools.js';
 
 type Fixture = ReturnType<typeof inertTarget>;
@@ -45,8 +45,16 @@ const routes: Route[] = [
   },
   {
     name: 'issue_create',
-    input: () => fixtureFields,
-    cli: (f) => ['create', '--title', fixtureFields.title, '--fields-file', inputFile(f, 'fields.json', fixtureFields)],
+    input: () => createFields,
+    cli: (f) => [
+      'create',
+      '--title',
+      fixtureFields.title,
+      '--priority',
+      'High',
+      '--fields-file',
+      inputFile(f, 'fields.json', fixtureFields),
+    ],
     witness: 'issues.create',
   },
   {

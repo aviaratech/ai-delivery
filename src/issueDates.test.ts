@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadDeliveryContext, updateIssue, issueInfo } from './issue.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
-import { inertTarget, fixtureFields } from './fixtures/inertTarget.js';
+import { inertTarget, fixtureFields, createFields } from './fixtures/inertTarget.js';
 
 function dateFixture() {
   const f = inertTarget();
@@ -81,8 +81,7 @@ test('MCP creates configured calendar dates and reads every supported field by n
   const c = await f.connect();
   try {
     const created = await c.call('issue_create', {
-      ...fixtureFields,
-      priority: 'High',
+      ...createFields,
       startDate: '2032-02-29',
       targetDate: '2032-03-01',
     });
@@ -140,7 +139,7 @@ for (const mode of ['missing', 'duplicate', 'wrong-type']) {
     const c = await f.connect();
     try {
       const before = f.calls.length;
-      const result = await c.call('issue_create', { ...fixtureFields, startDate: '2032-02-29' });
+      const result = await c.call('issue_create', { ...createFields, startDate: '2032-02-29' });
       assert.equal(result.response.isError, true);
       assert.match(result.text, /Start date|duplicate|catalog/u);
       assert.equal(
@@ -220,7 +219,10 @@ for (const command of ['create', 'update']) {
     const root = mkdtempSync(join(tmpdir(), 'issue151-cli-'));
     try {
       const file = join(root, 'fields.json');
-      const args = command === 'create' ? ['create', '--title', fixtureFields.title] : ['update', '--issue', '17'];
+      const args =
+        command === 'create'
+          ? ['create', '--title', fixtureFields.title, '--priority', 'High']
+          : ['update', '--issue', '17'];
       for (const value of ['2032-02-29', null, '2031-02-29']) {
         writeFileSync(file, JSON.stringify({ ...(command === 'create' ? fixtureFields : {}), targetDate: value }));
         const result = spawnSync(
@@ -252,7 +254,7 @@ test('a date-field failure after issue creation reports the known issue without 
   const c = await f.connect();
   try {
     f.controls.failWrite = true;
-    const result = await c.call('issue_create', { ...fixtureFields, startDate: '2032-02-29' });
+    const result = await c.call('issue_create', { ...createFields, startDate: '2032-02-29' });
     assert.equal(result.response.isError, true);
     assert.match(result.text, /Issue #17 was created/u);
     assert.match(result.text, /do not create another/u);

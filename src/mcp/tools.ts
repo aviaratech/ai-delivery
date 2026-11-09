@@ -151,7 +151,8 @@ export const AI_DELIVERY_MCP_TOOLS = [
   {
     name: 'issue_create',
     commandName: 'create',
-    description: 'Create a native GitHub tracking issue with configured metadata and relationships',
+    description:
+      'Create a native GitHub tracking issue with configured metadata and relationships. A non-draft issue needs issueType, and a non-epic also needs priority.',
     issueContract: ISSUE_JSON_SCHEMAS,
     inputSchema: issueInputSchema(
       z.strictObject(
@@ -179,7 +180,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_start',
     commandName: 'start',
     description:
-      'Start a linked issue. Prefer issueNumber of an open issue that already meets the ready contract: title, Points and, for Bug issues, the bug fields (see issue_create). A new issue from title or request cannot carry bug fields.',
+      'Start a linked issue. Prefer issueNumber of an open issue that already meets the ready contract: title, Issue Type, Priority (not for epics), Points and, for Bug issues, the bug fields (see issue_create). A new issue from title or request cannot carry bug fields.',
     inputSchema: NormalStart,
   },
   {

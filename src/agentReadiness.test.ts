@@ -9,6 +9,7 @@ import { IssueFields, renderIssueBody } from './issueContract.js';
 function fixture() {
   return IssueFields.parse({
     title: 'Reject invalid widget identifiers before persistence',
+    issueType: 'Task',
     points: 2,
     problem: 'The Project Todo column tracks work; TODO/TBD are literal documentation.',
     outcome: 'Reject malformed widget identifiers.',
@@ -28,6 +29,8 @@ function evaluate(overrides: Partial<Parameters<typeof evaluateAgentReadiness>[0
     title: issue.title,
     body: renderIssueBody(issue),
     points: 2,
+    priority: 'High',
+    issueType: 'Task',
     repoRoot: undefined,
     ...overrides,
   });
@@ -60,6 +63,8 @@ test('one or eight observable criteria are valid; count warns above seven', () =
 });
 for (const [name, override, code] of [
   ['missing live Points', { points: undefined }, 'points'],
+  ['missing live Priority', { priority: undefined }, 'priority'],
+  ['missing live issue type', { issueType: undefined }, 'issue-type'],
   ['open native blocker', { blockedBy: [17] }, 'blocked'],
   ['tracking parent', { trackingParent: true }, 'tracking-parent'],
 ] as const)

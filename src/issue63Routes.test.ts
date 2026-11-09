@@ -35,8 +35,8 @@ test('public update/create schemas preserve guard fields and refuse invalid reas
     { issueNumber: 20, blocks: [17], overrideReason: 'Reason' },
   );
   const create = getAiDeliveryMcpTool('issue_create')!.inputSchema;
-  assert.equal(create.safeParse({ ...f.ready, blocks: [17], overrideReason: 'Reason' }).success, true);
-  assert.throws(() => create.parse({ ...f.ready, blocks: [17], overrideReason: ' '.repeat(4) }));
+  assert.equal(create.safeParse({ ...f.createInput, blocks: [17], overrideReason: 'Reason' }).success, true);
+  assert.throws(() => create.parse({ ...f.createInput, blocks: [17], overrideReason: ' '.repeat(4) }));
   assert.throws(() =>
     getAiDeliveryMcpTool('issue_update')!.inputSchema.parse({ ...input, overrideReason: 'x'.repeat(2001) }),
   );
@@ -59,7 +59,7 @@ test('actual issue_start recovery executes guarded reciprocal tracking against t
   const { f } = routes();
   f.controls.failAdd = true;
   await assert.rejects(
-    issues.createIssue(f.context, { ...f.ready, blocks: [17], overrideReason: 'Recorded prerequisite' }),
+    issues.createIssue(f.context, { ...f.createInput, blocks: [17], overrideReason: 'Recorded prerequisite' }),
   );
   assert.ok(f.rows.has(20));
   f.controls.failAdd = false;

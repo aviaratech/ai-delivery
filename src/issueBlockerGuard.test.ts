@@ -6,7 +6,7 @@ import { issue63Fixture as guardFixture } from './fixtures/issue63.js';
 test('forward creation reads a known Blocked item when its list status projection is empty', async () => {
   const f = guardFixture();
   f.controls.missingProjectStatus = 20;
-  const result = await createIssue(f.context, { ...f.ready, blockedBy: [18] });
+  const result = await createIssue(f.context, { ...f.createInput, blockedBy: [18] });
   assert.equal(result.created.number, 20);
   assert.equal(result.created.url, 'https://github.com/example/widget/issues/20');
   assert.deepEqual([...f.edges.get(20)!], [18]);
@@ -26,7 +26,7 @@ test('a forward dependency failure preserves the created issue and update repair
   const f = guardFixture();
   f.controls.missingProjectStatus = 20;
   f.controls.failAdd = true;
-  await assert.rejects(createIssue(f.context, { ...f.ready, blockedBy: [18] }), (error) => {
+  await assert.rejects(createIssue(f.context, { ...f.createInput, blockedBy: [18] }), (error) => {
     assert.ok(error instanceof CreatedTrackingIssueError);
     assert.deepEqual(error.created, {
       number: 20,
@@ -97,7 +97,7 @@ test('new blocker on active work refuses before every affected write without an 
 test('reciprocal creation preflights the active dependent before creating an issue', async () => {
   const f = guardFixture();
   await assert.rejects(
-    createIssue(f.context, { ...f.ready, blocks: [17] } as Parameters<typeof createIssue>[1]),
+    createIssue(f.context, { ...f.createInput, blocks: [17] } as Parameters<typeof createIssue>[1]),
     /overrideReason/u,
   );
   assert.deepEqual(f.writes, []);
@@ -207,7 +207,7 @@ test('reciprocal create preserves unrelated edges and provides known-created rec
   f.edges.get(17)!.add(19);
   f.controls.failAdd = true;
   await assert.rejects(
-    createIssue(f.context, { ...f.ready, blocks: [17], overrideReason: 'New prerequisite' }),
+    createIssue(f.context, { ...f.createInput, blocks: [17], overrideReason: 'New prerequisite' }),
     (error) => error instanceof CreatedTrackingIssueError && error.created.number === 20,
   );
   assert.deepEqual([...f.edges.get(17)!], [19]);
@@ -222,7 +222,7 @@ test('forward create refuses PR and foreign endpoint identities before creation'
   for (const bad of [{ pull_request: {} }, { html_url: 'https://github.com/foreign/repo/issues/18' }, { number: 19 }]) {
     const f = guardFixture();
     Object.assign(f.rows.get(18)!, bad);
-    await assert.rejects(createIssue(f.context, { ...f.ready, blockedBy: [18] }), /endpoint|repository issue/u);
+    await assert.rejects(createIssue(f.context, { ...f.createInput, blockedBy: [18] }), /endpoint|repository issue/u);
     assert.deepEqual(f.writes, []);
   }
 });

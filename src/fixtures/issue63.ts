@@ -108,6 +108,7 @@ export function issue63Fixture() {
             rows.set(n, {
               ...get(18),
               ...input,
+              ...(typeof input.type === 'string' ? { type: { name: input.type } } : {}),
               number: n,
               id: 120,
               node_id: 'ISSUE20',
@@ -163,7 +164,10 @@ export function issue63Fixture() {
                     options: ['High', 'Low'].map((name) => ({ name })),
                   },
                 ]
-              : [{ issue_field_id: 101, issue_field_name: 'Estimate', data_type: 'single_select', value: '2' }],
+              : [
+                  { issue_field_id: 101, issue_field_name: 'Estimate', data_type: 'single_select', value: '2' },
+                  { issue_field_id: 102, issue_field_name: 'Urgency', data_type: 'single_select', value: 'High' },
+                ],
           };
         },
       },
@@ -273,5 +277,19 @@ export function issue63Fixture() {
       },
     },
   } as unknown as DeliveryContext;
-  return { context, ready, rows, edges, statuses, writes, graphqlCalls, comments, history, histories, controls };
+  const createInput = { ...ready, issueType: 'Task', priority: 'High' };
+  return {
+    context,
+    ready,
+    createInput,
+    rows,
+    edges,
+    statuses,
+    writes,
+    graphqlCalls,
+    comments,
+    history,
+    histories,
+    controls,
+  };
 }

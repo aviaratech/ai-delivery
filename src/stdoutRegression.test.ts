@@ -101,6 +101,13 @@ function fixture(developmentFails = false): { context: DeliveryContext; cleanup:
             value: '2',
             single_select_option: { name: '2' },
           },
+          {
+            issue_field_id: 102,
+            issue_field_name: 'Urgency',
+            data_type: 'single_select',
+            value: 'High',
+            single_select_option: { name: 'High' },
+          },
         ],
       };
     throw new Error(`Unexpected synthetic stdout REST operation: ${route}`);
@@ -302,6 +309,8 @@ test('failed remote branch start after parent linking preserves parseable CLI re
       'Synthetic change',
       '--body',
       readyBody,
+      '--priority',
+      'High',
       '--parent',
       '5',
     ]);
