@@ -3,9 +3,10 @@ import { afterEach, test, vi } from 'vitest';
 
 import { recordedIssue233Links, recordedPr235Summary } from './fixtures/readView.js';
 import * as projectDelivery from './github/projectDelivery.js';
+import * as issues from './issue.js';
 import type { DeliveryContext } from './issue.js';
 import * as prs from './pr.js';
-import { latestJournal, prView, readIssueLinks, readPrSummary, summarizePr } from './readView.js';
+import { issueView, journals, latestJournal, prView, readIssueLinks, readPrSummary, summarizePr } from './readView.js';
 
 const pr235 = recordedPr235Summary.repository.pullRequest;
 const context = (response: unknown) =>
@@ -161,4 +162,53 @@ test('a linked issue keeps the In Review flag of its Project item', async () => 
     view.issues.map((issue) => [issue.number, issue.projectStatus, 'inReview' in issue ? issue.inReview : undefined]),
     [[233, 'In Progress', true]],
   );
+});
+
+test('journals lists every typed journal oldest first with its full body', () => {
+  const [recorded] = recordedIssue233Links.repository.issue.comments.nodes;
+  const plain = {
+    author: { login: 'someone' },
+    body: 'LGTM',
+    createdAt: '2026-10-29T00:00:00Z',
+    url: 'https://example.test/c/2',
+  };
+  const later = {
+    ...recorded!,
+    author: null,
+    body: `Progress.\n\nMore.\n\n${recorded!.body.match(/<!--[^>]*-->\s*$/u)![0]}`,
+    url: 'https://example.test/c/3',
+  };
+  assert.deepEqual(journals([recorded!, plain, later]), [
+    {
+      by: 'PaulSavignano',
+      url: recorded!.url,
+      createdAt: recorded!.createdAt,
+      body: recorded!.body,
+    },
+    {
+      by: 'unknown',
+      url: later.url,
+      createdAt: later.createdAt,
+      body: later.body,
+    },
+  ]);
+  assert.deepEqual(journals([]), []);
+});
+
+test('issue_info verbose adds every journal; the default view has none', async () => {
+  vi.spyOn(issues, 'issueInfo').mockResolvedValue({
+    issueNumber: 233,
+  } as Awaited<ReturnType<typeof issues.issueInfo>>);
+  const ctx = context(recordedIssue233Links);
+  const [recorded] = recordedIssue233Links.repository.issue.comments.nodes;
+  const verbose = await issueView(ctx, 233, { verbose: true });
+  assert.deepEqual(verbose.journals, [
+    {
+      by: 'PaulSavignano',
+      url: recorded!.url,
+      createdAt: recorded!.createdAt,
+      body: recorded!.body,
+    },
+  ]);
+  assert.equal('journals' in (await issueView(ctx, 233, { verbose: false })), false);
 });
