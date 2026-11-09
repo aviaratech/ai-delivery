@@ -1510,6 +1510,7 @@ test('legacy Ready issues still update and rebuild without builder, and warn bui
     acceptanceCriteria: legacyReady().acceptanceCriteria,
   });
   assert.ok(rebuilt.warnings.some((warning) => warning.code === 'builder.unset'));
+  assert.equal(f.comments.length, 1, 'the hand-edited body went to the history comment');
 });
 
 test('incomplete drafts write parked; reviewer-role writes and wrong native repository readback are refused', async () => {
