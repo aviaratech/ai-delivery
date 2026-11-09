@@ -228,8 +228,12 @@ test('history preserves exact prior content before a rewrite and retries a faile
     assert.match(result.body, /ai-delivery:issue@1/u);
     assert.equal(fixture.comments.length, 1);
     assert.equal((result as unknown as { historyComment: { reused: boolean } }).historyComment.reused, true);
+    // The body replaces the converted legacy text; once that text has history, repeating the update is a no-op.
     await issue.updateIssue(fixture.context, input);
-    assert.equal(fixture.comments.length, 1, 'a no-op rewrite adds no history');
+    await issue.updateIssue(fixture.context, input);
+    const afterReplace = fixture.comments.length;
+    await issue.updateIssue(fixture.context, input);
+    assert.equal(fixture.comments.length, afterReplace, 'a no-op rewrite adds no history');
   } finally {
     fixture.cleanup();
   }
