@@ -302,7 +302,7 @@ export function inspectCandidate(contract) {
     'Packaged MCP launch contract differs',
   );
   const skills = [];
-  for (const skill of ['intake-create', 'worktree-lifecycle', 'pr-handoff']) {
+  for (const skill of ['intake-create', 'ticket-design', 'worktree-lifecycle', 'pr-handoff']) {
     const path = `plugins/ai-delivery/skills/${skill}/SKILL.md`;
     requireProof(byPath.has(path), 'missing-file', 'Packaged skill is absent');
     const member = byPath.get(path);

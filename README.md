@@ -6,7 +6,7 @@ Explicit `--repo owner/name` or MCP `repo: "owner/name"` works outside Git. With
 
 ## Scope
 
-In scope. ai-delivery is the only writer of the work-item standard: the issue contract (create, update, ready check, parents, sub-issues, blockers, milestones); work-item state (Project Status, Points, Priority, issue type, dates, `area:`/`risk:` labels); journals; linking an issue to its branch and PR; independent review under the reviewer App; one-call reads agents need to act; drift detection and repair.
+In scope. ai-delivery is the only writer of the work-item standard: the issue contract (create, update, ready check, parents, sub-issues, blockers, milestones); work-item state (Project Status, Points, Priority, issue type, dates, `area:`/`risk:` labels); journals; linking an issue to its branch and PR; independent review under the reviewer App; one-call reads agents need to act; a ticket-design skill for builder-ready issues; drift detection and repair.
 
 Out of scope. Checks and CI (repo-owned); worktrees and local git (host-owned); merge timing (the merge itself is `gh pr merge` at the reviewed head, with eligibility from GitHub rulesets); releases and deploys; generic GitHub reads (plain `gh`); agent orchestration. Install and doctor code stays but gains no features.
 

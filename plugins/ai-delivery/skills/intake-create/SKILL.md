@@ -9,7 +9,7 @@ description: Use ai-delivery MCP to read, list, search, create or update GitHub 
 
 2. Reads use requested `issue_info`/`issue_list`/`issue_search` only. Before authorized updates inspect full native issue/metadata/relationships; use configured author, not Git identity. Preserve requirements/history; exclude secrets.
 
-3. Typed intake requires problem/outcome, `behavior`/`verifiedBy`, non-goals, resolved questions/portable context, edge behavior and Bug regression/steps/expected/actual/reproducibility/environment. Native Type/Points: configured 1–8; split13. Blocked/tracking parents cannot autonomously start.
+3. For a new Ready issue, follow `ai-delivery:ticket-design`; to capture now, pass `draft: true`. Typed intake requires problem/outcome, `behavior`/`verifiedBy`, non-goals, resolved questions/portable context, edge behavior and Bug regression/steps/expected/actual/reproducibility/environment. Native Type/Points: configured 1–8; split13. Blocked/tracking parents cannot autonomously start.
 
 4. Ready defaults; Draft requires explicitly parked incomplete work and secret checks. Inspect warnings; fix blocking `code`/`field`/`fixHint`. Read `issue_info`/`issue_ready_check` before `issue_start`. [Schemas](https://github.com/aviaratech/ai-delivery/blob/main/src/mcp/tools.ts)/[status fields](https://github.com/aviaratech/ai-delivery/blob/main/src/issueContract.ts), drafts/publication prove neither readiness/review/merge/adoption.
 
@@ -21,16 +21,6 @@ Read example:
 
 ```json
 {"repo":"example/widget","issueNumber":17}
-```
-
-Ready `/owned/issue.json`:
-
-```json
-{"title":"Reject invalid widget identifiers before persistence","issueType":"Task","points":2,"problem":"Malformed identifiers currently reach widget persistence.","outcome":"Reject malformed identifiers before persistence.","acceptanceCriteria":[{"behavior":"Invalid identifiers cause no persistence call.","verifiedBy":"Synthetic invalid-ID fixture asserts zero persistence calls."}],"outOfScope":["Changing storage."],"openQuestions":[],"context":{"components":["widget intake"],"files":["src/widget.ts"],"evidence":["Portable synthetic invalid-identifier fixture."]},"draft":false}
-```
-
-```sh
-ai-delivery --identity host-author --repo example/widget create --title 'Reject invalid widget identifiers before persistence' --fields-file /owned/issue.json
 ```
 
 Canonical marker: `<!-- ai-delivery:issue@1 -->`.
