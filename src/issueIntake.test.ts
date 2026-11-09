@@ -2348,3 +2348,35 @@ test('created post-tracking recovery preserves later ready content without repla
   assert.equal(f.branchWrites.length, 1);
   assert.equal(f.getStatus(), 'Active');
 });
+
+test('update with a body replaces the preserved legacy body instead of appending (ai-delivery#298)', async () => {
+  const f = fixture();
+  const a = '## Decisions\n\n- Decision A\n';
+  const b = a + '- Decision B\n';
+  const created = await createIssue(f.context, { ...ready(), body: a });
+  f.live.body = created.body;
+  const updated = await updateIssue(f.context, { issueNumber: 17, ...ready(), body: b });
+  const legacy = parseIssueBody(updated.body, { title: updated.title }).issue.legacyBody;
+  assert.equal(legacy, b);
+  assert.equal(updated.body.split('Decision A').length - 1, 2);
+});
+
+test('one full typed-field update repairs a hand-edited body (ai-delivery#298)', async () => {
+  const f = fixture();
+  const created = await createIssue(f.context, { ...ready(), body: '## Decisions\n\n- Decision A\n' });
+  f.live.body = created.body.replace('- Decision A\n', '- Decision A\n\n- Decision A\n');
+  const withBody = await updateIssue(f.context, {
+    issueNumber: 17,
+    ...ready(),
+    body: '## Decisions\n\n- Decision A\n',
+  });
+  assert.equal(
+    parseIssueBody(withBody.body, { title: withBody.title }).issue.legacyBody,
+    '## Decisions\n\n- Decision A\n',
+  );
+  const repaired = await updateIssue(f.context, { issueNumber: 17, ...ready() });
+  f.live.body = repaired.body;
+  const info = await issueInfo(f.context, 17);
+  assert.equal(parseIssueBody(info.body, { title: info.title }).legacy, false);
+  assert.equal((await readyCheck(f.context, 17)).ready, true);
+});
