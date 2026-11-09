@@ -9,6 +9,7 @@ import { test, vi } from 'vitest';
 import * as githubClients from './github/client.js';
 import { syntheticDiscoveryClients, syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { createAiDeliveryMcpServer } from './mcp/index.js';
+import { withBuilder } from './fixtures/builderReady.js';
 import { canonicalIssueBody, type IssueInfo } from './issue.js';
 
 type Input = Record<string, unknown>;
@@ -404,7 +405,7 @@ test('composes shipped tracking through one non-Git MCP session with persisted r
     assert.equal(refused, true, name);
     assert.deepEqual(fixture.snapshot(), before, `${name} must not mutate stored native state or write count`);
   }
-  const fields = {
+  const fields = withBuilder({
     issueType: 'Task',
     points: 2,
     problem: 'Legacy tracking needs a portable replacement.',
@@ -422,7 +423,7 @@ test('composes shipped tracking through one non-Git MCP session with persisted r
       evidence: ['https://github.com/example/widget/issues/17'],
     },
     draft: false,
-  };
+  });
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);

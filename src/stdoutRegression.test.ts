@@ -13,6 +13,7 @@ import type { GitHubClients } from './github/client.js';
 import type { ProjectDeliveryStatus, ProjectDeliveryStatusReadback } from './github/projectDelivery.js';
 import { replaceParentIssue } from './github/relationships.js';
 import type { DeliveryContext } from './issue.js';
+import { withBuilder } from './fixtures/builderReady.js';
 import { IssueFields, renderIssueBody } from './issueContract.js';
 import { logDebug, logInfo, logWarn, setLogsSuppressed } from './logger.js';
 
@@ -41,21 +42,23 @@ afterEach(() => {
 });
 
 const readyBody = renderIssueBody(
-  IssueFields.parse({
-    title: 'Synthetic change',
-    issueType: 'Task',
-    points: 2,
-    problem: 'Parent-link diagnostics can corrupt the CLI JSON result.',
-    outcome: 'Return one parseable JSON result after parent linking or branch failure.',
-    acceptanceCriteria: [
-      {
-        behavior: 'Parent linking leaves stdout as one JSON result and diagnostics on stderr.',
-        verifiedBy: 'Byte-level CLI stream assertions.',
-      },
-    ],
-    outOfScope: ['Live GitHub access and host configuration.'],
-    context: { files: ['artifact.txt'] },
-  }),
+  IssueFields.parse(
+    withBuilder({
+      title: 'Synthetic change',
+      issueType: 'Task',
+      points: 2,
+      problem: 'Parent-link diagnostics can corrupt the CLI JSON result.',
+      outcome: 'Return one parseable JSON result after parent linking or branch failure.',
+      acceptanceCriteria: [
+        {
+          behavior: 'Parent linking leaves stdout as one JSON result and diagnostics on stderr.',
+          verifiedBy: 'Byte-level CLI stream assertions.',
+        },
+      ],
+      outOfScope: ['Live GitHub access and host configuration.'],
+      context: { files: ['artifact.txt'] },
+    }),
+  ),
 );
 
 function fixture(developmentFails = false): { context: DeliveryContext; cleanup: () => void } {

@@ -34,6 +34,7 @@ import {
   ISSUE_BODY_MARKER,
 } from './issueContract.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
+import { withBuilder } from './fixtures/builderReady.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -374,10 +375,10 @@ test('default legacy omission refuses drift between preparation and the history 
 
 test('status-only updates preserve embedded metadata and old formatting despite different native metadata', async () => {
   const f = fixture();
-  const data = {
+  const data = withBuilder({
     ...ready(),
     acceptanceCriteria: [{ behavior: 'Reject malformed input:\n- Empty input', verifiedBy: 'Regression test.' }],
-  };
+  });
   f.live.body =
     renderIssueBody(data).replace('  - Empty input\n\n  Verified', '- Empty input\n  Verified') +
     '\n\n<!-- ai-delivery-start-intent: sha256:' +
@@ -441,10 +442,10 @@ test('CLI typed field files reach status privacy validation before configuration
 
 test('status updates retain old multiline canonical formatting and reject ambiguous status blocks', async () => {
   const f = fixture();
-  const data = {
+  const data = withBuilder({
     ...ready(),
     acceptanceCriteria: [{ behavior: 'Reject malformed input:\n- Empty input', verifiedBy: 'Regression test.' }],
-  };
+  });
   f.live.body = renderIssueBody(data).replace('  - Empty input\n\n  Verified', '- Empty input\n  Verified');
   const before = f.live.body.split('\n\n## Problem')[1];
   const patch = { issueNumber: 17, status: { nextMilestone: '<literal> *text* [link]' } };
@@ -458,21 +459,23 @@ test('status updates retain old multiline canonical formatting and reject ambigu
 });
 
 const ready = () =>
-  IssueFields.parse({
-    title: 'Reject invalid widget identifiers before persistence',
-    issueType: 'Task',
-    points: 2,
-    problem: 'Malformed identifiers reach persistence.',
-    outcome: 'Reject malformed widget identifiers before persistence.',
-    acceptanceCriteria: [
-      {
-        behavior: 'An invalid identifier returns an error with zero persistence calls.',
-        verifiedBy: 'A portable mocked persistence regression test.',
-      },
-    ],
-    outOfScope: ['Storage changes.'],
-    context: { components: ['widget'], files: [], evidence: [] },
-  });
+  IssueFields.parse(
+    withBuilder({
+      title: 'Reject invalid widget identifiers before persistence',
+      issueType: 'Task',
+      points: 2,
+      problem: 'Malformed identifiers reach persistence.',
+      outcome: 'Reject malformed widget identifiers before persistence.',
+      acceptanceCriteria: [
+        {
+          behavior: 'An invalid identifier returns an error with zero persistence calls.',
+          verifiedBy: 'A portable mocked persistence regression test.',
+        },
+      ],
+      outOfScope: ['Storage changes.'],
+      context: { components: ['widget'], files: [], evidence: [] },
+    }),
+  );
 
 const createInput = () => ({ ...ready(), priority: 'High' });
 
@@ -1463,6 +1466,50 @@ test('native create validates first, writes canonical fields, reads back metadat
   assert.equal(parseIssueBody(result.body, { title: result.created.title }).issue.points, 2);
   assert.deepEqual(result.warnings, []);
   assert.equal(f.getStatus(), 'Queued');
+});
+
+const legacyReady = () => {
+  const { builder: _b, extends: _e, decisions: _d, surface: _s, fences: _f, proof: _p, ...rest } = ready();
+  return { ...rest, acceptanceCriteria: rest.acceptanceCriteria.map(({ examples: _x, ...ac }) => ac) };
+};
+const builderMissing = (error: unknown) =>
+  error instanceof IssueValidationError && error.failures.some((failure) => failure.code === 'builder.missing');
+
+test('a Ready create without builder gives builder.missing and writes nothing; a draft is captured', async () => {
+  const f = fixture();
+  await assert.rejects(createIssue(f.context, { ...legacyReady(), priority: 'High' }), builderMissing);
+  assert.equal(f.writes.length, 0);
+  await createIssue(f.context, { ...legacyReady(), priority: 'High', draft: true });
+  assert.match(f.live.body, /\*\*State:\*\* Draft/u);
+});
+
+test('draft-to-Ready without builder gives builder.missing; with builder it succeeds', async () => {
+  const f = fixture();
+  f.live.body = renderIssueBody({ ...legacyReady(), draft: true });
+  const writes = f.writes.length;
+  await assert.rejects(updateIssue(f.context, { issueNumber: 17, draft: false }), builderMissing);
+  assert.equal(f.writes.length, writes);
+  f.live.body = renderIssueBody({ ...ready(), draft: true });
+  await updateIssue(f.context, { issueNumber: 17, draft: false });
+  assert.match(f.live.body, /\*\*State:\*\* Ready/u);
+});
+
+test('legacy Ready issues still update and rebuild without builder, and warn builder.unset', async () => {
+  const f = fixture();
+  f.live.body = renderIssueBody(legacyReady());
+  const result = await updateIssue(f.context, {
+    issueNumber: 17,
+    outcome: 'Reject malformed widget identifiers early.',
+  });
+  assert.ok(result.warnings.some((warning) => warning.code === 'builder.unset'));
+  f.live.body = renderIssueBody(legacyReady()).replace('## Outcome', '## Outcome edited');
+  const { builder: _b, extends: _e, decisions: _d, surface: _s, fences: _f, proof: _p, ...rebuild } = ready();
+  const rebuilt = await updateIssue(f.context, {
+    issueNumber: 17,
+    ...rebuild,
+    acceptanceCriteria: legacyReady().acceptanceCriteria,
+  });
+  assert.ok(rebuilt.warnings.some((warning) => warning.code === 'builder.unset'));
 });
 
 test('incomplete drafts write parked; reviewer-role writes and wrong native repository readback are refused', async () => {

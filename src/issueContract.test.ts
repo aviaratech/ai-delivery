@@ -13,8 +13,10 @@ import {
   parseIssueBody,
   validateIssue,
   issueWarnings,
+  IssueValidationError,
 } from './issueContract.js';
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/index.js';
+import { builderReady } from './fixtures/builderReady.js';
 
 export const validIssue = () =>
   IssueFields.parse({
@@ -38,24 +40,25 @@ export const validIssue = () =>
     },
   });
 
-test('readable body length excludes embedded issue data and warns strictly above 4000', () => {
-  for (const [length, warning] of [
-    [3500, false],
-    [4000, false],
-    [4001, true],
-    [4500, true],
+test('body.length counts prose words in problem, outcome and criteria and warns strictly above 300', () => {
+  for (const [words, warning] of [
+    [299, false],
+    [300, false],
+    [301, true],
   ] as const) {
     const issue = validIssue();
-    issue.problem = '';
-    const prefix = () => renderIssueBody(issue).split('<!-- ai-delivery:issue-data@1 ')[0]!;
-    issue.problem = '<'.repeat(length - prefix().length);
-    assert.equal(prefix().length, length);
+    issue.problem = Array.from({ length: words - 2 }, () => 'w').join(' ');
+    issue.outcome = 'one';
+    issue.acceptanceCriteria[0]!.behavior = 'two';
     assert.equal(
       issueWarnings(issue).some((item) => item.code === 'body.length'),
       warning,
-      String(length),
+      String(words),
     );
   }
+  const structured = validIssue();
+  structured.context.evidence.push('A'.repeat(5000));
+  assert.ok(!issueWarnings(structured).some((item) => item.code === 'body.length'));
 });
 
 test('multiline criteria keep nested bullets and verification attached to their own checkbox', () => {
@@ -379,7 +382,7 @@ const warningCases: [string, (issue: ReturnType<typeof validIssue>) => void, str
   [
     'long body',
     (i) => {
-      i.context.evidence.push('A'.repeat(4500));
+      i.problem = Array.from({ length: 301 }, () => 'word').join(' ');
     },
     'body.length',
   ],
@@ -485,4 +488,116 @@ test('create and update tools and the portable Ready schema expose the six top-l
   for (const key of ['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'])
     assert.ok(key in ISSUE_JSON_SCHEMAS.ready.properties!, key);
   assert.ok(!ISSUE_JSON_SCHEMAS.ready.required?.includes('builder'));
+});
+
+test('builderReady has no failures and no warnings', () => {
+  assert.deepEqual(validateIssue(builderReady()).failures, []);
+  assert.deepEqual(issueWarnings(builderReady()), []);
+});
+
+const refusalCases: [string, (i: ReturnType<typeof builderReady>) => void, string][] = [
+  ['no decisions', (i) => void (i.decisions = []), 'decisions'],
+  ['blank decision', (i) => void (i.decisions = [' ']), 'decisions'],
+  ['no surface', (i) => void (i.surface = []), 'surface'],
+  ['blank surface path', (i) => void (i.surface = [{ path: ' ', change: 'edit' }]), 'surface'],
+  [
+    'no examples',
+    (i) => {
+      delete i.acceptanceCriteria[0]!.examples;
+    },
+    'examples',
+  ],
+  [
+    'no failure example',
+    (i) => {
+      i.acceptanceCriteria[0]!.examples = [{ input: 'a', expected: 'b' }];
+    },
+    'examples.failure',
+  ],
+  ['no proof', (i) => void (i.proof = []), 'proof'],
+];
+for (const [name, mutate, code] of refusalCases)
+  test('Ready with builder refuses ' + name, () => {
+    const issue = builderReady();
+    mutate(issue);
+    const failures = validateIssue(issue).failures;
+    assert.ok(
+      failures.some((f) => f.code === code && f.fixHint.endsWith('See ai-delivery:ticket-design.')),
+      code,
+    );
+  });
+
+test('builder fields are required only with builder, and never for epics or drafts', () => {
+  assert.deepEqual(validateIssue(validIssue()).failures, []);
+  const bare = { ...builderReady(), decisions: undefined, surface: undefined, proof: undefined, epic: true as const };
+  assert.deepEqual(validateIssue(bare).failures, []);
+  assert.deepEqual(validateIssue({ ...bare, epic: undefined, draft: true }, false).failures, []);
+});
+
+test('requireBuilder refuses a Ready non-epic issue without builder and offers draft', () => {
+  assert.throws(
+    () => requireIssue(validIssue(), { requireBuilder: true }),
+    (error: unknown) =>
+      error instanceof IssueValidationError &&
+      error.failures.some((f) => f.code === 'builder.missing' && f.fixHint.includes('draft: true')),
+  );
+  assert.ok(requireIssue(validIssue()));
+  assert.ok(requireIssue(builderReady(), { requireBuilder: true }));
+  assert.ok(requireIssue({ ...validIssue(), draft: true }, { requireBuilder: true }));
+  assert.ok(requireIssue({ ...validIssue(), epic: true }, { requireBuilder: true }));
+});
+
+const judgmentCases: [string, (i: ReturnType<typeof builderReady>) => void, string][] = [
+  ['8 points', (i) => void (i.points = 8), 'size.points'],
+  [
+    'seven surface paths',
+    (i) =>
+      void (i.surface = Array.from({ length: 7 }, (_, n) => ({ path: `src/a${n}.ts`, change: 'delete' as const }))),
+    'size.surface',
+  ],
+  [
+    'a criterion without examples',
+    (i) => {
+      i.acceptanceCriteria.push({ behavior: 'saveWidget stores a valid id', verifiedBy: 'src/widget.test.ts' });
+    },
+    'examples.ac',
+  ],
+  [
+    'a code path without signatures',
+    (i) => void (i.surface = [{ path: 'src/widget.ts', change: 'edit' }]),
+    'surface.signature',
+  ],
+  ['no fences', (i) => void (i.fences = []), 'fences'],
+  ['blank extends', (i) => void (i.extends = [' ']), 'extends'],
+];
+for (const [name, mutate, code] of judgmentCases)
+  test('Ready with builder warns, never refuses, for ' + name, () => {
+    const issue = builderReady();
+    mutate(issue);
+    assert.deepEqual(validateIssue(issue).failures, []);
+    assert.ok(
+      issueWarnings(issue).some((w) => w.code === code && w.fixHint.endsWith('See ai-delivery:ticket-design.')),
+    );
+  });
+
+test('surface.signature skips deleted paths, tests and non-code files', () => {
+  const issue = builderReady();
+  issue.surface = [
+    { path: 'src/gone.ts', change: 'delete' },
+    { path: 'src/widget.test.ts', change: 'edit' },
+    { path: 'README.md', change: 'edit' },
+  ];
+  assert.ok(!issueWarnings(issue).some((w) => w.code === 'surface.signature'));
+});
+
+test('a legacy Ready issue warns builder.unset and skips builder-only warnings; edge-case and context drop with builder', () => {
+  const codes = (issue: Parameters<typeof issueWarnings>[0]) => issueWarnings(issue).map((w) => w.code);
+  assert.ok(codes(validIssue()).includes('builder.unset'));
+  assert.ok(!codes({ ...validIssue(), draft: true }).includes('builder.unset'));
+  assert.ok(!codes({ ...validIssue(), epic: true }).includes('builder.unset'));
+  assert.ok(!codes(validIssue()).some((code) => code.startsWith('size.') || code === 'fences' || code === 'extends'));
+  const noCopy = builderReady();
+  noCopy.acceptanceCriteria[0]!.behavior = 'saveWidget stores valid ids';
+  noCopy.context = { components: [], files: [], evidence: [] };
+  assert.ok(!codes(noCopy).some((code) => code === 'edge-case' || code === 'context'));
 });
