@@ -11,6 +11,7 @@ import { test } from 'vitest';
 import pkg from '../package.json' with { type: 'json' };
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/tools.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
+import { withBuilder } from './fixtures/builderReady.js';
 
 const packageRoot = fileURLToPath(new URL('../', import.meta.url));
 const pluginRoot = join(packageRoot, 'plugins', 'ai-delivery');
@@ -212,7 +213,7 @@ globalThis.fetch=async(url,init)=>{
       const client = new Client({ name: 'actual-launch-routing', version: '1' });
       try {
         await client.connect(transport, { timeout: 30000 });
-        const readyInput = {
+        const readyInput = withBuilder({
           repo: 'example/b',
           title: 'Validate widget launch routing across repositories',
           issueType: 'Task',
@@ -227,7 +228,7 @@ globalThis.fetch=async(url,init)=>{
             },
           ],
           outOfScope: ['Live authentication and host configuration.'],
-        };
+        });
         const created = await client.callTool({
           name: 'issue_create',
           arguments: { ...readyInput, labels: ['enhancement'] },
