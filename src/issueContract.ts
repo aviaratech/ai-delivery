@@ -15,7 +15,35 @@ export function issueTrackingFooter(body: string): string {
 }
 const Text = z.string();
 const Strings = z.array(Text);
-const AcceptanceCriterion = z.strictObject({ behavior: Text, verifiedBy: Text });
+export const IssueExample = z.strictObject({
+  input: Text,
+  expected: Text,
+  failure: z.literal(true).optional().describe('Marks an example of what must be refused or must fail.'),
+});
+const AcceptanceCriterion = z.strictObject({
+  behavior: Text,
+  verifiedBy: Text,
+  examples: z
+    .array(IssueExample)
+    .optional()
+    .describe('Example Mapping: concrete input and expected result for this criterion, including a failure case.'),
+});
+export const FrontierReason = z.enum([
+  'state-machine',
+  'concurrency-recovery',
+  'risk-semantics',
+  'unprovable-refactor',
+]);
+export const BuilderTier = z.discriminatedUnion('tier', [
+  z.strictObject({ tier: z.literal('standard') }),
+  z.strictObject({ tier: z.literal('frontier'), reason: FrontierReason }),
+]);
+export type BuilderTierData = z.infer<typeof BuilderTier>;
+export const SurfaceEntry = z.strictObject({
+  path: Text,
+  change: z.enum(['add', 'edit', 'delete']),
+  signatures: Strings.optional(),
+});
 export const IssueDeferral = z.strictObject({
   until: z.iso.date().optional(),
   trigger: z.string().trim().min(1).max(2000).optional(),
@@ -58,6 +86,19 @@ export const IssueFields = z.strictObject({
     .describe('Ready Bug issues need non-empty steps, expected, actual, reproducibility and environment.'),
   draft: z.boolean().default(false),
   deferral: IssueDeferral.optional(),
+  builder: BuilderTier.optional().describe(
+    'Builder capability: standard (any lighter builder can finish from the issue alone) or frontier with one reason.',
+  ),
+  extends: Strings.optional().describe('The design decision or existing owner this change uses or extends.'),
+  decisions: Strings.optional().describe('Choices already made; the builder must not reopen them.'),
+  surface: z
+    .array(SurfaceEntry)
+    .optional()
+    .describe(
+      'The complete change set: each path, its change, and exact signatures. Tests for these paths are implied.',
+    ),
+  fences: Strings.optional().describe("Nearby paths the builder must not touch, with each shared file's owner."),
+  proof: Strings.optional().describe('Commands or replays to run in order, focused first.'),
   legacyBody: Text.optional(),
   retainLegacyBody: z.boolean().optional(),
 });
@@ -246,6 +287,12 @@ export const IssueWriteFields = {
   openQuestions: IssueFields.shape.openQuestions.removeDefault().optional(),
   context: IssueFields.shape.context.removeDefault().optional(),
   bug: IssueFields.shape.bug,
+  builder: IssueFields.shape.builder,
+  extends: IssueFields.shape.extends,
+  decisions: IssueFields.shape.decisions,
+  surface: IssueFields.shape.surface,
+  fences: IssueFields.shape.fences,
+  proof: IssueFields.shape.proof,
   draft: IssueFields.shape.draft.removeDefault().optional(),
   retainLegacyBody: IssueFields.shape.retainLegacyBody,
 };
@@ -351,6 +398,8 @@ export function renderIssueBody(value: DraftIssueData, status?: IssueStatusData,
   const item = DraftIssue.parse(value);
   if (status !== undefined) requireIssueStatus(IssueStatus, status);
   const list = (values: string[]): string => (values.length ? values.map((v) => `- ${v}`).join('\n') : '(none)');
+  const bulletSection = (title: string, values: string[] | undefined): string[] =>
+    values?.length ? [`## ${title}`, list(values)] : [];
   const parts = [
     ISSUE_BODY_MARKER,
     '## Status',
@@ -364,14 +413,38 @@ export function renderIssueBody(value: DraftIssueData, status?: IssueStatusData,
     '## Outcome',
     item.outcome,
     ...(item.deferral === undefined ? [] : ['## Deferral', `Deferred: ${JSON.stringify(item.deferral)}`]),
+    ...(item.builder === undefined
+      ? []
+      : ['## Builder', item.builder.tier === 'standard' ? 'standard' : `frontier: ${item.builder.reason}`]),
+    ...bulletSection('Extends', item.extends),
+    ...bulletSection('Decisions', item.decisions),
     '## Acceptance criteria',
     item.acceptanceCriteria
-      .map((ac) =>
-        legacyFormatting
-          ? `- [ ] ${ac.behavior}\n  Verified by: ${ac.verifiedBy}`
-          : `- [ ] ${ac.behavior.replace(/\n/gu, '\n  ')}${ac.behavior.includes('\n') ? '\n' : ''}\n  Verified by: ${ac.verifiedBy.replace(/\n/gu, '\n  ')}`,
+      .map(
+        (ac) =>
+          (legacyFormatting
+            ? `- [ ] ${ac.behavior}\n  Verified by: ${ac.verifiedBy}`
+            : `- [ ] ${ac.behavior.replace(/\n/gu, '\n  ')}${ac.behavior.includes('\n') ? '\n' : ''}\n  Verified by: ${ac.verifiedBy.replace(/\n/gu, '\n  ')}`) +
+          (ac.examples ?? [])
+            .map(
+              (example) =>
+                `\n  Example: ${example.input.replace(/\n/gu, '\n  ')} → ${example.expected.replace(/\n/gu, '\n  ')}${example.failure === true ? ' (failure)' : ''}`,
+            )
+            .join(''),
       )
       .join('\n'),
+    ...(item.surface?.length
+      ? [
+          '## Surface',
+          item.surface
+            .map((entry) =>
+              [`- ${entry.change} \`${entry.path}\``, ...(entry.signatures ?? []).map((sig) => `  ${sig}`)].join('\n'),
+            )
+            .join('\n'),
+        ]
+      : []),
+    ...bulletSection('Fences', item.fences),
+    ...bulletSection('Proof', item.proof),
     '## Out of scope',
     list(item.outOfScope),
     '## Open questions',

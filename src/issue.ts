@@ -81,6 +81,7 @@ import {
   type IssueDiagnostic,
   type IssueStatusData,
   type IssueDeferralData,
+  type BuilderTierData,
   requireDeferralPatch,
 } from './issueContract.js';
 
@@ -1490,7 +1491,15 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
     );
     if (validateIssue(fields, true).failures.length) throw error;
     const prepared = prepareIssueWrite(full, undefined);
-    const reset = (['draft', 'openQuestions', 'context'] as const).filter((key) => input[key] === undefined);
+    // The builder-ready fields can only be lost when the old body's data comment still carried them.
+    const reset = [
+      'draft',
+      'openQuestions',
+      'context',
+      ...(['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) =>
+        current.body.includes(`"${key}":`),
+      ),
+    ].filter((key) => input[key as keyof typeof input] === undefined);
     if (reset.length) {
       const message = `Rebuilt the hand-edited body (old one in the history comment); reset because not sent: ${reset.join(', ')}.`;
       prepared.warnings.push({ code: 'body.rebuilt', field: 'body', message, fixHint: message });
@@ -2529,6 +2538,7 @@ export type IssueChildCounts = Pick<IssueChildProgress, 'childCount' | 'closedCh
 export interface IssueInfo {
   childProgress?: IssueChildProgress | IssueChildCounts;
   deferred?: IssueDeferralData | null;
+  builder?: BuilderTierData | null;
   routing?: LoadedDeliveryConfig['routing'];
   blockedBy: number[];
   body: string;
@@ -2652,13 +2662,17 @@ function childCounts(children: readonly { state: 'open' | 'closed' }[]): IssueCh
 }
 
 /** Invalid canonical content stays inspectable; omitted state is unknown, never an assertion of undeferred. */
-function deferralReadback(body: string | null | undefined, title: string): { deferred?: IssueDeferralData | null } {
+function deferralReadback(
+  body: string | null | undefined,
+  title: string,
+): { deferred?: IssueDeferralData | null; builder?: BuilderTierData | null } {
   if (body === undefined) return {};
   try {
-    return { deferred: parseIssueBody(body ?? '', { title }).issue.deferral ?? null };
+    const { issue } = parseIssueBody(body ?? '', { title });
+    return { deferred: issue.deferral ?? null, builder: issue.builder ?? null };
   } catch (error) {
     if (!(error instanceof IssueValidationError)) throw error;
-    return {};
+    return { builder: null };
   }
 }
 
