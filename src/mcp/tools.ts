@@ -184,12 +184,14 @@ export const AI_DELIVERY_MCP_TOOLS = [
   },
   {
     name: 'issue_list',
+    readOnly: true,
     commandName: 'list',
     description: 'List repository issues with native filters, named organization fields and pagination',
     inputSchema: z.strictObject({ ...IssueListing, query: SearchText.optional() }, { error: acceptedKeysError }),
   },
   {
     name: 'issue_search',
+    readOnly: true,
     commandName: 'search',
     description: 'Search literal issue text in the selected repository with native filters and pagination',
     inputSchema: z.strictObject({ ...IssueListing, query: SearchText }, { error: acceptedKeysError }),
@@ -218,6 +220,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
   },
   {
     name: 'issue_info',
+    readOnly: true,
     commandName: 'info',
     description:
       'Read live GitHub issue metadata, relationships, Project status, linked PRs (state, merge commit, checks, reviews) and the latest journal in one call. Child counts by default; verbose adds the body, every journal in full, routing and full child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
@@ -225,6 +228,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
   },
   {
     name: 'issue_ready_check',
+    readOnly: true,
     commandName: 'ready:check',
     description: 'Evaluate deterministic readiness from live native issue state',
     inputSchema: z.strictObject(
@@ -269,6 +273,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
   },
   {
     name: 'issue_pr_info',
+    readOnly: true,
     commandName: 'pr:info',
     description:
       "Inspect a PR by number or its GitHub-linked issue branch: state, merge state, merge commit, checks, reviews and each linked issue's state, Project status and latest journal, in one call",

@@ -27,7 +27,7 @@ const info = (v: Record<string, unknown>) => {
   assert.equal(v.points, 2);
   assert.equal(v.parentIssueNumber, 11);
   assert.deepEqual(v.blockedBy, [13]);
-  assert.equal(v.worktree, null);
+  assert.equal('worktree' in v, false);
   assert.deepEqual(v.childProgress, { childCount: 2, closedChildCount: 1, percentClosed: 50 });
 };
 const scenarios: Scenario[] = [

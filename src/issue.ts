@@ -2548,7 +2548,6 @@ export interface IssueInfo {
   state: string;
   title: string;
   url: string;
-  worktree: string | null;
 }
 
 async function readIssueInfo(
@@ -2630,7 +2629,6 @@ async function readIssueInfo(
     state: issue.state,
     title: issue.title,
     url: issue.html_url,
-    worktree: null,
   };
   return { info, issueNodeId: issue.node_id, issueNumber: issue.number };
 }

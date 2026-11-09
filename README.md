@@ -4,6 +4,12 @@ ai-delivery handles **GitHub issues, pull requests and independent reviews** thr
 
 Explicit `--repo owner/name` or MCP `repo: "owner/name"` works outside Git. Without it, the checkout's `origin` selects the repository. Only `github.com` is supported. The runtime reads operator-owned JSON; it never executes a consuming repository's policy or checks.
 
+## Scope
+
+In scope. ai-delivery is the only writer of the work-item standard: the issue contract (create, update, ready check, parents, sub-issues, blockers, milestones); work-item state (Project Status, Points, Priority, issue type, dates, `area:`/`risk:` labels); journals; linking an issue to its branch and PR; independent review under the reviewer App; one-call reads agents need to act; drift detection and repair.
+
+Out of scope. Checks and CI (repo-owned); worktrees and local git (host-owned); merge timing (the merge itself is `gh pr merge` at the reviewed head, with eligibility from GitHub rulesets); releases and deploys; generic GitHub reads (plain `gh`); agent orchestration. Install and doctor code stays but gains no features.
+
 ## Installation and runtime
 
 Use Node **24.21.0** and npm **11.19.0** for CLI/MCP and contributor checks; public library consumers also support Node **26.2.0**. Install a qualified published version or reviewed archive. The [complete plugin](plugins/ai-delivery/README.md) is the canonical native installation; CLI/SDK/MCP entrypoints remain available.

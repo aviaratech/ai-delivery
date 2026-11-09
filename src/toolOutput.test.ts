@@ -163,6 +163,21 @@ test('verbose belongs to the batch envelope and cannot alter an individual write
   ).toThrow();
 });
 
+test('only the read tools are annotated readOnlyHint so hosts can run them in parallel', async () => {
+  const server = createAiDeliveryMcpServer({ repoRoot: '/synthetic' });
+  const client = new Client({ name: 'read-only-synthetic', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const { tools } = await client.listTools();
+  await client.close();
+  await server.close();
+  const readOnly = tools.filter((tool) => tool.annotations?.readOnlyHint === true).map((tool) => tool.name);
+  expect(readOnly.sort()).toEqual(
+    ['issue_info', 'issue_list', 'issue_pr_info', 'issue_ready_check', 'issue_search'].sort(),
+  );
+});
+
 test('published write schemas state the limits that refuse a write', async () => {
   const server = createAiDeliveryMcpServer({ repoRoot: '/synthetic' });
   const client = new Client({ name: 'schema-limits-synthetic', version: '1' });
