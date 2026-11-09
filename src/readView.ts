@@ -93,16 +93,18 @@ const Comment = z.object({
 });
 const JOURNAL_MARKER = /<!--\s*ai-delivery:journal@1:sha256:[a-f0-9]{64}\s*-->\s*$/u;
 
+/** Every typed journal comment, oldest first, with its full body. */
+export function journals(comments: readonly z.infer<typeof Comment>[]) {
+  return comments
+    .filter((comment) => JOURNAL_MARKER.test(comment.body))
+    .map(({ author, url, createdAt, body }) => ({ by: author?.login ?? 'unknown', url, createdAt, body }));
+}
+
 /** The newest typed journal comment, reduced to its own `Status: … Next: …` preview line. */
 export function latestJournal(comments: readonly z.infer<typeof Comment>[]) {
-  const journal = comments.findLast((comment) => JOURNAL_MARKER.test(comment.body));
+  const journal = journals(comments).at(-1);
   return journal
-    ? {
-        by: journal.author?.login ?? 'unknown',
-        url: journal.url,
-        createdAt: journal.createdAt,
-        preview: journal.body.split('\n')[0]!,
-      }
+    ? { by: journal.by, url: journal.url, createdAt: journal.createdAt, preview: journal.body.split('\n')[0]! }
     : null;
 }
 
@@ -160,6 +162,7 @@ export async function readIssueLinks(context: DeliveryContext, issueNumber: numb
     state: data.state.toLowerCase(),
     pullRequests,
     latestJournal: latestJournal(data.comments.nodes),
+    journals: journals(data.comments.nodes),
   };
 }
 
@@ -176,7 +179,12 @@ export async function issueView(context: DeliveryContext, issueNumber: number, o
     issueInfo(context, issueNumber, { childDetail: options.verbose }),
     readIssueLinks(context, issueNumber),
   ]);
-  return { ...info, pullRequests: links.pullRequests, latestJournal: links.latestJournal };
+  return {
+    ...info,
+    pullRequests: links.pullRequests,
+    latestJournal: links.latestJournal,
+    ...(options.verbose ? { journals: links.journals } : {}),
+  };
 }
 
 async function readIssueBrief(context: DeliveryContext, issueNumber: number) {
