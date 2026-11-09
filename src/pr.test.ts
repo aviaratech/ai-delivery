@@ -621,14 +621,6 @@ describe('remote GitHub lifecycle', () => {
     const { context } = fixture();
     await assert.rejects(publishPr(context, { issueNumber: 17, baseBranch: 'release' }), /default branch/u);
   });
-  it('refuses conflicting prior PR metadata during dry-run before promotion', async () => {
-    const { context } = fixture();
-    context.clients.rest.pulls.list = (async () => ({
-      data: [{ number: 23 }],
-    })) as typeof context.clients.rest.pulls.list;
-    await assert.rejects(publishPr(context, { issueNumber: 17, body: 'Different intent', dryRun: true }), /conflict/u);
-  });
-
   it('reads every PR match page before refusing ambiguous branch publication', async () => {
     const { context } = fixture();
     context.clients.rest.pulls.list = (async (input: { page?: number }) => ({

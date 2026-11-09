@@ -240,7 +240,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_pr_create',
     commandName: 'pr:create',
     description:
-      'Create or reuse a PR from any directory using repo, issueNumber and a pushed head. By default it closes the issue and restores a missing closing link on reuse. nonClosing opens a draft that references the issue and leaves it open. expectedHeadSha refuses a different pushed head.',
+      'Create or reuse a PR from any directory using repo, issueNumber and a pushed head. By default it closes the issue and restores a missing closing link on reuse. On an existing closing PR, a new title or body edits it and draft: false marks it ready. nonClosing opens a draft that references the issue and leaves it open. expectedHeadSha refuses a different pushed head.',
     inputSchema: z
       .strictObject(
         {
