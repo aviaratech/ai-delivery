@@ -1916,7 +1916,7 @@ test(
 );
 
 test(
-  'skill examples: intake-create reads, ticket-design creates Ready with zero warnings, every CLI line has options and identity',
+  'intake skill example is Ready and every CLI line has actual required options and an explicit identity',
   { tags: ['release'] },
   () => {
     const intake = readFileSync(resolve('plugins/ai-delivery/skills/intake-create/SKILL.md'), 'utf8');
