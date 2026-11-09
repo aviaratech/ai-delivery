@@ -541,6 +541,14 @@ export async function createIssue(
   if (input.priority !== undefined && !context.config.native.priority.values.includes(input.priority)) {
     throw new DeliveryError('Unsupported configured Priority value.');
   }
+  if (!prepared.issue.draft) {
+    const missing: IssueDiagnostic[] = [];
+    if (input.issueType === undefined)
+      missing.push(missingNativeField('issue-type', 'issueType', context.config.native.issueTypes));
+    if (input.priority === undefined && !prepared.issue.epic)
+      missing.push(missingNativeField('priority', 'priority', context.config.native.priority.values));
+    if (missing.length > 0) throw new IssueValidationError(missing);
+  }
   const { clients, config, repo } = context;
   const targets = await resolveNativeRelationshipTargets({
     blockers: input.blockedBy ?? [],
@@ -2874,6 +2882,11 @@ export async function listIssueSubissues(context: DeliveryContext, issueNumber: 
   return (await readDirectIssueChildren(context, issueNumber, issue)).map((child) => child.number);
 }
 
+function missingNativeField(code: string, field: string, values: readonly string[]): IssueDiagnostic {
+  const fixHint = `Choose ${code}: ${values.join(', ')}.`;
+  return { code, field, fixHint, message: fixHint };
+}
+
 export async function readyCheck(
   context: DeliveryContext,
   issueNumber: number,
@@ -2897,6 +2910,7 @@ export async function readyCheck(
     blockedBy: info.blockedBy,
     body: info.body,
     ...(info.points === undefined ? {} : { points: info.points }),
+    ...(info.priority === undefined ? {} : { priority: info.priority }),
     repoRoot: undefined,
     title: info.title,
     ...(info.issueType === null ? {} : { issueType: info.issueType }),

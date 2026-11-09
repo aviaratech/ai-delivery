@@ -25,7 +25,14 @@ import {
 import { executeTool, startTrackedIssue } from './dispatch.js';
 import { digestValue } from './delivery/common.js';
 import { getAiDeliveryMcpTool } from './mcp/tools.js';
-import { IssueFields, ReadyIssue, renderIssueBody, parseIssueBody, ISSUE_BODY_MARKER } from './issueContract.js';
+import {
+  IssueFields,
+  IssueValidationError,
+  ReadyIssue,
+  renderIssueBody,
+  parseIssueBody,
+  ISSUE_BODY_MARKER,
+} from './issueContract.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 
 afterEach(() => {
@@ -37,7 +44,7 @@ test('create renders all five status fields with a UTC timestamp and optional mi
   vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-16T20:30:00Z'));
   for (const draft of [false, true]) {
     const f = fixture();
-    const input = { ...ready(), draft, status: { nextMilestone: 'Run checks' } };
+    const input = { ...createInput(), draft, status: { nextMilestone: 'Run checks' } };
     const result = await createIssue(f.context, input);
     const status = result.body.split('## Status\n\n')[1]!.split('\n\n## Problem')[0];
     assert.equal(
@@ -46,12 +53,12 @@ test('create renders all five status fields with a UTC timestamp and optional mi
     );
   }
   const f = fixture();
-  assert.match((await createIssue(f.context, ready())).body, /\*\*Next milestone:\*\* Not started/u);
+  assert.match((await createIssue(f.context, createInput())).body, /\*\*Next milestone:\*\* Not started/u);
 });
 
 test('status-only patches preserve every outside-Status byte including canonical data and start markers', async () => {
   const f = fixture();
-  const created = await createIssue(f.context, ready());
+  const created = await createIssue(f.context, createInput());
   f.live.body =
     created.body +
     '\n\n<!-- ai-delivery-start-intent: sha256:' +
@@ -302,6 +309,7 @@ test('normal-start recovery preserves legacy rendering across repeated exact ret
     body: renderIssueBody({ ...ready(), legacyBody: 'Original operator context.\n' }),
     issueType: 'Task',
     points: 2,
+    priority: 'High',
     requestId: 'legacy-status-retry',
   });
   await startTrackedIssue(f.context, request);
@@ -339,6 +347,7 @@ test.each([{ points: 4 }, { issueType: 'Feature' }])(
       body: renderIssueBody(ready()),
       issueType: 'Task',
       points: 2,
+      priority: 'High',
       requestId: 'contract-metadata-retry',
     });
     await startTrackedIssue(f.context, request);
@@ -465,6 +474,8 @@ const ready = () =>
     context: { components: ['widget'], files: [], evidence: [] },
   });
 
+const createInput = () => ({ ...ready(), priority: 'High' });
+
 function fixture() {
   const live = {
     number: 17,
@@ -495,6 +506,7 @@ function fixture() {
     closeAfterReason: false,
     trackingParent: false,
     livePoints: 2,
+    livePriority: true,
     projectMember: true,
     projectArchived: false,
     projectFailure: '' as '' | 'before' | 'after' | 'readback',
@@ -525,6 +537,16 @@ function fixture() {
       value: String(controls.livePoints),
       single_select_option: { name: String(controls.livePoints) },
     },
+    ...(controls.livePriority && !controls.capacityMode
+      ? [
+          {
+            issue_field_id: 102,
+            issue_field_name: 'Urgency',
+            data_type: 'single_select',
+            single_select_option: { name: 'High' },
+          },
+        ]
+      : []),
     ...(controls.capacityMode
       ? [
           {
@@ -926,7 +948,7 @@ test('canonical new-start intent preserves supplied deferral rather than silentl
   });
   const f = fixture();
   f.controls.created = false;
-  const request = { ...ready(), body: deferred };
+  const request = { ...createInput(), body: deferred };
   const first = await startTrackedIssue(f.context, request);
   assert.equal(Reflect.get(first, 'status'), 'created-not-started');
   assert.deepEqual(Reflect.get(parseIssueBody(f.live.body, { title: f.live.title }).issue, 'deferral'), {
@@ -1430,9 +1452,12 @@ test('WIP refuses observation drift after recording an override and preserves th
 
 test('native create validates first, writes canonical fields, reads back metadata and returns warnings', async () => {
   const f = fixture();
-  await assert.rejects(createIssue(f.context, { ...ready(), openQuestions: ['Select behavior.'] }), /open-questions/u);
+  await assert.rejects(
+    createIssue(f.context, { ...createInput(), openQuestions: ['Select behavior.'] }),
+    /open-questions/u,
+  );
   assert.equal(f.writes.length, 0);
-  const result = await createIssue(f.context, ready());
+  const result = await createIssue(f.context, createInput());
   assert.equal(f.writes.length, 1);
   assert.equal(canonicalIssueBody({ ...ready(), body: result.body }), renderIssueBody(ready()));
   assert.equal(parseIssueBody(result.body, { title: result.created.title }).issue.points, 2);
@@ -1446,11 +1471,11 @@ test('incomplete drafts write parked; reviewer-role writes and wrong native repo
   assert.equal(f.getStatus(), 'Queued');
   assert.match(f.live.body, /\*\*State:\*\* Draft/u);
   f.controls.role = 'reviewer';
-  await assert.rejects(createIssue(f.context, ready()), /author role/u);
+  await assert.rejects(createIssue(f.context, createInput()), /author role/u);
   await assert.rejects(updateIssue(f.context, { issueNumber: 17, draft: true }), /author role/u);
   const bad = fixture();
   bad.controls.wrongCreateRepo = true;
-  await assert.rejects(createIssue(bad.context, ready()), /created but native tracking did not complete/u);
+  await assert.rejects(createIssue(bad.context, createInput()), /created but native tracking did not complete/u);
   assert.equal(bad.writes.length, 1);
 });
 
@@ -1539,6 +1564,7 @@ test('normal-start canonical retry body keeps exact intent markers through creat
     body: canonical + footer,
     points: 2,
     issueType: 'Task',
+    priority: 'High',
   });
   assert.equal(canonicalIssueBody({ ...issue, body: result.body }), canonical + footer);
   assert.deepEqual(parseIssueBody(result.body, { title: issue.title }).issue, issue);
@@ -1553,6 +1579,7 @@ test('actual normal-start creation and retry reuse the exact canonical body, bra
     body: renderIssueBody(ready()),
     issueType: 'Task',
     points: 2,
+    priority: 'High',
     requestId: 'issue68-normal-start',
   });
   const first = await startTrackedIssue(f.context, request);
@@ -1610,6 +1637,18 @@ test('ordinary start checks typed Draft, Points and live eligibility before bran
       'points.sync',
       (f: ReturnType<typeof fixture>) => {
         f.controls.livePoints = 4;
+      },
+    ],
+    [
+      'priority',
+      (f: ReturnType<typeof fixture>) => {
+        f.controls.livePriority = false;
+      },
+    ],
+    [
+      'issue-type',
+      (f: ReturnType<typeof fixture>) => {
+        Reflect.set(f.live, 'type', null);
       },
     ],
     [
@@ -1682,6 +1721,7 @@ test('created readiness refusal returns exact retry markers through safe resume 
     body: renderIssueBody(ready()),
     issueType: 'Task',
     points: 2,
+    priority: 'High',
     requestId: 'issue68-readiness-recovery',
   });
   const interrupted = await startTrackedIssue(f.context, request);
@@ -1986,6 +2026,7 @@ test('created start retains its exact issue recovery when Project synchronizatio
     body: renderIssueBody(ready()),
     issueType: 'Task',
     points: 2,
+    priority: 'High',
     requestId: 'project-recovery',
   };
   const result = await startTrackedIssue(f.context, request);
@@ -2291,6 +2332,7 @@ test.each(['project-status', 'journal'] as const)(
       body: renderIssueBody(ready()),
       issueType: 'Task',
       points: 2,
+      priority: 'High',
       requestId: 'parked-created-' + phase,
     });
     if (result.status !== 'created-not-started') assert.fail('Expected known-created recovery');
@@ -2329,6 +2371,7 @@ test('created post-tracking recovery preserves later ready content without repla
     body: renderIssueBody(ready()),
     issueType: 'Task',
     points: 2,
+    priority: 'High',
     requestId: 'edited-created-recovery',
   });
   if (result.status !== 'created-not-started') assert.fail('Expected known-created recovery');
@@ -2353,7 +2396,7 @@ test('update with a body replaces the preserved legacy body instead of appending
   const f = fixture();
   const a = '## Decisions\n\n- Decision A\n';
   const b = a + '- Decision B\n';
-  const created = await createIssue(f.context, { ...ready(), body: a });
+  const created = await createIssue(f.context, { ...createInput(), body: a });
   f.live.body = created.body;
   const updated = await updateIssue(f.context, { issueNumber: 17, ...ready(), body: b });
   const legacy = parseIssueBody(updated.body, { title: updated.title }).issue.legacyBody;
@@ -2363,7 +2406,7 @@ test('update with a body replaces the preserved legacy body instead of appending
 
 test('one full typed-field update repairs a hand-edited body (ai-delivery#298)', async () => {
   const f = fixture();
-  const created = await createIssue(f.context, { ...ready(), body: '## Decisions\n\n- Decision A\n' });
+  const created = await createIssue(f.context, { ...createInput(), body: '## Decisions\n\n- Decision A\n' });
   f.live.body = created.body.replace('- Decision A\n', '- Decision A\n\n- Decision A\n');
   const withBody = await updateIssue(f.context, {
     issueNumber: 17,
@@ -2379,4 +2422,42 @@ test('one full typed-field update repairs a hand-edited body (ai-delivery#298)',
   const info = await issueInfo(f.context, 17);
   assert.equal(parseIssueBody(info.body, { title: info.title }).legacy, false);
   assert.equal((await readyCheck(f.context, 17)).ready, true);
+});
+
+test('create refuses a non-draft issue without type or Priority in one error and writes nothing', async () => {
+  const codes = async (input: Parameters<typeof createIssue>[1]) => {
+    const f = fixture();
+    const error = await createIssue(f.context, input).catch((e: unknown) => e);
+    assert.ok(error instanceof IssueValidationError);
+    assert.equal(f.writes.length, 0);
+    return error.failures;
+  };
+  const task = await codes(ready());
+  assert.deepEqual(
+    task.map((x) => [x.code, x.fixHint]),
+    [['priority', 'Choose priority: High, Low.']],
+  );
+  const { issueType: _type, ...untyped } = createInput();
+  assert.deepEqual(
+    (await codes(untyped)).map((x) => x.code),
+    ['issue-type'],
+  );
+  const { issueType: _both, ...neither } = ready();
+  assert.deepEqual(
+    (await codes(neither)).map((x) => x.code),
+    ['issue-type', 'priority'],
+  );
+});
+
+test('create accepts a draft without type or Priority and an epic without Priority', async () => {
+  await createIssue(fixture().context, { title: 'Investigate invalid widget identifiers', draft: true });
+  const { points: _points, ...rest } = ready();
+  const result = await createIssue(fixture().context, { ...rest, epic: true });
+  assert.equal(parseIssueBody(result.body, { title: result.created.title }).issue.epic, true);
+});
+
+test('update with a Priority adds no new refusal', async () => {
+  const f = fixture();
+  await updateIssue(f.context, { issueNumber: 17, priority: 'High' });
+  assert.ok(f.writes.length > 0);
 });

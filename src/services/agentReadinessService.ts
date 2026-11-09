@@ -17,9 +17,10 @@ export function evaluateAgentReadiness(input: {
   blockedBy?: readonly number[];
   body: string;
   points?: NativePointValue | undefined;
+  priority?: string | undefined;
   repoRoot?: string | undefined;
   title: string;
-  issueType?: string;
+  issueType?: string | undefined;
   trackingParent?: boolean;
 }): AgentReadinessResult {
   const failures: IssueDiagnostic[] = [];
@@ -27,6 +28,7 @@ export function evaluateAgentReadiness(input: {
     failures.push({ code, field, message, fixHint: message });
   };
   let warnings: IssueDiagnostic[] = [];
+  let epic = false;
   try {
     const parsed = parseIssueBody(input.body, {
       title: input.title,
@@ -36,6 +38,7 @@ export function evaluateAgentReadiness(input: {
     const result = validateIssue(parsed.issue);
     if (parsed.issue.deferral !== undefined)
       add('deferred', 'defer', 'Issue is deferred; explicitly undefer it before starting work.');
+    epic = parsed.issue.epic === true;
     failures.push(...result.failures);
     warnings = issueWarnings(parsed.issue);
     if (!parsed.legacy && input.points !== undefined && parsed.issue.points !== input.points)
@@ -48,6 +51,10 @@ export function evaluateAgentReadiness(input: {
   }
   if (input.points === undefined)
     add('points', 'points', 'Set configured native Points before autonomous development.');
+  if (input.priority === undefined && !epic)
+    add('priority', 'priority', 'Set native Priority with issue_update before autonomous development.');
+  if (input.issueType === undefined)
+    add('issue-type', 'issueType', 'Set native Issue Type with issue_update before autonomous development.');
   if ((input.blockedBy?.length ?? 0) > 0)
     add('blocked', 'blockedBy', 'Resolve open native blockers before autonomous development.');
   if (input.trackingParent)

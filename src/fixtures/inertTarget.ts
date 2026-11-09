@@ -45,6 +45,9 @@ export const fixtureFields = IssueFields.parse({
   context: { components: ['Widget validation'], files: [], evidence: [] },
 });
 
+/** Create and start now require a Priority beside the issue fields. */
+export const createFields = { ...fixtureFields, priority: 'High' };
+
 /** All Git operations act on an owned fictional consumer and ignore host Git configuration. */
 export function fixtureGit(root: string, ...args: string[]): string {
   return execFileSync(

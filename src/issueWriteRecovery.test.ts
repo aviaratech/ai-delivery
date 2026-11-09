@@ -3,7 +3,7 @@ import { test } from 'vitest';
 import { createIssue, CreatedTrackingIssueError, canonicalIssueBody } from './issue.js';
 import { issue63Fixture } from './fixtures/issue63.js';
 import { parseIssueBody, validateIssue } from './issueContract.js';
-import { inertTarget, fixtureFields } from './fixtures/inertTarget.js';
+import { inertTarget, fixtureFields, createFields } from './fixtures/inertTarget.js';
 
 function fixture() {
   const f = issue63Fixture();
@@ -90,7 +90,7 @@ const intent = { opId: 'synthetic-187', parentIssueNumber: 19, blockedBy: [18] }
 
 test('create establishes Project status before parent and blockers and reuses completed opId', async () => {
   const f = fixture();
-  const input = { ...f.ready, ...intent };
+  const input = { ...f.createInput, ...intent };
   const result = await createIssue(f.context, input);
   assert.equal(result.created.number, 20);
   assert.equal(f.parent(), 19);
@@ -106,7 +106,7 @@ test('create establishes Project status before parent and blockers and reuses co
 test('same opId completes a failed dependency step once and identifies remaining work', async () => {
   const f = fixture();
   f.controls.failAdd = true;
-  const input = { ...f.ready, ...intent };
+  const input = { ...f.createInput, ...intent };
   await assert.rejects(createIssue(f.context, input), (error) => {
     assert.ok(error instanceof CreatedTrackingIssueError);
     assert.equal(error.created.number, 20);
@@ -124,13 +124,13 @@ test('same opId completes a failed dependency step once and identifies remaining
 test('opId refuses changed intent, duplicate markers and foreign authors without writes', async () => {
   for (const mode of ['intent', 'duplicate', 'author'] as const) {
     const f = fixture();
-    const input = { ...f.ready, ...intent };
+    const input = { ...f.createInput, ...intent };
     await createIssue(f.context, input);
     if (mode === 'duplicate') f.rows.set(21, { ...f.rows.get(20)!, number: 21 });
     if (mode === 'author') Object.assign(f.rows.get(20)!, { user: { login: 'someone-else' } });
     const writes = [...f.writes];
     await assert.rejects(
-      createIssue(f.context, { ...input, ...(mode === 'intent' ? { priority: 'High' } : {}) }),
+      createIssue(f.context, { ...input, ...(mode === 'intent' ? { priority: 'Low' } : {}) }),
       /conflict|author/iu,
     );
     assert.deepEqual(f.writes, writes);
@@ -159,7 +159,7 @@ test.each(['project', 'acknowledgement'] as const)(
   'same opId resumes after %s failure without another issue',
   async (stage) => {
     const f = fixture();
-    const input = { ...f.ready, ...intent };
+    const input = { ...f.createInput, ...intent };
     f.recovery.failProject = stage === 'project';
     f.recovery.lostCreateResponse = stage === 'acknowledgement';
     await assert.rejects(
@@ -185,7 +185,7 @@ test.each(['completed', 'partial'] as const)(
       ['103', '2026-02-02'],
     ] as const) {
       const f = fixture();
-      const input = { ...f.ready, ...intent, priority: 'High', startDate: '2026-01-01' };
+      const input = { ...f.createInput, ...intent, priority: 'High', startDate: '2026-01-01' };
       f.controls.failAdd = stage === 'partial';
       if (stage === 'partial') await assert.rejects(createIssue(f.context, input));
       else await createIssue(f.context, input);
@@ -202,7 +202,7 @@ test.each(['completed', 'partial'] as const)(
 test('partial create reports only the requested remaining operations', async () => {
   const f = fixture();
   f.recovery.failProject = true;
-  await assert.rejects(createIssue(f.context, { ...f.ready, opId: 'synthetic-simple' }), (error) => {
+  await assert.rejects(createIssue(f.context, { ...f.createInput, opId: 'synthetic-simple' }), (error) => {
     assert.ok(error instanceof CreatedTrackingIssueError);
     assert.deepEqual(error.remainingSteps, ['project', 'readback']);
     return true;
@@ -211,7 +211,7 @@ test('partial create reports only the requested remaining operations', async () 
 
 test('same opId preserves independently added closed blocker relationships', async () => {
   const f = fixture();
-  const input = { ...f.ready, ...intent };
+  const input = { ...f.createInput, ...intent };
   await createIssue(f.context, input);
   f.rows.get(19)!.state = 'closed';
   f.edges.get(20)!.add(19);
@@ -242,8 +242,8 @@ for (const mode of ['partial', 'epic'] as const) {
       }
       return result;
     };
-    const { points: _points, ...unsized } = fixtureFields;
-    const input = { ...(mode === 'epic' ? { ...unsized, epic: true } : fixtureFields), opId: `synthetic-mcp-${mode}` };
+    const { points: _points, priority: _priority, ...unsized } = createFields;
+    const input = { ...(mode === 'epic' ? { ...unsized, epic: true } : createFields), opId: `synthetic-mcp-${mode}` };
     const connection = await f.connect();
     try {
       if (mode === 'partial') {
@@ -300,7 +300,7 @@ test('MCP create with a fresh opId on a busy repository creates, and a same-opId
   };
   const originalGet = f.rest.issues.get;
   f.rest.issues.get = async (input) => ({ data: { ...(await originalGet(input)).data, user: { login: 'operator' } } });
-  const input = { ...fixtureFields, opId: 'synthetic-busy-repo' };
+  const input = { ...createFields, opId: 'synthetic-busy-repo' };
   const connection = await f.connect();
   try {
     const first = await connection.call('issue_create', input);
