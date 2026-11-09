@@ -1471,9 +1471,13 @@ const BODY_FREE_KEYS = new Set([
 
 /** Top-level keys of a body's issue-data comment; empty when the comment is missing or unreadable. */
 function oldDataKeys(body: string): Set<string> {
-  const json = /<!-- ai-delivery:issue-data@1 (.*) -->/u.exec(body)?.[1];
+  const prefix = '<!-- ai-delivery:issue-data@1 ';
+  const start = body.lastIndexOf(prefix);
+  const end = body.indexOf(' -->', start);
   try {
-    return new Set(json === undefined ? [] : Object.keys(JSON.parse(json) as object));
+    return new Set(
+      start < 0 || end < 0 ? [] : Object.keys(JSON.parse(body.slice(start + prefix.length, end)) as object),
+    );
   } catch {
     return new Set();
   }

@@ -493,7 +493,7 @@ test('MCP rebuild of a hand-edited body names builder-ready fields it carried bu
     const [warning] = rebuiltWarnings(result);
     assert.match(warning!.message, /reset because not sent: builder\./u);
     // A key quoted inside prose is not a carried field.
-    f.native.body = renderIssueBody({ ...f.ready, problem: 'Saw \\"proof\\": in a log.' }).replace(
+    f.native.body = renderIssueBody({ ...f.ready, problem: 'Saw "proof": in a log.' }).replace(
       '## Outcome',
       '## Outcome edited',
     );
