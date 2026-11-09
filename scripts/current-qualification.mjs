@@ -447,7 +447,7 @@ export function validateConsumer(input, contract, candidate) {
     assert.equal(phase.quiescent, true);
   }
   assert.ok(
-    result.productionClosure && result.mcp && result.skills?.length === 3 && result.resolutions?.length,
+    result.productionClosure && result.mcp && result.skills?.length === 4 && result.resolutions?.length,
     'Consumer application/resolution evidence is missing.',
   );
   return result;

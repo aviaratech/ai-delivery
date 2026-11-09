@@ -1281,7 +1281,10 @@ function qualificationFixture() {
       packageVersion: contract.packageVersion,
       inventorySha256: consumerProof.sha256(JSON.stringify(inventory)),
       inventory,
-      skills: ['intake-create', 'worktree-lifecycle', 'pr-handoff'].map((path) => ({ path, sha256: 'a'.repeat(64) })),
+      skills: ['intake-create', 'ticket-design', 'worktree-lifecycle', 'pr-handoff'].map((path) => ({
+        path,
+        sha256: 'a'.repeat(64),
+      })),
     };
   };
   const produce: NonNullable<QualificationOptions['checks']> = async ({ resultsDir, release, signal }) => {

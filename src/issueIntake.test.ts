@@ -32,6 +32,7 @@ import {
   renderIssueBody,
   parseIssueBody,
   ISSUE_BODY_MARKER,
+  issueWarnings,
 } from './issueContract.js';
 import { syntheticDiscoveryConfig } from './fixtures/discovery.js';
 import { withBuilder } from './fixtures/builderReady.js';
@@ -1918,11 +1919,17 @@ test(
   'intake skill example is Ready and every CLI line has actual required options and an explicit identity',
   { tags: ['release'] },
   () => {
-    const skill = readFileSync(resolve('plugins/ai-delivery/skills/intake-create/SKILL.md'), 'utf8');
-    const examples = [...skill.matchAll(/```json\n([\s\S]*?)\n```/gu)].map((match) => {
-      const json = match[1] ?? '';
-      return { json, value: JSON.parse(json) as unknown };
-    });
+    const intake = readFileSync(resolve('plugins/ai-delivery/skills/intake-create/SKILL.md'), 'utf8');
+    const skill = readFileSync(resolve('plugins/ai-delivery/skills/ticket-design/SKILL.md'), 'utf8');
+    const jsonBlocks = (text: string) =>
+      [...text.matchAll(/```json\n([\s\S]*?)\n```/gu)].map((match) => {
+        const json = match[1] ?? '';
+        return { json, value: JSON.parse(json) as unknown };
+      });
+    const intakeExamples = jsonBlocks(intake);
+    assert.equal(intakeExamples.length, 1, 'intake-create keeps only its read example');
+    assert.ok(!intake.includes('create --title'), 'the one Ready create line lives only in ticket-design');
+    const examples = [...intakeExamples, ...jsonBlocks(skill)];
     const readTool = getAiDeliveryMcpTool('issue_info');
     assert.ok(readTool?.name === 'issue_info');
     const readSchema = readTool.inputSchema;
@@ -1939,6 +1946,8 @@ test(
     assert.equal(readArguments.issueNumber, 17);
     const createExample = examples.find((example) => ReadyIssue.safeParse(example.value).success);
     assert.ok(createExample, 'the creation example must remain Ready');
+    assert.deepEqual(issueWarnings(IssueFields.parse(createExample.value)), []);
+    assert.match(skill, /create --title .*--priority P2/u);
     const json = createExample.json;
     const root = mkdtempSync(join(tmpdir(), 'intake-cli-'));
     try {
@@ -1983,8 +1992,8 @@ test(
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-    assert.ok(skill.includes(ISSUE_BODY_MARKER));
-    assert.ok(!skill.includes('ai-delivery develop'));
+    assert.ok(intake.includes(ISSUE_BODY_MARKER));
+    assert.ok(!intake.includes('ai-delivery develop') && !skill.includes('ai-delivery develop'));
   },
 );
 

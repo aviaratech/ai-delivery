@@ -265,7 +265,7 @@ function fixture() {
       mcpServers: { 'ai-delivery': { type: 'stdio', command: 'node', args: ['${PLUGIN_ROOT}/dist/mcp-launcher.js'] } },
     }),
   );
-  for (const skill of ['intake-create', 'worktree-lifecycle', 'pr-handoff'])
+  for (const skill of ['intake-create', 'ticket-design', 'worktree-lifecycle', 'pr-handoff'])
     files.set(
       `plugins/ai-delivery/skills/${skill}/SKILL.md`,
       `---\nname: "ai-delivery:${skill}"\ndescription: Synthetic fixture only\n---\n`,
@@ -601,6 +601,7 @@ test.each([
   'dist/index.js',
   'plugins/ai-delivery/runtime/dist/cli.js',
   'plugins/ai-delivery/skills/intake-create/SKILL.md',
+  'plugins/ai-delivery/skills/ticket-design/SKILL.md',
 ])('synthetic missing packaged entry %s fails inspection', (path) => {
   const f = fixture();
   try {
