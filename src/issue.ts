@@ -1490,6 +1490,11 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
     );
     if (validateIssue(fields, true).failures.length) throw error;
     const prepared = prepareIssueWrite(full, undefined);
+    const reset = (['draft', 'openQuestions', 'context'] as const).filter((key) => input[key] === undefined);
+    if (reset.length) {
+      const message = `Rebuilt the hand-edited body (old one in the history comment); reset because not sent: ${reset.join(', ')}.`;
+      prepared.warnings.push({ code: 'body.rebuilt', field: 'body', message, fixHint: message });
+    }
     prepared.body += issueTrackingFooter(current.body);
     prepared.preserveHistory = input.preserveHistory ?? true;
     return prepared;

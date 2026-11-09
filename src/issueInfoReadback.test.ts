@@ -378,7 +378,7 @@ for (const { name, points, edit } of finishedBodies) {
 }
 
 const REPAIR =
-  'The issue body was edited outside ai-delivery; send problem, outcome, acceptanceCriteria and outOfScope (plus bug for a Bug) in one issue_update to rebuild it.';
+  'The issue body was edited outside ai-delivery; send problem, outcome, acceptanceCriteria and outOfScope (plus bug for a Bug, epic for an epic, and any draft, openQuestions or context to keep) in one issue_update to rebuild it.';
 
 test('MCP content writes without a full rewrite refuse a hand-edited canonical body with the repair step', async () => {
   const f = fixture();
@@ -395,12 +395,21 @@ test('MCP content writes without a full rewrite refuse a hand-edited canonical b
       api.call('issue_update', { issueNumber: 17, state: 'closed', closeReason: 'completed', title: 'Rename it' }),
       /body\.canonical/u,
     );
-    await assert.rejects(api.call('issue_start', { issueNumber: 17 }), /body\.canonical/u);
+    await assert.rejects(api.call('issue_start', { issueNumber: 17 }), (error: Error) => {
+      assert.match(error.message, /body\.canonical/u);
+      assert.ok(error.message.includes(REPAIR));
+      return true;
+    });
     assert.deepEqual(f.writes, []);
   } finally {
     await api.close();
   }
 });
+
+function rebuiltWarnings(result: unknown): { code: string; message: string }[] {
+  const { warnings } = result as { warnings: { code: string; message: string }[] };
+  return warnings.filter((warning) => warning.code === 'body.rebuilt');
+}
 
 for (const dataComment of ['with', 'without'] as const) {
   test(`MCP full-content write rebuilds a hand-edited canonical body ${dataComment} its issue-data comment`, async () => {
@@ -418,7 +427,10 @@ for (const dataComment of ['with', 'without'] as const) {
     };
     const api = await caller('MCP');
     try {
-      await api.call('issue_update', { issueNumber: 17, ...content });
+      const result = await api.call('issue_update', { issueNumber: 17, ...content });
+      const rebuilt = rebuiltWarnings(result);
+      assert.equal(rebuilt.length, 1);
+      for (const key of ['draft', 'openQuestions', 'context']) assert.ok(rebuilt[0]!.message.includes(key));
       const parsed = parseIssueBody(f.native.body, { title: f.native.title, points: 2, issueType: 'Task' });
       assert.equal(parsed.legacy, false);
       assert.equal(parsed.issue.problem, content.problem);
@@ -434,6 +446,27 @@ for (const dataComment of ['with', 'without'] as const) {
     }
   });
 }
+
+test('MCP full-content rebuild sent every kept field reports nothing reset', async () => {
+  const f = fixture();
+  finishedBodies[2]!.edit(f.native, f.ready);
+  const api = await caller('MCP');
+  try {
+    const result = await api.call('issue_update', {
+      issueNumber: 17,
+      problem: 'A hand-edited body blocked a rewrite.',
+      outcome: 'A full rewrite replaces the broken body.',
+      acceptanceCriteria: [{ behavior: 'The body parses again.', verifiedBy: 'issueInfoReadback test.' }],
+      outOfScope: ['Other writes.'],
+      draft: false,
+      openQuestions: [],
+      context: { components: [], evidence: [], files: [] },
+    });
+    assert.deepEqual(rebuiltWarnings(result), []);
+  } finally {
+    await api.close();
+  }
+});
 
 test('MCP explicit native metadata still updates and configured-value refusals write nothing', async () => {
   const f = fixture([], null, { points: null, issueType: null });
