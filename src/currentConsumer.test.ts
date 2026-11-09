@@ -601,6 +601,7 @@ test.each([
   'dist/index.js',
   'plugins/ai-delivery/runtime/dist/cli.js',
   'plugins/ai-delivery/skills/intake-create/SKILL.md',
+  'plugins/ai-delivery/skills/ticket-design/SKILL.md',
 ])('synthetic missing packaged entry %s fails inspection', (path) => {
   const f = fixture();
   try {
