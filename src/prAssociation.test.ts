@@ -597,6 +597,15 @@ describe('remote closing PR creation', () => {
       assert.equal(state.promotions, 1);
     });
 
+    it('restores a lost closing line and applies a new body in one update', async () => {
+      const { context, state } = fixture();
+      state.body = 'Old explanation';
+      const result = await publishPr(context, { ...input, body: 'New explanation' });
+      assert.equal(result.closingLinkAdded, true);
+      assert.equal(state.body, 'Closes #17\n\nNew explanation');
+      assert.equal(state.updates, 1);
+    });
+
     it('refuses a new title on a non-closing PR', async () => {
       const { context, state } = fixture(true, true);
       await assert.rejects(
