@@ -3,6 +3,7 @@ import { issueProjectItemsResponse } from './issueProjectItems.js';
 import type { DeliveryContext } from '../issue.js';
 import { IssueFields, renderIssueBody } from '../issueContract.js';
 import { syntheticDiscoveryConfig } from './discovery.js';
+import { withBuilder } from './builderReady.js';
 export function issue63Fixture() {
   const ready = IssueFields.parse({
     title: 'Guard active widget dependency additions',
@@ -277,7 +278,7 @@ export function issue63Fixture() {
       },
     },
   } as unknown as DeliveryContext;
-  const createInput = { ...ready, issueType: 'Task', priority: 'High' };
+  const createInput = withBuilder({ ...ready, issueType: 'Task', priority: 'High' });
   return {
     context,
     ready,

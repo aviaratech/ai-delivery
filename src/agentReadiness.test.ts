@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'vitest';
 import { evaluateAgentReadiness } from './agent.js';
 import { IssueFields, renderIssueBody } from './issueContract.js';
+import { builderReady } from './fixtures/builderReady.js';
 
 function fixture() {
   return IssueFields.parse({
@@ -86,4 +87,14 @@ test('native Points drift and visible/payload divergence cannot pass canonical r
       (f) => f.code === 'body.canonical',
     ),
   );
+});
+
+test('a legacy Ready issue without builder is ready and warns builder.unset; a builder-ready one does not', () => {
+  const legacy = evaluate();
+  assert.equal(legacy.ready, true);
+  assert.ok(legacy.warnings.some((w) => w.code === 'builder.unset'));
+  const built = builderReady();
+  const result = evaluate({ title: built.title, body: renderIssueBody(built) });
+  assert.equal(result.ready, true);
+  assert.deepEqual(result.warnings, []);
 });

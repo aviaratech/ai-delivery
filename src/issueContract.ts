@@ -196,6 +196,8 @@ export const DraftIssue = IssueFields.superRefine(secretRule);
 export type DraftIssueData = z.output<typeof DraftIssue>;
 export type IssueFieldsInput = z.input<typeof IssueFields>;
 
+const SKILL_HINT = 'See ai-delivery:ticket-design.';
+
 function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
   const add = (code: string, field: (string | number)[], fixHint: string): void =>
     ctx.addIssue({ code: 'custom', path: field, message: fixHint, params: { issueCode: code } });
@@ -250,6 +252,23 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
         if (!value.bug[field].trim()) add(`bug.${field}`, ['bug', field], `Describe the bug's ${field}.`);
     }
   }
+  if (value.epic || value.builder === undefined) return;
+  if (!(value.decisions ?? []).some((item) => item.trim()))
+    add('decisions', ['decisions'], `Record each choice the builder must not reopen. ${SKILL_HINT}`);
+  const entries = value.surface ?? [];
+  if (!entries.length || entries.some((entry) => !entry.path.trim()))
+    add('surface', ['surface'], `List every path to change, each with a path and its change. ${SKILL_HINT}`);
+  const examples = value.acceptanceCriteria.flatMap((ac) => ac.examples ?? []);
+  if (!examples.length)
+    add('examples', ['acceptanceCriteria'], `Give each criterion examples (input and expected). ${SKILL_HINT}`);
+  else if (!examples.some((example) => example.failure === true))
+    add(
+      'examples.failure',
+      ['acceptanceCriteria'],
+      `Add one example marked failure: true for what must be refused or must fail. ${SKILL_HINT}`,
+    );
+  if (!(value.proof ?? []).some((item) => item.trim()))
+    add('proof', ['proof'], `List the commands to run in order, focused first. ${SKILL_HINT}`);
 }
 
 export const ReadyIssue = IssueFields.extend({
@@ -374,10 +393,29 @@ export class IssueValidationError extends DeliveryError {
   }
 }
 
-export function requireIssue(value: unknown): DraftIssueData {
+/** `requireBuilder` is set at Ready create and draft-to-Ready; legacy content updates never set it. */
+export function requireIssue(value: unknown, options: { requireBuilder?: true } = {}): DraftIssueData {
   const structural = IssueFields.safeParse(value);
   const result = validateIssue(value, !structural.success || !structural.data.draft);
-  if (!result.issue) throw new IssueValidationError(result.failures);
+  const unbuilt =
+    options.requireBuilder === true &&
+    structural.success &&
+    !structural.data.draft &&
+    !structural.data.epic &&
+    structural.data.builder === undefined;
+  if (!result.issue || unbuilt)
+    throw new IssueValidationError([
+      ...(unbuilt
+        ? [
+            hint(
+              'builder.missing',
+              'builder',
+              `Add builder, decisions, surface, proof and examples, or pass draft: true to capture it now. ${SKILL_HINT}`,
+            ),
+          ]
+        : []),
+      ...result.failures,
+    ]);
   return result.issue;
 }
 
@@ -583,37 +621,71 @@ export function parseIssueBody(
   return { issue: converted.issue, legacy: true };
 }
 
-export function issueWarnings(
-  issue: DraftIssueData,
-  status?: IssueStatusData,
-  legacyFormatting = false,
-): IssueDiagnostic[] {
+const CODE_EXTENSIONS = /\.(?:ts|tsx|js|mjs|cjs|py|go|rs|java|kt|rb|sql|sh)$/iu;
+const proseWords = (issue: DraftIssueData): number =>
+  [issue.problem, issue.outcome, ...issue.acceptanceCriteria.map((ac) => ac.behavior)]
+    .flatMap((text) => text.split(/\s+/u))
+    .filter(Boolean).length;
+
+export function issueWarnings(issue: DraftIssueData): IssueDiagnostic[] {
   const warnings: IssueDiagnostic[] = [];
+  const warn = (code: string, field: string, message: string): void => {
+    warnings.push(hint(code, field, message));
+  };
   if (issue.acceptanceCriteria.length > 7)
-    warnings.push(
-      hint('many-criteria', 'acceptanceCriteria', 'Consider slicing more than seven criteria into smaller issues.'),
-    );
+    warn('many-criteria', 'acceptanceCriteria', 'Consider slicing more than seven criteria into smaller issues.');
   if (
+    issue.builder === undefined &&
     !issue.acceptanceCriteria.some((ac) =>
       /\b(?:edge|failure|fail|error|invalid|reject|refus|empty|missing|interrupt|timeout|boundary)/iu.test(ac.behavior),
     )
   )
-    warnings.push(hint('edge-case', 'acceptanceCriteria', 'Describe an edge or failure case.'));
+    warn('edge-case', 'acceptanceCriteria', 'Describe an edge or failure case.');
   if (
     issue.issueType?.toLowerCase() === 'bug' &&
     !issue.acceptanceCriteria.some((ac) => /regression/iu.test(ac.behavior + ' ' + ac.verifiedBy))
   )
-    warnings.push(hint('bug.regression', 'acceptanceCriteria', 'Add a regression test criterion for the bug.'));
-  if (![...issue.context.files, ...issue.context.components].some((item) => item.trim()))
-    warnings.push(hint('context', 'context', 'Name relevant components or files.'));
+    warn('bug.regression', 'acceptanceCriteria', 'Add a regression test criterion for the bug.');
+  if (issue.builder === undefined && ![...issue.context.files, ...issue.context.components].some((item) => item.trim()))
+    warn('context', 'context', 'Name relevant components or files.');
   const proofs = [...issue.context.evidence, ...issue.acceptanceCriteria.map((ac) => ac.verifiedBy)];
   if (proofs.length && proofs.every((proof) => /^(?:\/|[A-Za-z]:\\|~\/)/u.test(proof.trim())))
-    warnings.push(
-      hint('local-evidence', 'context.evidence', 'Use portable evidence in addition to machine-local paths.'),
+    warn('local-evidence', 'context.evidence', 'Use portable evidence in addition to machine-local paths.');
+  if (proseWords(issue) > 300)
+    warn('body.length', 'body', `Consider cutting the problem, outcome and criteria to 300 words. ${SKILL_HINT}`);
+  if (issue.draft || issue.epic) return warnings;
+  if (issue.builder === undefined) {
+    warn(
+      'builder.unset',
+      'builder',
+      `Set builder, decisions, surface, proof and examples when next editing. ${SKILL_HINT}`,
     );
-  const body = renderIssueBody(issue, status, legacyFormatting);
-  if (body.slice(0, body.lastIndexOf(DATA_PREFIX)).length > 4000)
-    warnings.push(hint('body.length', 'body', 'Consider reducing a readable body over 4,000 characters.'));
+    return warnings;
+  }
+  if (issue.points !== undefined && issue.points > 5)
+    warn('size.points', 'points', `Consider splitting an issue above 5 points. ${SKILL_HINT}`);
+  const entries = issue.surface ?? [];
+  if (new Set(entries.map((entry) => entry.path.trim())).size > 6)
+    warn('size.surface', 'surface', `Consider splitting an issue that changes more than 6 paths. ${SKILL_HINT}`);
+  if (issue.acceptanceCriteria.some((ac) => !ac.examples?.length))
+    warn('examples.ac', 'acceptanceCriteria', `Give every criterion at least one example. ${SKILL_HINT}`);
+  const unsigned = entries.filter(
+    (entry) =>
+      entry.change !== 'delete' &&
+      CODE_EXTENSIONS.test(entry.path.trim()) &&
+      !/\.test\.|\.spec\.|\/test/u.test(entry.path) &&
+      !entry.signatures?.some((signature) => signature.trim()),
+  );
+  if (unsigned.length)
+    warn(
+      'surface.signature',
+      'surface',
+      `Add exact signatures for ${unsigned.map((entry) => entry.path).join(', ')}. ${SKILL_HINT}`,
+    );
+  if (!(issue.fences ?? []).some((item) => item.trim()))
+    warn('fences', 'fences', `Name the nearby paths the builder must not touch. ${SKILL_HINT}`);
+  if (!(issue.extends ?? []).some((item) => item.trim()))
+    warn('extends', 'extends', `Name the design or owner this change extends; add no parallel path. ${SKILL_HINT}`);
   return warnings;
 }
 

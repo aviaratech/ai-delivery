@@ -26,24 +26,27 @@ import { digestBytes, digestValue } from '../delivery/common.js';
 import { createAiDeliveryMcpServer } from '../mcp/index.js';
 import type { ExecutionContext } from '../dispatch.js';
 import { syntheticDiscoveryClients } from './discovery.js';
+import { withBuilder } from './builderReady.js';
 
 export type PolicyState = 'tracked' | 'edited';
-export const fixtureFields = IssueFields.parse({
-  title: 'Reject invalid widget identifiers before persistence',
-  issueType: 'Task',
-  points: 2,
-  problem: 'Invalid widget identifiers currently reach persistence.',
-  outcome: 'Reject invalid identifiers before any persistence call.',
-  acceptanceCriteria: [
-    {
-      behavior: 'Invalid identifiers return an error with zero persistence calls.',
-      verifiedBy:
-        'Synthetic port regression test; node consumer-trap.cjs and npm run trap are inert verification prose.',
-    },
-  ],
-  outOfScope: ['Storage format changes.'],
-  context: { components: ['Widget validation'], files: [], evidence: [] },
-});
+export const fixtureFields = IssueFields.parse(
+  withBuilder({
+    title: 'Reject invalid widget identifiers before persistence',
+    issueType: 'Task',
+    points: 2,
+    problem: 'Invalid widget identifiers currently reach persistence.',
+    outcome: 'Reject invalid identifiers before any persistence call.',
+    acceptanceCriteria: [
+      {
+        behavior: 'Invalid identifiers return an error with zero persistence calls.',
+        verifiedBy:
+          'Synthetic port regression test; node consumer-trap.cjs and npm run trap are inert verification prose.',
+      },
+    ],
+    outOfScope: ['Storage format changes.'],
+    context: { components: ['Widget validation'], files: [], evidence: [] },
+  }),
+);
 
 /** Create and start now require a Priority beside the issue fields. */
 export const createFields = { ...fixtureFields, priority: 'High' };

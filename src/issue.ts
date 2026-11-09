@@ -341,6 +341,7 @@ function prepareIssueWrite(
     status?: { nextMilestone?: string; blockers?: string; latestJournal?: string };
     blockedBy?: number[];
     preserveHistory?: boolean;
+    requireBuilder?: true;
   },
   current?: IssueInfo,
   forIntent = false,
@@ -404,26 +405,32 @@ function prepareIssueWrite(
       return value === undefined ? [] : [[key, value]];
     }),
   );
-  const issue = requireIssue({
-    ...parsed.issue,
-    // Body replacements and unrelated typed patches cannot implicitly resume deferred work.
-    deferral:
-      input.undefer === true
-        ? undefined
-        : (input.defer ?? (current === undefined ? parsed.issue.deferral : currentParsed?.issue.deferral)),
-    ...metadata,
-    ...fields,
-    title,
-    ...(legacyBody === undefined ? {} : { legacyBody }),
-    ...(input.retainLegacyBody !== undefined
-      ? { retainLegacyBody: input.retainLegacyBody }
-      : incomingLegacy
-        ? { retainLegacyBody: true }
-        : current !== undefined && legacyBody !== undefined && input.preserveHistory !== false && !statusOnly
-          ? { retainLegacyBody: false }
-          : {}),
-    ...(input.park ? { draft: true } : {}),
-  });
+  // Ready creates and draft-to-Ready updates need builder; content updates of legacy Ready issues never do.
+  const requireBuilder =
+    input.requireBuilder === true || (currentParsed?.issue.draft === true && input.draft === false);
+  const issue = requireIssue(
+    {
+      ...parsed.issue,
+      // Body replacements and unrelated typed patches cannot implicitly resume deferred work.
+      deferral:
+        input.undefer === true
+          ? undefined
+          : (input.defer ?? (current === undefined ? parsed.issue.deferral : currentParsed?.issue.deferral)),
+      ...metadata,
+      ...fields,
+      title,
+      ...(legacyBody === undefined ? {} : { legacyBody }),
+      ...(input.retainLegacyBody !== undefined
+        ? { retainLegacyBody: input.retainLegacyBody }
+        : incomingLegacy
+          ? { retainLegacyBody: true }
+          : current !== undefined && legacyBody !== undefined && input.preserveHistory !== false && !statusOnly
+            ? { retainLegacyBody: false }
+            : {}),
+      ...(input.park ? { draft: true } : {}),
+    },
+    requireBuilder ? { requireBuilder: true } : {},
+  );
   const unchangedContract =
     currentParsed !== undefined && JSON.stringify(issue) === JSON.stringify(currentParsed.issue);
   const legacyFormatting = unchangedContract && parsed.legacyFormatting === true;
@@ -481,7 +488,7 @@ function prepareIssueWrite(
           issue.retainLegacyBody === false &&
           currentParsed?.issue.retainLegacyBody !== false)) &&
         !statusOnly),
-    warnings: issueWarnings(issue, status, legacyFormatting),
+    warnings: issueWarnings(issue),
     ...((currentLegacy || parsed.legacy) && prior !== undefined
       ? { conversion: { priorBody: prior, canonicalBody: body, diff: issueBodyDiff(prior, body) } }
       : {}),
@@ -517,7 +524,7 @@ export async function createIssue(
 }> {
   if (context.clients.role !== 'author') throw new DeliveryError('Issue writes require the configured author role.');
   const canonicalBody = canonicalIssueBody(input);
-  const prepared = prepareIssueWrite(input);
+  const prepared = prepareIssueWrite({ ...input, requireBuilder: true });
   const originalIntent = digestValue(
     Object.fromEntries(
       Object.entries({ ...input, opId: undefined, body: canonicalBody }).filter(([, value]) => value !== undefined),
