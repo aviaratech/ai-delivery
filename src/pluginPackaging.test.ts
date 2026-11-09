@@ -186,7 +186,7 @@ globalThis.fetch=async(url,init)=>{
     if(method==='POST')fieldValues=json.issue_field_values.map(entry=>({issue_field_id:entry.field_id,issue_field_name:fields.find(field=>field.id===entry.field_id).name,data_type:'single_select',value:entry.value}));
     data=fieldValues;
   }
-  else if(path.endsWith('/issues')&&method==='POST'){issue={...issue,...json};data=issue;}
+  else if(path.endsWith('/issues')&&method==='POST'){issue={...issue,...json,...(json.type?{type:{name:json.type}}:{})};data=issue;}
   else if(path.endsWith('/issues')&&method==='GET')data=[issue];
   else if(path.endsWith('/sub_issues'))data=[];
   else if(path.endsWith('/issues/17')){if(method==='PATCH')issue={...issue,...json};data=issue;}
@@ -215,7 +215,9 @@ globalThis.fetch=async(url,init)=>{
         const readyInput = {
           repo: 'example/b',
           title: 'Validate widget launch routing across repositories',
+          issueType: 'Task',
           points: 2,
+          priority: 'High',
           problem: 'A launcher can bind a widget issue to the checkout repository instead of the explicit caller.',
           outcome: 'Create and update the issue only in explicitly selected repository B.',
           acceptanceCriteria: [
