@@ -447,6 +447,73 @@ for (const dataComment of ['with', 'without'] as const) {
   });
 }
 
+test('issue_info returns builder from the canonical body, and null for a legacy or hand-edited body', async () => {
+  const f = fixture();
+  const api = await caller('MCP');
+  try {
+    f.native.body = renderIssueBody({
+      ...f.ready,
+      builder: { tier: 'standard' },
+    });
+    assert.deepEqual((await api.call('issue_info', { issueNumber: 17 })).builder, { tier: 'standard' });
+    f.native.body = renderIssueBody(f.ready);
+    assert.equal((await api.call('issue_info', { issueNumber: 17 })).builder, null);
+    f.native.body = '## Summary\n\nWritten before the issue contract.\n';
+    assert.equal((await api.call('issue_info', { issueNumber: 17 })).builder, null);
+    finishedBodies[2]!.edit(f.native, f.ready);
+    assert.equal((await api.call('issue_info', { issueNumber: 17 })).builder, null);
+  } finally {
+    await api.close();
+  }
+});
+
+test('MCP rebuild of a hand-edited body names builder-ready fields it carried but the write did not send', async () => {
+  const f = fixture();
+  f.native.body = renderIssueBody({
+    ...f.ready,
+    builder: { tier: 'standard' },
+  }).replace('Unexplained', 'Hand-edited');
+  const api = await caller('MCP');
+  try {
+    const result = await api.call('issue_update', {
+      issueNumber: 17,
+      problem: 'A hand-edited body blocked a rewrite.',
+      outcome: 'A full rewrite replaces the broken body.',
+      acceptanceCriteria: [
+        {
+          behavior: 'The body parses again.',
+          verifiedBy: 'issueInfoReadback test.',
+        },
+      ],
+      outOfScope: ['Other writes.'],
+      draft: false,
+      openQuestions: [],
+      context: { components: [], evidence: [], files: [] },
+    });
+    const [warning] = rebuiltWarnings(result);
+    assert.match(warning!.message, /reset because not sent: builder\./u);
+    // A key quoted inside prose is not a carried field.
+    f.native.body = renderIssueBody({ ...f.ready, problem: 'Saw "proof": in a log.' }).replace(
+      '## Outcome',
+      '## Outcome edited',
+    );
+    const again = await api.call('issue_update', {
+      issueNumber: 17,
+      problem: 'A hand-edited body blocked a rewrite.',
+      outcome: 'A full rewrite replaces the broken body.',
+      acceptanceCriteria: [{ behavior: 'The body parses again.', verifiedBy: 'issueInfoReadback test.' }],
+      outOfScope: ['Other writes.'],
+      draft: false,
+      openQuestions: [],
+      context: { components: [], evidence: [], files: [] },
+    });
+    assert.deepEqual(rebuiltWarnings(again), []);
+    assert.equal(f.comments.length, 2, 'both writes rebuilt the body');
+  } finally {
+    await api.close();
+  }
+});
+
 test('MCP full-content rebuild sent every kept field reports nothing reset', async () => {
   const f = fixture();
   finishedBodies[2]!.edit(f.native, f.ready);

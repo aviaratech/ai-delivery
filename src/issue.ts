@@ -81,6 +81,7 @@ import {
   type IssueDiagnostic,
   type IssueStatusData,
   type IssueDeferralData,
+  type BuilderTierData,
   requireDeferralPatch,
 } from './issueContract.js';
 
@@ -1221,11 +1222,13 @@ export async function listIssues(
     )
       return null;
     if (input.projectStatus !== undefined && (project?.status ?? null) !== input.projectStatus) return null;
+    const readback = deferralReadback(current.body, current.title);
+    delete readback.builder; // list rows carry no builder; issue_info does
     const listed: ListedTrackingIssue = {
       ...(options.capacityRead
         ? { nodeId: current.node_id, fieldIds: Object.fromEntries(catalog.map((field) => [field.name, field.id])) }
         : {}),
-      ...deferralReadback(current.body, current.title),
+      ...readback,
       number: current.number,
       title: current.title,
       state: current.state,
@@ -1474,6 +1477,20 @@ const BODY_FREE_KEYS = new Set([
   ...'expectedTradesPerDay measuredTradesPerDay'.split(' '),
 ]);
 
+/** Top-level keys of a body's issue-data comment; empty when the comment is missing or unreadable. */
+function oldDataKeys(body: string): Set<string> {
+  const prefix = '<!-- ai-delivery:issue-data@1 ';
+  const start = body.lastIndexOf(prefix);
+  const end = body.indexOf(' -->', start);
+  try {
+    return new Set(
+      start < 0 || end < 0 ? [] : Object.keys(JSON.parse(body.slice(start + prefix.length, end)) as object),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 /** A full-content write replaces a body that fails the canonical parse; the old body goes to the history comment. */
 function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnType<typeof prepareIssueWrite> {
   try {
@@ -1498,7 +1515,14 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
     );
     if (validateIssue(fields, true).failures.length) throw error;
     const prepared = prepareIssueWrite(full, undefined);
-    const reset = (['draft', 'openQuestions', 'context'] as const).filter((key) => input[key] === undefined);
+    // The builder-ready fields can only be lost when the old body's data comment still carried them.
+    const carried = oldDataKeys(current.body);
+    const reset = [
+      'draft',
+      'openQuestions',
+      'context',
+      ...(['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) => carried.has(key)),
+    ].filter((key) => input[key as keyof typeof input] === undefined);
     if (reset.length) {
       const message = `Rebuilt the hand-edited body (old one in the history comment); reset because not sent: ${reset.join(', ')}.`;
       prepared.warnings.push({ code: 'body.rebuilt', field: 'body', message, fixHint: message });
@@ -2537,6 +2561,7 @@ export type IssueChildCounts = Pick<IssueChildProgress, 'childCount' | 'closedCh
 export interface IssueInfo {
   childProgress?: IssueChildProgress | IssueChildCounts;
   deferred?: IssueDeferralData | null;
+  builder?: BuilderTierData | null;
   routing?: LoadedDeliveryConfig['routing'];
   blockedBy: number[];
   body: string;
@@ -2660,13 +2685,17 @@ function childCounts(children: readonly { state: 'open' | 'closed' }[]): IssueCh
 }
 
 /** Invalid canonical content stays inspectable; omitted state is unknown, never an assertion of undeferred. */
-function deferralReadback(body: string | null | undefined, title: string): { deferred?: IssueDeferralData | null } {
+function deferralReadback(
+  body: string | null | undefined,
+  title: string,
+): { deferred?: IssueDeferralData | null; builder?: BuilderTierData | null } {
   if (body === undefined) return {};
   try {
-    return { deferred: parseIssueBody(body ?? '', { title }).issue.deferral ?? null };
+    const { issue } = parseIssueBody(body ?? '', { title });
+    return { deferred: issue.deferral ?? null, builder: issue.builder ?? null };
   } catch (error) {
     if (!(error instanceof IssueValidationError)) throw error;
-    return {};
+    return { builder: null };
   }
 }
 

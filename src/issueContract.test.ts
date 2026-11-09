@@ -391,3 +391,98 @@ for (const [name, mutate, code] of warningCases)
     assert.equal(validateIssue(issue).failures.length, 0);
     assert.ok(issueWarnings(issue).some((w) => w.code === code));
   });
+
+const builderFields = {
+  builder: { tier: 'frontier' as const, reason: 'state-machine' as const },
+  extends: ['src/widget.ts saveWidget (the one widget write path)'],
+  decisions: ['Valid id: ^w-[0-9a-f]{8}$. Refuse with InvalidWidgetId.'],
+  surface: [
+    {
+      path: 'src/widget.ts',
+      change: 'edit' as const,
+      signatures: ['export function saveWidget(w: Widget): void'],
+    },
+    { path: 'src/old.ts', change: 'delete' as const },
+  ],
+  fences: ['src/store.ts (storage owner)'],
+  proof: ['npx vitest run src/widget.test.ts'],
+};
+
+test('every builder-ready field renders in order and parses back equal', () => {
+  const issue = IssueFields.parse({
+    ...validIssue(),
+    ...builderFields,
+    acceptanceCriteria: [
+      {
+        behavior: 'An invalid widget identifier returns an error without a persistence call.',
+        verifiedBy: 'src/widget.test.ts',
+        examples: [
+          { input: "id 'w-0a1b2c3d'", expected: 'one store.put' },
+          {
+            input: "id ' w-0A1B2C3D'",
+            expected: 'InvalidWidgetId',
+            failure: true,
+          },
+        ],
+      },
+    ],
+  });
+  const body = renderIssueBody(issue);
+  const at = (heading: string) => body.indexOf(`\n## ${heading}\n`);
+  assert.ok(at('Outcome') < at('Builder') && at('Builder') < at('Extends') && at('Extends') < at('Decisions'));
+  assert.ok(at('Decisions') < at('Acceptance criteria') && at('Acceptance criteria') < at('Surface'));
+  assert.ok(at('Surface') < at('Fences') && at('Fences') < at('Proof') && at('Proof') < at('Out of scope'));
+  assert.ok(body.includes('## Builder\n\nfrontier: state-machine\n'));
+  assert.ok(
+    body.includes(
+      "  Example: id 'w-0a1b2c3d' → one store.put\n  Example: id ' w-0A1B2C3D' → InvalidWidgetId (failure)\n",
+    ),
+  );
+  assert.ok(
+    body.includes('- edit `src/widget.ts`\n  export function saveWidget(w: Widget): void\n- delete `src/old.ts`\n'),
+  );
+  const parsed = parseIssueBody(body, { title: issue.title });
+  assert.equal(parsed.legacy, false);
+  assert.deepEqual(parsed.issue, issue);
+  assert.deepEqual(validateIssue(issue).failures, []);
+});
+
+test('bodies without builder-ready fields re-render byte for byte with no new data keys', () => {
+  const body = renderIssueBody(validIssue());
+  assert.ok(!/\n## (?:Builder|Extends|Decisions|Surface|Fences|Proof)\n/u.test(body));
+  const data = body.split('<!-- ai-delivery:issue-data@1 ')[1]!;
+  for (const key of ['builder', 'extends', 'decisions', 'surface', 'fences', 'proof', 'examples'])
+    assert.ok(!data.includes(`"${key}"`), key);
+  const parsed = parseIssueBody(body, { title: validIssue().title });
+  assert.equal(renderIssueBody(parsed.issue), body);
+  assert.equal(
+    body.split('\n\n## Acceptance criteria\n\n')[1]!.split('\n\n## Out of scope')[0],
+    '- [ ] An invalid widget identifier returns an error without a persistence call.\n  Verified by: A mocked persistence regression asserts the error and zero calls.',
+  );
+});
+
+test('malformed builder-ready fields fail at their own field', () => {
+  const fails = (extra: object, field: string) => {
+    const result = validateIssue({ ...validIssue(), ...extra }, false);
+    assert.ok(
+      result.failures.some((failure) => failure.field.startsWith(field)),
+      field,
+    );
+  };
+  fails({ builder: { tier: 'frontier' } }, 'builder');
+  fails({ builder: { tier: 'frontier', reason: 'because' } }, 'builder');
+  fails({ builder: { tier: 'standard', reason: 'state-machine' } }, 'builder');
+  fails({ surface: [{ path: 'src/a.ts', change: 'move' }] }, 'surface');
+});
+
+test('create and update tools and the portable Ready schema expose the six top-level keys', () => {
+  const shape = z.toJSONSchema(IssueWriteSchema).properties;
+  for (const tool of ['issue_create', 'issue_update']) {
+    const schema = AI_DELIVERY_MCP_TOOLS.find((t) => t.name === tool)!.inputSchema;
+    for (const key of ['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'])
+      assert.deepEqual(z.toJSONSchema(schema).properties?.[key], shape?.[key], `${tool} ${key}`);
+  }
+  for (const key of ['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'])
+    assert.ok(key in ISSUE_JSON_SCHEMAS.ready.properties!, key);
+  assert.ok(!ISSUE_JSON_SCHEMAS.ready.required?.includes('builder'));
+});
