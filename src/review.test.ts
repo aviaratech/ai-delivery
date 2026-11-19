@@ -1311,3 +1311,67 @@ test('recorded reassociation submits a fresh artifact and retry reuses only that
     rmSync(state.root, { recursive: true, force: true });
   }
 });
+
+const lens = [
+  { name: 'money-path', blob: 'abc1234'.padEnd(40, '0') },
+  { name: 'risk', blob: 'def5678'.padEnd(40, '1') },
+];
+
+test('verdict lens is optional, validated, and copied into the artifact only when present', () => {
+  assert.equal('lens' in parseReviewVerdict(verdictInput()), false);
+  assert.deepEqual(parseReviewVerdict({ ...verdictInput(), lens }).lens, lens);
+  for (const bad of [
+    [],
+    [...lens, ...lens, lens[0]],
+    [{ name: 'Bad Name', blob: lens[0]!.blob }],
+    [{ name: 'risk', blob: 'abc1234' }],
+    [lens[0], lens[0]],
+  ])
+    assert.throws(() => parseReviewVerdict({ ...verdictInput(), lens: bad }), /lens/u);
+  const build = (verdict: ReturnType<typeof parseReviewVerdict>) =>
+    buildReviewArtifact({
+      verdict,
+      verdictFileSha256: `sha256:${'d'.repeat(64)}`,
+      identity: 'synthetic-reviewer',
+      provider: 'openai',
+      expectedHead: head.sha,
+      prNumber: 19,
+      authorIdentity: 'synthetic-author',
+    });
+  assert.equal('lens' in build(parseReviewVerdict(verdictInput())), false);
+  assert.deepEqual(build(parseReviewVerdict({ ...verdictInput(), lens })).lens, lens);
+});
+
+test('submit shows the Lens line and labels the PR only with labels that exist', async () => {
+  const state = fixture();
+  try {
+    const { artifactId: _id, ...base } = state.artifact;
+    const content = { ...base, lens, verdictFileSha256: `sha256:${'d'.repeat(64)}` };
+    const withLens = ReviewArtifactSchema.parse({ ...content, artifactId: digestValue(content) });
+    const added: string[][] = [];
+    const rest = state.context.clients.rest as unknown as Record<string, unknown>;
+    rest.issues = {
+      getLabel: async ({ name }: { name: string }) => {
+        if (name === 'lens:risk') throw Object.assign(new Error('Not Found'), { status: 404 });
+        return { data: { name } };
+      },
+      addLabels: async ({ labels }: { labels: string[] }) => {
+        added.push(labels);
+        return { data: [] };
+      },
+    };
+    await submitReview({ artifact: withLens, context: state.context, issueNumber: 17, prNumber: 19 });
+    assert.match(state.reviews[0]!.body, /\nLens: money-path \(blob abc1234\), risk \(blob def5678\)\n/u);
+    assert.deepEqual(added, [['lens:money-path']]);
+    // No lens: no Lens line and no label calls.
+    const plain = fixture();
+    try {
+      await plain.submit();
+      assert.doesNotMatch(plain.reviews[0]!.body, /Lens:/u);
+    } finally {
+      rmSync(plain.root, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});

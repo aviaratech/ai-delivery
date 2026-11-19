@@ -4,6 +4,7 @@ import { z } from 'zod';
 
 import { assertPrivateFile, digestValue } from './delivery/common.js';
 import { DeliveryError } from './errors.js';
+import { logWarn } from './logger.js';
 import { git, gitExitCode } from './git.js';
 import { GIT_EXECUTABLE, gitEnvironment, inertGitArguments } from './gitProcess.js';
 import type { DeliveryContext } from './issue.js';
@@ -13,6 +14,11 @@ const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const Text = z.string().trim().min(1);
 const Effort = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'inherited']);
 const ReviewBase = z.strictObject({ baseSha: Sha, mergeBaseSha: Sha });
+const Lens = z
+  .array(z.strictObject({ name: z.string().regex(/^[a-z0-9-]{1,32}$/u), blob: z.string().regex(/^[a-f0-9]{40}$/u) }))
+  .min(1)
+  .max(4)
+  .refine((lens) => new Set(lens.map((entry) => entry.name)).size === lens.length, 'Lens names must be unique.');
 const Reuse = z.strictObject({ fromReviewId: z.number().int().positive(), verificationResultPath: Text });
 export const ReviewVerdictSchema = z.strictObject({
   schemaVersion: z.literal('ai-delivery.review-verdict@1'),
@@ -41,6 +47,7 @@ export const ReviewVerdictSchema = z.strictObject({
   readOnly: z.literal(true),
   nonClosing: z.boolean().optional(),
   reuse: Reuse.optional(),
+  lens: Lens.optional(),
 });
 export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
 
@@ -87,6 +94,7 @@ export function buildReviewArtifact(input: {
     changedPaths: verdict.scope.changedPaths,
     ...(input.reviewBase === undefined ? {} : { reviewBase: input.reviewBase }),
     ...(verdict.reuse === undefined ? {} : { reuse: verdict.reuse }),
+    ...(verdict.lens === undefined ? {} : { lens: verdict.lens }),
     checks: verdict.verificationReproduced,
     elapsedMs: verdict.elapsedMs,
     findings: verdict.findings,
@@ -163,6 +171,7 @@ export const ReviewArtifactSchema = z
       )
       .optional(),
     issueNumber: z.number().int().positive(),
+    lens: Lens.optional(),
     prNumber: z.number().int().positive().nullable(),
     readOnly: z.literal(true),
     requestedEffort: z.string().min(1),
@@ -354,10 +363,13 @@ export function parseGitHubReviewArtifact(body: string | null | undefined): Revi
 
 function githubReviewBody(artifact: ReviewArtifact): string {
   ReviewArtifactSchema.parse(artifact);
+  const lensLine = artifact.lens
+    ? `\nLens: ${artifact.lens.map((entry) => `${entry.name} (blob ${entry.blob.slice(0, 7)})`).join(', ')}`
+    : '';
   const metadata =
     artifact.verdictFileSha256 === undefined
       ? ''
-      : `\n\nVerdict: ${artifact.verdict}\nRequested model/effort: ${artifact.requestedModel} / ${artifact.requestedEffort}\nEffective model/effort: ${artifact.effectiveModel} / ${artifact.effectiveEffort}\nElapsed milliseconds: ${artifact.elapsedMs}\nVerdict-file SHA256: ${artifact.verdictFileSha256}\nFindings: ${artifact.findings.length ? artifact.findings.join('; ') : 'none'}`;
+      : `\n\nVerdict: ${artifact.verdict}\nRequested model/effort: ${artifact.requestedModel} / ${artifact.requestedEffort}\nEffective model/effort: ${artifact.effectiveModel} / ${artifact.effectiveEffort}\nElapsed milliseconds: ${artifact.elapsedMs}\nVerdict-file SHA256: ${artifact.verdictFileSha256}\nFindings: ${artifact.findings.length ? artifact.findings.join('; ') : 'none'}${lensLine}`;
   const body = `${artifact.summary}${metadata}\n\n<!-- ai-delivery-review-artifact: ${artifact.artifactId} -->\n<!-- ai-delivery-review-artifact-data: ${Buffer.from(JSON.stringify(artifact)).toString('base64url')} -->`;
   if (Buffer.byteLength(body) > 64 * 1024)
     throw new DeliveryError('Review body exceeds the 64 KiB publication limit; provide a concise verdict.');
@@ -649,6 +661,28 @@ async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArti
 export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
 export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
 export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
+/** Labels are optional metadata: add only labels that already exist, and never fail a landed review. */
+async function addLensLabels(context: DeliveryContext, prNumber: number, lens: ReviewArtifact['lens']) {
+  const present: string[] = [];
+  for (const { name } of lens ?? []) {
+    const label = `lens:${name}`;
+    try {
+      await context.clients.rest.issues.getLabel({ ...context.repo, name: label });
+      present.push(label);
+    } catch {
+      logWarn(
+        `Label ${label} is missing or unreadable in ${context.config.repository}; create it, then add it to PR ${prNumber}.`,
+      );
+    }
+  }
+  if (present.length === 0) return;
+  try {
+    await context.clients.rest.issues.addLabels({ ...context.repo, issue_number: prNumber, labels: present });
+  } catch {
+    logWarn(`Could not add ${present.join(', ')} to PR ${prNumber}; add them manually.`);
+  }
+}
+
 export async function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun> {
   const { context, issueNumber, prNumber } = input;
   let artifact = input.artifact;
@@ -762,6 +796,7 @@ export async function submitReview(input: ReviewSubmissionInput): Promise<GitHub
     const current = (await context.clients.rest.pulls.get({ ...context.repo, pull_number: prNumber })).data;
     if (current.head.sha !== artifact.head.sha || current.base.sha !== pr.base.sha || current.state !== 'open')
       throw new DeliveryError('PR moved during independent review submission; approval is not current.');
+    await addLensLabels(context, prNumber, artifact.lens);
     return receipt;
   } catch (error) {
     throw new ReviewSubmissionError(
