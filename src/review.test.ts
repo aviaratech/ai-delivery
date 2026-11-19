@@ -4,7 +4,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 
 import type { DeliveryConfig } from './config/deliveryConfig.js';
 import { recordedReassociation, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
@@ -1338,7 +1338,7 @@ test('verdict lens is optional, validated, and copied into the artifact only whe
       prNumber: 19,
       authorIdentity: 'synthetic-author',
     });
-  assert.equal('lens' in build(parseReviewVerdict(verdictInput())), false);
+  assert.doesNotMatch(JSON.stringify(build(parseReviewVerdict(verdictInput()))), /lens/u);
   assert.deepEqual(build(parseReviewVerdict({ ...verdictInput(), lens })).lens, lens);
 });
 
@@ -1360,7 +1360,10 @@ test('submit shows the Lens line and labels the PR only with labels that exist',
         return { data: [] };
       },
     };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await submitReview({ artifact: withLens, context: state.context, issueNumber: 17, prNumber: 19 });
+    assert.equal(warn.mock.calls.filter(([line]) => String(line).includes('lens:risk')).length, 1);
+    warn.mockRestore();
     assert.match(state.reviews[0]!.body, /\nLens: money-path \(blob abc1234\), risk \(blob def5678\)\n/u);
     assert.deepEqual(added, [['lens:money-path']]);
     // No lens: no Lens line and no label calls.

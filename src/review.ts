@@ -4,10 +4,10 @@ import { z } from 'zod';
 
 import { assertPrivateFile, digestValue } from './delivery/common.js';
 import { DeliveryError } from './errors.js';
-import { logWarn } from './logger.js';
 import { git, gitExitCode } from './git.js';
 import { GIT_EXECUTABLE, gitEnvironment, inertGitArguments } from './gitProcess.js';
 import type { DeliveryContext } from './issue.js';
+import { logWarn } from './logger.js';
 
 const Sha = z.string().regex(/^[a-f0-9]{40}$/u);
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
