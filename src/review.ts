@@ -658,9 +658,6 @@ async function qualifyReviewReuse(context: DeliveryContext, artifact: ReviewArti
   }
 }
 
-export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
-export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
-export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
 /** Labels are optional metadata: add only labels that already exist, and never fail a landed review. */
 async function addLensLabels(context: DeliveryContext, prNumber: number, lens: ReviewArtifact['lens']) {
   const present: string[] = [];
@@ -683,6 +680,9 @@ async function addLensLabels(context: DeliveryContext, prNumber: number, lens: R
   }
 }
 
+export function submitReview(input: ReviewSubmissionInput & { dryRun: true }): Promise<ReviewDryRun>;
+export function submitReview(input: ReviewSubmissionInput & { dryRun?: false }): Promise<GitHubReviewReceipt>;
+export function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun>;
 export async function submitReview(input: ReviewSubmissionInput): Promise<GitHubReviewReceipt | ReviewDryRun> {
   const { context, issueNumber, prNumber } = input;
   let artifact = input.artifact;
