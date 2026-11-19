@@ -4,7 +4,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 
 import type { DeliveryConfig } from './config/deliveryConfig.js';
 import { recordedReassociation, recordedZeroApproval } from './fixtures/recordedGitHubFlows.js';
@@ -1307,6 +1307,73 @@ test('recorded reassociation submits a fresh artifact and retry reuses only that
     assert.equal(history.length, 2);
     assert.deepEqual(events, ['pr', 'commit', 'files', 'reviews', 'pr', 'readback', 'pr']);
     assert.equal(oldReview.body, encode(oldArtifact));
+  } finally {
+    rmSync(state.root, { recursive: true, force: true });
+  }
+});
+
+const lens = [
+  { name: 'money-path', blob: 'abc1234'.padEnd(40, '0') },
+  { name: 'risk', blob: 'def5678'.padEnd(40, '1') },
+];
+
+test('verdict lens is optional, validated, and copied into the artifact only when present', () => {
+  assert.equal('lens' in parseReviewVerdict(verdictInput()), false);
+  assert.deepEqual(parseReviewVerdict({ ...verdictInput(), lens }).lens, lens);
+  for (const bad of [
+    [],
+    [...lens, ...lens, lens[0]],
+    [{ name: 'Bad Name', blob: lens[0]!.blob }],
+    [{ name: 'risk', blob: 'abc1234' }],
+    [lens[0], lens[0]],
+  ])
+    assert.throws(() => parseReviewVerdict({ ...verdictInput(), lens: bad }), /lens/u);
+  const build = (verdict: ReturnType<typeof parseReviewVerdict>) =>
+    buildReviewArtifact({
+      verdict,
+      verdictFileSha256: `sha256:${'d'.repeat(64)}`,
+      identity: 'synthetic-reviewer',
+      provider: 'openai',
+      expectedHead: head.sha,
+      prNumber: 19,
+      authorIdentity: 'synthetic-author',
+    });
+  assert.doesNotMatch(JSON.stringify(build(parseReviewVerdict(verdictInput()))), /lens/u);
+  assert.deepEqual(build(parseReviewVerdict({ ...verdictInput(), lens })).lens, lens);
+});
+
+test('submit shows the Lens line and labels the PR only with labels that exist', async () => {
+  const state = fixture();
+  try {
+    const { artifactId: _id, ...base } = state.artifact;
+    const content = { ...base, lens, verdictFileSha256: `sha256:${'d'.repeat(64)}` };
+    const withLens = ReviewArtifactSchema.parse({ ...content, artifactId: digestValue(content) });
+    const added: string[][] = [];
+    const rest = state.context.clients.rest as unknown as Record<string, unknown>;
+    rest.issues = {
+      getLabel: async ({ name }: { name: string }) => {
+        if (name === 'lens:risk') throw Object.assign(new Error('Not Found'), { status: 404 });
+        return { data: { name } };
+      },
+      addLabels: async ({ labels }: { labels: string[] }) => {
+        added.push(labels);
+        return { data: [] };
+      },
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await submitReview({ artifact: withLens, context: state.context, issueNumber: 17, prNumber: 19 });
+    assert.equal(warn.mock.calls.filter(([line]) => String(line).includes('lens:risk')).length, 1);
+    warn.mockRestore();
+    assert.match(state.reviews[0]!.body, /\nLens: money-path \(blob abc1234\), risk \(blob def5678\)\n/u);
+    assert.deepEqual(added, [['lens:money-path']]);
+    // No lens: no Lens line and no label calls.
+    const plain = fixture();
+    try {
+      await plain.submit();
+      assert.doesNotMatch(plain.reviews[0]!.body, /Lens:/u);
+    } finally {
+      rmSync(plain.root, { recursive: true, force: true });
+    }
   } finally {
     rmSync(state.root, { recursive: true, force: true });
   }
