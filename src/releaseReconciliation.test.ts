@@ -120,7 +120,7 @@ async function runRelease(fixture: Fixture = {}) {
         return new Response(
           new ReadableStream({
             start: (controller) => {
-              elapsed += 5 * 60_000;
+              elapsed += 20 * 60_000;
               controller.error(new DOMException('Readback body timed out', 'TimeoutError'));
             },
           }),
@@ -247,12 +247,21 @@ test('conflicting archive bytes fail immediately after one publication', async (
   assert.deepEqual(result.waits, []);
 });
 
-test('unresolved visibility reports the external reconciliation bound without republishing', async () => {
+test('a version npm indexes after seven minutes still ends green', async () => {
+  const result = await runRelease({ versionReadyAt: 8 });
+  assert.equal(result.error, null);
+  assert.equal(result.publications, 1);
+  assert.ok(result.elapsed > 7 * 60_000);
+  assert.deepEqual(result.waits, [15_000, 30_000, 60_000, 120_000, 120_000, 120_000, 120_000]);
+});
+
+test('a version that never appears fails with how to check by hand, without republishing', async () => {
   const result = await runRelease({ versionReadyAt: Infinity });
-  assert.match(result.error ?? '', /reconciliation unresolved/iu);
+  assert.match(result.error ?? '', /accepted the publish but .* not fully visible.*npm view/iu);
   assert.equal(result.publications, 1);
   assert.ok(result.waits.length > 0);
-  assert.ok(result.elapsed < 10 * 60_000, 'Reconciliation must fit the existing external publish job.');
+  assert.ok(result.elapsed >= 15 * 60_000, 'Reconciliation must wait at least 15 minutes.');
+  assert.ok(result.elapsed < 30 * 60_000, 'Reconciliation must fit the 30-minute publish job.');
   assert.ok(
     result.timeouts.some((ms) => ms < 30_000),
     'Requests must respect the remaining reconciliation allowance.',
@@ -335,14 +344,21 @@ test('oversized registry metadata fails within the readback output bound', async
 
 test('a body timeout at the reconciliation bound retains an explicit unresolved result', async () => {
   const result = await runRelease({ bodyDeadlineExceeded: true });
-  assert.match(result.error ?? '', /reconciliation unresolved/iu);
+  assert.match(result.error ?? '', /accepted the publish but .* not fully visible/iu);
+  assert.equal(result.publications, 1);
+});
+
+test('a rejected publish that never appears does not claim npm accepted it', async () => {
+  const result = await runRelease({ publishStatus: 1, versionReadyAt: Infinity });
+  assert.match(result.error ?? '', /did not exit cleanly.*not fully visible.*npm view/iu);
+  assert.doesNotMatch(result.error ?? '', /accepted the publish/iu);
   assert.equal(result.publications, 1);
 });
 
 for (const phase of ['archiveReadyAt', 'provenanceReadyAt', 'indexReadyAt', 'latestReadyAt'] as const) {
   test(`unresolved ${phase} cannot be accepted as a completed release`, async () => {
     const result = await runRelease({ [phase]: Infinity });
-    assert.match(result.error ?? '', /reconciliation unresolved/iu);
+    assert.match(result.error ?? '', /accepted the publish but .* not fully visible/iu);
     assert.equal(result.publications, 1);
   });
 }
