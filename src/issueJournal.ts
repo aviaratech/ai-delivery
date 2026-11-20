@@ -3,7 +3,9 @@ import { z } from 'zod';
 
 const Text = z.string().trim().min(1).max(10000);
 const Summary = Text.max(500).refine((value) => !/[\r\n]/u.test(value), 'Summary must be one plain-language line.');
-const Date = z.iso.date();
+export const NEXT_DATE_REFUSAL = 'nextDate must be a YYYY-MM-DD date, or null when none is scheduled.';
+const Date = z.iso.date({ error: NEXT_DATE_REFUSAL });
+export const PLAIN_COMMENT_REFUSAL = 'Send body alone for a plain comment, or kind with its journal fields.';
 const EvidenceUrl = z.url({ protocol: /^https$/u }).refine((value) => {
   let url: URL;
   try {
@@ -30,7 +32,7 @@ const Common = {
   summary: Summary,
   status: Text,
   nextStep: Text,
-  nextDate: Date.nullable(),
+  nextDate: z.union([Date, z.null(), z.literal('null').transform(() => null)], { error: NEXT_DATE_REFUSAL }),
   keyNumbers: z.array(Text),
   evidence: z.array(Evidence),
   details: Text.optional(),
@@ -56,20 +58,18 @@ const JournalVariants = z.discriminatedUnion('kind', [
   }),
 ]);
 export type JournalInput = z.infer<typeof JournalVariants>;
-/** Publish the same kind requirements enforced by the canonical variant schemas. */
+/** Publish a plain `body` or each journal kind with the fields its canonical variant requires. */
 export const JOURNAL_SCHEMA_METADATA = {
-  required: [
-    ...Object.entries(Common)
-      .filter(([, schema]) => !schema.isOptional())
-      .map(([key]) => key),
-    'kind',
+  required: ['issueNumber'],
+  anyOf: [
+    { required: ['body'] },
+    ...JournalVariants.options.map((variant) => ({
+      properties: { kind: { const: variant.shape.kind.value } },
+      required: Object.entries(variant.shape as Record<string, z.ZodType>)
+        .filter(([key, schema]) => key !== 'issueNumber' && !schema.isOptional())
+        .map(([key]) => key),
+    })),
   ],
-  anyOf: JournalVariants.options.map((variant) => ({
-    properties: { kind: { const: variant.shape.kind.value } },
-    required: Object.entries(variant.shape as Record<string, z.ZodType>)
-      .filter(([key, schema]) => !(key in Common) && key !== 'kind' && !schema.isOptional())
-      .map(([key]) => key),
-  })),
 };
 export function missingJournalFields(input: Record<string, unknown>): string[] {
   const variant = JournalVariants.options.find((option) => option.shape.kind.value === input.kind);

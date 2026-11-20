@@ -283,3 +283,15 @@ test('duplicate authority markers are refused before another content write', asy
   );
   assert.deepEqual(f.writes, before);
 });
+
+test('blockedBy with blockers naming each issue succeeds and shows that text', async () => {
+  const f = guardFixture();
+  const result = await updateIssue(f.context, {
+    issueNumber: 17,
+    blockedBy: [18, 19],
+    status: { blockers: '#19, #18' },
+    overrideReason: 'Wait for the newly identified prerequisites.',
+  });
+  assert.match(result.body ?? '', /\*\*Blockers:\*\* #19, #18/u);
+  assert.deepEqual([...f.edges.get(17)!], [18, 19]);
+});

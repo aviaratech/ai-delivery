@@ -332,6 +332,13 @@ export interface CreateIssueInput extends Partial<IssueFieldsInput>, NativeIssue
   title: string;
 }
 
+const BLOCKERS_DISAGREE =
+  'status.blockers must name each blockedBy issue as #<n>, or start with None; or send only blockedBy.';
+const blockersAgree = (blockedBy: number[], text: string): boolean =>
+  blockedBy.length === 0
+    ? /^None\b/u.test(text)
+    : blockedBy.every((number) => new RegExp(`#${String(number)}(?!\\d)`, 'u').test(text));
+
 function prepareIssueWrite(
   input: Partial<IssueFieldsInput> & {
     body?: string;
@@ -353,8 +360,8 @@ function prepareIssueWrite(
           IssueStatusPatch,
           current === undefined ? requireIssueStatus(CreateIssueStatus, input.status) : input.status,
         );
-  if (input.blockedBy !== undefined && patch && 'blockers' in patch)
-    throw new DeliveryError('Choose native blockedBy or display-only status.blockers in one update, not both.');
+  if (input.blockedBy !== undefined && patch?.blockers !== undefined && !blockersAgree(input.blockedBy, patch.blockers))
+    throw new DeliveryError(BLOCKERS_DISAGREE);
   const statusOnly =
     patch !== undefined &&
     Object.entries(input).every(
@@ -442,7 +449,7 @@ function prepareIssueWrite(
     nextMilestone: patch?.nextMilestone ?? base?.nextMilestone ?? 'Not started',
     blockers: patch?.blockers ?? base?.blockers ?? 'None',
     latestJournal: patch?.latestJournal ?? base?.latestJournal ?? 'None yet',
-    ...(input.blockedBy === undefined
+    ...(input.blockedBy === undefined || patch?.blockers !== undefined
       ? {}
       : {
           blockers: input.blockedBy.length ? input.blockedBy.map((number) => '#' + String(number)).join(', ') : 'None',
@@ -2363,7 +2370,7 @@ function localBatchFailureReason(error: unknown): string | undefined {
     [
       'Choose a valid defer condition or explicit undefer, never both.',
       'Use defer or undefer to change deferral state.',
-      'Choose native blockedBy or display-only status.blockers in one update, not both.',
+      BLOCKERS_DISAGREE,
       'Convert the legacy contract explicitly before a status-only update.',
       'Issue labels must be non-empty and unique.',
       'Repository label listing exceeds the bounded readback window.',

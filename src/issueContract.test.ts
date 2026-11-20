@@ -601,3 +601,10 @@ test('a legacy Ready issue warns builder.unset and skips builder-only warnings; 
   noCopy.context = { components: [], files: [], evidence: [] };
   assert.ok(!codes(noCopy).some((code) => code === 'edge-case' || code === 'context'));
 });
+
+test('an 85-character title refuses with its length', () => {
+  const failure = validateIssue({ ...validIssue(), title: 'x'.repeat(85) }).failures.find(
+    (f) => f.code === 'title.length',
+  );
+  assert.equal(failure?.fixHint, 'The title is 85 characters; shorten it to at most 80.');
+});

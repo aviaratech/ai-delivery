@@ -212,7 +212,8 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
     )
   )
     add('title.specific', ['title'], 'Name the specific behavior or component that changes.');
-  if (value.title.length > 80) add('title.length', ['title'], 'Shorten the title to at most 80 characters.');
+  if (value.title.length > 80)
+    add('title.length', ['title'], `The title is ${String(value.title.length)} characters; shorten it to at most 80.`);
   if (/^\s*(?:\[\s*(?:bug|feature|task)\s*\]|(?:bug|feature|task)\s*:)/iu.test(value.title))
     add('title.prefix', ['title'], 'Remove the issue-type prefix; use the native Issue Type field.');
   for (const field of ['problem', 'outcome'] as const)

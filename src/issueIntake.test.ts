@@ -2531,3 +2531,22 @@ test('update with a Priority adds no new refusal', async () => {
   await updateIssue(f.context, { issueNumber: 17, priority: 'High' });
   assert.ok(f.writes.length > 0);
 });
+
+test('blockedBy [] accepts a blockers line that starts with None', async () => {
+  const f = fixture();
+  const result = await updateIssue(f.context, {
+    issueNumber: 17,
+    blockedBy: [],
+    status: { blockers: 'None: #4931 merged' },
+  } as never);
+  assert.match(result.body, /\*\*Blockers:\*\* None: #4931 merged/u);
+});
+
+test('blockedBy [4741] refuses blockers "None" and writes nothing', async () => {
+  const f = fixture();
+  await assert.rejects(
+    updateIssue(f.context, { issueNumber: 17, blockedBy: [4741], status: { blockers: 'None' } } as never),
+    /status\.blockers must name each blockedBy issue as #<n>, or start with None; or send only blockedBy\./u,
+  );
+  assert.deepEqual(f.writes, []);
+});

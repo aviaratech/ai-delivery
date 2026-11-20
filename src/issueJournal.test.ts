@@ -62,14 +62,17 @@ test('a cut status or next-step preview ends on a whole word and an ellipsis (ai
   assert.equal(first('🙂'.repeat(40), 'Run checks'), `Status: ${'🙂'.repeat(15)}…. Next: Run checks.`);
 });
 
-test('published comment schema lists required fields for every journal kind', () => {
-  const schema = z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema);
+test('published comment schema lists a plain body or the required fields for every journal kind', () => {
+  const schema = z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema, { io: 'input' });
+  const common = ['summary', 'status', 'nextStep', 'nextDate', 'keyNumbers', 'evidence', 'kind'];
+  assert.deepEqual(schema.required, ['issueNumber']);
   assert.deepEqual(schema.anyOf, [
-    { properties: { kind: { const: 'start' } }, required: ['outcome'] },
-    { properties: { kind: { const: 'progress' } }, required: ['done', 'decisionNeeded'] },
-    { properties: { kind: { const: 'decision' } }, required: ['decision', 'rationale'] },
-    { properties: { kind: { const: 'blocker' } }, required: ['blocker', 'resolution'] },
-    { properties: { kind: { const: 'closeout' } }, required: ['acceptance', 'followUps'] },
+    { required: ['body'] },
+    { properties: { kind: { const: 'start' } }, required: [...common, 'outcome'] },
+    { properties: { kind: { const: 'progress' } }, required: [...common, 'done', 'decisionNeeded'] },
+    { properties: { kind: { const: 'decision' } }, required: [...common, 'decision', 'rationale'] },
+    { properties: { kind: { const: 'blocker' } }, required: [...common, 'blocker', 'resolution'] },
+    { properties: { kind: { const: 'closeout' } }, required: [...common, 'acceptance', 'followUps'] },
   ]);
 });
 
@@ -463,7 +466,7 @@ test('registered journal tool returns actionable decision refusals before native
     const published = (await client.listTools()).tools.find((t) => t.name === 'issue_comment');
     assert.deepEqual(
       published?.inputSchema.anyOf,
-      z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema).anyOf,
+      z.toJSONSchema(getAiDeliveryMcpTool('issue_comment')!.inputSchema, { io: 'input' }).anyOf,
     );
     assert.match(text, /[Pp]rovide/u, 'the refusal explains the correction');
     const listed = (await client.listTools()).tools.find((tool) => tool.name === 'issue_comment');
