@@ -615,7 +615,7 @@ jobs:
     needs: package
     if: ${{ !inputs.qualification_only && needs.package.result == 'success' && github.ref == 'refs/heads/main' && github.ref_protected && github.repository == 'aviaratech/ai-delivery' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     environment: npm-publish
     permissions:
       contents: read
@@ -665,7 +665,7 @@ jobs:
           const integrity = `sha512-${createHash('sha512').update(archive).digest('base64')}`;
           if (process.env.GITHUB_SHA !== source || sha256(archive) !== digest || pkg.name !== '@aviaratech/ai-delivery' || pkg.version !== version || pkg.private !== false || pkg.license !== 'MIT' || pkg.repository?.url !== 'git+https://github.com/aviaratech/ai-delivery.git') throw new Error('Downloaded package differs from the reviewed release.');
           let reconciliationDeadline;
-          const unresolved = () => new Error('Registry reconciliation unresolved within its external-job allowance; qualify the original publication read-only. Publication will not be repeated.');
+          const unresolved = () => new Error(`npm accepted the publish but ${version} is not fully visible in the registry after 20 minutes; check by hand with: npm view @aviaratech/ai-delivery@${version} dist.integrity dist.attestations. Publication will not be repeated.`);
           const request = async (url, options = {}) => {
             const remaining = reconciliationDeadline === undefined ? 30_000 : Math.min(30_000, Math.ceil(reconciliationDeadline - performance.now()));
             if (remaining <= 0) throw unresolved();
@@ -722,8 +722,9 @@ jobs:
             return { tarball, hasProvenance: predicate !== undefined };
           };
           const verifyPublished = async (initialResponse, initialPackage) => {
-            // Five minutes of GET-only reconciliation fit inside the existing ten-minute publish job.
-            reconciliationDeadline = performance.now() + 5 * 60_000;
+            // npm can take about 10 minutes to index an accepted publish. Twenty minutes of GET-only reconciliation fit inside the thirty-minute publish job.
+            reconciliationDeadline = performance.now() + 20 * 60_000;
+            let delay = 15_000;
             for (let attempt = 1; ; attempt++) {
               const pending = [];
               const index = initialPackage ?? await readPackage();
@@ -756,7 +757,8 @@ jobs:
                 return;
               }
               console.log(JSON.stringify({ registryReconciliation: 'pending', attempt, waitingFor: pending, remainingMs: Math.floor(reconciliationDeadline - performance.now()) }));
-              await new Promise(resolve => setTimeout(resolve, Math.min(15_000, reconciliationDeadline - performance.now())));
+              await new Promise(resolve => setTimeout(resolve, Math.min(delay, reconciliationDeadline - performance.now())));
+              delay = Math.min(delay * 2, 120_000);
             }
           };
           await requireMain();
