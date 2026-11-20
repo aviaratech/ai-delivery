@@ -6,7 +6,12 @@ import { executeTool, type ExecutionContext } from '../dispatch.js';
 import { setLogsSuppressed } from '../logger.js';
 import { PACKAGE_VERSION } from '../version.js';
 import { acceptedKeysError } from '../issueContract.js';
-import { JOURNAL_SCHEMA_METADATA, missingJournalFields } from '../issueJournal.js';
+import {
+  JOURNAL_SCHEMA_METADATA,
+  NEXT_DATE_REFUSAL,
+  PLAIN_COMMENT_REFUSAL,
+  missingJournalFields,
+} from '../issueJournal.js';
 import { getIncompleteIssueUpdate } from '../issue.js';
 import { projectToolOutput } from '../toolOutput.js';
 import { AI_DELIVERY_MCP_TOOLS, type AiDeliveryMcpToolName } from './tools.js';
@@ -47,12 +52,19 @@ export function createAiDeliveryMcpServer(context: ExecutionContext, activeCalls
       async (args, extra) => {
         const parsed = tool.inputSchema.safeParse(args);
         if (!parsed.success) {
-          const missing = tool.name === 'issue_comment' ? missingJournalFields(args) : [];
+          const journal = tool.name === 'issue_comment';
+          const missing = journal && args.body === undefined ? missingJournalFields(args) : [];
+          // A missing-field list comes first; these refusals already say what to send, so they replace the generic text.
+          const stated = journal
+            ? parsed.error.issues
+                .map((issue) => issue.message)
+                .filter((m) => [NEXT_DATE_REFUSAL, PLAIN_COMMENT_REFUSAL].includes(m))
+            : [];
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `Invalid arguments for ${tool.name}.${missing.length ? ` Missing required fields: ${missing.join(', ')}. Provide every missing field.` : tool.name === 'issue_comment' ? ` ${tool.description}` : ''}`,
+                text: `Invalid arguments for ${tool.name}.${missing.length ? ` Missing required fields: ${missing.join(', ')}. Provide every missing field.` : stated.length ? ` ${stated.join(' ')}` : journal ? ` ${tool.description}` : ''}`,
               },
             ],
             isError: true,

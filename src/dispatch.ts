@@ -21,10 +21,10 @@ import {
   batchUpdateIssues,
   type BatchUpdateIssueInput,
   type CreateIssueInput,
+  type IssueCommentInput,
   type ListIssuesInput,
   type UpdateIssueInput,
 } from './issue.js';
-import type { JournalInput } from './issueJournal.js';
 import { publishPr, submitFormalReview } from './pr.js';
 import { getAiDeliveryMcpTool, type AiDeliveryMcpToolName } from './mcp/tools.js';
 import { IssueValidationError } from './issueContract.js';
@@ -290,7 +290,7 @@ export async function executeTool(
   );
   switch (name) {
     case 'issue_comment':
-      return commentIssue(context, input as JournalInput);
+      return commentIssue(context, input as IssueCommentInput);
     case 'issue_create':
       return createIssue(context, input as unknown as CreateIssueInput);
     case 'issue_start':

@@ -411,6 +411,27 @@ describe('per-call repository selection', () => {
       assert.equal(stored.length, 2, 'inheriting the server selector reuses repository A');
       assert.deepEqual(journalTargets, ['example/a', 'example/b', 'example/a', 'example/a']);
       assert.equal(vi.mocked(repository.resolveRepoFromRemote).mock.calls.length, 0);
+      const call = (args: Record<string, unknown>) =>
+        client.callTool({ name: 'issue_comment', arguments: { repo: 'example/a', ...args } });
+      const plain = await call({ issueNumber: 17, body: 'Plain note.' });
+      assert.equal(plain.isError, undefined, JSON.stringify(plain));
+      assert.equal(stored.at(-1)?.body, 'Plain note.', 'a plain body posts exactly as sent');
+      const afterPlain = stored.length;
+      const mixed = await call({ ...journal, body: 'Plain note.' });
+      assert.equal(mixed.isError, true);
+      assert.match(JSON.stringify(mixed), /Send body alone for a plain comment, or kind with its journal fields\./u);
+      assert.equal(stored.length, afterPlain, 'a mixed request writes nothing');
+      const asNull = await call({ ...journal, nextDate: null });
+      const asString = await call({ ...journal, nextDate: 'null' });
+      assert.equal(asString.isError, undefined, JSON.stringify(asString));
+      assert.equal(stored.length, afterPlain + 1, 'the string "null" posts the same journal as null');
+      const readback = (result: typeof asNull) =>
+        JSON.parse((result.content as { text: string }[])[0]!.text) as { url: string; reused: boolean };
+      assert.equal(readback(asString).url, readback(asNull).url);
+      assert.equal(readback(asString).reused, true);
+      const impossible = await call({ ...journal, nextDate: '2026-02-30' });
+      assert.equal(impossible.isError, true);
+      assert.match(JSON.stringify(impossible), /nextDate must be a YYYY-MM-DD date, or null when none is scheduled\./u);
       const names = AI_DELIVERY_MCP_TOOLS.map((tool) => tool.name as string);
       for (const removed of [
         'issue_develop',

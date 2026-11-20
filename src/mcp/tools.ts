@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { NativeIssueDateFields } from '../github/nativeIssueMetadata.js';
 import { ProjectTradeFields } from '../github/projectNumbers.js';
 import { OverrideReason } from '../services/blockerGuardService.js';
-import { JournalInputSchema, JOURNAL_SCHEMA_METADATA } from '../issueJournal.js';
+import { JournalInputSchema, JOURNAL_SCHEMA_METADATA, PLAIN_COMMENT_REFUSAL } from '../issueJournal.js';
 import {
   IssueFields,
   IssueWriteFields,
@@ -136,10 +136,30 @@ export const AI_DELIVERY_MCP_TOOLS = [
     name: 'issue_comment',
     commandName: 'comment',
     description:
-      'Post a typed issue journal with authoritative comment readback. Provide the fields required by kind: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: non-empty decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps. Omit fields belonging to other kinds.',
+      'Post a plain comment with body alone, or a typed issue journal with kind and its fields, with authoritative comment readback. Provide the fields required by kind: start: outcome; progress: done, decisionNeeded and non-empty evidence; decision: non-empty decision and rationale; blocker: blocker and resolution; closeout: acceptance and followUps. Omit fields belonging to other kinds.',
     inputSchema: z
-      .strictObject({ ...JournalInputSchema.shape, repo: Repo, verbose: Verbose }, { error: acceptedKeysError })
-      .superRefine(({ repo: _repo, verbose: _verbose, ...journal }, ctx) => {
+      .strictObject(
+        {
+          ...JournalInputSchema.shape,
+          body: z
+            .string()
+            .optional()
+            .describe('A plain comment posted exactly as written; send it without any journal field.'),
+          repo: Repo,
+          verbose: Verbose,
+        },
+        { error: acceptedKeysError },
+      )
+      // A plain body needs only issueNumber; the superRefine below enforces the journal fields without it.
+      .partial()
+      .required({ issueNumber: true })
+      .superRefine(({ repo: _repo, verbose: _verbose, body, ...journal }, ctx) => {
+        if (body !== undefined) {
+          const { issueNumber: _issueNumber, ...keys } = journal;
+          if (Object.values(keys).some((value) => value !== undefined))
+            ctx.addIssue({ code: 'custom', message: PLAIN_COMMENT_REFUSAL });
+          return;
+        }
         // Repository routing belongs to the MCP envelope, not the strict journal variants.
         const parsed = JournalInputSchema.safeParse(journal);
         if (!parsed.success)
