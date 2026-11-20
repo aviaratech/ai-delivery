@@ -348,6 +348,13 @@ test('a body timeout at the reconciliation bound retains an explicit unresolved 
   assert.equal(result.publications, 1);
 });
 
+test('a rejected publish that never appears does not claim npm accepted it', async () => {
+  const result = await runRelease({ publishStatus: 1, versionReadyAt: Infinity });
+  assert.match(result.error ?? '', /did not exit cleanly.*not fully visible.*npm view/iu);
+  assert.doesNotMatch(result.error ?? '', /accepted the publish/iu);
+  assert.equal(result.publications, 1);
+});
+
 for (const phase of ['archiveReadyAt', 'provenanceReadyAt', 'indexReadyAt', 'latestReadyAt'] as const) {
   test(`unresolved ${phase} cannot be accepted as a completed release`, async () => {
     const result = await runRelease({ [phase]: Infinity });
