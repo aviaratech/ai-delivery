@@ -90,6 +90,9 @@ export const IssueFields = z.strictObject({
     'Builder capability: standard (any lighter builder can finish from the issue alone) or frontier with one reason.',
   ),
   extends: Strings.optional().describe('The design decision or existing owner this change uses or extends.'),
+  priorWork: Strings.optional().describe(
+    "Searches run for earlier work on this question (closed issues, issue artifacts, decision logs) and what each found, or 'none found' with the searches.",
+  ),
   decisions: Strings.optional().describe('Choices already made; the builder must not reopen them.'),
   surface: z
     .array(SurfaceEntry)
@@ -253,6 +256,12 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
         if (!value.bug[field].trim()) add(`bug.${field}`, ['bug', field], `Describe the bug's ${field}.`);
     }
   }
+  if (/^study\b/iu.test(value.title) && !(value.priorWork ?? []).some((item) => item.trim()))
+    add(
+      'priorWork',
+      ['priorWork'],
+      "List each search you ran for earlier work on this question and what it found, or 'none found' with the searches.",
+    );
   if (value.epic || value.builder === undefined) return;
   if (!(value.decisions ?? []).some((item) => item.trim()))
     add('decisions', ['decisions'], `Record each choice the builder must not reopen. ${SKILL_HINT}`);
@@ -309,6 +318,7 @@ export const IssueWriteFields = {
   bug: IssueFields.shape.bug,
   builder: IssueFields.shape.builder,
   extends: IssueFields.shape.extends,
+  priorWork: IssueFields.shape.priorWork,
   decisions: IssueFields.shape.decisions,
   surface: IssueFields.shape.surface,
   fences: IssueFields.shape.fences,
@@ -456,6 +466,7 @@ export function renderIssueBody(value: DraftIssueData, status?: IssueStatusData,
       ? []
       : ['## Builder', item.builder.tier === 'standard' ? 'standard' : `frontier: ${item.builder.reason}`]),
     ...bulletSection('Extends', item.extends),
+    ...bulletSection('Prior work', item.priorWork),
     ...bulletSection('Decisions', item.decisions),
     '## Acceptance criteria',
     item.acceptanceCriteria
