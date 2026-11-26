@@ -305,6 +305,8 @@ program
   .option('--project-status-reason <reason>', 'Required public reason for an explicit Project Status')
   .option('--preserve-history', 'Preserve the previous title and body before a rewrite')
   .option('--close-reason <reason>')
+  .option('--closeout-verdict <text>', 'Study verdict (1–3 lines); required to close a study as completed')
+  .option('--closeout-result-file <path>', "File holding the study READOUT's Result section, verbatim")
   .option('--superseded-by <number>')
   .option('--park', 'Park execution while retaining the issue worktree')
   .option('--defer', 'Defer until an explicit undefer')
@@ -346,6 +348,10 @@ program
                 : ProjectStatusPatch.parse({ status: o.projectStatus, reason: o.projectStatusReason }),
             preserveHistory: o.preserveHistory === true ? true : undefined,
             closeReason: o.closeReason,
+            closeout:
+              o.closeoutVerdict === undefined && o.closeoutResultFile === undefined
+                ? undefined
+                : { verdict: o.closeoutVerdict, result: body(undefined, o.closeoutResultFile) },
             supersededBy: int(o.supersededBy),
             park: o.park === true ? true : undefined,
             defer:
