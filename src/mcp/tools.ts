@@ -51,6 +51,13 @@ const IssueUpdateInput = issueInputSchema(
         state: z.enum(['open', 'closed']).optional(),
         preserveHistory: z.boolean().optional(),
         closeReason: z.enum(['completed', 'not_planned', 'duplicate']).optional(),
+        closeout: z
+          .strictObject({
+            verdict: z.string().min(1).max(600).describe('The study verdict, 1–3 lines.'),
+            result: z.string().min(1).max(4000).describe("The READOUT's Result section, verbatim."),
+          })
+          .optional()
+          .describe('Required to close a study (title starts with "Study") as completed; needs a READOUT artifact.'),
         supersededBy: Positive.optional(),
         title: IssueWriteFields.title,
       },
@@ -59,7 +66,10 @@ const IssueUpdateInput = issueInputSchema(
     .superRefine((input, ctx) => {
       if (input.defer !== undefined && input.undefer !== undefined)
         ctx.addIssue({ code: 'custom', message: 'Choose defer or undefer, never both.', path: ['defer'] });
-      if ((input.closeReason !== undefined || input.supersededBy !== undefined) && input.state !== 'closed')
+      if (
+        (input.closeReason !== undefined || input.closeout !== undefined || input.supersededBy !== undefined) &&
+        input.state !== 'closed'
+      )
         ctx.addIssue({
           code: 'custom',
           path: ['state'],
@@ -244,7 +254,7 @@ export const AI_DELIVERY_MCP_TOOLS = [
     readOnly: true,
     commandName: 'info',
     description:
-      'Read live GitHub issue metadata, relationships, Project status, linked PRs (state, merge commit, checks, reviews) and the latest journal in one call. Child counts by default; verbose adds the body, every journal in full, routing and full child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
+      'Read live GitHub issue metadata, relationships, Project status, linked PRs (state, merge commit, checks, reviews), artifacts and the latest journal in one call. Child counts by default; verbose adds the body, every journal in full, routing and full child progress. Pass the requested owner/name as repo; an explicit repo works outside Git without a checkout. This read does not start or update the issue.',
     inputSchema: z.strictObject({ issueNumber: Positive, repo: Repo, verbose: Verbose }, { error: acceptedKeysError }),
   },
   {

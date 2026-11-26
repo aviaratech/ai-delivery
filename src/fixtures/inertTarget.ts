@@ -374,6 +374,7 @@ export function inertTarget(
         }
         if (route === 'GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values') return { data: fields() };
         if (route.includes('rules')) return { data: [] };
+        if (route === 'GET /repos/{owner}/{repo}/issues/{issue_number}/artifacts') return { status: 200, data: [] };
         throw new Error(`Unexpected synthetic REST route: ${route}`);
       },
       repos: {
@@ -656,6 +657,10 @@ export function inertTarget(
               duplicateOf: null,
             },
           },
+        };
+      if (query.includes('blocking(first:'))
+        return {
+          repository: { issue: { blocking: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } },
         };
       if (query.includes('blockedBy(first:'))
         return {

@@ -180,7 +180,7 @@ async function inOrder<T extends unknown[]>(reads: { [K in keyof T]: Promise<T[K
 /** issue_info plus the linked PRs (state, checks, reviews) and the latest journal, in one call. */
 export async function issueView(context: DeliveryContext, issueNumber: number, options: { verbose: boolean }) {
   const [info, links] = await inOrder([
-    issueInfo(context, issueNumber, { childDetail: options.verbose }),
+    issueInfo(context, issueNumber, { childDetail: options.verbose, artifacts: true }),
     readIssueLinks(context, issueNumber),
   ]);
   return {

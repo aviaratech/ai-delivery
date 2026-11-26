@@ -50,6 +50,7 @@ import {
 } from './github/projectNumbers.js';
 import {
   getNativeBlockerRelationships,
+  getNativeBlockingRelationships,
   hasNativeSubIssues,
   linkBlockedBy,
   replaceBlockedBy,
@@ -1361,6 +1362,8 @@ export interface UpdateIssueInput
   state?: 'open' | 'closed';
   preserveHistory?: boolean;
   closeReason?: 'completed' | 'not_planned' | 'duplicate';
+  /** Required to close a study as completed: the verdict and the READOUT's Result section, verbatim. */
+  closeout?: { verdict: string; result: string };
   supersededBy?: number;
   title?: string;
 }
@@ -1373,6 +1376,8 @@ export interface UpdateIssueResult extends IssueInfo {
   historyComment?: IssueCommentReadback;
   projectStatusComment?: IssueCommentReadback & ProjectStatusPatchData;
   closure?: IssueClosureReadback & { supersededBy: number | null; comment: IssueCommentReadback };
+  /** Open issues the closed issue was blocking; present on every reasoned close. */
+  unblocks?: number[];
 }
 
 interface IncompleteIssueUpdateResult {
@@ -1487,7 +1492,7 @@ async function assertProjectTransition(
 }
 
 const BODY_FREE_KEYS = new Set([
-  ...'repo issueNumber state closeReason supersededBy preserveHistory overrideReason'.split(' '),
+  ...'repo issueNumber state closeReason closeout supersededBy preserveHistory overrideReason'.split(' '),
   ...'projectStatus milestone labels priority startDate targetDate'.split(' '),
   ...'expectedTradesPerDay measuredTradesPerDay'.split(' '),
 ]);
@@ -1536,7 +1541,9 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
       'draft',
       'openQuestions',
       'context',
-      ...(['builder', 'extends', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) => carried.has(key)),
+      ...(['builder', 'extends', 'priorWork', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) =>
+        carried.has(key),
+      ),
     ].filter((key) => input[key as keyof typeof input] === undefined);
     if (reset.length) {
       const message = `Rebuilt the hand-edited body (old one in the history comment); reset because not sent: ${reset.join(', ')}.`;
@@ -1579,7 +1586,7 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     throw new DeliveryError('A superseding issue must be a different positive issue number.');
   const { clients, config, repo } = context;
   const preserveArchived = Object.keys(input).every((key) =>
-    ['issueNumber', 'title', 'state', 'closeReason', 'supersededBy', 'preserveHistory'].includes(key),
+    ['issueNumber', 'title', 'state', 'closeReason', 'closeout', 'supersededBy', 'preserveHistory'].includes(key),
   );
   const dateChanges = await prepareIssueDates(context, input);
   const currentContent = await issueInfo(context, input.issueNumber);
@@ -1695,6 +1702,9 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
       }
     }
   }
+  const studyClose = await prepareStudyClose(context, input, closeReason, input.title ?? currentContent.title);
+  const unblocks = closeReason === undefined ? undefined : await readUnblocks(context, input.issueNumber);
+  if (unblocks?.warning !== undefined) prepared.warnings.push(unblocks.warning);
   let historyBody: string | undefined;
   let priorContent: { title: string; body: string } | undefined =
     input.status === undefined ? undefined : { title: currentContent.title, body: currentContent.body };
@@ -1723,7 +1733,13 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
   const closureBody =
     closeReason === undefined
       ? undefined
-      : `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`;
+      : [
+          ...(studyClose ?? []),
+          `Requested closure reason: ${closeReason}.${input.supersededBy === undefined ? '' : `\nSuperseded by ${repo.owner}/${repo.repo}#${String(input.supersededBy)}.`}`,
+          ...(unblocks?.numbers.length
+            ? [`**Unblocks:** ${unblocks.numbers.map((n) => `#${String(n)}`).join(', ')}`]
+            : []),
+        ].join('\n\n');
   const target = (await clients.rest.issues.get({ ...repo, issue_number: input.issueNumber })).data;
   if (
     target.number !== input.issueNumber ||
@@ -1758,7 +1774,98 @@ async function prepareIssueUpdate(context: DeliveryContext, input: UpdateIssueIn
     priorContent,
     historyBody,
     closureBody,
+    unblocks: unblocks?.numbers,
   };
+}
+
+const STUDY_TITLE = /^study\b/iu;
+
+/**
+ * A study closed as completed must carry its verdict, its READOUT's Result and a READOUT artifact.
+ * Returns the comment sections that replace the bare reason line, or undefined for every other close.
+ */
+async function prepareStudyClose(
+  context: DeliveryContext,
+  input: UpdateIssueInput,
+  closeReason: string | undefined,
+  title: string,
+): Promise<string[] | undefined> {
+  const study = STUDY_TITLE.test(title);
+  if (study && input.state === 'closed' && closeReason === undefined)
+    throw new DeliveryError("Pass closeReason to close a study: 'completed' with closeout, or 'not_planned'.");
+  if (!study || closeReason !== 'completed') {
+    if (input.closeout !== undefined)
+      throw new DeliveryError('closeout applies only when closing a study (title starts with "Study") as completed.');
+    return undefined;
+  }
+  const verdict = input.closeout?.verdict.trim() ?? '';
+  const result = input.closeout?.result ?? '';
+  if (!verdict || verdict.split('\n').length > 3 || verdict.length > 600)
+    throw new DeliveryError('Pass closeout.verdict (1–3 lines) to close a study.');
+  if (!result.trim() || result.length > 4000)
+    throw new DeliveryError(
+      "Pass closeout.result (the READOUT's Result section); GitHub search doesn't read artifacts.",
+    );
+  const artifacts = await readIssueArtifacts(context, input.issueNumber);
+  if (!artifacts.some((artifact) => /^readout\b/iu.test(artifact.name)))
+    throw new DeliveryError(
+      `Attach the READOUT with gh issue artifact create ${String(input.issueNumber)} READOUT.md, then close again.`,
+    );
+  return [
+    `**Verdict:** ${verdict}`,
+    `**Result:**\n\n${result}`,
+    `**Artifacts:**\n${artifacts.map((artifact) => `- [${artifact.name}](${artifact.url})`).join('\n')}`,
+  ];
+}
+
+export interface IssueArtifact {
+  number: number;
+  name: string;
+  type: string;
+  url: string;
+}
+
+const IssueArtifactRows = z.array(
+  z.object({ number: z.number().int().positive(), name: z.string(), type: z.string(), html_url: z.url() }),
+);
+
+/** Issue artifacts (GitHub preview), first 100. Any answer but 200 throws, naming the HTTP status. */
+async function readIssueArtifacts(context: DeliveryContext, issueNumber: number): Promise<IssueArtifact[]> {
+  let status: unknown;
+  let data: unknown;
+  try {
+    const response: { status: number; data: unknown } = await context.clients.rest.request(
+      'GET /repos/{owner}/{repo}/issues/{issue_number}/artifacts',
+      { ...context.repo, issue_number: issueNumber, per_page: 100 },
+    );
+    ({ status, data } = response);
+  } catch (error) {
+    status = (error as { status?: unknown }).status ?? 'unavailable';
+  }
+  const rows = status === 200 ? IssueArtifactRows.safeParse(data) : undefined;
+  if (!rows?.success)
+    throw new DeliveryError(
+      `Can't read this issue's artifacts (HTTP ${String(status)}); attach the READOUT with gh issue artifact create and retry.`,
+    );
+  return rows.data.map((row) => ({ number: row.number, name: row.name, type: row.type, url: row.html_url }));
+}
+
+/** The open issues this one blocks. A failed read is advisory: the close goes ahead with a warning. */
+async function readUnblocks(
+  context: DeliveryContext,
+  issueNumber: number,
+): Promise<{ numbers: number[]; warning?: IssueDiagnostic }> {
+  try {
+    const dependents = await getNativeBlockingRelationships({
+      graphql: context.clients.graphql,
+      issueNumber,
+      repo: context.repo,
+    });
+    return { numbers: dependents.filter((issue) => issue.state === 'OPEN').map((issue) => issue.number) };
+  } catch (error) {
+    const message = `Couldn't read the issues #${String(issueNumber)} blocks (${error instanceof Error ? error.message : String(error)}); the close has no Unblocks line, so tell their owners yourself.`;
+    return { numbers: [], warning: { code: 'close.unblocks', field: 'blocking', message, fixHint: message } };
+  }
 }
 
 type PreparedIssueUpdate = Awaited<ReturnType<typeof prepareIssueUpdate>>;
@@ -2114,6 +2221,7 @@ async function applyIssueUpdate(
     ...(closure === undefined || closureComment === undefined
       ? {}
       : { closure: { ...closure, supersededBy: input.supersededBy ?? null, comment: closureComment } }),
+    ...(plan.unblocks === undefined ? {} : { unblocks: plan.unblocks }),
   };
 }
 
@@ -2596,6 +2704,9 @@ export interface IssueInfo {
   state: string;
   title: string;
   url: string;
+  /** Present when the read asked for artifacts and GitHub returned them. */
+  artifacts?: IssueArtifact[];
+  warnings?: IssueDiagnostic[];
 }
 
 async function readIssueInfo(
@@ -2681,13 +2792,23 @@ async function readIssueInfo(
   return { info, issueNodeId: issue.node_id, issueNumber: issue.number };
 }
 
-/** `childDetail: false` reports child counts only, skipping the per-child Points and status reads. */
+/**
+ * `childDetail: false` reports child counts only, skipping the per-child Points and status reads.
+ * `artifacts: true` adds the issue's artifacts; a failed artifact read leaves them out with a warning.
+ */
 export async function issueInfo(
   context: DeliveryContext,
   issueNumber: number,
-  options: { childDetail?: boolean } = {},
+  options: { childDetail?: boolean; artifacts?: boolean } = {},
 ): Promise<IssueInfo> {
-  return (await readIssueInfo(context, issueNumber, true, undefined, options.childDetail)).info;
+  const info = (await readIssueInfo(context, issueNumber, true, undefined, options.childDetail)).info;
+  if (options.artifacts !== true) return info;
+  try {
+    return { ...info, artifacts: await readIssueArtifacts(context, issueNumber) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ...info, warnings: [{ code: 'artifacts.unread', field: 'artifacts', message, fixHint: message }] };
+  }
 }
 
 function childCounts(children: readonly { state: 'open' | 'closed' }[]): IssueChildCounts {
