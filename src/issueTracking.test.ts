@@ -44,6 +44,10 @@ function updateFixture() {
     nativeReadsAfterUpdate: 0,
     failChildReadAfterUpdate: false,
     childReadsAfterUpdate: 0,
+    artifacts: [] as { number: number; name: string; type: string; html_url: string }[],
+    artifactStatus: 200,
+    blocking: [] as { number: number; state: 'OPEN' | 'CLOSED' }[],
+    blockingStatus: 200,
   };
   const comments: { id: number; body: string; html_url: string; user: { login: string }; issue_url: string }[] = [];
   const updates: Record<string, unknown>[] = [];
@@ -130,9 +134,24 @@ function updateFixture() {
             return { data: { ...live } };
           },
         },
-        request: async () => ({ data: [] }),
+        request: async (route: string) => {
+          if (!route.endsWith('/artifacts')) return { data: [] };
+          if (controls.artifactStatus !== 200)
+            throw Object.assign(new Error('Artifacts unavailable'), { status: controls.artifactStatus });
+          return { status: 200, data: controls.artifacts };
+        },
       },
       graphql: async (query: string, variables: Record<string, unknown>) => {
+        if (query.includes('blocking(first:')) {
+          if (controls.blockingStatus !== 200)
+            throw Object.assign(new Error('Bad gateway'), { status: controls.blockingStatus });
+          const nodes = controls.blocking.map((node) => ({
+            ...node,
+            id: `ISSUE${String(node.number)}`,
+            title: 'Dependent',
+          }));
+          return { repository: { issue: { blocking: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } };
+        }
         if (query.includes('ProjectDelivery') && updates.length && controls.projectFailure) {
           if (controls.projectFailure === 'cancel') throw new DOMException('Cancelled', 'AbortError');
           throw Object.assign(new Error('PRIVATE_RATE_CONTENT'), {
@@ -476,6 +495,130 @@ test('reasoned closure records supersession and verifies native reason and dupli
     } finally {
       fixture.cleanup();
     }
+  }
+});
+
+const studyArtifact = (number: number, name: string) => ({
+  number,
+  name,
+  type: 'generic',
+  html_url: `https://github.com/example/widget/issues/17/artifacts/${String(number)}`,
+});
+
+test('a study closes as completed only with a verdict, a Result and a READOUT artifact', async () => {
+  const close = { issueNumber: 17, state: 'closed' as const, closeReason: 'completed' as const };
+  const closeout = { verdict: 'NONE: no cut passed', result: 'Net −0.4¢/fill (n=212)' };
+  const cases: {
+    title?: string;
+    input: issue.UpdateIssueInput;
+    artifacts?: ReturnType<typeof studyArtifact>[];
+    artifactStatus?: number;
+    refusal?: RegExp;
+  }[] = [
+    { input: close, refusal: /Pass closeout\.verdict/u },
+    { input: { ...close, closeout: { ...closeout, result: '' } }, refusal: /Pass closeout\.result/u },
+    {
+      input: { ...close, closeout },
+      artifacts: [studyArtifact(1, 'PLAN.md')],
+      refusal: /gh issue artifact create 17/u,
+    },
+    { input: { ...close, closeout }, artifactStatus: 404, refusal: /artifacts \(HTTP 404\)/u },
+    { input: { ...close, closeout: { ...closeout, verdict: 'a\nb\nc\nd' } }, refusal: /1–3 lines/u },
+    { input: { ...close, closeReason: 'not_planned' } },
+    { title: 'Book cell can hold tied', input: close },
+  ];
+  for (const example of cases) {
+    const f = updateFixture();
+    try {
+      f.live.title = example.title ?? 'Study: X';
+      f.controls.artifacts = example.artifacts ?? [];
+      f.controls.artifactStatus = example.artifactStatus ?? 200;
+      if (example.refusal) {
+        await assert.rejects(issue.updateIssue(f.context, example.input), example.refusal);
+        assert.equal(f.live.state, 'open');
+        assert.equal(f.comments.length, 0);
+      } else {
+        const result = await issue.updateIssue(f.context, example.input);
+        assert.equal(result.state, 'closed');
+        assert.match(f.comments[0]!.body, /^Requested closure reason: (completed|not_planned)\.$/u);
+      }
+    } finally {
+      f.cleanup();
+    }
+  }
+  const f = updateFixture();
+  try {
+    f.live.title = 'Study: X';
+    f.controls.artifacts = [studyArtifact(1, 'READOUT.md'), studyArtifact(2, 'SHA256SUMS')];
+    const result = await issue.updateIssue(f.context, { ...close, closeout });
+    assert.equal(result.state, 'closed');
+    assert.equal(
+      result.closure?.comment.body,
+      [
+        '**Verdict:** NONE: no cut passed',
+        '**Result:**\n\nNet −0.4¢/fill (n=212)',
+        '**Artifacts:**\n- [READOUT.md](https://github.com/example/widget/issues/17/artifacts/1)\n- [SHA256SUMS](https://github.com/example/widget/issues/17/artifacts/2)',
+        'Requested closure reason: completed.',
+      ].join('\n\n'),
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('every close lists the open issues it was blocking', async () => {
+  const close = { issueNumber: 17, state: 'closed' as const, closeReason: 'not_planned' as const };
+  for (const example of [
+    {
+      blocking: [
+        { number: 11, state: 'OPEN' as const },
+        { number: 12, state: 'CLOSED' as const },
+      ],
+      unblocks: [11],
+    },
+    { blocking: [], unblocks: [] },
+    { blocking: [], blockingStatus: 502, unblocks: [] },
+  ]) {
+    const f = updateFixture();
+    try {
+      f.controls.blocking = example.blocking;
+      f.controls.blockingStatus = example.blockingStatus ?? 200;
+      const result = await issue.updateIssue(f.context, close);
+      assert.equal(result.state, 'closed');
+      assert.deepEqual(result.unblocks, example.unblocks);
+      const unblocksLine = /\*\*Unblocks:\*\* (.*)$/u.exec(result.closure!.comment.body)?.[1];
+      assert.equal(unblocksLine, example.unblocks.length ? '#11' : undefined);
+      assert.equal(
+        result.warnings.some(
+          (warning) => warning.code === 'close.unblocks' && /issues #17 blocks/u.test(warning.message),
+        ),
+        example.blockingStatus === 502,
+      );
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('issue info lists artifacts on request and warns instead of failing when they are unreadable', async () => {
+  const f = updateFixture();
+  try {
+    f.controls.artifacts = [studyArtifact(1, 'READOUT.md'), { ...studyArtifact(2, 's3 link'), type: 'link' }];
+    assert.deepEqual((await issue.issueInfo(f.context, 17, { artifacts: true })).artifacts, [
+      {
+        number: 1,
+        name: 'READOUT.md',
+        type: 'generic',
+        url: 'https://github.com/example/widget/issues/17/artifacts/1',
+      },
+      { number: 2, name: 's3 link', type: 'link', url: 'https://github.com/example/widget/issues/17/artifacts/2' },
+    ]);
+    f.controls.artifactStatus = 403;
+    const unread = await issue.issueInfo(f.context, 17, { artifacts: true });
+    assert.equal(unread.artifacts, undefined);
+    assert.match(unread.warnings?.[0]?.message ?? '', /HTTP 403/u);
+  } finally {
+    f.cleanup();
   }
 });
 
