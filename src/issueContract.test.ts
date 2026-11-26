@@ -608,3 +608,18 @@ test('an 85-character title refuses with its length', () => {
   );
   assert.equal(failure?.fixHint, 'The title is 85 characters; shorten it to at most 80.');
 });
+
+test('a study needs non-empty Prior work to be Ready, and Prior work round-trips after Extends', () => {
+  const codes = (title: string, priorWork?: string[]) =>
+    validateIssue({ ...builderReady(), title, priorWork }).failures.map((f) => f.code);
+  const study = 'Study: Kalshi round trip by region';
+  assert.deepEqual(
+    [codes(study, ['ai#3482: no room at 250 ms']), codes(study), codes(study, ['  '])],
+    [[], ['priorWork'], ['priorWork']],
+  );
+  assert.deepEqual(codes('Book cell can hold tied at the best bid'), []);
+  const issue = IssueFields.parse({ ...builderReady(), priorWork: ['ai#3482: 250 ms floor', 'none found'] });
+  const body = renderIssueBody(issue);
+  assert.ok(body.indexOf('\n## Extends\n') < body.indexOf('\n## Prior work\n'));
+  assert.deepEqual(parseIssueBody(body, { title: issue.title }).issue.priorWork, issue.priorWork);
+});

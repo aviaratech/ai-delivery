@@ -8,15 +8,15 @@ description: Use before a Ready issue_create, or when slicing a design into tick
 A builder who reads only the issue must finish without asking. Work through these in order.
 
 1. **Start from the design.** Write each rule as an acceptance criterion with `behavior` and `verifiedBy`. Give each one examples (input → expected), including one failure (late, empty, invalid, restart). An open question means a draft, not Ready.
-2. **Extend, don't fork.** Name in `extends` the architecture decision or existing owner the ticket uses or extends. If the change would add a second path beside an existing engine or owner, redesign it or fold it into that owner first.
-3. **Decide.** Record each choice a builder would otherwise ask about as a decision: shape, names, failure behavior, the invariant it implements.
+2. **Extend, don't fork.** Name in `extends` the architecture decision or existing owner the ticket uses or extends. If the change would add a second path beside an existing engine or owner, redesign it or fold it into that owner first. Studies: list each search for earlier work in `priorWork` with its finding, or "none found".
+3. **Decide.** Record each choice a builder would otherwise ask about: shape, names, failure behavior, the invariant it implements.
 4. **Surface.** List every path with its change and exact signatures, copied from merged code. The surface is closed: the builder stops and asks before touching anything else.
 5. **Fences.** Name the tempting neighbors and each shared file's owner.
 6. **Proof.** List commands in run order, focused first.
-7. **Size.** Over 5 points or 6 paths, split into tickets that merge in order (`blockedBy`). Points run 1–8; 13 means split.
+7. **Size.** Over 5 points or 6 paths, split into tickets that merge in order (`blockedBy`).
 8. **Tier.** Default to standard. Use frontier only for a new state machine, concurrency or recovery logic, risk semantics, or a refactor no parity check can prove.
 9. **Type and Priority.** Set both; Priority goes in the tool's `priority` argument. A Bug also needs steps, expected, actual, reproducibility, environment and a regression criterion.
-10. **Self-check.** Could a builder finish without asking, and without adding a second way to do something that already exists? Then create it, and fix any refusal by its `code`. To capture an idea now, pass `draft: true`.
+10. **Self-check.** Could a builder finish without asking, and without adding a second way to do something that already exists? Then create it; fix refusals by `code`. To capture an idea now, pass `draft: true`.
 
 Ready `/owned/issue.json`:
 
