@@ -1448,14 +1448,14 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
       const installArgs = nativePluginArgs({ ...nativeTarget, action: prior ? 'update' : 'install' });
       let selectionStarted = false;
       try {
-        state.nativeVersion = (await native(['--version'])).trim();
+        const nativeVersion = (await native(['--version'])).trim();
         if (prior && version) {
           if (input.host === 'claude-code') {
             // Qualified against this native binary in an isolated USER profile,
             // including unknown settings, unrelated selections and a catalog path change.
             const stable = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
             if (
-              state.nativeVersion !== '2.1.296 (Claude Code)' ||
+              nativeVersion !== '2.1.296 (Claude Code)' ||
               input.scope !== 'user' ||
               !stable.test(prior) ||
               !stable.test(version) ||
@@ -1471,9 +1471,12 @@ export async function managePlugin(value: unknown): Promise<PluginResult> {
           }
           // Only this pinned native source has a qualified preserving-add footprint.
           // This does not establish exclusion of concurrent, unrelated native writers.
-          if (input.host === 'codex' && state.nativeVersion !== 'codex-cli 0.162.1')
-            throw new Error('This native version has no qualified preserving replacement route.');
+          if (input.host === 'codex' && nativeVersion !== 'codex-cli 0.162.1')
+            throw new Error(
+              `This native version (${nativeVersion}) has no qualified preserving replacement route; put the pinned codex first on PATH.`,
+            );
         }
+        state.nativeVersion = nativeVersion;
         if (input.host === 'claude-code' && !(await native(['plugin', 'uninstall', '--help'])).includes('--keep-data'))
           throw new Error('This Claude Code version cannot preserve plugin data; upgrade the native tool first.');
         process.stderr.write(

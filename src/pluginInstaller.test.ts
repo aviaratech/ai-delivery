@@ -832,6 +832,31 @@ test.each([
   if (fault === 'catalog symlink') assert.equal(readFileSync(unrelatedCatalog, 'utf8'), 'unrelated catalog sentinel');
 });
 
+test.each([
+  ['codex-cli 0.133.0', false],
+  ['codex-cli 0.162.1', true],
+])('Codex update with native %s keeps state.json nativeVersion consistent', async (found, qualified) => {
+  const { native, catalog } = replacementFixture();
+  const statePath = join(dirname(catalog), 'state.json');
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+  atomicJson.writePrivateJsonFileAtomically(statePath, { ...state, nativeVersion: 'codex-cli 0.162.1' });
+  const before = readFileSync(statePath);
+  native.version = found;
+  const update = managePlugin({ ...input(), action: 'update', version: '0.3.22' });
+  if (qualified) {
+    await update;
+    const after = JSON.parse(readFileSync(statePath, 'utf8')) as { nativeVersion?: string };
+    assert.equal(after.nativeVersion, found);
+    return;
+  }
+  const refusal = await update.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  assert.deepEqual(readFileSync(statePath), before);
+  assert.ok(refusal instanceof Error && refusal.message.includes(`(${found})`));
+});
+
 test.each(['update', 'install', 'rollback'])(
   'Claude owned %s refuses an unqualified native version before catalog or selection changes',
   async (action) => {
