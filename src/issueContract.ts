@@ -170,16 +170,17 @@ const hint = (code: string, field: string, fixHint: string): IssueDiagnostic => 
   message: fixHint,
 });
 
+/** Every string inside value, each with its dotted field path (e.g. `context.evidence.0`). */
+function stringEntries(value: unknown, path = ''): [string, string][] {
+  if (typeof value === 'string') return [[path, value]];
+  if (value === null || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([key, item]) => stringEntries(item, path ? `${path}.${key}` : key));
+}
+
 function secrets(value: unknown): boolean {
-  const strings = (item: unknown): string[] =>
-    typeof item === 'string'
-      ? [item]
-      : Array.isArray(item)
-        ? item.flatMap(strings)
-        : item !== null && typeof item === 'object'
-          ? Object.values(item).flatMap(strings)
-          : [];
-  const text = strings(value).join('\n');
+  const text = stringEntries(value)
+    .map(([, item]) => item)
+    .join('\n');
   return /(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b|\b(?:password|secret|api[_-]?key|access[_-]?token)\s*[=:]\s*["']?(?!<|\$|redacted\b|placeholder\b)[A-Za-z0-9_+/-]{8,})/iu.test(
     text,
   );
@@ -256,12 +257,6 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
         if (!value.bug[field].trim()) add(`bug.${field}`, ['bug', field], `Describe the bug's ${field}.`);
     }
   }
-  if (/^study\b/iu.test(value.title) && !(value.priorWork ?? []).some((item) => item.trim()))
-    add(
-      'priorWork',
-      ['priorWork'],
-      "List each search you ran for earlier work on this question and what it found, or 'none found' with the searches.",
-    );
   if (value.epic || value.builder === undefined) return;
   if (!(value.decisions ?? []).some((item) => item.trim()))
     add('decisions', ['decisions'], `Record each choice the builder must not reopen. ${SKILL_HINT}`);
@@ -279,6 +274,47 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
     );
   if (!(value.proof ?? []).some((item) => item.trim()))
     add('proof', ['proof'], `List the commands to run in order, focused first. ${SKILL_HINT}`);
+}
+
+const LOCAL_PATH = /\.local\/|\/Users\/|~\//u;
+const CONTRACT_WORD_LIMIT = 400;
+
+/** Rules the Ready write gate refuses (create and draft-to-Ready); every other path only warns. Paul, Nov 26 (ai#5835, ai#5838). */
+function readyWriteRules(issue: DraftIssueData): IssueDiagnostic[] {
+  if (issue.draft) return [];
+  const results: IssueDiagnostic[] = [];
+  if (!issue.epic && !(issue.priorWork ?? []).some((item) => item.trim()))
+    results.push(
+      hint(
+        'priorWork',
+        'priorWork',
+        "List each search you ran for earlier work on this question and what it found, or 'none found' with the searches.",
+      ),
+    );
+  for (const [field, text] of stringEntries(issue)) {
+    const match = LOCAL_PATH.exec(text);
+    if (match)
+      results.push(
+        hint(
+          'local-path',
+          field,
+          `${field} cites a local path (${match[0]}); put that evidence on the issue as a comment or artifact and link it instead.`,
+        ),
+      );
+  }
+  const { outcome, surface, acceptanceCriteria, proof, priorWork } = issue;
+  const words = stringEntries({ outcome, surface, acceptanceCriteria, proof, priorWork })
+    .flatMap(([, text]) => text.split(/\s+/u))
+    .filter(Boolean).length;
+  if (words > CONTRACT_WORD_LIMIT)
+    results.push(
+      hint(
+        'contract-words',
+        'contract',
+        `The contract (outcome, files, acceptance, tests, prior work) is ${String(words)} words; keep it to 400 and move evidence to a comment or artifact.`,
+      ),
+    );
+  return results;
 }
 
 export const ReadyIssue = IssueFields.extend({
@@ -408,13 +444,10 @@ export class IssueValidationError extends DeliveryError {
 export function requireIssue(value: unknown, options: { requireBuilder?: true } = {}): DraftIssueData {
   const structural = IssueFields.safeParse(value);
   const result = validateIssue(value, !structural.success || !structural.data.draft);
-  const unbuilt =
-    options.requireBuilder === true &&
-    structural.success &&
-    !structural.data.draft &&
-    !structural.data.epic &&
-    structural.data.builder === undefined;
-  if (!result.issue || unbuilt)
+  const gated = options.requireBuilder === true && structural.success && !structural.data.draft;
+  const unbuilt = gated && !structural.data.epic && structural.data.builder === undefined;
+  const writeFailures = gated ? readyWriteRules(structural.data) : [];
+  if (!result.issue || unbuilt || writeFailures.length)
     throw new IssueValidationError([
       ...(unbuilt
         ? [
@@ -426,6 +459,7 @@ export function requireIssue(value: unknown, options: { requireBuilder?: true } 
           ]
         : []),
       ...result.failures,
+      ...writeFailures,
     ]);
   return result.issue;
 }
@@ -660,9 +694,7 @@ export function issueWarnings(issue: DraftIssueData): IssueDiagnostic[] {
     warn('bug.regression', 'acceptanceCriteria', 'Add a regression test criterion for the bug.');
   if (issue.builder === undefined && ![...issue.context.files, ...issue.context.components].some((item) => item.trim()))
     warn('context', 'context', 'Name relevant components or files.');
-  const proofs = [...issue.context.evidence, ...issue.acceptanceCriteria.map((ac) => ac.verifiedBy)];
-  if (proofs.length && proofs.every((proof) => /^(?:\/|[A-Za-z]:\\|~\/)/u.test(proof.trim())))
-    warn('local-evidence', 'context.evidence', 'Use portable evidence in addition to machine-local paths.');
+  warnings.push(...readyWriteRules(issue));
   if (proseWords(issue) > 300)
     warn('body.length', 'body', `Consider cutting the problem, outcome and criteria to 300 words. ${SKILL_HINT}`);
   if (issue.draft || issue.epic) return warnings;

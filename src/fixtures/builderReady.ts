@@ -10,6 +10,7 @@ export const builderReady = () =>
     outcome: 'saveWidget refuses malformed identifiers and writes nothing.',
     builder: { tier: 'standard' },
     extends: ['src/widget.ts saveWidget (the one widget write path)'],
+    priorWork: ["none found: closed issues 'widget id'"],
     decisions: ['Valid id: ^w-[0-9a-f]{8}$. Refuse with InvalidWidgetId; never trim or coerce.'],
     acceptanceCriteria: [
       {
@@ -46,6 +47,7 @@ export const withBuilder = <
   ...issue,
   builder: { tier: 'standard' as const },
   extends: ['src/widget.ts saveWidget (the one widget write path)'],
+  priorWork: ["none found: closed issues 'widget id'"],
   decisions: ['Refuse malformed input; never coerce it.'],
   surface: [{ path: 'src/widget.ts', change: 'edit' as const, signatures: ['export function saveWidget(): void'] }],
   fences: ['src/store.ts (storage owner)'],

@@ -98,3 +98,16 @@ test('a legacy Ready issue without builder is ready and warns builder.unset; a b
   assert.equal(result.ready, true);
   assert.deepEqual(result.warnings, []);
 });
+
+test('an already-Ready issue with a local path, no Prior work and a long contract is ready and warns', () => {
+  const issue = {
+    ...builderReady(),
+    priorWork: undefined,
+    outcome: Array.from({ length: 800 }, () => 'w').join(' '),
+    proof: ['.local/operator/run.sh'],
+  };
+  const result = evaluate({ title: issue.title, body: renderIssueBody(issue) });
+  assert.equal(result.ready, true);
+  const codes = result.warnings.map((w) => w.code);
+  for (const code of ['priorWork', 'local-path', 'contract-words']) assert.ok(codes.includes(code), code);
+});
