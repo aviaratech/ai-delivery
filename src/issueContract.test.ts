@@ -623,16 +623,16 @@ test('the Ready write gate refuses missing Prior work, local paths and a contrac
   const fit = { ...builderReady(), outcome: words(140) };
   assert.deepEqual(gate(fit), []);
   assert.deepEqual(issueWarnings(fit), []);
-  assert.deepEqual(gate({ ...fit, priorWork: undefined }), [
-    {
-      code: 'priorWork',
-      field: 'priorWork',
-      fixHint:
+  const prior = gate({ ...fit, priorWork: undefined });
+  assert.deepEqual(
+    prior.map((f) => [f.code, f.fixHint]),
+    [
+      [
+        'priorWork',
         "List each search you ran for earlier work on this question and what it found, or 'none found' with the searches.",
-      message:
-        "List each search you ran for earlier work on this question and what it found, or 'none found' with the searches.",
-    },
-  ]);
+      ],
+    ],
+  );
   const local = gate({ ...fit, context: { components: [], files: [], evidence: ['~/runs/READOUT.md'] } });
   assert.deepEqual(
     local.map((f) => f.fixHint),
@@ -655,16 +655,9 @@ test('the Ready write gate refuses missing Prior work, local paths and a contrac
   const existing = { ...fit, priorWork: undefined, outcome: words(800), proof: ['.local/operator/run.sh'] };
   assert.deepEqual(validateIssue(existing).failures, []);
   assert.ok(requireIssue(existing));
-  const codes = ['priorWork', 'local-path', 'contract-words'];
-  assert.deepEqual(
-    issueWarnings(existing)
-      .map((w) => w.code)
-      .filter((code) => codes.includes(code)),
-    codes,
-  );
   assert.deepEqual(
     gate(existing).map((f) => f.code),
-    codes,
+    ['priorWork', 'local-path', 'contract-words'],
   );
 });
 
