@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -405,7 +406,7 @@ beforeEach(() => {
     'fetch',
     vi.fn(() => Promise.resolve(new Response('{"latest":"0.3.35"}'))),
   );
-  fixture.home = mkdtempSync(join(tmpdir(), 'ai-delivery-installer-'));
+  fixture.home = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-installer-')));
   vi.stubEnv('CODEX_HOME', join(fixture.home, '.codex'));
   vi.stubEnv('CLAUDE_CONFIG_DIR', join(fixture.home, '.claude'));
   fixture.commands = [];
@@ -784,17 +785,17 @@ test('an exact same-version owned selection is reused without invoking native ad
 });
 
 test.each([
-  'disabled',
-  'missing selection',
-  'unregistered catalog',
-  'foreign source',
-  'changed cache',
-  'changed catalog',
-  'catalog symlink',
-  'read-only catalog',
-  'unqualified native',
-  'unqualified newer native',
-])('replacement refuses %s before preparing a new version', async (fault) => {
+  ['disabled', /selection is disabled/],
+  ['missing selection', /native selection changed/],
+  ['unregistered catalog', /unmanaged source/],
+  ['foreign source', /source differs from the managed version/],
+  ['changed cache', /bytes differ from the verified archive/],
+  ['changed catalog', /Selected policy stage command failed/],
+  ['catalog symlink', /Selected policy stage command failed/],
+  ['read-only catalog', /Managed catalog is unsafe/],
+  ['unqualified native', /codex-cli 0\.153\.0\) has no qualified/],
+  ['unqualified newer native', /codex-cli 0\.162\.2\) has no qualified/],
+])('replacement refuses %s before preparing a new version', async (fault, expected) => {
   const { native, catalog, policy, before } = replacementFixture();
   if (fault === 'disabled') native.selected[0]!.enabled = false;
   if (fault === 'missing selection') native.selected = [];
@@ -825,7 +826,7 @@ test.each([
   if (fault === 'read-only catalog') chmodSync(join(catalog, '.agents/plugins/marketplace.json'), 0o400);
   if (fault === 'unqualified native') native.version = 'codex-cli 0.153.0';
   if (fault === 'unqualified newer native') native.version = 'codex-cli 0.162.2';
-  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }));
+  await assert.rejects(managePlugin({ ...input(), action: 'update', version: '0.3.22' }), expected);
   assert.equal(native.selectionCalls, 0);
   assert.equal(existsSync(join(catalog, 'versions/0.3.22')), false);
   assert.deepEqual(policy, before);

@@ -348,7 +348,7 @@ function native(host = 'codex') {
   }
 }
 beforeEach(() => {
-  fixture.home = mkdtempSync(join(tmpdir(), 'ai-delivery-doctor-'));
+  fixture.home = realpathSync(mkdtempSync(join(tmpdir(), 'ai-delivery-doctor-')));
   fixture.config = join(fixture.home, 'settings.json');
   fixture.enabled = true;
   fixture.mode = 'success';
