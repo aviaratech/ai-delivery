@@ -5,11 +5,11 @@ description: Use before a Ready issue_create, or when slicing a design into tick
 
 # Design a builder-ready issue
 
-A builder who reads only the issue must finish without asking. Work in order.
+A builder who reads only the issue must finish without asking.
 
 1. **Start from the design.** Write each rule as an acceptance criterion with `behavior` and `verifiedBy`. Give each examples (input → expected), including one failure. An open question means a draft, not Ready.
 2. **Extend, don't fork.** Name in `extends` the decision or owner the ticket extends. If it would add a second path beside an owner, fold it into that owner first. List each search for earlier work in `priorWork` with its finding, or "none found".
-3. **Decide.** Record each choice a builder would ask about: shape, names, failure behavior, invariants.
+3. **Decide.** Record each choice a builder would ask about: shape, names, failure behavior, invariants. If the repo's review policy gates a path it touches, set `moneyPath: true` and link the owner's OK of its live-effect line in `ownerOk`.
 4. **Surface.** List every path with its change and exact signatures, copied from merged code. The surface is closed: the builder asks before touching more.
 5. **Fences.** Name the tempting neighbors and each shared file's owner.
 6. **Proof.** List commands in run order, focused first.

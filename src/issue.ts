@@ -1546,9 +1546,9 @@ function rebuildableWrite(input: UpdateIssueInput, current: IssueInfo): ReturnTy
       'draft',
       'openQuestions',
       'context',
-      ...(['builder', 'extends', 'priorWork', 'decisions', 'surface', 'fences', 'proof'] as const).filter((key) =>
-        carried.has(key),
-      ),
+      ...(
+        ['builder', 'extends', 'priorWork', 'decisions', 'moneyPath', 'ownerOk', 'surface', 'fences', 'proof'] as const
+      ).filter((key) => carried.has(key)),
     ].filter((key) => input[key as keyof typeof input] === undefined);
     if (reset.length) {
       const message = `Rebuilt the hand-edited body (old one in the history comment); reset because not sent: ${reset.join(', ')}.`;

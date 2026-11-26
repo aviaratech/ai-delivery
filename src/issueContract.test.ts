@@ -669,6 +669,24 @@ test('Prior work round-trips after Extends', () => {
   assert.deepEqual(parseIssueBody(body, { title: issue.title }).issue.priorWork, issue.priorWork);
 });
 
+test('a moneyPath ticket is Ready only with an https Owner OK link, which round-trips', () => {
+  const link = 'https://github.com/aviaratech/ai/issues/5842#issuecomment-1';
+  const ownerOkFailures = (value: object) =>
+    validateIssue({ ...builderReady(), ...value }).failures.filter((f) => f.code === 'ownerOk');
+  assert.deepEqual(ownerOkFailures({ moneyPath: true, ownerOk: [link] }), []);
+  assert.deepEqual(ownerOkFailures({}), []);
+  for (const ownerOk of [undefined, ['Paul said yes']])
+    assert.deepEqual(
+      ownerOkFailures({ moneyPath: true, ownerOk }).map((f) => f.fixHint),
+      ["Link the owner's comment that OKs this ticket's live-effect line, or set moneyPath to false."],
+    );
+  const issue = IssueFields.parse({ ...builderReady(), moneyPath: true, ownerOk: [link] });
+  const body = renderIssueBody(issue);
+  assert.ok(body.indexOf('\n## Decisions\n') < body.indexOf('\n## Money path\n\nyes\n\n## Owner OK\n'));
+  const parsed = parseIssueBody(body, { title: issue.title }).issue;
+  assert.deepEqual([parsed.moneyPath, parsed.ownerOk], [true, [link]]);
+});
+
 test('addedLocalPaths names only paths no current string already holds, legacy body included', () => {
   const before = IssueFields.parse({ ...builderReady(), legacyBody: 'old notes in .local/operator/x' });
   assert.deepEqual(addedLocalPaths(before, { ...before, outcome: 'see .local/operator/x' }), []);
