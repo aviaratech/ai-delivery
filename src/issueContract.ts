@@ -94,6 +94,11 @@ export const IssueFields = z.strictObject({
     "Searches run for earlier work on this question (closed issues, issue artifacts, decision logs) and what each found, or 'none found' with the searches.",
   ),
   decisions: Strings.optional().describe('Choices already made; the builder must not reopen them.'),
+  moneyPath: z
+    .boolean()
+    .optional()
+    .describe("True when the change touches a path the repository's review policy gates; ownerOk is then required."),
+  ownerOk: Strings.optional().describe("Link to the owner's comment approving this ticket's live-effect line."),
   surface: z
     .array(SurfaceEntry)
     .optional()
@@ -257,6 +262,12 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
         if (!value.bug[field].trim()) add(`bug.${field}`, ['bug', field], `Describe the bug's ${field}.`);
     }
   }
+  if (value.moneyPath === true && !(value.ownerOk ?? []).some((item) => item.startsWith('https://')))
+    add(
+      'ownerOk',
+      ['ownerOk'],
+      "Link the owner's comment that OKs this ticket's live-effect line, or set moneyPath to false.",
+    );
   if (value.epic || value.builder === undefined) return;
   if (!(value.decisions ?? []).some((item) => item.trim()))
     add('decisions', ['decisions'], `Record each choice the builder must not reopen. ${SKILL_HINT}`);
@@ -369,6 +380,8 @@ export const IssueWriteFields = {
   extends: IssueFields.shape.extends,
   priorWork: IssueFields.shape.priorWork,
   decisions: IssueFields.shape.decisions,
+  moneyPath: IssueFields.shape.moneyPath,
+  ownerOk: IssueFields.shape.ownerOk,
   surface: IssueFields.shape.surface,
   fences: IssueFields.shape.fences,
   proof: IssueFields.shape.proof,
@@ -515,6 +528,8 @@ export function renderIssueBody(value: DraftIssueData, status?: IssueStatusData,
     ...bulletSection('Extends', item.extends),
     ...bulletSection('Prior work', item.priorWork),
     ...bulletSection('Decisions', item.decisions),
+    ...(item.moneyPath === true ? ['## Money path', 'yes'] : []),
+    ...bulletSection('Owner OK', item.ownerOk),
     '## Acceptance criteria',
     item.acceptanceCriteria
       .map(
