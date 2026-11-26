@@ -372,12 +372,11 @@ const warningCases: [string, (issue: ReturnType<typeof validIssue>) => void, str
     'context',
   ],
   [
-    'only local evidence',
+    'local path',
     (i) => {
-      i.context.evidence = ['/synthetic/machine/proof.txt'];
-      i.acceptanceCriteria[0]!.verifiedBy = '/synthetic/machine/test.ts';
+      i.context.evidence = ['~/runs/READOUT.md'];
     },
-    'local-evidence',
+    'local-path',
   ],
   [
     'long body',
@@ -609,15 +608,60 @@ test('an 85-character title refuses with its length', () => {
   assert.equal(failure?.fixHint, 'The title is 85 characters; shorten it to at most 80.');
 });
 
-test('a study needs non-empty Prior work to be Ready, and Prior work round-trips after Extends', () => {
-  const codes = (title: string, priorWork?: string[]) =>
-    validateIssue({ ...builderReady(), title, priorWork }).failures.map((f) => f.code);
-  const study = 'Study: Kalshi round trip by region';
+test('the Ready write gate refuses missing Prior work, local paths and a contract over 400 words; other paths warn', () => {
+  // builderReady's contract is 40 words outside its one-word outcome.
+  const words = (n: number) => Array.from({ length: n }, () => 'w').join(' ');
+  const gate = (value: unknown) => {
+    try {
+      requireIssue(value, { requireBuilder: true });
+      return [];
+    } catch (error) {
+      if (!(error instanceof IssueValidationError)) throw error;
+      return error.failures;
+    }
+  };
+  const fit = { ...builderReady(), outcome: words(140) };
+  assert.deepEqual(gate(fit), []);
+  assert.deepEqual(issueWarnings(fit), []);
+  const prior = gate({ ...fit, priorWork: undefined });
   assert.deepEqual(
-    [codes(study, ['ai#3482: no room at 250 ms']), codes(study), codes(study, ['  '])],
-    [[], ['priorWork'], ['priorWork']],
+    prior.map((f) => [f.code, f.fixHint]),
+    [
+      [
+        'priorWork',
+        "List each search you ran for earlier work on this question and what it found, or 'none found' with the searches.",
+      ],
+    ],
   );
-  assert.deepEqual(codes('Book cell can hold tied at the best bid'), []);
+  const local = gate({ ...fit, context: { components: [], files: [], evidence: ['~/runs/READOUT.md'] } });
+  assert.deepEqual(
+    local.map((f) => f.fixHint),
+    [
+      'context.evidence.0 cites a local path (~/); put that evidence on the issue as a comment or artifact and link it instead.',
+    ],
+  );
+  const long = gate({ ...fit, outcome: words(390) });
+  assert.deepEqual(
+    long.map((f) => [f.code, f.fixHint]),
+    [
+      [
+        'contract-words',
+        'The contract (outcome, files, acceptance, tests, prior work) is 430 words; keep it to 400 and move evidence to a comment or artifact.',
+      ],
+    ],
+  );
+  assert.ok(requireIssue({ ...validIssue(), epic: true }, { requireBuilder: true }));
+  assert.ok(requireIssue({ ...fit, draft: true, proof: ['.local/operator/run.sh'] }, { requireBuilder: true }));
+  const existing = { ...fit, priorWork: undefined, outcome: words(800), proof: ['.local/operator/run.sh'] };
+  assert.deepEqual(validateIssue(existing).failures, []);
+  assert.ok(requireIssue(existing));
+  assert.deepEqual(
+    gate(existing).map((f) => f.code),
+    ['priorWork', 'local-path', 'contract-words'],
+  );
+});
+
+test('Prior work round-trips after Extends', () => {
   const issue = IssueFields.parse({ ...builderReady(), priorWork: ['ai#3482: 250 ms floor', 'none found'] });
   const body = renderIssueBody(issue);
   assert.ok(body.indexOf('\n## Extends\n') < body.indexOf('\n## Prior work\n'));
