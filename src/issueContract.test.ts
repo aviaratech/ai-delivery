@@ -14,6 +14,7 @@ import {
   validateIssue,
   issueWarnings,
   IssueValidationError,
+  addedLocalPaths,
 } from './issueContract.js';
 import { AI_DELIVERY_MCP_TOOLS } from './mcp/index.js';
 import { builderReady } from './fixtures/builderReady.js';
@@ -666,4 +667,13 @@ test('Prior work round-trips after Extends', () => {
   const body = renderIssueBody(issue);
   assert.ok(body.indexOf('\n## Extends\n') < body.indexOf('\n## Prior work\n'));
   assert.deepEqual(parseIssueBody(body, { title: issue.title }).issue.priorWork, issue.priorWork);
+});
+
+test('addedLocalPaths names only paths no current string already holds, legacy body included', () => {
+  const before = IssueFields.parse({ ...builderReady(), legacyBody: 'old notes in .local/operator/x' });
+  assert.deepEqual(addedLocalPaths(before, { ...before, outcome: 'see .local/operator/x' }), []);
+  assert.deepEqual(
+    addedLocalPaths(before, { ...before, proof: ['run ~/run.sh'] }).map((f) => [f.code, f.field]),
+    [['local-path', 'proof.0']],
+  );
 });

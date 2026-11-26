@@ -1527,6 +1527,30 @@ test('legacy Ready issues still update and rebuild without builder, and warn bui
   assert.equal(f.comments.length, 1, 'the hand-edited body went to the history comment');
 });
 
+test('a Ready update that adds a local path is refused; cited paths warn and park succeeds', async () => {
+  const f = fixture();
+  f.live.body = renderIssueBody({
+    ...ready(),
+    context: { components: [], files: [], evidence: ['.local/operator/x'] },
+  });
+  const writes = f.writes.length;
+  await assert.rejects(
+    updateIssue(f.context, { issueNumber: 17, proof: ['~/run.sh'] }),
+    (error: unknown) =>
+      error instanceof IssueValidationError &&
+      error.failures.map((failure) => failure.fixHint).join() ===
+        'proof.0 cites a local path (~/); put that evidence on the issue as a comment or artifact and link it instead.',
+  );
+  assert.equal(f.writes.length, writes);
+  const edited = await updateIssue(f.context, {
+    issueNumber: 17,
+    outcome: 'Reject malformed widget identifiers early.',
+  });
+  assert.ok(edited.warnings.some((warning) => warning.code === 'local-path'));
+  await updateIssue(f.context, { issueNumber: 17, proof: ['~/run.sh'], park: true });
+  assert.match(f.live.body, /\*\*State:\*\* Draft/u);
+});
+
 test('incomplete drafts write parked; reviewer-role writes and wrong native repository readback are refused', async () => {
   const f = fixture();
   await createIssue(f.context, { title: 'Investigate invalid widget identifiers', draft: true });

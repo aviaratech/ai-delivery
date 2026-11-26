@@ -72,6 +72,7 @@ import {
   requireIssueStatus,
   parseIssueBody,
   requireIssue,
+  addedLocalPaths,
   renderIssueBody,
   issueWarnings,
   issueBodyDiff,
@@ -440,6 +441,10 @@ function prepareIssueWrite(
     },
     requireBuilder ? { requireBuilder: true } : {},
   );
+  if (currentParsed !== undefined && !currentParsed.issue.draft && !issue.draft) {
+    const added = addedLocalPaths(currentParsed.issue, issue);
+    if (added.length) throw new IssueValidationError(added);
+  }
   const unchangedContract =
     currentParsed !== undefined && JSON.stringify(issue) === JSON.stringify(currentParsed.issue);
   const legacyFormatting = unchangedContract && parsed.legacyFormatting === true;

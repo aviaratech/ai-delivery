@@ -279,6 +279,26 @@ function readyRules(value: DraftIssueData, ctx: z.RefinementCtx): void {
 const LOCAL_PATH = /\.local\/|\/Users\/|~\//u;
 const CONTRACT_WORD_LIMIT = 400;
 
+function localPathHint(field: string, match: string): IssueDiagnostic {
+  return hint(
+    'local-path',
+    field,
+    `${field} cites a local path (${match}); put that evidence on the issue as a comment or artifact and link it instead.`,
+  );
+}
+
+/** Local paths an update adds to an already-Ready issue; paths it already cites only warn (#339). */
+export function addedLocalPaths(before: DraftIssueData, after: DraftIssueData): IssueDiagnostic[] {
+  const existing = stringEntries(before).map(([, text]) => text);
+  return stringEntries(after).flatMap(([field, text]) => {
+    const added = text
+      .split(/\s+/u)
+      .find((word) => LOCAL_PATH.test(word) && !existing.some((item) => item.includes(word)));
+    const match = added === undefined ? null : LOCAL_PATH.exec(added);
+    return match ? [localPathHint(field, match[0])] : [];
+  });
+}
+
 /** Rules the Ready write gate refuses (create and draft-to-Ready); every other path only warns. Paul, Nov 26 (ai#5835, ai#5838). */
 function readyWriteRules(issue: DraftIssueData): IssueDiagnostic[] {
   if (issue.draft) return [];
@@ -293,14 +313,7 @@ function readyWriteRules(issue: DraftIssueData): IssueDiagnostic[] {
     );
   for (const [field, text] of stringEntries(issue)) {
     const match = LOCAL_PATH.exec(text);
-    if (match)
-      results.push(
-        hint(
-          'local-path',
-          field,
-          `${field} cites a local path (${match[0]}); put that evidence on the issue as a comment or artifact and link it instead.`,
-        ),
-      );
+    if (match) results.push(localPathHint(field, match[0]));
   }
   const { outcome, surface, acceptanceCriteria, proof, priorWork } = issue;
   const words = stringEntries({ outcome, surface, acceptanceCriteria, proof, priorWork })
